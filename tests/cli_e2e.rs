@@ -185,6 +185,74 @@ fn explain_forensics_and_agent_links_behave_as_specified() {
 }
 
 #[test]
+fn record_command_captures_tool_events_and_exit_status() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+    let _ = run_json(repo, &["init"], None);
+
+    let record = run_json(
+        repo,
+        &[
+            "record",
+            "/bin/sh",
+            "-c",
+            "printf 'stdout-msg'; printf 'stderr-msg' 1>&2; exit 7",
+        ],
+        None,
+    );
+    let tape_id = record["tape_id"].as_str().expect("tape id");
+    assert_eq!(record["status"], "ok");
+    assert_eq!(record["recorded_command"]["exit"], 7);
+    assert_eq!(record["recorded_command"]["success"], false);
+    assert_eq!(record["recorded_command"]["argv"][0], "/bin/sh");
+
+    let raw = run_cli(repo, &["show", tape_id, "--raw"], None);
+    assert!(raw.status.success(), "show --raw should succeed");
+    let raw_text = String::from_utf8_lossy(&raw.stdout);
+    assert!(raw_text.contains("\"k\":\"tool.call\""));
+    assert!(raw_text.contains("\"k\":\"tool.result\""));
+    assert!(raw_text.contains("\"exit\":7"));
+    assert!(raw_text.contains("stdout-msg"));
+    assert!(raw_text.contains("stderr-msg"));
+}
+
+#[test]
+fn explain_orders_sessions_by_touch_count_then_recency() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+    let _ = run_json(repo, &["init"], None);
+
+    let anchor = "ordering-anchor";
+    let tape_one = format!(
+        concat!(
+            "{{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"meta\",\"label\":\"first\"}}\n",
+            "{{\"t\":\"2026-02-22T00:00:01Z\",\"k\":\"code.read\",\"file\":\"src/lib.rs\",\"range\":[1,1],\"anchor_hashes\":[\"{0}\"]}}\n"
+        ),
+        anchor
+    );
+    let tape_two = format!(
+        concat!(
+            "{{\"t\":\"2026-02-22T00:00:10Z\",\"k\":\"meta\",\"label\":\"second\"}}\n",
+            "{{\"t\":\"2026-02-22T00:00:11Z\",\"k\":\"code.read\",\"file\":\"src/lib.rs\",\"range\":[1,1],\"anchor_hashes\":[\"{0}\"]}}\n",
+            "{{\"t\":\"2026-02-22T00:00:12Z\",\"k\":\"code.read\",\"file\":\"src/lib.rs\",\"range\":[2,2],\"anchor_hashes\":[\"{0}\"]}}\n"
+        ),
+        anchor
+    );
+    let _ = run_json(repo, &["record", "--stdin"], Some(&tape_one));
+    let second = run_json(repo, &["record", "--stdin"], Some(&tape_two));
+
+    let explain = run_json(repo, &["explain", anchor, "--anchor"], None);
+    let sessions = explain["sessions"].as_array().expect("sessions");
+    assert_eq!(sessions.len(), 2);
+    assert_eq!(sessions[0]["touch_count"], 2);
+    assert_eq!(
+        sessions[0]["tape_id"], second["tape_id"],
+        "higher touch-count tape should rank first"
+    );
+    assert_eq!(sessions[1]["touch_count"], 1);
+}
+
+#[test]
 fn gc_removes_unreferenced_tapes() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();
