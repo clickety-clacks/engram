@@ -10,6 +10,7 @@ pub enum EventKind {
     CodeEdit,
     SpanLink,
     Meta,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,7 +192,7 @@ fn to_kind(kind: &str) -> EventKind {
         "code.edit" => EventKind::CodeEdit,
         "span.link" => EventKind::SpanLink,
         "meta" => EventKind::Meta,
-        _ => EventKind::Meta,
+        _ => EventKind::Unknown,
     }
 }
 
@@ -229,6 +230,19 @@ mod tests {
             events[0].event.data,
             TapeEventData::Other {
                 kind: EventKind::ToolResult
+            }
+        ));
+    }
+
+    #[test]
+    fn unknown_kind_is_not_misclassified_as_meta() {
+        let jsonl = r#"{"t":"2026-02-22T00:00:00Z","k":"not.real"}"#;
+        let events = parse_jsonl_events(jsonl).expect("valid JSONL");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0].event.data,
+            TapeEventData::Other {
+                kind: EventKind::Unknown
             }
         ));
     }

@@ -4,7 +4,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::index::lineage::{
     Cardinality, EvidenceFragmentRef, EvidenceKind, FileRange, LocationDelta, SpanEdge,
-    StoredEdgeClass, Tombstone, should_link_successor,
+    LINK_THRESHOLD_DEFAULT, StoredEdgeClass, Tombstone,
 };
 use crate::tape::event::{TapeEventAt, TapeEventData};
 
@@ -60,8 +60,7 @@ impl SqliteIndex {
                 location_delta TEXT NOT NULL,
                 cardinality TEXT NOT NULL,
                 agent_link INTEGER NOT NULL,
-                note TEXT,
-                stored_class TEXT NOT NULL
+                note TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_edges_from_anchor ON edges(from_anchor);
@@ -102,13 +101,12 @@ impl SqliteIndex {
         Ok(())
     }
 
-    pub fn insert_edge(&self, edge: &SpanEdge, link_threshold: f32) -> rusqlite::Result<()> {
-        let stored_class = edge.stored_class(link_threshold);
+    pub fn insert_edge(&self, edge: &SpanEdge, _link_threshold: f32) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT INTO edges (
                 from_anchor, to_anchor, confidence, location_delta, cardinality,
-                agent_link, note, stored_class
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                agent_link, note
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 edge.from_anchor,
                 edge.to_anchor,
@@ -116,8 +114,7 @@ impl SqliteIndex {
                 encode_location_delta(edge.location_delta),
                 encode_cardinality(edge.cardinality),
                 if edge.agent_link { 1_i64 } else { 0_i64 },
-                edge.note,
-                encode_stored_class(stored_class)
+                edge.note
             ],
         )?;
         Ok(())
@@ -173,7 +170,7 @@ impl SqliteIndex {
     ) -> rusqlite::Result<Vec<EdgeRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT from_anchor, to_anchor, confidence, location_delta, cardinality,
-                    agent_link, note, stored_class
+                    agent_link, note
              FROM edges
              WHERE from_anchor = ?1
              ORDER BY confidence DESC",
@@ -182,14 +179,14 @@ impl SqliteIndex {
         let mut rows = stmt.query(params![from_anchor])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
-            let stored_class = decode_stored_class(&row.get::<_, String>(7)?);
             let confidence: f32 = row.get(2)?;
             let agent_link = row.get::<_, i64>(5)? != 0;
-            if !include_forensics
-                && stored_class == StoredEdgeClass::LocationOnly
-                && !agent_link
-                && confidence < min_confidence
-            {
+            let stored_class = if !agent_link && confidence < LINK_THRESHOLD_DEFAULT {
+                StoredEdgeClass::LocationOnly
+            } else {
+                StoredEdgeClass::Lineage
+            };
+            if !include_forensics && stored_class == StoredEdgeClass::LocationOnly && !agent_link {
                 continue;
             }
             if !agent_link && confidence < min_confidence && !include_forensics {
@@ -272,20 +269,18 @@ impl SqliteIndex {
                         (edit.before_hash.as_ref(), edit.after_hash.as_ref())
                     {
                         let confidence = if before_hash == after_hash { 1.0 } else { 0.30 };
-                        if should_link_successor(confidence, false, link_threshold) {
-                            self.insert_edge(
-                                &SpanEdge {
-                                    from_anchor: before_hash.clone(),
-                                    to_anchor: after_hash.clone(),
-                                    confidence,
-                                    location_delta: LocationDelta::Same,
-                                    cardinality: Cardinality::OneToOne,
-                                    agent_link: false,
-                                    note: None,
-                                },
-                                link_threshold,
-                            )?;
-                        }
+                        self.insert_edge(
+                            &SpanEdge {
+                                from_anchor: before_hash.clone(),
+                                to_anchor: after_hash.clone(),
+                                confidence,
+                                location_delta: LocationDelta::Same,
+                                cardinality: Cardinality::OneToOne,
+                                agent_link: false,
+                                note: None,
+                            },
+                            link_threshold,
+                        )?;
                     }
 
                     if edit.after_hash.is_none() {
@@ -398,20 +393,6 @@ fn decode_cardinality(raw: &str) -> Cardinality {
     }
 }
 
-fn encode_stored_class(class: StoredEdgeClass) -> &'static str {
-    match class {
-        StoredEdgeClass::Lineage => "lineage",
-        StoredEdgeClass::LocationOnly => "location_only",
-    }
-}
-
-fn decode_stored_class(raw: &str) -> StoredEdgeClass {
-    match raw {
-        "location_only" => StoredEdgeClass::LocationOnly,
-        _ => StoredEdgeClass::Lineage,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,5 +502,61 @@ mod tests {
         assert_eq!(edges.len(), 1);
         assert!(edges[0].agent_link);
         assert_eq!(edges[0].note.as_deref(), Some("extract"));
+    }
+
+    #[test]
+    fn location_only_edges_remain_hidden_without_forensics_even_when_min_confidence_is_lowered() {
+        let index = SqliteIndex::open_in_memory().expect("in-memory sqlite");
+        index
+            .insert_edge(
+                &SpanEdge {
+                    from_anchor: "before".to_string(),
+                    to_anchor: "after".to_string(),
+                    confidence: 0.29,
+                    location_delta: LocationDelta::Moved,
+                    cardinality: Cardinality::OneToOne,
+                    agent_link: false,
+                    note: None,
+                },
+                LINK_THRESHOLD_DEFAULT,
+            )
+            .expect("insert edge");
+
+        let normal = index
+            .outbound_edges("before", 0.20, false)
+            .expect("edge query without forensics");
+        assert_eq!(normal.len(), 0);
+
+        let forensics = index
+            .outbound_edges("before", 0.20, true)
+            .expect("edge query with forensics");
+        assert_eq!(forensics.len(), 1);
+        assert_eq!(forensics[0].stored_class, StoredEdgeClass::LocationOnly);
+    }
+
+    #[test]
+    fn below_threshold_links_are_stored_as_location_only_instead_of_dropped() {
+        let index = SqliteIndex::open_in_memory().expect("in-memory sqlite");
+        index
+            .insert_edge(
+                &SpanEdge {
+                    from_anchor: "before".to_string(),
+                    to_anchor: "after".to_string(),
+                    confidence: 0.29,
+                    location_delta: LocationDelta::Moved,
+                    cardinality: Cardinality::OneToOne,
+                    agent_link: false,
+                    note: None,
+                },
+                LINK_THRESHOLD_DEFAULT,
+            )
+            .expect("insert edge");
+
+        let forensics = index
+            .outbound_edges("before", 0.50, true)
+            .expect("edge query with forensics");
+        assert_eq!(forensics.len(), 1);
+        assert_eq!(forensics[0].to_anchor, "after");
+        assert_eq!(forensics[0].stored_class, StoredEdgeClass::LocationOnly);
     }
 }
