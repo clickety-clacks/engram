@@ -75,4 +75,39 @@ mod tests {
             PrettyConfidenceTier::ForensicsOnly
         );
     }
+
+    #[test]
+    fn moved_vs_non_moved_classification() {
+        assert_eq!(pretty_tier(0.85, true, false), PrettyConfidenceTier::Move);
+        assert_eq!(
+            pretty_tier(0.85, false, false),
+            PrettyConfidenceTier::Related
+        );
+    }
+
+    #[test]
+    fn threshold_edges_are_classified_as_specified() {
+        assert_eq!(pretty_tier(0.49, true, false), PrettyConfidenceTier::Hidden);
+        assert_eq!(
+            pretty_tier(0.50, true, false),
+            PrettyConfidenceTier::Related
+        );
+        assert_eq!(
+            pretty_tier(0.89, false, false),
+            PrettyConfidenceTier::Related
+        );
+        assert_eq!(pretty_tier(0.90, true, false), PrettyConfidenceTier::Move);
+        assert_eq!(
+            pretty_tier(0.90, false, false),
+            PrettyConfidenceTier::Edit
+        );
+    }
+
+    #[test]
+    fn location_only_always_forensics_even_for_high_confidence() {
+        assert_eq!(
+            pretty_tier(0.95, false, true),
+            PrettyConfidenceTier::ForensicsOnly
+        );
+    }
 }

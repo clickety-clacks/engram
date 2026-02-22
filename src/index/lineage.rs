@@ -92,17 +92,21 @@ pub fn should_link_identical_reinsertion(similarity: f32) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn below_link_threshold_is_location_only_without_agent_link() {
-        let edge = SpanEdge {
+    fn sample_edge(confidence: f32, agent_link: bool) -> SpanEdge {
+        SpanEdge {
             from_anchor: "a".to_string(),
             to_anchor: "b".to_string(),
-            confidence: 0.29,
+            confidence,
             location_delta: LocationDelta::Moved,
             cardinality: Cardinality::OneToOne,
-            agent_link: false,
+            agent_link,
             note: None,
-        };
+        }
+    }
+
+    #[test]
+    fn below_link_threshold_is_location_only_without_agent_link() {
+        let edge = sample_edge(0.29, false);
         assert_eq!(
             edge.stored_class(LINK_THRESHOLD_DEFAULT),
             StoredEdgeClass::LocationOnly
@@ -110,16 +114,20 @@ mod tests {
     }
 
     #[test]
+    fn at_link_threshold_is_lineage() {
+        let edge = sample_edge(0.30, false);
+        assert_eq!(
+            edge.stored_class(LINK_THRESHOLD_DEFAULT),
+            StoredEdgeClass::Lineage
+        );
+    }
+
+    #[test]
     fn agent_link_overrides_low_confidence_for_storage_and_traversal() {
-        let edge = SpanEdge {
-            from_anchor: "a".to_string(),
-            to_anchor: "b".to_string(),
-            confidence: 0.01,
-            location_delta: LocationDelta::Absent,
-            cardinality: Cardinality::OneToMany,
-            agent_link: true,
-            note: Some("explicit successor".to_string()),
-        };
+        let mut edge = sample_edge(0.01, true);
+        edge.location_delta = LocationDelta::Absent;
+        edge.cardinality = Cardinality::OneToMany;
+        edge.note = Some("explicit successor".to_string());
         assert_eq!(
             edge.stored_class(LINK_THRESHOLD_DEFAULT),
             StoredEdgeClass::Lineage
@@ -131,5 +139,39 @@ mod tests {
     fn identical_reinsertion_threshold_is_inclusive() {
         assert!(should_link_identical_reinsertion(0.90));
         assert!(!should_link_identical_reinsertion(0.89));
+    }
+
+    #[test]
+    fn should_link_successor_is_inclusive_at_threshold() {
+        assert!(should_link_successor(0.30, false, LINK_THRESHOLD_DEFAULT));
+        assert!(!should_link_successor(0.29, false, LINK_THRESHOLD_DEFAULT));
+    }
+
+    #[test]
+    fn traversal_threshold_is_inclusive_without_agent_link() {
+        let at_threshold = sample_edge(0.50, false);
+        let below_threshold = sample_edge(0.49, false);
+        assert!(at_threshold.included_in_default_traversal(0.50));
+        assert!(!below_threshold.included_in_default_traversal(0.50));
+    }
+
+    #[test]
+    fn tombstone_captures_required_deletion_facts() {
+        let tombstone = Tombstone {
+            anchor_hashes: vec!["h1".to_string(), "h2".to_string()],
+            tape_id: "tape-123".to_string(),
+            event_offset: 42,
+            file_path: "src/lib.rs".to_string(),
+            range_at_deletion: FileRange { start: 10, end: 20 },
+            timestamp: "2026-02-22T00:00:00Z".to_string(),
+        };
+
+        assert_eq!(tombstone.anchor_hashes.len(), 2);
+        assert_eq!(tombstone.tape_id, "tape-123");
+        assert_eq!(tombstone.event_offset, 42);
+        assert_eq!(tombstone.file_path, "src/lib.rs");
+        assert_eq!(tombstone.range_at_deletion.start, 10);
+        assert_eq!(tombstone.range_at_deletion.end, 20);
+        assert_eq!(tombstone.timestamp, "2026-02-22T00:00:00Z");
     }
 }
