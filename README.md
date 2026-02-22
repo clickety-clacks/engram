@@ -55,8 +55,8 @@ cargo run -- --help
 
 ## Repo
 
+https://github.com/clickety-clacks/engram
+
 ## Slideshow
 
 https://clawline.chat/engram-slides.html
-
-https://github.com/clickety-clacks/engram
