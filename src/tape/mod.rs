@@ -1,3 +1,4 @@
+pub mod adapter;
 pub mod compress;
 pub mod event;
 pub mod harness;
