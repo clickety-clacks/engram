@@ -114,6 +114,10 @@ impl SqliteIndex {
             );
 
             CREATE INDEX IF NOT EXISTS idx_tombstones_anchor ON tombstones(anchor);
+
+            CREATE TABLE IF NOT EXISTS tapes (
+                tape_id TEXT PRIMARY KEY
+            );
             ",
         )?;
         Ok(())
@@ -388,6 +392,28 @@ impl SqliteIndex {
         Ok(out)
     }
 
+    pub fn referenced_tape_ids(&self) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tape_id FROM evidence
+             UNION
+             SELECT tape_id FROM tombstones",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(row.get(0)?);
+        }
+        Ok(out)
+    }
+
+    pub fn has_tape(&self, tape_id: &str) -> rusqlite::Result<bool> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT 1 FROM tapes WHERE tape_id = ?1 LIMIT 1")?;
+        let mut rows = stmt.query(params![tape_id])?;
+        Ok(rows.next()?.is_some())
+    }
+
     pub fn ingest_tape_events(
         &self,
         tape_id: &str,
@@ -498,6 +524,11 @@ impl SqliteIndex {
                 TapeEventData::Meta(_) | TapeEventData::Other { .. } => {}
             }
         }
+
+        tx.execute(
+            "INSERT OR IGNORE INTO tapes (tape_id) VALUES (?1)",
+            params![tape_id],
+        )?;
 
         tx.commit()?;
         Ok(())
