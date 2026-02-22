@@ -1,10 +1,11 @@
 pub mod lineage;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 
+use crate::anchor::fingerprint_similarity;
 use crate::index::lineage::{
     Cardinality, EvidenceFragmentRef, EvidenceKind, FileRange, LocationDelta, SpanEdge,
-    StoredEdgeClass, Tombstone, should_link_successor,
+    StoredEdgeClass, Tombstone,
 };
 use crate::tape::event::{TapeEventAt, TapeEventData};
 
@@ -65,6 +66,7 @@ impl SqliteIndex {
             );
 
             CREATE INDEX IF NOT EXISTS idx_edges_from_anchor ON edges(from_anchor);
+            CREATE INDEX IF NOT EXISTS idx_edges_to_anchor ON edges(to_anchor);
 
             CREATE TABLE IF NOT EXISTS tombstones (
                 anchor TEXT NOT NULL,
@@ -77,6 +79,10 @@ impl SqliteIndex {
             );
 
             CREATE INDEX IF NOT EXISTS idx_tombstones_anchor ON tombstones(anchor);
+
+            CREATE TABLE IF NOT EXISTS tapes (
+                tape_id TEXT PRIMARY KEY
+            );
             ",
         )?;
         Ok(())
@@ -171,28 +177,48 @@ impl SqliteIndex {
         min_confidence: f32,
         include_forensics: bool,
     ) -> rusqlite::Result<Vec<EdgeRow>> {
-        let mut stmt = self.conn.prepare(
+        self.query_edges(
+            "from_anchor",
+            from_anchor,
+            min_confidence,
+            include_forensics,
+        )
+    }
+
+    pub fn inbound_edges(
+        &self,
+        to_anchor: &str,
+        min_confidence: f32,
+        include_forensics: bool,
+    ) -> rusqlite::Result<Vec<EdgeRow>> {
+        self.query_edges("to_anchor", to_anchor, min_confidence, include_forensics)
+    }
+
+    fn query_edges(
+        &self,
+        column: &str,
+        anchor: &str,
+        min_confidence: f32,
+        include_forensics: bool,
+    ) -> rusqlite::Result<Vec<EdgeRow>> {
+        let sql = format!(
             "SELECT from_anchor, to_anchor, confidence, location_delta, cardinality,
                     agent_link, note, stored_class
              FROM edges
-             WHERE from_anchor = ?1
-             ORDER BY confidence DESC",
-        )?;
-
-        let mut rows = stmt.query(params![from_anchor])?;
+             WHERE {column} = ?1
+             ORDER BY confidence DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params![anchor])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
             let stored_class = decode_stored_class(&row.get::<_, String>(7)?);
             let confidence: f32 = row.get(2)?;
             let agent_link = row.get::<_, i64>(5)? != 0;
-            if !include_forensics
-                && stored_class == StoredEdgeClass::LocationOnly
-                && !agent_link
-                && confidence < min_confidence
-            {
+            if !agent_link && confidence < min_confidence && !include_forensics {
                 continue;
             }
-            if !agent_link && confidence < min_confidence && !include_forensics {
+            if !agent_link && stored_class == StoredEdgeClass::LocationOnly && !include_forensics {
                 continue;
             }
             out.push(EdgeRow {
@@ -236,43 +262,71 @@ impl SqliteIndex {
         Ok(out)
     }
 
+    pub fn referenced_tape_ids(&self) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tape_id FROM evidence
+             UNION
+             SELECT tape_id FROM tombstones",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(row.get(0)?);
+        }
+        Ok(out)
+    }
+
+    pub fn has_tape(&self, tape_id: &str) -> rusqlite::Result<bool> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT 1 FROM tapes WHERE tape_id = ?1 LIMIT 1")?;
+        let mut rows = stmt.query(params![tape_id])?;
+        Ok(rows.next()?.is_some())
+    }
+
     pub fn ingest_tape_events(
         &self,
         tape_id: &str,
         events: &[TapeEventAt],
         link_threshold: f32,
     ) -> rusqlite::Result<()> {
-        for item in events {
-            match &item.event.data {
-                TapeEventData::CodeRead(read) => {
-                    let fragment = EvidenceFragmentRef {
-                        tape_id: tape_id.to_string(),
-                        event_offset: item.offset,
-                        kind: EvidenceKind::Read,
-                        file_path: read.file.clone(),
-                        timestamp: item.event.timestamp.clone(),
-                    };
-                    for anchor in &read.anchor_hashes {
-                        self.insert_evidence(anchor, &fragment)?;
-                    }
-                }
-                TapeEventData::CodeEdit(edit) => {
-                    if let Some(after_hash) = &edit.after_hash {
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+
+        let ingest_result = (|| {
+            for item in events {
+                match &item.event.data {
+                    TapeEventData::CodeRead(read) => {
                         let fragment = EvidenceFragmentRef {
                             tape_id: tape_id.to_string(),
                             event_offset: item.offset,
-                            kind: EvidenceKind::Edit,
-                            file_path: edit.file.clone(),
+                            kind: EvidenceKind::Read,
+                            file_path: read.file.clone(),
                             timestamp: item.event.timestamp.clone(),
                         };
-                        self.insert_evidence(after_hash, &fragment)?;
+                        for anchor in &read.anchor_hashes {
+                            self.insert_evidence(anchor, &fragment)?;
+                        }
                     }
+                    TapeEventData::CodeEdit(edit) => {
+                        if let Some(after_hash) = &edit.after_hash {
+                            let fragment = EvidenceFragmentRef {
+                                tape_id: tape_id.to_string(),
+                                event_offset: item.offset,
+                                kind: EvidenceKind::Edit,
+                                file_path: edit.file.clone(),
+                                timestamp: item.event.timestamp.clone(),
+                            };
+                            self.insert_evidence(after_hash, &fragment)?;
+                        }
 
-                    if let (Some(before_hash), Some(after_hash)) =
-                        (edit.before_hash.as_ref(), edit.after_hash.as_ref())
-                    {
-                        let confidence = if before_hash == after_hash { 1.0 } else { 0.30 };
-                        if should_link_successor(confidence, false, link_threshold) {
+                        if let (Some(before_hash), Some(after_hash)) =
+                            (edit.before_hash.as_ref(), edit.after_hash.as_ref())
+                        {
+                            let confidence = if before_hash == after_hash {
+                                1.0
+                            } else {
+                                fingerprint_similarity(before_hash, after_hash).unwrap_or(0.0)
+                            };
                             self.insert_edge(
                                 &SpanEdge {
                                     from_anchor: before_hash.clone(),
@@ -286,56 +340,64 @@ impl SqliteIndex {
                                 link_threshold,
                             )?;
                         }
-                    }
 
-                    if edit.after_hash.is_none() {
-                        if let Some(before_hash) = &edit.before_hash {
-                            let range = edit
-                                .before_range
-                                .or(edit.after_range)
-                                .map(|r| FileRange {
-                                    start: r.start,
-                                    end: r.end,
-                                })
-                                .unwrap_or(FileRange { start: 0, end: 0 });
-                            self.insert_tombstone(&Tombstone {
-                                anchor_hashes: vec![before_hash.clone()],
-                                tape_id: tape_id.to_string(),
-                                event_offset: item.offset,
-                                file_path: edit.file.clone(),
-                                range_at_deletion: range,
-                                timestamp: item.event.timestamp.clone(),
-                            })?;
+                        if edit.after_hash.is_none() {
+                            if let Some(before_hash) = &edit.before_hash {
+                                let range = edit
+                                    .before_range
+                                    .or(edit.after_range)
+                                    .map(|r| FileRange {
+                                        start: r.start,
+                                        end: r.end,
+                                    })
+                                    .unwrap_or(FileRange { start: 0, end: 0 });
+                                self.insert_tombstone(&Tombstone {
+                                    anchor_hashes: vec![before_hash.clone()],
+                                    tape_id: tape_id.to_string(),
+                                    event_offset: item.offset,
+                                    file_path: edit.file.clone(),
+                                    range_at_deletion: range,
+                                    timestamp: item.event.timestamp.clone(),
+                                })?;
+                            }
                         }
                     }
+                    TapeEventData::SpanLink(link) => {
+                        let from_anchor = encode_span_link_anchor(&link.from_file, link.from_range);
+                        let to_anchor = encode_span_link_anchor(&link.to_file, link.to_range);
+                        self.insert_edge(
+                            &SpanEdge {
+                                from_anchor,
+                                to_anchor,
+                                confidence: 0.0,
+                                location_delta: LocationDelta::Moved,
+                                cardinality: Cardinality::OneToOne,
+                                agent_link: true,
+                                note: link.note.clone(),
+                            },
+                            link_threshold,
+                        )?;
+                    }
+                    TapeEventData::Meta(_) | TapeEventData::Other { .. } => {}
                 }
-                TapeEventData::SpanLink(link) => {
-                    let from_anchor = encode_span_link_anchor(&link.from_file, link.from_range);
-                    let to_anchor = encode_span_link_anchor(&link.to_file, link.to_range);
-                    self.insert_edge(
-                        &SpanEdge {
-                            from_anchor,
-                            to_anchor,
-                            confidence: 0.0,
-                            location_delta: LocationDelta::Moved,
-                            cardinality: Cardinality::OneToOne,
-                            agent_link: true,
-                            note: link.note.clone(),
-                        },
-                        link_threshold,
-                    )?;
-                }
-                TapeEventData::Meta(_) | TapeEventData::Other { .. } => {}
+            }
+            self.conn.execute(
+                "INSERT OR IGNORE INTO tapes (tape_id) VALUES (?1)",
+                params![tape_id],
+            )?;
+            Ok(())
+        })();
+
+        match ingest_result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
             }
         }
-
-        Ok(())
-    }
-
-    pub fn maybe_meta_label(&self) -> rusqlite::Result<Option<String>> {
-        self.conn
-            .query_row("SELECT NULL", [], |row| row.get(0))
-            .optional()
     }
 }
 
@@ -472,7 +534,9 @@ mod tests {
         assert_eq!(read_refs.len(), 1);
         assert_eq!(read_refs[0].kind, EvidenceKind::Read);
 
-        let edit_refs = index.evidence_for_anchor("after").expect("edit evidence query");
+        let edit_refs = index
+            .evidence_for_anchor("after")
+            .expect("edit evidence query");
         assert_eq!(edit_refs.len(), 1);
         assert_eq!(edit_refs[0].kind, EvidenceKind::Edit);
 

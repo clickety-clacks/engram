@@ -1,17 +1,19 @@
 use std::collections::{HashSet, VecDeque};
 
-use crate::index::{EdgeRow, SqliteIndex};
 use crate::index::lineage::EvidenceFragmentRef;
+use crate::index::{EdgeRow, SqliteIndex};
 
 pub const MIN_CONFIDENCE_DEFAULT: f32 = 0.50;
 pub const MAX_FANOUT_DEFAULT: usize = 50;
 pub const MAX_EDGES_DEFAULT: usize = 500;
+pub const MAX_DEPTH_DEFAULT: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ExplainTraversal {
     pub min_confidence: f32,
     pub max_fanout: usize,
     pub max_edges: usize,
+    pub max_depth: usize,
 }
 
 impl Default for ExplainTraversal {
@@ -20,6 +22,7 @@ impl Default for ExplainTraversal {
             min_confidence: MIN_CONFIDENCE_DEFAULT,
             max_fanout: MAX_FANOUT_DEFAULT,
             max_edges: MAX_EDGES_DEFAULT,
+            max_depth: MAX_DEPTH_DEFAULT,
         }
     }
 }
@@ -55,7 +58,10 @@ pub struct ExplainResult {
     pub touched_anchors: Vec<String>,
 }
 
-pub fn retrieve_direct(index: &SqliteIndex, anchors: &[String]) -> rusqlite::Result<Vec<EvidenceFragmentRef>> {
+pub fn retrieve_direct(
+    index: &SqliteIndex,
+    anchors: &[String],
+) -> rusqlite::Result<Vec<EvidenceFragmentRef>> {
     let mut all = Vec::new();
     for anchor in anchors {
         all.extend(index.evidence_for_anchor(anchor)?);
@@ -69,24 +75,28 @@ pub fn retrieve_lineage(
     traversal: ExplainTraversal,
     include_forensics: bool,
 ) -> rusqlite::Result<Vec<EdgeRow>> {
-    let mut queue: VecDeque<String> = anchors.iter().cloned().collect();
+    let mut queue: VecDeque<(String, usize)> =
+        anchors.iter().cloned().map(|anchor| (anchor, 0)).collect();
     let mut visited = HashSet::new();
     let mut out = Vec::new();
 
-    while let Some(anchor) = queue.pop_front() {
+    while let Some((anchor, depth)) = queue.pop_front() {
         if !visited.insert(anchor.clone()) {
+            continue;
+        }
+        if depth >= traversal.max_depth {
             continue;
         }
         if out.len() >= traversal.max_edges {
             break;
         }
-        let edges = index.outbound_edges(&anchor, traversal.min_confidence, include_forensics)?;
+        let edges = index.inbound_edges(&anchor, traversal.min_confidence, include_forensics)?;
         for edge in edges.into_iter().take(traversal.max_fanout) {
             if out.len() >= traversal.max_edges {
                 break;
             }
-            if !visited.contains(&edge.to_anchor) {
-                queue.push_back(edge.to_anchor.clone());
+            if !visited.contains(&edge.from_anchor) {
+                queue.push_back((edge.from_anchor.clone(), depth + 1));
             }
             out.push(edge);
         }
@@ -105,6 +115,9 @@ pub fn explain_by_anchor(
     let lineage = retrieve_lineage(index, anchors, traversal, include_forensics)?;
     let mut touched_anchors = anchors.to_vec();
     for edge in &lineage {
+        if !touched_anchors.contains(&edge.from_anchor) {
+            touched_anchors.push(edge.from_anchor.clone());
+        }
         if !touched_anchors.contains(&edge.to_anchor) {
             touched_anchors.push(edge.to_anchor.clone());
         }
@@ -156,11 +169,76 @@ mod tests {
 
         let lineage = explain_by_anchor(
             &index,
-            &["a".to_string()],
+            &["b".to_string()],
             ExplainTraversal::default(),
             true,
         )
-        .expect("explain from predecessor");
+        .expect("explain from current anchor");
         assert_eq!(lineage.lineage.len(), 1);
+        assert!(lineage.touched_anchors.contains(&"a".to_string()));
+    }
+
+    #[test]
+    fn lineage_traversal_respects_depth_limit() {
+        let index = SqliteIndex::open_in_memory().expect("sqlite");
+        let events = vec![
+            TapeEventAt {
+                offset: 0,
+                event: TapeEvent {
+                    timestamp: "2026-02-22T00:00:00Z".to_string(),
+                    data: TapeEventData::CodeEdit(CodeEditEvent {
+                        file: "src/lib.rs".to_string(),
+                        before_range: Some(FileRange { start: 1, end: 1 }),
+                        after_range: Some(FileRange { start: 1, end: 1 }),
+                        before_hash: Some("a".to_string()),
+                        after_hash: Some("b".to_string()),
+                    }),
+                },
+            },
+            TapeEventAt {
+                offset: 1,
+                event: TapeEvent {
+                    timestamp: "2026-02-22T00:00:01Z".to_string(),
+                    data: TapeEventData::CodeEdit(CodeEditEvent {
+                        file: "src/lib.rs".to_string(),
+                        before_range: Some(FileRange { start: 1, end: 1 }),
+                        after_range: Some(FileRange { start: 1, end: 1 }),
+                        before_hash: Some("b".to_string()),
+                        after_hash: Some("c".to_string()),
+                    }),
+                },
+            },
+        ];
+        index
+            .ingest_tape_events("tape", &events, LINK_THRESHOLD_DEFAULT)
+            .expect("ingest");
+
+        let one_hop = explain_by_anchor(
+            &index,
+            &["c".to_string()],
+            ExplainTraversal {
+                min_confidence: 0.0,
+                max_fanout: 50,
+                max_edges: 500,
+                max_depth: 1,
+            },
+            true,
+        )
+        .expect("explain one hop");
+        assert_eq!(one_hop.lineage.len(), 1);
+
+        let two_hops = explain_by_anchor(
+            &index,
+            &["c".to_string()],
+            ExplainTraversal {
+                min_confidence: 0.0,
+                max_fanout: 50,
+                max_edges: 500,
+                max_depth: 2,
+            },
+            true,
+        )
+        .expect("explain two hops");
+        assert_eq!(two_hops.lineage.len(), 2);
     }
 }

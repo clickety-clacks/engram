@@ -1,6 +1,6 @@
 use engram::index::lineage::{
-    Cardinality, LINK_THRESHOLD_DEFAULT, LocationDelta, SpanEdge, StoredEdgeClass,
-    Tombstone, should_link_identical_reinsertion, should_link_successor,
+    Cardinality, LINK_THRESHOLD_DEFAULT, LocationDelta, SpanEdge, StoredEdgeClass, Tombstone,
+    should_link_identical_reinsertion, should_link_successor,
 };
 use engram::query::explain::{ExplainTraversal, PrettyConfidenceTier, pretty_tier};
 
@@ -24,12 +24,16 @@ fn linkage_and_query_defaults_work_together_at_boundaries() {
         StoredEdgeClass::Lineage
     );
     assert!(!link_edge.included_in_default_traversal(0.50));
-    assert_eq!(pretty_tier(0.30, false, false), PrettyConfidenceTier::Hidden);
+    assert_eq!(
+        pretty_tier(0.30, false, false),
+        PrettyConfidenceTier::Hidden
+    );
 
     let default_traversal = ExplainTraversal::default();
     assert_eq!(default_traversal.min_confidence, 0.50);
     assert_eq!(default_traversal.max_fanout, 50);
     assert_eq!(default_traversal.max_edges, 500);
+    assert_eq!(default_traversal.max_depth, 10);
 }
 
 #[test]
