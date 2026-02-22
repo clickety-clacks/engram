@@ -5,10 +5,10 @@ use std::ops::Deref;
 use rusqlite::{Connection, params};
 
 use crate::index::lineage::{
-    Cardinality, EvidenceFragmentRef, EvidenceKind, FileRange, LocationDelta, SpanEdge,
+    Cardinality, EvidenceFragmentRef, EvidenceKind, LocationDelta, SpanEdge,
     LINK_THRESHOLD_DEFAULT, StoredEdgeClass, Tombstone,
 };
-use crate::tape::event::{TapeEventAt, TapeEventData};
+use crate::tape::event::{FileRange, TapeEventAt, TapeEventData};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EdgeRow {
