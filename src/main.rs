@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command as ProcessCommand, ExitCode};
 
 use clap::{Args, Parser, Subcommand};
 use engram::anchor::fingerprint_text;
@@ -18,6 +18,8 @@ use engram::tape::compress::{compress_jsonl, decompress_jsonl};
 use engram::tape::event::{TapeEventAt, TapeEventData, parse_jsonl_events};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 const TAPE_SUFFIX: &str = ".jsonl.zst";
 const TRANSCRIPT_WINDOW_RADIUS: usize = 2;
@@ -116,6 +118,15 @@ struct RepoPaths {
 }
 
 #[derive(Debug, Clone)]
+struct CommandCapture {
+    tape_jsonl: String,
+    argv: Vec<String>,
+    exit: i32,
+    stdout_bytes: usize,
+    stderr_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
 struct TapeRow {
     offset: u64,
     value: Value,
@@ -164,27 +175,32 @@ fn cmd_init(cwd: &Path) -> Result<(), CliError> {
 }
 
 fn cmd_record(cwd: &Path, args: RecordArgs) -> Result<(), CliError> {
-    if !args.stdin {
-        return Err(CliError::new(
-            "unsupported_record_mode",
-            "only `engram record --stdin` is implemented",
-        ));
-    }
-    if !args.command.is_empty() {
-        return Err(CliError::new(
-            "unsupported_record_command",
-            "command execution capture is not implemented yet; use --stdin",
-        ));
-    }
+    let (tape_jsonl, command_capture) = if args.stdin {
+        if !args.command.is_empty() {
+            return Err(CliError::new(
+                "invalid_record_args",
+                "use either `engram record --stdin` or `engram record <command...>`",
+            ));
+        }
+        let mut stdin_buf = String::new();
+        io::stdin()
+            .read_to_string(&mut stdin_buf)
+            .map_err(|err| CliError::io("stdin_error", err))?;
+        (stdin_buf, None)
+    } else {
+        if args.command.is_empty() {
+            return Err(CliError::new(
+                "missing_command",
+                "expected `engram record <command...>` or `engram record --stdin`",
+            ));
+        }
+        let capture = capture_command_tape(cwd, &args.command)?;
+        (capture.tape_jsonl.clone(), Some(capture))
+    };
 
     let paths = require_initialized_paths(cwd)?;
-    let mut stdin_buf = String::new();
-    io::stdin()
-        .read_to_string(&mut stdin_buf)
-        .map_err(|err| CliError::io("stdin_error", err))?;
-
-    let events = parse_jsonl_events(&stdin_buf)?;
-    let tape_id = tape_id_for_contents(&stdin_buf);
+    let events = parse_jsonl_events(&tape_jsonl)?;
+    let tape_id = tape_id_for_contents(&tape_jsonl);
     let tape_path = tape_path_for_id(&paths, &tape_id);
     let tape_file_exists = tape_path.exists();
     let index = SqliteIndex::open(&path_string(&paths.index))?;
@@ -195,7 +211,7 @@ fn cmd_record(cwd: &Path, args: RecordArgs) -> Result<(), CliError> {
     }
     if !tape_file_exists {
         let compressed =
-            compress_jsonl(&stdin_buf).map_err(|err| CliError::io("compress_error", err))?;
+            compress_jsonl(&tape_jsonl).map_err(|err| CliError::io("compress_error", err))?;
         fs::write(&tape_path, &compressed).map_err(|err| CliError::io("write_error", err))?;
     }
 
@@ -203,18 +219,92 @@ fn cmd_record(cwd: &Path, args: RecordArgs) -> Result<(), CliError> {
         .map_err(|err| CliError::io("metadata_error", err))?
         .len();
 
-    print_json(&json!({
-        "status": "ok",
-        "tape_id": tape_id,
-        "path": tape_path,
-        "event_count": events.len(),
-        "uncompressed_bytes": stdin_buf.len(),
-        "compressed_bytes": compressed_len,
-        "already_exists": tape_file_exists && already_indexed,
-        "already_indexed": already_indexed,
-        "tape_file_exists": tape_file_exists,
-        "meta": extract_meta(&events),
-    }))
+    let mut payload = Map::new();
+    payload.insert("status".to_string(), json!("ok"));
+    payload.insert("tape_id".to_string(), json!(tape_id));
+    payload.insert("path".to_string(), json!(tape_path));
+    payload.insert("event_count".to_string(), json!(events.len()));
+    payload.insert("uncompressed_bytes".to_string(), json!(tape_jsonl.len()));
+    payload.insert("compressed_bytes".to_string(), json!(compressed_len));
+    payload.insert(
+        "already_exists".to_string(),
+        json!(tape_file_exists && already_indexed),
+    );
+    payload.insert("already_indexed".to_string(), json!(already_indexed));
+    payload.insert("tape_file_exists".to_string(), json!(tape_file_exists));
+    payload.insert("meta".to_string(), json!(extract_meta(&events)));
+    if let Some(capture) = command_capture {
+        payload.insert(
+            "recorded_command".to_string(),
+            json!({
+                "argv": capture.argv,
+                "exit": capture.exit,
+                "success": capture.exit == 0,
+                "stdout_bytes": capture.stdout_bytes,
+                "stderr_bytes": capture.stderr_bytes,
+            }),
+        );
+    }
+
+    print_json(&Value::Object(payload))
+}
+
+fn capture_command_tape(cwd: &Path, command: &[String]) -> Result<CommandCapture, CliError> {
+    let executable = command
+        .first()
+        .ok_or_else(|| CliError::new("missing_command", "record command cannot be empty"))?;
+    let args = command.iter().skip(1).cloned().collect::<Vec<_>>();
+    let args_string = args.join(" ");
+    let started_at = now_timestamp();
+    let output = ProcessCommand::new(executable)
+        .args(&args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|err| CliError::io("command_exec_error", err))?;
+    let finished_at = now_timestamp();
+
+    let exit = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let cwd_raw = cwd.to_string_lossy().into_owned();
+    let repo_head = repo_head(cwd);
+
+    let events = vec![
+        json!({
+            "t": started_at.clone(),
+            "k": "meta",
+            "repo_head": repo_head,
+            "label": format!("record {}", command.join(" "))
+        }),
+        json!({
+            "t": started_at,
+            "k": "tool.call",
+            "tool": executable,
+            "args": args_string,
+            "cwd": cwd_raw
+        }),
+        json!({
+            "t": finished_at,
+            "k": "tool.result",
+            "tool": executable,
+            "exit": exit,
+            "stdout": stdout,
+            "stderr": stderr
+        }),
+    ];
+    let mut tape_jsonl = String::new();
+    for event in events {
+        tape_jsonl.push_str(&serde_json::to_string(&event)?);
+        tape_jsonl.push('\n');
+    }
+
+    Ok(CommandCapture {
+        tape_jsonl,
+        argv: command.to_vec(),
+        exit,
+        stdout_bytes: output.stdout.len(),
+        stderr_bytes: output.stderr.len(),
+    })
 }
 
 fn cmd_tapes(cwd: &Path) -> Result<(), CliError> {
@@ -737,6 +827,27 @@ fn tape_id_for_contents(input: &str) -> String {
         let _ = write!(&mut out, "{byte:02x}");
     }
     out
+}
+
+fn now_timestamp() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+fn repo_head(cwd: &Path) -> Option<String> {
+    let output = ProcessCommand::new("git")
+        .arg("rev-parse")
+        .arg("HEAD")
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
 }
 
 fn extract_meta(events: &[TapeEventAt]) -> Option<Value> {
