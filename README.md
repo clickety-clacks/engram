@@ -57,6 +57,16 @@ cargo run -- --help
 
 https://github.com/clickety-clacks/engram
 
+
+## Specs
+
+- Core event contract: `specs/core/event-contract.md`
+- Claude Code adapter: `specs/adapters/claude-code.md`
+- Codex CLI adapter: `specs/adapters/codex-cli.md`
+- OpenCode adapter (TODO): `specs/adapters/opencode.md`
+- Gemini CLI adapter (TODO): `specs/adapters/gemini-cli.md`
+- Cursor adapter (TODO): `specs/adapters/cursor.md`
+
 ## Slideshow
 
 https://clawline.chat/engram-slides.html
