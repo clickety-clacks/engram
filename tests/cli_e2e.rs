@@ -274,3 +274,25 @@ fn record_command_captures_tool_events_and_persists_tape() {
     assert!(raw.contains("\"k\":\"tool.result\""), "raw={raw}");
     assert!(raw.contains("\"stdout\":\"hello\""), "raw={raw}");
 }
+
+#[test]
+fn record_command_keeps_trace_for_failed_process() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+    let _ = run_json(repo, &["init"], None);
+
+    let record = run_json(repo, &["record", "/bin/sh", "-c", "echo boom >&2; exit 7"], None);
+    assert_eq!(record["status"], "ok");
+    assert_eq!(record["record"]["mode"], "command");
+    assert_eq!(record["record"]["success"], false);
+    assert_eq!(record["record"]["exit_code"], 7);
+
+    let tape_id = record["tape_id"].as_str().expect("tape id");
+    let show_raw = run_cli(repo, &["show", tape_id, "--raw"], None);
+    assert!(show_raw.status.success(), "show --raw should succeed");
+    let raw = String::from_utf8_lossy(&show_raw.stdout);
+    assert!(raw.contains("\"k\":\"tool.call\""), "raw={raw}");
+    assert!(raw.contains("\"k\":\"tool.result\""), "raw={raw}");
+    assert!(raw.contains("\"exit\":7"), "raw={raw}");
+    assert!(raw.contains("\"stderr\":\"boom\\n\""), "raw={raw}");
+}
