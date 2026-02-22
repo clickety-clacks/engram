@@ -6,12 +6,14 @@ use crate::index::lineage::EvidenceFragmentRef;
 pub const MIN_CONFIDENCE_DEFAULT: f32 = 0.50;
 pub const MAX_FANOUT_DEFAULT: usize = 50;
 pub const MAX_EDGES_DEFAULT: usize = 500;
+pub const MAX_DEPTH_DEFAULT: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ExplainTraversal {
     pub min_confidence: f32,
     pub max_fanout: usize,
     pub max_edges: usize,
+    pub max_depth: usize,
 }
 
 impl Default for ExplainTraversal {
@@ -20,6 +22,7 @@ impl Default for ExplainTraversal {
             min_confidence: MIN_CONFIDENCE_DEFAULT,
             max_fanout: MAX_FANOUT_DEFAULT,
             max_edges: MAX_EDGES_DEFAULT,
+            max_depth: MAX_DEPTH_DEFAULT,
         }
     }
 }
@@ -69,16 +72,19 @@ pub fn retrieve_lineage(
     traversal: ExplainTraversal,
     include_forensics: bool,
 ) -> rusqlite::Result<Vec<EdgeRow>> {
-    let mut queue: VecDeque<String> = anchors.iter().cloned().collect();
+    let mut queue: VecDeque<(String, usize)> = anchors.iter().cloned().map(|a| (a, 0)).collect();
     let mut visited = HashSet::new();
     let mut out = Vec::new();
 
-    while let Some(anchor) = queue.pop_front() {
+    while let Some((anchor, depth)) = queue.pop_front() {
         if !visited.insert(anchor.clone()) {
             continue;
         }
         if out.len() >= traversal.max_edges {
             break;
+        }
+        if depth >= traversal.max_depth {
+            continue;
         }
         let edges = index.inbound_edges(&anchor, traversal.min_confidence, include_forensics)?;
         for edge in edges.into_iter().take(traversal.max_fanout) {
@@ -86,7 +92,7 @@ pub fn retrieve_lineage(
                 break;
             }
             if !visited.contains(&edge.from_anchor) {
-                queue.push_back(edge.from_anchor.clone());
+                queue.push_back((edge.from_anchor.clone(), depth + 1));
             }
             out.push(edge);
         }
@@ -127,6 +133,7 @@ pub fn explain_by_anchor(
 mod tests {
     use super::*;
     use crate::index::lineage::LINK_THRESHOLD_DEFAULT;
+    use crate::index::lineage::{Cardinality, LocationDelta, SpanEdge};
     use crate::tape::event::{CodeEditEvent, FileRange, TapeEvent, TapeEventAt, TapeEventData};
 
     #[test]
@@ -173,5 +180,53 @@ mod tests {
         assert_eq!(lineage.lineage[0].from_anchor, "a");
         assert_eq!(lineage.lineage[0].to_anchor, "b");
         assert!(lineage.touched_anchors.contains(&"a".to_string()));
+    }
+
+    #[test]
+    fn lineage_traversal_honors_max_depth() {
+        let index = SqliteIndex::open_in_memory().expect("sqlite");
+        index
+            .insert_edge(
+                &SpanEdge {
+                    from_anchor: "a".to_string(),
+                    to_anchor: "b".to_string(),
+                    confidence: 0.90,
+                    location_delta: LocationDelta::Moved,
+                    cardinality: Cardinality::OneToOne,
+                    agent_link: false,
+                    note: None,
+                },
+                LINK_THRESHOLD_DEFAULT,
+            )
+            .expect("insert edge a->b");
+        index
+            .insert_edge(
+                &SpanEdge {
+                    from_anchor: "b".to_string(),
+                    to_anchor: "c".to_string(),
+                    confidence: 0.90,
+                    location_delta: LocationDelta::Moved,
+                    cardinality: Cardinality::OneToOne,
+                    agent_link: false,
+                    note: None,
+                },
+                LINK_THRESHOLD_DEFAULT,
+            )
+            .expect("insert edge b->c");
+
+        let lineage = retrieve_lineage(
+            &index,
+            &["c".to_string()],
+            ExplainTraversal {
+                max_depth: 1,
+                ..ExplainTraversal::default()
+            },
+            false,
+        )
+        .expect("retrieve lineage");
+
+        assert_eq!(lineage.len(), 1);
+        assert_eq!(lineage[0].from_anchor, "b");
+        assert_eq!(lineage[0].to_anchor, "c");
     }
 }

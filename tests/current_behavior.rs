@@ -1,8 +1,9 @@
 use engram::index::lineage::{
-    Cardinality, LINK_THRESHOLD_DEFAULT, LocationDelta, SpanEdge, StoredEdgeClass,
-    Tombstone, should_link_identical_reinsertion, should_link_successor,
+    Cardinality, LINK_THRESHOLD_DEFAULT, LocationDelta, SpanEdge, StoredEdgeClass, Tombstone,
+    should_link_identical_reinsertion, should_link_successor,
 };
 use engram::query::explain::{ExplainTraversal, PrettyConfidenceTier, pretty_tier};
+use engram::tape::event::FileRange;
 
 fn edge(confidence: f32, agent_link: bool) -> SpanEdge {
     SpanEdge {
@@ -30,6 +31,7 @@ fn linkage_and_query_defaults_work_together_at_boundaries() {
     assert_eq!(default_traversal.min_confidence, 0.50);
     assert_eq!(default_traversal.max_fanout, 50);
     assert_eq!(default_traversal.max_edges, 500);
+    assert_eq!(default_traversal.max_depth, 10);
 }
 
 #[test]
@@ -58,7 +60,7 @@ fn reinsertion_threshold_and_tombstone_data_shape() {
         tape_id: "tape".to_string(),
         event_offset: 9,
         file_path: "src/main.rs".to_string(),
-        range_at_deletion: engram::index::lineage::FileRange { start: 1, end: 1 },
+        range_at_deletion: FileRange { start: 1, end: 1 },
         timestamp: "2026-02-22T00:00:00Z".to_string(),
     };
     assert_eq!(deleted.anchor_hashes, vec!["a1".to_string()]);
