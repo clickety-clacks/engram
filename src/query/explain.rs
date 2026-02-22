@@ -80,13 +80,13 @@ pub fn retrieve_lineage(
         if out.len() >= traversal.max_edges {
             break;
         }
-        let edges = index.outbound_edges(&anchor, traversal.min_confidence, include_forensics)?;
+        let edges = index.inbound_edges(&anchor, traversal.min_confidence, include_forensics)?;
         for edge in edges.into_iter().take(traversal.max_fanout) {
             if out.len() >= traversal.max_edges {
                 break;
             }
-            if !visited.contains(&edge.to_anchor) {
-                queue.push_back(edge.to_anchor.clone());
+            if !visited.contains(&edge.from_anchor) {
+                queue.push_back(edge.from_anchor.clone());
             }
             out.push(edge);
         }
@@ -103,9 +103,16 @@ pub fn explain_by_anchor(
 ) -> rusqlite::Result<ExplainResult> {
     let direct = retrieve_direct(index, anchors)?;
     let lineage = retrieve_lineage(index, anchors, traversal, include_forensics)?;
+    let mut seen = HashSet::new();
     let mut touched_anchors = anchors.to_vec();
+    for anchor in anchors {
+        seen.insert(anchor.clone());
+    }
     for edge in &lineage {
-        if !touched_anchors.contains(&edge.to_anchor) {
+        if seen.insert(edge.from_anchor.clone()) {
+            touched_anchors.push(edge.from_anchor.clone());
+        }
+        if seen.insert(edge.to_anchor.clone()) {
             touched_anchors.push(edge.to_anchor.clone());
         }
     }
@@ -123,7 +130,7 @@ mod tests {
     use crate::tape::event::{CodeEditEvent, FileRange, TapeEvent, TapeEventAt, TapeEventData};
 
     #[test]
-    fn explain_collects_direct_and_lineage_edges() {
+    fn explain_collects_direct_and_backward_lineage_edges() {
         let index = SqliteIndex::open_in_memory().expect("sqlite");
         let events = vec![TapeEventAt {
             offset: 0,
@@ -156,11 +163,14 @@ mod tests {
 
         let lineage = explain_by_anchor(
             &index,
-            &["a".to_string()],
+            &["b".to_string()],
             ExplainTraversal::default(),
             true,
         )
-        .expect("explain from predecessor");
+        .expect("explain from successor");
         assert_eq!(lineage.lineage.len(), 1);
+        assert_eq!(lineage.lineage[0].from_anchor, "a");
+        assert_eq!(lineage.lineage[0].to_anchor, "b");
+        assert!(lineage.touched_anchors.contains(&"a".to_string()));
     }
 }
