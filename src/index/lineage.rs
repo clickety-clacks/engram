@@ -1,3 +1,5 @@
+use crate::tape::event::FileRange;
+
 pub const LINK_THRESHOLD_DEFAULT: f32 = 0.30;
 pub const IDENTICAL_REINSERTION_THRESHOLD: f32 = 0.90;
 
@@ -62,12 +64,6 @@ impl SpanEdge {
     pub fn included_in_default_traversal(&self, min_confidence: f32) -> bool {
         self.agent_link || self.confidence >= min_confidence
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileRange {
-    pub start: u32,
-    pub end: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
