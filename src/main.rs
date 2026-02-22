@@ -857,6 +857,9 @@ fn extract_meta(events: &[TapeEventAt]) -> Option<Value> {
             "model": meta.model,
             "repo_head": meta.repo_head,
             "label": meta.label,
+            "coverage.read": meta.coverage_read,
+            "coverage.edit": meta.coverage_edit,
+            "coverage.tool": meta.coverage_tool,
         })),
         _ => None,
     })

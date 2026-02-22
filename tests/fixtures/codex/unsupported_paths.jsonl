@@ -1,0 +1,5 @@
+{"timestamp":"2026-02-22T00:00:00Z","session_id":"sess_unsupported","type":"session_meta","payload":{"model_provider":"openai"}}
+{"timestamp":"2026-02-22T00:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call_read","arguments":"{\"cmd\":\"cat src/lib.rs\"}"}}
+{"timestamp":"2026-02-22T00:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_read","output":"alpha\nbeta"}}
+{"timestamp":"2026-02-22T00:00:03Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call_edit","arguments":"{\"cmd\":\"sed -i '' 's/alpha/beta/' src/lib.rs\"}"}}
+{"timestamp":"2026-02-22T00:00:04Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_edit","output":""}}

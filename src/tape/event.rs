@@ -39,6 +39,9 @@ pub struct MetaEvent {
     pub model: Option<String>,
     pub repo_head: Option<String>,
     pub label: Option<String>,
+    pub coverage_read: Option<String>,
+    pub coverage_edit: Option<String>,
+    pub coverage_tool: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -131,6 +134,12 @@ struct RawEvent {
     repo_head: Option<String>,
     #[serde(default)]
     label: Option<String>,
+    #[serde(default, rename = "coverage.read")]
+    coverage_read: Option<String>,
+    #[serde(default, rename = "coverage.edit")]
+    coverage_edit: Option<String>,
+    #[serde(default, rename = "coverage.tool")]
+    coverage_tool: Option<String>,
     #[serde(default)]
     file: Option<String>,
     #[serde(default)]
@@ -198,6 +207,9 @@ impl RawEvent {
                 model: self.model,
                 repo_head: self.repo_head,
                 label: self.label,
+                coverage_read: self.coverage_read,
+                coverage_edit: self.coverage_edit,
+                coverage_tool: self.coverage_tool,
             }),
             _ => TapeEventData::Other { kind },
         };
