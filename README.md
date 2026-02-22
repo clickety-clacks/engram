@@ -1,10 +1,19 @@
 # Engram
 
-A causal index over code.
+**Agentic engineering needs memory.**
+
+Engram is a causal index over code for agent-driven development. It captures the full execution trail agents already emit — prompts, tool calls, reads, edits, and results — then makes that trail queryable at span level.
 
 Engram answers: **"why does this code span exist?"**
 
-Given a file span, Engram retrieves the causal trail (messages, tool calls, reads, edits) that produced it — so agents can understand context before changing code.
+### Value proposition
+
+Modern agents are strong at local reasoning but weak at longitudinal memory. Engram turns prior work into retrievable context so each new task can start warm instead of cold.
+
+- Preserve full causal history, not just commit diffs
+- Retrieve the exact evidence behind any span before refactoring
+- Warm future agent context with real prior decisions, constraints, and tradeoffs
+- Reduce repeated mistakes caused by missing historical intent
 
 ## Status
 
