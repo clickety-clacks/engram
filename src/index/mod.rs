@@ -298,7 +298,10 @@ impl SqliteIndex {
             let stored_class = decode_stored_class(&row.get::<_, String>(7)?);
             let confidence: f32 = row.get(2)?;
             let agent_link = row.get::<_, i64>(5)? != 0;
-            if !include_forensics && !agent_link && confidence < min_confidence {
+            if !include_forensics
+                && !agent_link
+                && (stored_class == StoredEdgeClass::LocationOnly || confidence < min_confidence)
+            {
                 continue;
             }
             out.push(EdgeRow {
@@ -337,7 +340,11 @@ impl SqliteIndex {
         while let Some(row) = rows.next()? {
             let confidence: f32 = row.get(2)?;
             let agent_link = row.get::<_, i64>(5)? != 0;
-            if !include_forensics && !agent_link && confidence < min_confidence {
+            let stored_class = decode_stored_class(&row.get::<_, String>(7)?);
+            if !include_forensics
+                && !agent_link
+                && (stored_class == StoredEdgeClass::LocationOnly || confidence < min_confidence)
+            {
                 continue;
             }
             out.push(EdgeRow {
@@ -351,7 +358,7 @@ impl SqliteIndex {
                     let note: String = row.get(6)?;
                     if note.is_empty() { None } else { Some(note) }
                 },
-                stored_class: decode_stored_class(&row.get::<_, String>(7)?),
+                stored_class,
             });
         }
         Ok(out)
@@ -431,7 +438,12 @@ impl SqliteIndex {
                     if let (Some(before_hash), Some(after_hash)) =
                         (edit.before_hash.as_ref(), edit.after_hash.as_ref())
                     {
-                        let confidence = if before_hash == after_hash { 1.0 } else { 0.30 };
+                        let confidence = if before_hash == after_hash {
+                            1.0
+                        } else {
+                            edit.similarity.unwrap_or(0.0)
+                        };
+                        Self::validate_confidence(confidence)?;
                         Self::insert_edge_on(
                             tx.deref(),
                             &SpanEdge {
@@ -504,6 +516,15 @@ impl SqliteIndex {
         if anchor.is_empty() {
             return Err(rusqlite::Error::InvalidParameterName(
                 "anchor_hash must not be empty".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_confidence(confidence: f32) -> rusqlite::Result<()> {
+        if !(0.0..=1.0).contains(&confidence) {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "confidence must be in [0.0, 1.0]".to_string(),
             ));
         }
         Ok(())
@@ -605,6 +626,16 @@ mod tests {
         file: &str,
         offset: u64,
     ) -> TapeEventAt {
+        edit_event_with_similarity(before_hash, after_hash, Some(0.80), file, offset)
+    }
+
+    fn edit_event_with_similarity(
+        before_hash: Option<&str>,
+        after_hash: Option<&str>,
+        similarity: Option<f32>,
+        file: &str,
+        offset: u64,
+    ) -> TapeEventAt {
         TapeEventAt {
             offset,
             event: TapeEvent {
@@ -615,6 +646,7 @@ mod tests {
                     after_range: Some(FileRange { start: 10, end: 13 }),
                     before_hash: before_hash.map(ToOwned::to_owned),
                     after_hash: after_hash.map(ToOwned::to_owned),
+                    similarity,
                 }),
             },
         }
@@ -651,7 +683,7 @@ mod tests {
         let edges = index
             .outbound_edges("before", 0.50, false)
             .expect("edge query");
-        assert_eq!(edges.len(), 0);
+        assert_eq!(edges.len(), 1);
 
         let edges_forensics = index
             .outbound_edges("before", 0.50, true)
@@ -739,6 +771,52 @@ mod tests {
         let events = vec![
             read_event("anchor-1", "src/lib.rs", 0),
             read_event("", "src/lib.rs", 1),
+        ];
+
+        let err = index.ingest_tape_events("tape-1", &events, LINK_THRESHOLD_DEFAULT);
+        assert!(err.is_err());
+        assert_eq!(
+            index
+                .evidence_for_anchor("anchor-1")
+                .expect("query after rollback")
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn location_only_edges_are_hidden_without_forensics_even_with_low_min_confidence() {
+        let index = SqliteIndex::open_in_memory().expect("in-memory sqlite");
+        let events = vec![edit_event_with_similarity(
+            Some("before"),
+            Some("after"),
+            Some(0.20),
+            "src/lib.rs",
+            1,
+        )];
+
+        index
+            .ingest_tape_events("tape-1", &events, LINK_THRESHOLD_DEFAULT)
+            .expect("ingest succeeds");
+
+        let without_forensics = index
+            .outbound_edges("before", 0.10, false)
+            .expect("non-forensics query");
+        assert_eq!(without_forensics.len(), 0);
+
+        let with_forensics = index
+            .outbound_edges("before", 0.10, true)
+            .expect("forensics query");
+        assert_eq!(with_forensics.len(), 1);
+        assert_eq!(with_forensics[0].stored_class, StoredEdgeClass::LocationOnly);
+    }
+
+    #[test]
+    fn invalid_similarity_rejects_ingest_and_rolls_back() {
+        let index = SqliteIndex::open_in_memory().expect("in-memory sqlite");
+        let events = vec![
+            read_event("anchor-1", "src/lib.rs", 0),
+            edit_event_with_similarity(Some("a"), Some("b"), Some(1.2), "src/lib.rs", 1),
         ];
 
         let err = index.ingest_tape_events("tape-1", &events, LINK_THRESHOLD_DEFAULT);

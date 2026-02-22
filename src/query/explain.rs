@@ -142,6 +142,7 @@ mod tests {
                     after_range: Some(FileRange { start: 1, end: 1 }),
                     before_hash: Some("a".to_string()),
                     after_hash: Some("b".to_string()),
+                    similarity: Some(0.80),
                 }),
             },
         }];

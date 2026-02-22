@@ -55,6 +55,7 @@ pub struct CodeEditEvent {
     pub after_range: Option<FileRange>,
     pub before_hash: Option<String>,
     pub after_hash: Option<String>,
+    pub similarity: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -143,6 +144,8 @@ struct RawEvent {
     #[serde(default)]
     after_hash: Option<String>,
     #[serde(default)]
+    similarity: Option<f32>,
+    #[serde(default)]
     anchor_hashes: Option<Vec<String>>,
     #[serde(default)]
     from_file: Option<String>,
@@ -175,6 +178,7 @@ impl RawEvent {
                     after_range: self.after_range.map(file_range),
                     before_hash: self.before_hash,
                     after_hash: self.after_hash,
+                    similarity: self.similarity,
                 }),
                 None => TapeEventData::Other { kind },
             },
