@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+if command -v engram >/dev/null 2>&1; then
+  engram ingest >/dev/null || echo "[engram] post-merge ingest warning" >&2
+fi

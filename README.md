@@ -6,6 +6,70 @@ Engram is a causal index over code for agent-driven development. It captures the
 
 Engram answers: **"why does this code span exist?"**
 
+## Agent integration (recommended default)
+
+This section is intentionally agent-executable. If an agent follows these steps, the repo gets a good-hygiene Engram setup with Git-coupled operations.
+
+### Repo layout
+
+- `.engram/` → **committed** immutable tape artifacts
+- `.engram-cache/` → **local only** derived cache/index (never committed)
+
+### One-time setup
+
+```bash
+# from repo root
+engram init
+mkdir -p .engram .engram-cache .githooks
+
+# install hook scripts shipped in this repo
+cp -f scripts/hooks/pre-commit .githooks/pre-commit
+cp -f scripts/hooks/pre-push .githooks/pre-push
+cp -f scripts/hooks/post-merge .git/hooks/post-merge
+chmod +x .githooks/pre-commit .githooks/pre-push .git/hooks/post-merge
+
+git config core.hooksPath .githooks
+```
+
+### Git ↔ Engram hygiene mapping
+
+- `git commit` → pre-commit hook runs `engram ingest`
+- `git push` → pre-push hook runs `engram ingest` and freshness check
+- `git merge` / `git pull` → post-merge hook rebuilds local `.engram-cache` index from `.engram` tapes
+
+### Daily workflow
+
+Use Git normally. Hooks should handle Engram hygiene.
+
+If needed manually:
+
+```bash
+engram ingest
+engram explain <file>:<start>-<end>
+```
+
+### Invariants
+
+- Tapes are write-once immutable.
+- Never edit existing tape files.
+- Never commit `.engram-cache/`.
+- If tape filename already exists during import, skip (optional warning-only hash sanity check).
+
+### Adapter coverage (current)
+
+- Claude Code: deterministic adapter path implemented
+- Codex CLI: deterministic adapter path implemented (partial read/edit by harness limits)
+- OpenCode: adapter implemented/discovery-backed
+- Gemini CLI: adapter implemented/discovery-backed
+- Cursor: adapter implemented/discovery-backed
+
+See adapter specs for exact coverage semantics:
+- `specs/adapters/claude-code.md`
+- `specs/adapters/codex-cli.md`
+- `specs/adapters/opencode.md`
+- `specs/adapters/gemini-cli.md`
+- `specs/adapters/cursor.md`
+
 ### Value proposition
 
 Modern agents are strong at local reasoning but weak at longitudinal memory. Engram turns prior work into retrievable context so each new task can start warm instead of cold.
@@ -57,15 +121,14 @@ cargo run -- --help
 
 https://github.com/clickety-clacks/engram
 
-
 ## Specs
 
 - Core event contract: `specs/core/event-contract.md`
 - Claude Code adapter: `specs/adapters/claude-code.md`
 - Codex CLI adapter: `specs/adapters/codex-cli.md`
-- OpenCode adapter (TODO): `specs/adapters/opencode.md`
-- Gemini CLI adapter (TODO): `specs/adapters/gemini-cli.md`
-- Cursor adapter (TODO): `specs/adapters/cursor.md`
+- OpenCode adapter: `specs/adapters/opencode.md`
+- Gemini CLI adapter: `specs/adapters/gemini-cli.md`
+- Cursor adapter: `specs/adapters/cursor.md`
 
 ## Slideshow
 

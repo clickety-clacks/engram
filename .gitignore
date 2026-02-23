@@ -1,1 +1,4 @@
 /target
+
+/.engram-cache/
+/.engram/index.sqlite
