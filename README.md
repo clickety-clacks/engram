@@ -8,7 +8,7 @@ Engram answers: **"why does this code span exist?"**
 
 ## Agent integration (recommended default)
 
-This section is intentionally agent-executable. If an agent follows these steps, the repo gets a good-hygiene Engram setup with Git-coupled operations.
+This section is intentionally agent-executable. If an agent follows these steps, the repo gets a good-hygiene Engram setup with Git-coupled operations, without overwriting existing repo hooks.
 
 ### Repo layout
 
@@ -23,10 +23,15 @@ engram init
 mkdir -p .engram .engram-cache .githooks
 
 # install hook scripts shipped in this repo
-cp -f scripts/hooks/pre-commit .githooks/pre-commit
-cp -f scripts/hooks/pre-push .githooks/pre-push
-cp -f scripts/hooks/post-merge .git/hooks/post-merge
-chmod +x .githooks/pre-commit .githooks/pre-push .git/hooks/post-merge
+# non-destructive install: do not overwrite existing hooks
+for h in pre-commit pre-push post-merge; do
+  if [ -f ".githooks/$h" ]; then
+    echo "[engram] .githooks/$h already exists; leaving as-is"
+  else
+    cp "scripts/hooks/$h" ".githooks/$h"
+  fi
+done
+chmod +x .githooks/pre-commit .githooks/pre-push .githooks/post-merge
 
 git config core.hooksPath .githooks
 ```
