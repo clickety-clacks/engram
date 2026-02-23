@@ -1,7 +1,7 @@
 use std::fs;
 
 use engram::tape::adapter::{AdapterId, CoverageGrade, run_conformance};
-use engram::tape::harness::cursor_jsonl_to_tape_jsonl;
+use engram::tape::adapters::cursor_jsonl_to_tape_jsonl;
 use serde_json::Value;
 
 fn load_fixture(path: &str) -> String {
