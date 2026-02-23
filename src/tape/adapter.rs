@@ -1,8 +1,11 @@
 use std::path::{Path, PathBuf};
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
-use super::harness::{claude_jsonl_to_tape_jsonl, codex_jsonl_to_tape_jsonl};
+use super::harness::{
+    claude_jsonl_to_tape_jsonl, codex_jsonl_to_tape_jsonl, cursor_jsonl_to_tape_jsonl,
+    gemini_json_to_tape_jsonl, opencode_json_to_tape_jsonl,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AdapterId {
@@ -148,50 +151,140 @@ pub fn adapter_registry() -> &'static [AdapterDescriptor] {
         },
         AdapterDescriptor {
             id: AdapterId::OpenCode,
-            status: AdapterStatus::DiscoveryRequired,
-            artifact_path_templates: &["TODO: discovery required"],
-            schema_sample_set: &["TODO: discovery required"],
-            mapping_table: &[MappingRule {
-                source: "TODO: discovery required",
-                target: "TODO: event-contract mapping",
-                note: "deterministic mapping table pending",
-            }],
+            status: AdapterStatus::Implemented,
+            artifact_path_templates: &[
+                "~/.local/share/opencode/storage/session/<project-id>/*.json",
+                "~/.local/share/opencode/storage/message/<session-id>/*.json",
+                "~/.local/share/opencode/storage/part/<message-id>/*.json",
+                "XDG_DATA_HOME/opencode/storage/**",
+            ],
+            schema_sample_set: &["opencode-session-export-json", "opencode-storage-part-json"],
+            mapping_table: &[
+                MappingRule {
+                    source: "messages[].parts[].type=text",
+                    target: "msg.in|msg.out",
+                    note: "role from messages[].info.role",
+                },
+                MappingRule {
+                    source: "messages[].parts[].type=tool",
+                    target: "tool.call",
+                    note: "tool + callID + serialized state.input",
+                },
+                MappingRule {
+                    source: "tool state.status=completed|error",
+                    target: "tool.result",
+                    note: "completed=>exit=0/stdout, error=>exit=1/stderr",
+                },
+                MappingRule {
+                    source: "tool=read with state.input.filePath",
+                    target: "code.read",
+                    note: "range from offset/limit when present",
+                },
+                MappingRule {
+                    source: "tool=edit|write|patch",
+                    target: "code.edit",
+                    note: "structured filePath or patchText file extraction",
+                },
+            ],
             coverage: CoverageGrades {
-                read: CoverageGrade::None,
-                edit: CoverageGrade::None,
-                tool: CoverageGrade::None,
+                read: CoverageGrade::Partial,
+                edit: CoverageGrade::Partial,
+                tool: CoverageGrade::Full,
             },
         },
         AdapterDescriptor {
             id: AdapterId::GeminiCli,
-            status: AdapterStatus::DiscoveryRequired,
-            artifact_path_templates: &["TODO: discovery required"],
-            schema_sample_set: &["TODO: discovery required"],
-            mapping_table: &[MappingRule {
-                source: "TODO: discovery required",
-                target: "TODO: event-contract mapping",
-                note: "deterministic mapping table pending",
-            }],
+            status: AdapterStatus::Implemented,
+            artifact_path_templates: &[
+                "~/.gemini/tmp/*/chats/session-*.json",
+                "~/.gemini/tmp/*/logs.json",
+            ],
+            schema_sample_set: &["gemini-session-json", "gemini-logs-json"],
+            mapping_table: &[
+                MappingRule {
+                    source: "messages[type=user].content",
+                    target: "msg.in",
+                    note: "user prompt text",
+                },
+                MappingRule {
+                    source: "messages[type=gemini].content",
+                    target: "msg.out",
+                    note: "assistant response text",
+                },
+                MappingRule {
+                    source: "messages[type=gemini].toolCalls[]",
+                    target: "tool.call|tool.result",
+                    note: "paired by toolCalls.id",
+                },
+                MappingRule {
+                    source: "toolCalls[name=read_file].args.file_path",
+                    target: "code.read",
+                    note: "range normalized to [1,1]",
+                },
+                MappingRule {
+                    source: "toolCalls[name=write_file].args.{file_path,content}",
+                    target: "code.edit",
+                    note: "after_hash from deterministic content hash",
+                },
+                MappingRule {
+                    source: "logs.json[]",
+                    target: "meta+msg.in|msg.out",
+                    note: "message-only fallback with none coverage",
+                },
+            ],
             coverage: CoverageGrades {
-                read: CoverageGrade::None,
-                edit: CoverageGrade::None,
-                tool: CoverageGrade::None,
+                read: CoverageGrade::Partial,
+                edit: CoverageGrade::Partial,
+                tool: CoverageGrade::Full,
             },
         },
         AdapterDescriptor {
             id: AdapterId::Cursor,
-            status: AdapterStatus::DiscoveryRequired,
-            artifact_path_templates: &["TODO: discovery required"],
-            schema_sample_set: &["TODO: discovery required"],
-            mapping_table: &[MappingRule {
-                source: "TODO: discovery required",
-                target: "TODO: event-contract mapping",
-                note: "deterministic mapping table pending",
-            }],
+            status: AdapterStatus::Implemented,
+            artifact_path_templates: &[
+                "<capture>/cursor-stream-jsonl.ndjson",
+                "<capture>/cursor-stream-jsonl-*.ndjson",
+            ],
+            schema_sample_set: &[
+                "cursor-cli-stream-json-ndjson",
+                "tests/fixtures/cursor/supported_paths.jsonl",
+            ],
+            mapping_table: &[
+                MappingRule {
+                    source: "system/init",
+                    target: "meta",
+                    note: "model + fixed coverage grades",
+                },
+                MappingRule {
+                    source: "user.message.content[].text",
+                    target: "msg.in",
+                    note: "joined text blocks",
+                },
+                MappingRule {
+                    source: "assistant.message.content[].text",
+                    target: "msg.out",
+                    note: "joined text blocks",
+                },
+                MappingRule {
+                    source: "tool_call[subtype=started]",
+                    target: "tool.call",
+                    note: "readToolCall/writeToolCall/function + call_id",
+                },
+                MappingRule {
+                    source: "tool_call[subtype=completed]",
+                    target: "tool.result",
+                    note: "deterministic exit/stdout/stderr extraction",
+                },
+                MappingRule {
+                    source: "writeToolCall.result.success.path",
+                    target: "code.edit",
+                    note: "file path only; read ranges unavailable in schema",
+                },
+            ],
             coverage: CoverageGrades {
-                read: CoverageGrade::None,
-                edit: CoverageGrade::None,
-                tool: CoverageGrade::None,
+                read: CoverageGrade::Partial,
+                edit: CoverageGrade::Partial,
+                tool: CoverageGrade::Full,
             },
         },
     ]
@@ -270,13 +363,52 @@ impl HarnessAdapter for CodexCliAdapter {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct OpenCodeAdapter;
+
+impl HarnessAdapter for OpenCodeAdapter {
+    fn adapter_id(&self) -> AdapterId {
+        AdapterId::OpenCode
+    }
+
+    fn convert_to_tape_jsonl(&self, input: &str) -> Result<String, AdapterError> {
+        Ok(opencode_json_to_tape_jsonl(input)?)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct CursorAdapter;
+
+impl HarnessAdapter for CursorAdapter {
+    fn adapter_id(&self) -> AdapterId {
+        AdapterId::Cursor
+    }
+
+    fn convert_to_tape_jsonl(&self, input: &str) -> Result<String, AdapterError> {
+        Ok(cursor_jsonl_to_tape_jsonl(input)?)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct GeminiCliAdapter;
+
+impl HarnessAdapter for GeminiCliAdapter {
+    fn adapter_id(&self) -> AdapterId {
+        AdapterId::GeminiCli
+    }
+
+    fn convert_to_tape_jsonl(&self, input: &str) -> Result<String, AdapterError> {
+        Ok(gemini_json_to_tape_jsonl(input)?)
+    }
+}
+
 pub fn convert_with_adapter(id: AdapterId, input: &str) -> Result<String, AdapterError> {
     match id {
         AdapterId::ClaudeCode => ClaudeCodeAdapter.convert_to_tape_jsonl(input),
         AdapterId::CodexCli => CodexCliAdapter.convert_to_tape_jsonl(input),
-        AdapterId::OpenCode | AdapterId::GeminiCli | AdapterId::Cursor => {
-            Ok(discovery_adapter_jsonl(id, input)?)
-        }
+        AdapterId::OpenCode => OpenCodeAdapter.convert_to_tape_jsonl(input),
+        AdapterId::Cursor => CursorAdapter.convert_to_tape_jsonl(input),
+        AdapterId::GeminiCli => GeminiCliAdapter.convert_to_tape_jsonl(input),
     }
 }
 
@@ -405,9 +537,7 @@ fn validate_contract_row(line: usize, row: &Value, issues: &mut Vec<ConformanceI
                 {
                     issues.push(ConformanceIssue {
                         line,
-                        detail: format!(
-                            "meta field `{field}` must be one of `full|partial|none`"
-                        ),
+                        detail: format!("meta field `{field}` must be one of `full|partial|none`"),
                     });
                 }
             }
@@ -490,34 +620,6 @@ fn validate_contract_row(line: usize, row: &Value, issues: &mut Vec<ConformanceI
     }
 }
 
-fn discovery_adapter_jsonl(id: AdapterId, input: &str) -> Result<String, serde_json::Error> {
-    let mut first_timestamp = "1970-01-01T00:00:00Z".to_string();
-    for line in input.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let row: Value = serde_json::from_str(line)?;
-        if let Some(ts) = row.get("timestamp").and_then(Value::as_str) {
-            first_timestamp = ts.to_string();
-            break;
-        }
-        if let Some(ts) = row.get("t").and_then(Value::as_str) {
-            first_timestamp = ts.to_string();
-            break;
-        }
-    }
-
-    serde_json::to_string(&json!({
-        "t": first_timestamp,
-        "k": "meta",
-        "source": {"harness": id.as_str()},
-        "coverage.read": "none",
-        "coverage.edit": "none",
-        "coverage.tool": "none"
-    }))
-    .map(|line| format!("{line}\n"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -533,7 +635,10 @@ mod tests {
 
         let report = run_conformance(AdapterId::CodexCli, input).expect("adapter should parse");
         assert_eq!(report.adapter, AdapterId::CodexCli);
-        assert_eq!(report.event_count, 3, "expected meta + tool.call + tool.result");
+        assert_eq!(
+            report.event_count, 3,
+            "expected meta + tool.call + tool.result"
+        );
         assert!(report.issues.is_empty(), "issues={:?}", report.issues);
         assert_eq!(report.coverage.tool, CoverageGrade::Full);
         assert_eq!(report.coverage.read, CoverageGrade::Partial);
@@ -568,28 +673,87 @@ mod tests {
 
     #[test]
     fn long_tail_registry_entries_have_discovery_and_mapping_scaffolding() {
-        for adapter in [AdapterId::OpenCode, AdapterId::GeminiCli, AdapterId::Cursor] {
-            let descriptor = descriptor_for(adapter);
-            assert_eq!(descriptor.status, AdapterStatus::DiscoveryRequired);
-            assert!(!descriptor.artifact_path_templates.is_empty());
-            assert!(!descriptor.schema_sample_set.is_empty());
-            assert!(!descriptor.mapping_table.is_empty());
-            assert_eq!(descriptor.coverage.tool, CoverageGrade::None);
-            assert_eq!(descriptor.coverage.read, CoverageGrade::None);
-            assert_eq!(descriptor.coverage.edit, CoverageGrade::None);
-        }
+        let open = descriptor_for(AdapterId::OpenCode);
+        assert_eq!(open.status, AdapterStatus::Implemented);
+        assert_eq!(open.coverage.tool, CoverageGrade::Full);
+        assert_eq!(open.coverage.read, CoverageGrade::Partial);
+        assert_eq!(open.coverage.edit, CoverageGrade::Partial);
+        assert!(!open.artifact_path_templates.is_empty());
+        assert!(!open.schema_sample_set.is_empty());
+        assert!(!open.mapping_table.is_empty());
+
+        let gemini = descriptor_for(AdapterId::GeminiCli);
+        assert_eq!(gemini.status, AdapterStatus::Implemented);
+        assert_eq!(gemini.coverage.tool, CoverageGrade::Full);
+        assert_eq!(gemini.coverage.read, CoverageGrade::Partial);
+        assert_eq!(gemini.coverage.edit, CoverageGrade::Partial);
+        assert!(!gemini.artifact_path_templates.is_empty());
+        assert!(!gemini.schema_sample_set.is_empty());
+        assert!(!gemini.mapping_table.is_empty());
+
+        let cursor = descriptor_for(AdapterId::Cursor);
+        assert_eq!(cursor.status, AdapterStatus::Implemented);
+        assert_eq!(cursor.coverage.tool, CoverageGrade::Full);
+        assert_eq!(cursor.coverage.read, CoverageGrade::Partial);
+        assert_eq!(cursor.coverage.edit, CoverageGrade::Partial);
+        assert!(!cursor.artifact_path_templates.is_empty());
+        assert!(!cursor.schema_sample_set.is_empty());
+        assert!(!cursor.mapping_table.is_empty());
     }
 
     #[test]
-    fn discovery_required_adapters_emit_deterministic_meta_with_none_coverage() {
-        for adapter in [AdapterId::OpenCode, AdapterId::GeminiCli, AdapterId::Cursor] {
-            let report = run_conformance(adapter, "{}\n").expect("adapter should normalize");
-            assert_eq!(report.event_count, 1);
-            assert!(report.issues.is_empty(), "issues={:?}", report.issues);
-            assert_eq!(report.coverage.tool, CoverageGrade::None);
-            assert_eq!(report.coverage.read, CoverageGrade::None);
-            assert_eq!(report.coverage.edit, CoverageGrade::None);
-        }
+    fn gemini_logs_conformance_emits_none_coverage() {
+        let input = include_str!("../../tests/fixtures/gemini/logs.json");
+        let report = run_conformance(AdapterId::GeminiCli, input).expect("adapter should parse");
+        assert_eq!(report.event_count, 3, "expected meta + 2 log messages");
+        assert!(report.issues.is_empty(), "issues={:?}", report.issues);
+        assert_eq!(report.coverage.tool, CoverageGrade::None);
+        assert_eq!(report.coverage.read, CoverageGrade::None);
+        assert_eq!(report.coverage.edit, CoverageGrade::None);
+    }
+
+    #[test]
+    fn gemini_conformance_harness_passes() {
+        let input = include_str!("../../tests/fixtures/gemini/session_with_tools.json");
+        let report = run_conformance(AdapterId::GeminiCli, input).expect("adapter should parse");
+        assert_eq!(report.adapter, AdapterId::GeminiCli);
+        assert!(report.event_count >= 8);
+        assert!(report.issues.is_empty(), "issues={:?}", report.issues);
+        assert_eq!(report.coverage.tool, CoverageGrade::Full);
+        assert_eq!(report.coverage.read, CoverageGrade::Full);
+        assert_eq!(report.coverage.edit, CoverageGrade::Full);
+    }
+
+    #[test]
+    fn opencode_conformance_harness_passes() {
+        let input = r#"{
+  "info": {"id": "ses_1", "time": {"created": 1735689600000}},
+  "messages": [{
+    "info": {"id": "msg_1", "role": "assistant", "time": {"created": 1735689601000}},
+    "parts": [
+      {"id":"part_1","type":"tool","callID":"call_1","tool":"read","state":{"status":"completed","input":{"filePath":"src/lib.rs","offset":0,"limit":2},"output":"ok"}}
+    ]
+  }]
+}"#;
+        let report = run_conformance(AdapterId::OpenCode, input).expect("adapter should parse");
+        assert_eq!(report.adapter, AdapterId::OpenCode);
+        assert!(report.event_count >= 3);
+        assert!(report.issues.is_empty(), "issues={:?}", report.issues);
+        assert_eq!(report.coverage.tool, CoverageGrade::Full);
+        assert_eq!(report.coverage.read, CoverageGrade::Partial);
+        assert_eq!(report.coverage.edit, CoverageGrade::Partial);
+    }
+
+    #[test]
+    fn cursor_conformance_harness_passes() {
+        let input = include_str!("../../tests/fixtures/cursor/supported_paths.jsonl");
+        let report = run_conformance(AdapterId::Cursor, input).expect("adapter should parse");
+        assert_eq!(report.adapter, AdapterId::Cursor);
+        assert!(report.event_count >= 7);
+        assert!(report.issues.is_empty(), "issues={:?}", report.issues);
+        assert_eq!(report.coverage.tool, CoverageGrade::Full);
+        assert_eq!(report.coverage.read, CoverageGrade::Partial);
+        assert_eq!(report.coverage.edit, CoverageGrade::Partial);
     }
 
     #[test]
@@ -597,7 +761,10 @@ mod tests {
         let input = r#"{"timestamp":"2026-02-22T00:00:00Z","type":"session_meta","payload":{"model_provider":"openai","git":{"commit_hash":"abc123"}}}"#;
         let mut normalized =
             super::convert_with_adapter(AdapterId::CodexCli, input).expect("adapter should parse");
-        normalized = normalized.replace("\"coverage.read\":\"partial\"", "\"coverage.read\":\"PARTIAL\"");
+        normalized = normalized.replace(
+            "\"coverage.read\":\"partial\"",
+            "\"coverage.read\":\"PARTIAL\"",
+        );
 
         let mut issues = Vec::new();
         for (idx, line) in normalized.lines().enumerate() {

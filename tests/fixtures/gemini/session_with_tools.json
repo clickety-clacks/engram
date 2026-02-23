@@ -1,0 +1,91 @@
+{
+  "sessionId": "session-gemini-1",
+  "projectHash": "proj-gemini",
+  "startTime": "2026-02-22T00:00:00Z",
+  "lastUpdated": "2026-02-22T00:00:03Z",
+  "messages": [
+    {
+      "id": "msg-user-1",
+      "timestamp": "2026-02-22T00:00:00Z",
+      "type": "user",
+      "content": "Read README then write notes"
+    },
+    {
+      "id": "msg-gem-1",
+      "timestamp": "2026-02-22T00:00:01Z",
+      "type": "gemini",
+      "model": "gemini-2.5-flash",
+      "content": "",
+      "toolCalls": [
+        {
+          "id": "read_file-1",
+          "name": "read_file",
+          "args": {
+            "file_path": "/repo/README.md"
+          },
+          "status": "success",
+          "timestamp": "2026-02-22T00:00:01Z",
+          "result": [
+            {
+              "functionResponse": {
+                "id": "read_file-1",
+                "name": "read_file",
+                "response": {
+                  "output": "README contents"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "id": "write_file-1",
+          "name": "write_file",
+          "args": {
+            "file_path": "/repo/notes.txt",
+            "content": "notes"
+          },
+          "status": "success",
+          "timestamp": "2026-02-22T00:00:02Z",
+          "result": [
+            {
+              "functionResponse": {
+                "id": "write_file-1",
+                "name": "write_file",
+                "response": {
+                  "output": "Successfully overwrote file: /repo/notes.txt"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "id": "run_shell_command-1",
+          "name": "run_shell_command",
+          "args": {
+            "command": "git status"
+          },
+          "status": "error",
+          "timestamp": "2026-02-22T00:00:02Z",
+          "result": [
+            {
+              "functionResponse": {
+                "id": "run_shell_command-1",
+                "name": "run_shell_command",
+                "response": {
+                  "error": "Tool \"run_shell_command\" not found"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "msg-gem-2",
+      "timestamp": "2026-02-22T00:00:03Z",
+      "type": "gemini",
+      "model": "gemini-2.5-flash",
+      "content": "Done."
+    }
+  ]
+}

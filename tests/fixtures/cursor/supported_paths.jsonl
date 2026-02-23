@@ -1,0 +1,7 @@
+{"timestamp":"2026-02-22T00:00:00Z","type":"system","subtype":"init","session_id":"c6b62c6f-7ead-4fd6-9922-e952131177ff","model":"gpt-5"}
+{"timestamp":"2026-02-22T00:00:00Z","type":"user","session_id":"c6b62c6f-7ead-4fd6-9922-e952131177ff","message":{"role":"user","content":"Please read and write a summary."}}
+{"timestamp":"2026-02-22T00:00:00Z","type":"assistant","session_id":"c6b62c6f-7ead-4fd6-9922-e952131177ff","message":{"role":"assistant","content":"Running tools now."}}
+{"timestamp":"2026-02-22T00:00:01Z","type":"tool_call","subtype":"started","session_id":"c6b62c6f-7ead-4fd6-9922-e952131177ff","call_id":"toolu_vrtx_01NnjaR886UcE8whekg2MGJd","tool_call":{"readToolCall":{"args":{"path":"/Users/user/project/README.md"}}}}
+{"timestamp":"2026-02-22T00:00:02Z","type":"tool_call","subtype":"completed","session_id":"c6b62c6f-7ead-4fd6-9922-e952131177ff","call_id":"toolu_vrtx_01NnjaR886UcE8whekg2MGJd","tool_call":{"readToolCall":{"result":{"success":{"content":"hello"}}}}}
+{"timestamp":"2026-02-22T00:00:03Z","type":"tool_call","subtype":"started","session_id":"c6b62c6f-7ead-4fd6-9922-e952131177ff","call_id":"toolu_write_01","tool_call":{"writeToolCall":{"args":{"path":"/Users/user/project/summary.txt","content":"x"}}}}
+{"timestamp":"2026-02-22T00:00:04Z","type":"tool_call","subtype":"completed","session_id":"c6b62c6f-7ead-4fd6-9922-e952131177ff","call_id":"toolu_write_01","tool_call":{"writeToolCall":{"result":{"success":{"path":"/Users/user/project/summary.txt"}}}}}
