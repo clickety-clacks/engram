@@ -3,6 +3,10 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+const CODEX_COVERAGE_TOOL: &str = "full";
+const CODEX_COVERAGE_READ: &str = "partial";
+const CODEX_COVERAGE_EDIT: &str = "partial";
+
 pub fn codex_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Error> {
     let mut out = Vec::new();
     let mut call_tools: HashMap<String, String> = HashMap::new();
@@ -45,16 +49,12 @@ pub fn codex_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Erro
                     .and_then(|git| git.get("commit_hash"))
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned);
-                let mut event = serde_json::Map::new();
-                event.insert("t".to_string(), json!(timestamp));
-                event.insert("k".to_string(), json!("meta"));
-                event.insert("source".to_string(), codex_source(session_id.as_deref()));
-                event.insert("model".to_string(), json!(model));
-                event.insert("repo_head".to_string(), json!(repo_head));
-                event.insert("coverage.tool".to_string(), json!("full"));
-                event.insert("coverage.read".to_string(), json!("partial"));
-                event.insert("coverage.edit".to_string(), json!("partial"));
-                out.push(Value::Object(event));
+                out.push(codex_meta_event(
+                    timestamp,
+                    session_id.as_deref(),
+                    model,
+                    repo_head,
+                ));
                 emitted_meta = true;
             }
             "response_item" => {
@@ -163,14 +163,14 @@ pub fn codex_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Erro
     if !emitted_meta {
         out.insert(
             0,
-            json!({
-                "t": first_timestamp.unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string()),
-                "k": "meta",
-                "source": codex_source(session_id.as_deref()),
-                "coverage.tool": "full",
-                "coverage.read": "partial",
-                "coverage.edit": "partial"
-            }),
+            codex_meta_event(
+                first_timestamp
+                    .as_deref()
+                    .unwrap_or("1970-01-01T00:00:00Z"),
+                session_id.as_deref(),
+                None,
+                None,
+            ),
         );
     }
 
@@ -429,10 +429,15 @@ pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
 }
 
 fn source_block(harness: &str, session_id: Option<&str>) -> Value {
-    json!({
-        "harness": harness,
-        "session_id": session_id
-    })
+    match session_id {
+        Some(session_id) => json!({
+            "harness": harness,
+            "session_id": session_id
+        }),
+        None => json!({
+            "harness": harness
+        }),
+    }
 }
 
 fn coverage_grade(total: u32, emitted: u32) -> &'static str {
@@ -539,6 +544,28 @@ fn codex_source(session_id: Option<&str>) -> Value {
     }
 }
 
+fn codex_meta_event(
+    timestamp: &str,
+    session_id: Option<&str>,
+    model: Option<String>,
+    repo_head: Option<String>,
+) -> Value {
+    let mut event = serde_json::Map::new();
+    event.insert("t".to_string(), json!(timestamp));
+    event.insert("k".to_string(), json!("meta"));
+    event.insert("source".to_string(), codex_source(session_id));
+    event.insert("coverage.tool".to_string(), json!(CODEX_COVERAGE_TOOL));
+    event.insert("coverage.read".to_string(), json!(CODEX_COVERAGE_READ));
+    event.insert("coverage.edit".to_string(), json!(CODEX_COVERAGE_EDIT));
+    if model.is_some() {
+        event.insert("model".to_string(), json!(model));
+    }
+    if repo_head.is_some() {
+        event.insert("repo_head".to_string(), json!(repo_head));
+    }
+    Value::Object(event)
+}
+
 fn extract_apply_patch_files(arguments: &str) -> Vec<String> {
     let patch_body = serde_json::from_str::<Value>(arguments)
         .ok()
@@ -587,6 +614,27 @@ mod tests {
         assert!(out.contains(r#""exit":7"#), "out={out}");
         assert!(out.contains(r#""k":"code.edit""#), "out={out}");
         assert!(out.contains(r#""file":"src/main.rs""#), "out={out}");
+    }
+
+    #[test]
+    fn codex_adapter_does_not_emit_code_edit_without_patch_file_headers() {
+        let input = r#"{"timestamp":"2026-02-22T00:00:00Z","type":"session_meta","payload":{"model_provider":"openai"}}
+{"timestamp":"2026-02-22T00:00:01Z","type":"response_item","payload":{"type":"function_call","name":"apply_patch","call_id":"call_1","arguments":"not a patch body"}}
+{"timestamp":"2026-02-22T00:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"Done."}}"#;
+
+        let out = codex_jsonl_to_tape_jsonl(input).expect("adapter should parse");
+        let events: Vec<Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid JSON event"))
+            .collect();
+
+        assert_eq!(events[0]["k"], "meta");
+        assert_eq!(events[0]["coverage.read"], "partial");
+        assert_eq!(events[0]["coverage.edit"], "partial");
+        assert!(
+            events.iter().all(|event| event["k"] != "code.edit"),
+            "events={events:?}"
+        );
     }
 
     #[test]

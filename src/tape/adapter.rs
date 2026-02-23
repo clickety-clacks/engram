@@ -365,6 +365,14 @@ fn validate_contract_row(line: usize, row: &Value, issues: &mut Vec<ConformanceI
                     detail: "missing string field `source.harness`".to_string(),
                 });
             }
+            if source.contains_key("session_id")
+                && !source.get("session_id").is_some_and(Value::is_string)
+            {
+                issues.push(ConformanceIssue {
+                    line,
+                    detail: "field `source.session_id` must be a string when present".to_string(),
+                });
+            }
         }
         None => issues.push(ConformanceIssue {
             line,
@@ -533,6 +541,18 @@ mod tests {
     }
 
     #[test]
+    fn codex_conformance_keeps_partial_coverage_for_unstructured_shell_io() {
+        let input = include_str!("../../tests/fixtures/codex/unsupported_paths.jsonl");
+        let report = run_conformance(AdapterId::CodexCli, input).expect("adapter should parse");
+        assert_eq!(report.adapter, AdapterId::CodexCli);
+        assert_eq!(report.event_count, 5, "expected meta + 2 calls + 2 results");
+        assert!(report.issues.is_empty(), "issues={:?}", report.issues);
+        assert_eq!(report.coverage.tool, CoverageGrade::Full);
+        assert_eq!(report.coverage.read, CoverageGrade::Partial);
+        assert_eq!(report.coverage.edit, CoverageGrade::Partial);
+    }
+
+    #[test]
     fn claude_conformance_harness_passes() {
         let input = r#"{"type":"assistant","timestamp":"2026-02-22T00:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/repo/src/lib.rs","offset":10,"limit":5}}]}}
 {"type":"user","timestamp":"2026-02-22T00:00:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"10->line"}]}}"#;
@@ -593,6 +613,26 @@ mod tests {
             issues
                 .iter()
                 .any(|issue| issue.detail.contains("must be one of `full|partial|none`")),
+            "issues={issues:?}"
+        );
+    }
+
+    #[test]
+    fn conformance_flags_non_string_source_session_id() {
+        let row = serde_json::json!({
+            "t": "2026-02-22T00:00:00Z",
+            "k": "msg.out",
+            "source": {
+                "harness": "claude-code",
+                "session_id": 7
+            }
+        });
+        let mut issues = Vec::new();
+        super::validate_contract_row(1, &row, &mut issues);
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.detail.contains("source.session_id")),
             "issues={issues:?}"
         );
     }
