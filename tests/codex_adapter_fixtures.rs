@@ -1,6 +1,6 @@
 use std::fs;
 
-use engram::tape::harness::codex_jsonl_to_tape_jsonl;
+use engram::tape::adapters::codex_jsonl_to_tape_jsonl;
 use serde_json::Value;
 
 fn load_fixture(path: &str) -> String {
