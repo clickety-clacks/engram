@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use super::harness::{
+use super::adapters::{
     claude_jsonl_to_tape_jsonl, codex_jsonl_to_tape_jsonl, cursor_jsonl_to_tape_jsonl,
     gemini_json_to_tape_jsonl, opencode_json_to_tape_jsonl,
 };
