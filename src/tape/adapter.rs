@@ -389,6 +389,18 @@ fn validate_contract_row(line: usize, row: &Value, issues: &mut Vec<ConformanceI
                         line,
                         detail: format!("meta missing string field `{field}`"),
                     });
+                } else if !obj
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .and_then(coverage_grade_from_str)
+                    .is_some()
+                {
+                    issues.push(ConformanceIssue {
+                        line,
+                        detail: format!(
+                            "meta field `{field}` must be one of `full|partial|none`"
+                        ),
+                    });
                 }
             }
         }
@@ -558,6 +570,31 @@ mod tests {
             assert_eq!(report.coverage.read, CoverageGrade::None);
             assert_eq!(report.coverage.edit, CoverageGrade::None);
         }
+    }
+
+    #[test]
+    fn conformance_flags_invalid_meta_coverage_values() {
+        let input = r#"{"timestamp":"2026-02-22T00:00:00Z","type":"session_meta","payload":{"model_provider":"openai","git":{"commit_hash":"abc123"}}}"#;
+        let mut normalized =
+            super::convert_with_adapter(AdapterId::CodexCli, input).expect("adapter should parse");
+        normalized = normalized.replace("\"coverage.read\":\"partial\"", "\"coverage.read\":\"PARTIAL\"");
+
+        let mut issues = Vec::new();
+        for (idx, line) in normalized.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let row: serde_json::Value =
+                serde_json::from_str(line).expect("normalized event should parse");
+            super::validate_contract_row(idx + 1, &row, &mut issues);
+        }
+
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.detail.contains("must be one of `full|partial|none`")),
+            "issues={issues:?}"
+        );
     }
 
     #[test]
