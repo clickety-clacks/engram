@@ -436,9 +436,9 @@ fn source_block(harness: &str, session_id: Option<&str>) -> Value {
 }
 
 fn coverage_grade(total: u32, emitted: u32) -> &'static str {
-    if total == 0 {
-        "none"
-    } else if emitted == total {
+    // total == 0 means no structured events of this type were seen; all zero
+    // of them were captured, so coverage is vacuously full.
+    if total == 0 || emitted == total {
         "full"
     } else {
         "partial"

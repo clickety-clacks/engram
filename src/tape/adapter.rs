@@ -298,6 +298,7 @@ pub fn run_conformance(id: AdapterId, input: &str) -> Result<ConformanceReport, 
     let normalized = convert_with_adapter(id, input)?;
     let mut issues = Vec::new();
     let mut event_count = 0usize;
+    let mut actual_coverage: Option<CoverageGrades> = None;
 
     for (idx, line) in normalized.lines().enumerate() {
         if line.trim().is_empty() {
@@ -306,15 +307,39 @@ pub fn run_conformance(id: AdapterId, input: &str) -> Result<ConformanceReport, 
 
         event_count += 1;
         let row: Value = serde_json::from_str(line)?;
+
+        // Extract coverage from the first meta event the adapter actually emits.
+        if actual_coverage.is_none() && row.get("k").and_then(Value::as_str) == Some("meta") {
+            actual_coverage = parse_meta_coverage(&row);
+        }
+
         validate_contract_row(idx + 1, &row, &mut issues);
     }
 
     Ok(ConformanceReport {
         adapter: id,
         event_count,
-        coverage: descriptor_for(id).coverage,
+        // Use actual adapter output; fall back to registry if meta is absent or
+        // its coverage fields cannot be parsed (which would also produce issues above).
+        coverage: actual_coverage.unwrap_or_else(|| descriptor_for(id).coverage),
         issues,
     })
+}
+
+fn parse_meta_coverage(meta: &Value) -> Option<CoverageGrades> {
+    let read = coverage_grade_from_str(meta.get("coverage.read").and_then(Value::as_str)?)?;
+    let edit = coverage_grade_from_str(meta.get("coverage.edit").and_then(Value::as_str)?)?;
+    let tool = coverage_grade_from_str(meta.get("coverage.tool").and_then(Value::as_str)?)?;
+    Some(CoverageGrades { read, edit, tool })
+}
+
+fn coverage_grade_from_str(s: &str) -> Option<CoverageGrade> {
+    match s {
+        "full" => Some(CoverageGrade::Full),
+        "partial" => Some(CoverageGrade::Partial),
+        "none" => Some(CoverageGrade::None),
+        _ => None,
+    }
 }
 
 fn validate_contract_row(line: usize, row: &Value, issues: &mut Vec<ConformanceIssue>) {
@@ -488,7 +513,7 @@ mod tests {
 
         let report = run_conformance(AdapterId::CodexCli, input).expect("adapter should parse");
         assert_eq!(report.adapter, AdapterId::CodexCli);
-        assert!(report.event_count >= 3);
+        assert_eq!(report.event_count, 3, "expected meta + tool.call + tool.result");
         assert!(report.issues.is_empty(), "issues={:?}", report.issues);
         assert_eq!(report.coverage.tool, CoverageGrade::Full);
         assert_eq!(report.coverage.read, CoverageGrade::Partial);
