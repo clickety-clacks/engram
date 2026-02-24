@@ -455,6 +455,52 @@ When `engram explain` walks backward through lineage and reaches the beginning o
 
 ---
 
+## Enrichment Model
+
+Engram's core is dumb and deterministic: fingerprint everything, match, return windows. Enrichment is an optional additive layer that makes output richer without changing core behavior. If no enrichment exists, everything still works.
+
+### Why enrichment?
+
+Raw fingerprint matching tells you "this transcript touched this code." It doesn't tell you "the agent realized its approach was wrong here" or "this is where the key design decision was made." Enrichment adds that interpretive layer on top of the deterministic base.
+
+### Three enrichment patterns
+
+#### 1. Inline enrichment (harness-provided)
+
+A harness (e.g., Codex, Claude, or a future OpenAI integration) can insert extra anchoring markers or context windows directly into the transcript it emits. Engram fingerprints these like any other content. When a match hits a recognized enrichment marker, Engram treats it as a navigation hint — not conversation content — and returns the surrounding real transcript instead of the marker itself.
+
+Example: OpenAI adds an inline anchoring span around every edit with extra context window. Engram matches it, recognizes the marker format, and uses it to improve anchor precision without returning the synthetic content to the agent.
+
+#### 2. Sidecar files (post-hoc or background agent)
+
+Companion files stored alongside tapes (e.g., `.engram/sidecars/<tape_id>.sidecar.jsonl`). These contain:
+
+- Annotated code copies with provenance pointers
+- Detected conversation start/end boundaries within a tape
+- Sub-pointers to notable moments ("agent pivots approach here", "key constraint discovered here")
+- Generated interpretation/analysis of conversation segments
+- Additional fingerprinted content that, when matched, returns enriched metadata instead of raw transcript
+
+Sidecar files are fingerprinted and indexed like tapes. When an explain query matches a sidecar anchor, the response includes the sidecar's metadata alongside the raw transcript window.
+
+#### 3. Background enrichment agents (async)
+
+Agents that run in parallel with or after ingestion, analyzing tapes and producing sidecar files. These can use LLMs for interpretation — since enrichment is additive, non-determinism is acceptable as long as it's labeled.
+
+Examples:
+- Conversation boundary detector: identifies where logical conversations start and end within a tape, even across compaction boundaries
+- Intent summarizer: generates one-line summaries of what each conversation segment was trying to accomplish
+- Pivot detector: identifies moments where the agent changed approach and annotates why
+
+### Invariants
+
+- Core Engram behavior must not depend on enrichment. Remove all sidecars and enrichment markers → system still works.
+- Enrichment content must be labeled as such in query output (not mixed with raw transcript without indication).
+- Non-deterministic enrichment (LLM-generated) must be marked with `source: enrichment` and not treated as ground truth.
+- Sidecar files follow the same immutability rule as tapes: write-once, never modified.
+
+---
+
 ## Open Questions
 
 - **P0 integration seam (must solve first):** deterministic adapters for Codex CLI + Claude Code that emit/derive `code.read` and `code.edit` events without LLM interpretation.
