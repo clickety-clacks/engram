@@ -318,6 +318,64 @@ task.
 
 ---
 
+## Conversation Continuation Detection
+
+### Problem
+
+Agent sessions compact, hit rate limits, or get resumed across multiple transcript files. A single logical task can span many tapes. Without detecting continuations, Engram treats each tape as isolated and may miss reasoning that started in an earlier session.
+
+### Approach: fingerprint-based tape alignment
+
+Engram already fingerprints code spans using winnowed k-gram hashes. The same mechanism applies to transcript content within tapes.
+
+When session B is a continuation of session A:
+- Session B typically contains carryover content from session A (compaction summaries, repeated assistant text, re-stated context).
+- Fingerprinting this content produces anchors that match anchors in session A's tail.
+- Overlapping fingerprint anchors between tape A's tail region and tape B's head region constitute a deterministic continuation signal.
+
+### Detection rules
+
+1. **Fingerprint tape content** (not just code spans) during ingest.
+2. **Compare tail anchors of earlier tapes against head anchors of later tapes** within the same project/repo scope.
+3. **Score continuation confidence** by overlap density:
+   - High anchor overlap at tail/head boundary → strong continuation signal.
+   - Single shared phrase → weak/no signal.
+   - Shared boilerplate (system prompts, AGENTS.md) must be excluded from matching (known-boilerplate filter).
+4. **Store continuation edges** between tapes: `tape_a → tape_b` with confidence score.
+5. **`engram explain` traversal follows continuation edges** when walking backward through lineage, so the agent can reach reasoning from earlier sessions.
+
+### Harness-specific signals (supplemental, not required)
+
+Some harnesses provide explicit continuation markers:
+- **Codex CLI**: `type: "compacted"` events with `replacement_history` payload.
+- **Claude Code**: no explicit continuation pointer, but compaction summaries and rate-limit terminal messages are detectable.
+
+When present, these markers can boost continuation confidence but are not required. The fingerprint overlap mechanism works independently of harness cooperation.
+
+### Boilerplate exclusion
+
+Every harness injects repeated scaffolding (system prompts, AGENTS.md, environment context) into every session. This content produces matching fingerprints across unrelated sessions.
+
+Mitigation:
+- Maintain a per-harness boilerplate fingerprint set (computed once from known scaffolding content).
+- Exclude boilerplate anchors from continuation matching.
+- Only non-boilerplate overlap counts toward continuation confidence.
+
+### Query behavior
+
+When `engram explain` walks backward through lineage and reaches the beginning of a tape:
+- If a continuation edge exists to an earlier tape, traversal continues into that tape.
+- The agent can use `engram view` to navigate backward across the continuation boundary seamlessly.
+- Continuation edges are labeled in output so the agent knows it crossed a session boundary.
+
+### Invariants
+
+- Continuation detection must be deterministic (same tapes → same edges).
+- False positives (linking unrelated sessions) must be minimized via boilerplate exclusion + confidence thresholds.
+- Continuation edges are advisory — they improve recall but do not affect correctness of direct span-anchor linkage.
+
+---
+
 ## Open Questions
 
 - **P0 integration seam (must solve first):** deterministic adapters for Codex CLI + Claude Code that emit/derive `code.read` and `code.edit` events without LLM interpretation.
