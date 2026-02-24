@@ -164,6 +164,9 @@ Output: structured list of (tape, event, kind, timestamp, transcript_window) —
 
 #### Window parameters
 
+Why windowed output? Agent context windows are finite and expensive. Dumping entire transcripts wastes tokens. Instead, `explain` returns a focused window around the anchor point — just enough context for the agent to understand the reasoning. The agent controls how much it sees, and can always expand if the initial window isn't enough.
+
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--before N` | configurable | Lines of transcript before anchor event |
@@ -173,6 +176,8 @@ Output: structured list of (tape, event, kind, timestamp, transcript_window) —
 Defaults for `--before` and `--after` are set in `.engram/config.yml` (or equivalent) under `explain.window.before` and `explain.window.after`. Agents can override per-call.
 
 #### Navigation from anchors
+
+Why navigation? The first `explain` window may not contain the full reasoning — especially for decisions that built up over many messages. Rather than guessing a large window upfront (expensive), agents start small and walk backward/forward through the transcript incrementally, pulling only what they need.
 
 After the initial `explain` call, agents can expand context:
 
@@ -184,6 +189,8 @@ engram view <tape_id> --at <offset> --after 50
 This allows token-efficient incremental research: start with a default window, expand only where needed.
 
 #### Iterative span expansion for disambiguation
+
+Why expansion? Fingerprinting works by matching small word patterns. A 3-line selection may share patterns with dozens of similar code regions across the codebase, producing noisy results. But the surrounding context (the code above and below the selection) is usually more unique. By expanding the span, the fingerprint becomes more specific and false matches drop away.
 
 Small spans produce many fingerprint matches. Agents can iteratively grow the selected span until results narrow to a useful set.
 
