@@ -95,14 +95,18 @@ The ingest path must be able to:
 
 Normalized output must only contain Engram event kinds:
 
-- `meta`
-- `msg.in`
-- `msg.out`
-- `tool.call`
-- `tool.result`
-- `code.read`
-- `code.edit`
-- `span.link`
+| Kind | What it captures | Key fields |
+|------|-----------------|------------|
+| `meta` | Session metadata: model, repo state, harness identity | `model`, `repo_head`, `label`, `source` |
+| `msg.in` | User/human prompt or task input to the agent | `text` |
+| `msg.out` | Agent/assistant response or reasoning output | `text` |
+| `tool.call` | Agent invokes a tool (read file, run command, edit, etc.) | `tool`, `call_id`, `args` |
+| `tool.result` | Result returned from a tool invocation | `tool`, `call_id`, `stdout`, `stderr`, `exit` |
+| `code.read` | Agent reads a specific file/range | `file`, `range`, `anchor_hashes` |
+| `code.edit` | Agent modifies a specific file/range | `file`, `before_hash`, `after_hash`, `before_range`, `after_range` |
+| `span.link` | Explicit agent-declared lineage between two spans | `from_file`, `from_range`, `to_file`, `to_range`, `note` |
+
+All events also carry: `t` (ISO timestamp), `k` (event kind), `source` (harness + session ID).
 
 Ordering rules:
 
