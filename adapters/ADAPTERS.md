@@ -20,33 +20,31 @@ Adapters are not summarizers and not analyzers. They preserve facts.
 
 ### Required (adapter is non-viable without these)
 
-1. **Deterministic output**
-   - Same input bytes -> same output bytes.
-   - No LLM-based interpretation.
+1. **Emit parseable text content**
+   - At minimum, an adapter must emit the raw transcript content deterministically.
+   - Engram fingerprints all content uniformly. Classification into event kinds is not required for basic provenance to work.
+   - Same input bytes -> same output bytes. No LLM-based interpretation.
 
-2. **Truthful coverage declaration**
-   - Adapter must declare coverage for each event kind:
-     - `meta`, `msg.in`, `msg.out`, `tool.call`, `tool.result`, `code.read`, `code.edit`, `span.link`
-   - Coverage values are only: `full`, `partial`, `none`.
-   - No silent `full` claims for partial extraction.
-
-3. **Version-aware behavior**
+2. **Version-aware behavior**
    - Adapter must identify harness version/schema (or mark unknown deterministically).
    - Unknown versions must either:
      - fail (`strict` mode), or
      - ingest safe subset with explicit degraded coverage (`permissive` mode).
 
-4. **Machine-readable failure**
+3. **Machine-readable failure**
    - Parse/version failures must return explicit machine-readable errors.
 
-5. **Raw fact preservation**
-   - Preserve key source facts used for auditability (`tool`, args/input, outputs, IDs, timestamps).
+### Enrichment tier (improves quality, not disqualifying if absent)
 
-### Valuable but optional (improves quality, not disqualifying)
+1. **Event kind classification** (`msg.in`, `msg.out`, `tool.call`, `tool.result`, `code.read`, `code.edit`, `span.link`, `meta`)
+   - Enables confidence tiers, structured traversal, and richer query output.
+   - Coverage declaration per kind: `full`, `partial`, `none`.
 
-- Better call/result correlation diagnostics
-- Large-output artifact dereferencing
-- Extra deterministic projections (e.g., patch-file lists)
+2. **Structured edit/read spans** (file paths, ranges, before/after hashes)
+   - Enables tombstones, high-confidence anchors, and lineage edges.
+
+3. **Call/result correlation, artifact dereferencing, patch-file lists**
+   - Further enrichment for diagnostics and display.
 
 ---
 

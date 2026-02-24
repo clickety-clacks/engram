@@ -65,13 +65,28 @@ Engram fingerprints all tape content uniformly — not just code spans from edit
 
 No special "detect code in messages" heuristic is needed. The same fingerprinting mechanism applies to everything. More content fingerprinted = more anchors in the index = better recall when querying provenance.
 
-Primary anchor sources (highest confidence):
-- `code.edit` — before/after text fingerprinted at edit time
-- `code.read` — read text fingerprinted at read time
+All tape content is fingerprinted uniformly. There are no "primary" vs "secondary" sources — fingerprinting treats all text equally. Confidence tiers emerge from event classification (when available), not from fingerprinting itself.
 
-Secondary anchor sources (automatic, lower confidence):
-- `msg.in` / `msg.out` — all message text fingerprinted
-- `tool.call` / `tool.result` — all tool I/O fingerprinted
+When an adapter provides event classification:
+- `code.edit` / `code.read` anchors get higher confidence in explain output
+- `msg` / `tool` anchors get lower default confidence
+- But all participate in matching equally
+
+When an adapter provides only raw text (no classification):
+- All anchors are equal confidence
+- Provenance still works — just without structured metadata
+
+This means a minimal adapter that dumps raw transcript text gives you working Engram. Better adapters that classify events give you richer output.
+
+### Prior art
+
+The fingerprinting approach is well-established. Engram applies the same winnowed k-gram technique used in:
+- **MOSS** (Stanford, 1994) — code plagiarism detection via winnowed fingerprints
+- **Winnowing** (Schleimer, Wilkerson, Aiken, SIGMOD 2003) — foundational local document fingerprinting algorithm
+- **ssdeep / sdhash** — fuzzy hashing for forensic document similarity
+
+The difference: these tools answer "are these two documents similar?" Engram applies the same math to answer "which transcript produced this code?"
+
 
 ### Span Anchor
 A robust content fingerprint of a code region. Must survive:
