@@ -59,6 +59,20 @@ A pointer to a specific moment inside a tape:
 
 This is how the system "points to different parts of transcripts at different conversations."
 
+### Fingerprint Sources
+
+Engram fingerprints all tape content uniformly — not just code spans from edit/read events, but also message text, tool output, and any other content in the tape. This means if an agent discusses code in a message (quotes it, reasons about it, pastes output containing it), those fingerprints automatically overlap with the code span's fingerprints and the match surfaces through normal query mechanics.
+
+No special "detect code in messages" heuristic is needed. The same fingerprinting mechanism applies to everything. More content fingerprinted = more anchors in the index = better recall when querying provenance.
+
+Primary anchor sources (highest confidence):
+- `code.edit` — before/after text fingerprinted at edit time
+- `code.read` — read text fingerprinted at read time
+
+Secondary anchor sources (automatic, lower confidence):
+- `msg.in` / `msg.out` — all message text fingerprinted
+- `tool.call` / `tool.result` — all tool I/O fingerprinted
+
 ### Span Anchor
 A robust content fingerprint of a code region. Must survive:
 - Line number shifts (code above/below changes)
