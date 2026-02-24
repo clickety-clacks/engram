@@ -152,13 +152,36 @@ Run an agent/tool command and record a trace tape. Captures stdin/stdout/stderr,
 Alternatively: `engram record --stdin` to pipe in a pre-existing session transcript (JSONL).
 
 ### `engram explain <file>:<start>-<end>`
-**The killer query.** Given a span, return all evidence trails:
+**The killer query.** Given a span, return ranked evidence trails with transcript context.
+
 1. Compute anchors for selected text
 2. Direct index lookup
 3. Lineage ancestor traversal (configurable depth)
-4. Return ranked evidence fragments grouped by session
+4. For each anchor, return a transcript window: `--before N` lines before the anchor event, `--after M` lines after
+5. Return ranked evidence fragments grouped by session
 
-Output: structured list of (tape, event, kind, timestamp) — machine-readable by default, human-readable with `--pretty`.
+Output: structured list of (tape, event, kind, timestamp, transcript_window) — machine-readable by default, human-readable with `--pretty`.
+
+#### Window parameters
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--before N` | configurable | Lines of transcript before anchor event |
+| `--after M` | configurable | Lines of transcript after anchor event |
+| `--brief` | off | Return anchor metadata only (tape_id, offset, confidence), no transcript |
+
+Defaults for `--before` and `--after` are set in `.engram/config.yml` (or equivalent) under `explain.window.before` and `explain.window.after`. Agents can override per-call.
+
+#### Navigation from anchors
+
+After the initial `explain` call, agents can expand context:
+
+```
+engram view <tape_id> --at <offset> --before 200
+engram view <tape_id> --at <offset> --after 50
+```
+
+This allows token-efficient incremental research: start with a default window, expand only where needed.
 
 ### `engram tapes`
 List recorded tapes. Metadata only (timestamp, model, repo head, label, size).
