@@ -1,163 +1,160 @@
-# Engram Adapter Contract (Canonical)
+# Engram Adapters
 
-Scope: deterministic ingestion adapters that convert external harness logs into Engram tape events.
+Purpose: define the contract for adapters that convert harness logs into Engram tape events.
 
-This file is the canonical contract for adapter behavior. If implementation, tests, or reviews conflict with this file, this file wins.
+This is the canonical adapter contract for this repo.
 
-Upstream authority: this contract must remain consistent with `/Users/mike/shared-workspace/shared/specs/engram.md`. If conflict exists, the Engram spec wins and this file must be updated.
+---
 
-## Product Intent
+## What an adapter is
 
-- Adapters exist only to preserve raw, deterministic provenance from real harness artifacts.
-- Adapters must not add interpretation, summaries, or inferred intent labels.
-- Keep design lightweight: enforce only what is required for deterministic ingestion and release safety.
+An adapter is a deterministic translator:
 
-## MUST Invariants
+`harness artifacts -> normalized Engram JSONL events`
 
-1. Deterministic only:
-   - Every emitted event must come from explicit on-disk harness facts.
-   - Same input bytes must produce byte-identical normalized JSONL output.
-2. Raw-fact preservation:
-   - Preserve source values needed for auditability (`tool`, args/input, result payloads, timestamps, identifiers).
-   - Do not classify or enrich semantics beyond Engram event schema.
-3. Coverage declaration:
-   - Each adapter must publish guaranteed deterministic coverage for:
-     - `meta`
-     - `msg.in`
-     - `msg.out`
-     - `tool.call`
-     - `tool.result`
-     - `code.read`
-     - `code.edit`
-     - `span.link`
-   - Unsupported kinds must be declared as unsupported or partial, never silently claimed as complete.
-4. Explicit partial semantics:
-   - If a harness cannot deterministically provide an event kind (for example, free-form shell edits), adapter must emit explicit partial/unsupported status in adapter metadata.
-5. Stable failure behavior:
-   - Invalid input or unknown schema/version must fail with explicit machine-readable error unless policy allows downgrade mode.
-6. No hidden fallback inference:
-   - No LLM interpretation.
-   - No heuristic that can silently change meaning across runs without version bump and contract update.
+Adapters are not summarizers and not analyzers. They preserve facts.
 
-## SHOULD Value-Adds
+---
 
-- Retain source IDs for call/result correlation when available.
-- Preserve large tool outputs (or references) without truncating semantics.
-- Extend required metadata with additional diagnostic fields that are not required by contract.
+## Compliance levels
 
-## OPTIONAL Value-Adds
+### Required (adapter is non-viable without these)
 
-- Additional deterministic projections that improve utility but do not alter meaning (for example, extracted file lists from patch headers).
-- Strict mode toggles that reject ambiguous but currently tolerated inputs.
+1. **Deterministic output**
+   - Same input bytes -> same output bytes.
+   - No LLM-based interpretation.
 
-## Deterministic Ingest Protocol
+2. **Truthful coverage declaration**
+   - Adapter must declare coverage for each event kind:
+     - `meta`, `msg.in`, `msg.out`, `tool.call`, `tool.result`, `code.read`, `code.edit`, `span.link`
+   - Coverage values are only: `full`, `partial`, `none`.
+   - No silent `full` claims for partial extraction.
 
-1. Detect harness family and schema/version from explicit fields.
-2. Validate minimal schema requirements for claimed coverage.
-3. Normalize to Engram tape events in chronological order, preserving source sequence.
-   - If multiple source events have identical timestamps, tie-break deterministically using source order.
-   - Never reorder by event type; tape chronology is required.
-   - Correlate `tool.call` / `tool.result` by explicit IDs when present.
-4. Emit adapter metadata event (or equivalent side metadata) with coverage map and version fields.
-   - Minimum required metadata fields:
-     - `adapter_id`
-     - `adapter_version`
-     - `harness_family`
-     - `harness_version` (or `unknown`)
-     - per-kind coverage map for:
-       - `meta`, `msg.in`, `msg.out`, `tool.call`, `tool.result`, `code.read`, `code.edit`, `span.link`
-     - downgrade mode/status when applicable
-5. If unsupported/ambiguous:
-   - fail-fast in strict mode
-   - or emit explicit downgraded coverage in permissive mode
+3. **Version-aware behavior**
+   - Adapter must identify harness version/schema (or mark unknown deterministically).
+   - Unknown versions must either:
+     - fail (`strict` mode), or
+     - ingest safe subset with explicit degraded coverage (`permissive` mode).
 
-## Coverage Semantics
+4. **Machine-readable failure**
+   - Parse/version failures must return explicit machine-readable errors.
 
-Coverage is per event kind and must be reported as one of:
+5. **Raw fact preservation**
+   - Preserve key source facts used for auditability (`tool`, args/input, outputs, IDs, timestamps).
 
-- `full`: all occurrences deterministically extractable by contract
-- `partial`: only a deterministic subset extractable
-- `none`: unsupported
+### Valuable but optional (improves quality, not disqualifying)
 
-Rules:
+- Better call/result correlation diagnostics
+- Large-output artifact dereferencing
+- Extra deterministic projections (e.g., patch-file lists)
 
-- `full` may only be claimed with deterministic extraction proofs (tests + fixtures).
-- `partial` must document deterministic boundaries (what is included/excluded).
-- CI must fail if code claims `full` while fixture tests demonstrate misses.
-- `meta` coverage is evaluated against spec-defined meta fields: `model`, `repo state` (for example `repo_head`), and `label`.
-  - `full`: adapter deterministically provides all spec-defined meta fields.
-  - `partial`: adapter deterministically provides a subset and marks missing fields.
+---
 
-## Integration Seam Contract
+## Adapter interface (required)
 
-Default production seam:
+### Rust interface (library)
 
-- Adapters produce normalized Engram JSONL suitable for `engram record --stdin`.
-- Normalized JSONL must conform to Engram tape event schema (`meta`, `msg.in`, `msg.out`, `tool.call`, `tool.result`, `code.read`, `code.edit`, `span.link`).
-- If an adapter is embedded as library code instead of standalone piping, output must remain contract-identical.
+```rust
+pub trait HarnessAdapter {
+    fn id(&self) -> AdapterId;
 
-## Harness Versioning Policy
+    /// Converts harness artifacts into Engram JSONL events.
+    /// Must be deterministic.
+    fn convert_to_tape_jsonl(&self, input: &str) -> Result<String, AdapterError>;
 
-### Supported-Version Matrix (required)
+    /// Declares supported versions and coverage guarantees.
+    fn descriptor(&self) -> AdapterDescriptor;
+}
+```
 
-Each adapter must maintain a matrix in code/docs:
+### Descriptor contract
 
-- harness family (e.g., codex-cli, claude-code)
-- supported version ranges
-- schema detection fields
-- guaranteed coverage profile per version range
+Each adapter descriptor must include:
 
-### Version/Schema Detection
+- `adapter_id`
+- `adapter_version`
+- `harness_family`
+- `supported_versions` (min/max-tested or explicit ranges)
+- `schema_detection_strategy`
+- per-kind coverage map (`full|partial|none`)
+- unknown-version policy (`strict_fail` or `permissive_degrade`)
 
-- Must rely on explicit version/schema fields when present.
-- If absent, must use a documented deterministic fingerprint strategy (field presence/signature), not guesswork.
+### Ingest runtime contract
 
-### Unknown-Version Behavior
+The ingest path must be able to:
 
-Default policy:
+1. detect harness family/version,
+2. pick adapter,
+3. normalize to Engram events,
+4. attach adapter metadata,
+5. enforce strict/permissive policy.
 
-- Strict mode: hard fail with `unknown_harness_version`.
-- Permissive mode: ingest only contract-safe deterministic subset, mark coverage degraded, and emit warning metadata.
+---
 
-### Downgrade/Fail Rules
+## Event output contract
 
-- Downgrade allowed only when:
-  - deterministic subset remains truthful
-  - degraded coverage is explicitly emitted
-- Hard fail required when:
-  - required correlation fields are missing and would make emitted facts misleading
-  - parser cannot guarantee deterministic mapping for claimed event kinds
+Normalized output must only contain Engram event kinds:
 
-## CI and Release Compliance Gates
+- `meta`
+- `msg.in`
+- `msg.out`
+- `tool.call`
+- `tool.result`
+- `code.read`
+- `code.edit`
+- `span.link`
 
-Adapters are release-blocking surfaces.
+Ordering rules:
 
-Required CI gates:
+- Preserve source chronology.
+- If timestamps tie, preserve stable source order.
+- Never reorder by event kind.
 
-1. Fixture conformance tests:
-   - version-pinned fixtures per supported harness version range
-   - golden normalized output snapshots
-2. Determinism test:
-   - repeated parse of identical input must produce identical output bytes
-3. Coverage assertions:
-   - fixture-validated `full/partial/none` status matches declared matrix
-4. Unknown-version tests:
-   - strict mode fails
-   - permissive mode degrades coverage explicitly
-5. Contract lint:
-   - adapter docs/matrix/code metadata stay in sync (no undeclared version range)
+---
 
-Release gate expectations:
+## Versioning policy
 
-- No adapter release if any required gate fails.
-- No expansion of claimed coverage without new fixtures and matrix update.
-- No schema heuristic changes without explicit contract changelog entry.
+Each adapter must maintain a version matrix with:
 
-## Enforcement Expectations for Reviews
+- harness family
+- supported versions/ranges
+- known-bad versions (if any)
+- guaranteed coverage profile per range
 
-- Reviewers must reject:
-  - unspecced inference
-  - silent downgrade behavior
-  - unsupported `full` coverage claims
-  - version handling that guesses without deterministic basis
-- Reviewers should prioritize correctness of deterministic boundaries over feature breadth.
+Unknown schema/version handling:
+
+- **strict mode**: fail with `unknown_harness_version`
+- **permissive mode**: ingest deterministic safe subset + emit degraded coverage
+
+---
+
+## CI gates (must pass)
+
+1. Fixture conformance tests (version-pinned)
+2. Determinism test (repeat parse byte-identical)
+3. Coverage-claim tests (`full/partial/none` must match fixtures)
+4. Unknown-version behavior tests (strict fail + permissive degrade)
+5. Contract sync test (descriptor/docs/code consistency)
+
+No adapter release if any gate fails.
+
+---
+
+## Current adapter expectations
+
+- **Claude Code**: should target high deterministic coverage.
+- **Codex CLI**: must be explicit where read/edit remain partial.
+- **OpenCode / Gemini / Cursor**: may be partial while discovery matures, but coverage must be explicit and truthful.
+
+---
+
+## Reviewer checklist
+
+Reject changes that:
+
+- add unspecced inference,
+- silently degrade behavior,
+- claim `full` without fixture proof,
+- guess version/schema non-deterministically.
+
+Prefer correctness of boundaries over breadth of claimed support.
