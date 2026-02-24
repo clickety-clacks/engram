@@ -183,6 +183,26 @@ engram view <tape_id> --at <offset> --after 50
 
 This allows token-efficient incremental research: start with a default window, expand only where needed.
 
+#### Iterative span expansion for disambiguation
+
+Small spans produce many fingerprint matches. Agents can iteratively grow the selected span until results narrow to a useful set.
+
+```
+engram explain <file>:<start>-<end> --expand-until N
+```
+
+Behavior:
+- If initial query returns more than N results, Engram automatically expands the span in both directions (reading more surrounding code from the file).
+- Re-queries with the larger span until result count drops to N or below, or a maximum expansion limit is reached.
+- Returns the narrowed result set plus the final expanded span range used.
+
+This lets agents start with a precise region of interest and let Engram disambiguate automatically, without manually guessing how much context to include.
+
+When not using `--expand-until`, agents can do this manually:
+1. Query small span → too many matches
+2. Widen selection → re-query
+3. Repeat until results are clean
+
 ### `engram tapes`
 List recorded tapes. Metadata only (timestamp, model, repo head, label, size).
 
