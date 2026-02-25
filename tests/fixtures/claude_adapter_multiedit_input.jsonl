@@ -1,0 +1,2 @@
+{"type":"assistant","sessionId":"session-claude-3","timestamp":"2026-02-22T00:10:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_multi_1","name":"MultiEdit","input":{"file_path":"/repo/src/lib.rs","edits":[{"old_string":"a","new_string":"b"},{"old_string":"c","new_string":"d"}]}}]}}
+{"type":"user","sessionId":"session-claude-3","timestamp":"2026-02-22T00:10:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_multi_1","content":"ok"}]}}

@@ -10,6 +10,7 @@ pub enum EventKind {
     CodeEdit,
     SpanLink,
     Meta,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +39,9 @@ pub struct MetaEvent {
     pub model: Option<String>,
     pub repo_head: Option<String>,
     pub label: Option<String>,
+    pub coverage_read: Option<String>,
+    pub coverage_edit: Option<String>,
+    pub coverage_tool: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -54,6 +58,7 @@ pub struct CodeEditEvent {
     pub after_range: Option<FileRange>,
     pub before_hash: Option<String>,
     pub after_hash: Option<String>,
+    pub similarity: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,6 +74,12 @@ pub struct SpanLinkEvent {
 pub struct TapeEventAt {
     pub offset: u64,
     pub event: TapeEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseIssue {
+    pub line: usize,
+    pub error: String,
 }
 
 pub fn parse_jsonl_events(input: &str) -> Result<Vec<TapeEventAt>, serde_json::Error> {
@@ -88,6 +99,29 @@ pub fn parse_jsonl_events(input: &str) -> Result<Vec<TapeEventAt>, serde_json::E
     Ok(out)
 }
 
+pub fn parse_jsonl_events_lossy(input: &str) -> (Vec<TapeEventAt>, Vec<ParseIssue>) {
+    let mut out = Vec::new();
+    let mut issues = Vec::new();
+
+    for (idx, line) in input.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<RawEvent>(line) {
+            Ok(raw) => out.push(TapeEventAt {
+                offset: idx as u64,
+                event: raw.into_tape_event(),
+            }),
+            Err(err) => issues.push(ParseIssue {
+                line: idx + 1,
+                error: err.to_string(),
+            }),
+        }
+    }
+
+    (out, issues)
+}
+
 #[derive(Debug, Deserialize)]
 struct RawEvent {
     #[serde(rename = "t")]
@@ -100,6 +134,12 @@ struct RawEvent {
     repo_head: Option<String>,
     #[serde(default)]
     label: Option<String>,
+    #[serde(default, rename = "coverage.read")]
+    coverage_read: Option<String>,
+    #[serde(default, rename = "coverage.edit")]
+    coverage_edit: Option<String>,
+    #[serde(default, rename = "coverage.tool")]
+    coverage_tool: Option<String>,
     #[serde(default)]
     file: Option<String>,
     #[serde(default)]
@@ -112,6 +152,8 @@ struct RawEvent {
     before_hash: Option<String>,
     #[serde(default)]
     after_hash: Option<String>,
+    #[serde(default)]
+    similarity: Option<f32>,
     #[serde(default)]
     anchor_hashes: Option<Vec<String>>,
     #[serde(default)]
@@ -128,43 +170,48 @@ struct RawEvent {
 
 impl RawEvent {
     fn into_tape_event(self) -> TapeEvent {
+        let kind = to_kind(&self.kind);
         let data = match self.kind.as_str() {
-            "code.read" => TapeEventData::CodeRead(CodeReadEvent {
-                file: self.file.unwrap_or_default(),
-                range: self
-                    .range
-                    .map(file_range)
-                    .unwrap_or(FileRange { start: 0, end: 0 }),
-                anchor_hashes: self.anchor_hashes.unwrap_or_default(),
-            }),
-            "code.edit" => TapeEventData::CodeEdit(CodeEditEvent {
-                file: self.file.unwrap_or_default(),
-                before_range: self.before_range.map(file_range),
-                after_range: self.after_range.map(file_range),
-                before_hash: self.before_hash,
-                after_hash: self.after_hash,
-            }),
-            "span.link" => TapeEventData::SpanLink(SpanLinkEvent {
-                from_file: self.from_file.unwrap_or_default(),
-                from_range: self
-                    .from_range
-                    .map(file_range)
-                    .unwrap_or(FileRange { start: 0, end: 0 }),
-                to_file: self.to_file.unwrap_or_default(),
-                to_range: self
-                    .to_range
-                    .map(file_range)
-                    .unwrap_or(FileRange { start: 0, end: 0 }),
-                note: self.note,
-            }),
+            "code.read" => match (self.file, self.range) {
+                (Some(file), Some(range)) => TapeEventData::CodeRead(CodeReadEvent {
+                    file,
+                    range: file_range(range),
+                    anchor_hashes: self.anchor_hashes.unwrap_or_default(),
+                }),
+                _ => TapeEventData::Other { kind },
+            },
+            "code.edit" => match self.file {
+                Some(file) => TapeEventData::CodeEdit(CodeEditEvent {
+                    file,
+                    before_range: self.before_range.map(file_range),
+                    after_range: self.after_range.map(file_range),
+                    before_hash: self.before_hash,
+                    after_hash: self.after_hash,
+                    similarity: self.similarity,
+                }),
+                None => TapeEventData::Other { kind },
+            },
+            "span.link" => match (self.from_file, self.from_range, self.to_file, self.to_range) {
+                (Some(from_file), Some(from_range), Some(to_file), Some(to_range)) => {
+                    TapeEventData::SpanLink(SpanLinkEvent {
+                        from_file,
+                        from_range: file_range(from_range),
+                        to_file,
+                        to_range: file_range(to_range),
+                        note: self.note,
+                    })
+                }
+                _ => TapeEventData::Other { kind },
+            },
             "meta" => TapeEventData::Meta(MetaEvent {
                 model: self.model,
                 repo_head: self.repo_head,
                 label: self.label,
+                coverage_read: self.coverage_read,
+                coverage_edit: self.coverage_edit,
+                coverage_tool: self.coverage_tool,
             }),
-            _ => TapeEventData::Other {
-                kind: to_kind(&self.kind),
-            },
+            _ => TapeEventData::Other { kind },
         };
 
         TapeEvent {
@@ -191,7 +238,7 @@ fn to_kind(kind: &str) -> EventKind {
         "code.edit" => EventKind::CodeEdit,
         "span.link" => EventKind::SpanLink,
         "meta" => EventKind::Meta,
-        _ => EventKind::Meta,
+        _ => EventKind::Unknown,
     }
 }
 
@@ -231,5 +278,42 @@ mod tests {
                 kind: EventKind::ToolResult
             }
         ));
+    }
+
+    #[test]
+    fn unknown_kind_is_not_misclassified_as_meta() {
+        let jsonl = r#"{"t":"2026-02-22T00:00:00Z","k":"not.real"}"#;
+        let events = parse_jsonl_events(jsonl).expect("valid JSONL");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0].event.data,
+            TapeEventData::Other {
+                kind: EventKind::Unknown
+            }
+        ));
+    }
+
+    #[test]
+    fn incomplete_structured_events_fall_back_to_other() {
+        let jsonl = r#"{"t":"2026-02-22T00:00:00Z","k":"code.read","range":[1,2]}"#;
+        let events = parse_jsonl_events(jsonl).expect("valid JSONL");
+        assert!(matches!(
+            events[0].event.data,
+            TapeEventData::Other {
+                kind: EventKind::CodeRead
+            }
+        ));
+    }
+
+    #[test]
+    fn lossy_parse_keeps_valid_lines_and_reports_errors() {
+        let jsonl = r#"{"t":"2026-02-22T00:00:00Z","k":"meta"}
+not json
+{"t":"2026-02-22T00:00:02Z","k":"tool.result"}"#;
+
+        let (events, issues) = parse_jsonl_events_lossy(jsonl);
+        assert_eq!(events.len(), 2);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].line, 2);
     }
 }

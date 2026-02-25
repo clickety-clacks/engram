@@ -1,0 +1,2 @@
+{"type":"assistant","session_id":"session-claude-2","timestamp":"2026-02-22T00:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_read_bad","name":"Read","input":{"offset":1,"limit":3}}]}}
+{"type":"assistant","session_id":"session-claude-2","timestamp":"2026-02-22T00:00:02Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_edit_bad","name":"Edit","input":{"old_string":"a","new_string":"b"}}]}}

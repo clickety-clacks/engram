@@ -1,0 +1,16 @@
+[
+  {
+    "sessionId": "session-gemini-log-1",
+    "messageId": 0,
+    "type": "user",
+    "message": "hello",
+    "timestamp": "2026-02-22T01:00:00Z"
+  },
+  {
+    "sessionId": "session-gemini-log-1",
+    "messageId": 1,
+    "type": "gemini",
+    "message": "hi there",
+    "timestamp": "2026-02-22T01:00:01Z"
+  }
+]

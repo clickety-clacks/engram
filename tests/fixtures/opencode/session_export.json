@@ -1,0 +1,97 @@
+{
+  "info": {
+    "id": "ses_open_1",
+    "time": {
+      "created": 1735689600000
+    }
+  },
+  "messages": [
+    {
+      "info": {
+        "id": "msg_user_1",
+        "role": "user",
+        "time": {
+          "created": 1735689600500
+        }
+      },
+      "parts": [
+        {
+          "id": "part_user_text",
+          "type": "text",
+          "text": "Please read src/lib.rs"
+        }
+      ]
+    },
+    {
+      "info": {
+        "id": "msg_assistant_1",
+        "role": "assistant",
+        "time": {
+          "created": 1735689601000
+        }
+      },
+      "parts": [
+        {
+          "id": "part_asst_text",
+          "type": "text",
+          "text": "Running tools"
+        },
+        {
+          "id": "part_tool_read",
+          "type": "tool",
+          "callID": "call_read_1",
+          "tool": "read",
+          "state": {
+            "status": "completed",
+            "input": {
+              "filePath": "src/lib.rs",
+              "offset": 0,
+              "limit": 3
+            },
+            "output": "ok",
+            "time": {
+              "start": 1735689601001,
+              "end": 1735689601020
+            }
+          }
+        },
+        {
+          "id": "part_tool_edit",
+          "type": "tool",
+          "callID": "call_edit_1",
+          "tool": "edit",
+          "state": {
+            "status": "completed",
+            "input": {
+              "filePath": "src/lib.rs",
+              "oldString": "a",
+              "newString": "b"
+            },
+            "output": "done",
+            "time": {
+              "start": 1735689601021,
+              "end": 1735689601040
+            }
+          }
+        },
+        {
+          "id": "part_tool_patch",
+          "type": "tool",
+          "callID": "call_patch_1",
+          "tool": "patch",
+          "state": {
+            "status": "error",
+            "input": {
+              "patchText": "*** Begin Patch\n*** Update File: src/main.rs\n*** Add File: src/new.rs\n*** End Patch\n"
+            },
+            "error": "patch failed",
+            "time": {
+              "start": 1735689601041,
+              "end": 1735689601050
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

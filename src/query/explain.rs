@@ -113,12 +113,16 @@ pub fn explain_by_anchor(
 ) -> rusqlite::Result<ExplainResult> {
     let direct = retrieve_direct(index, anchors)?;
     let lineage = retrieve_lineage(index, anchors, traversal, include_forensics)?;
+    let mut seen = HashSet::new();
     let mut touched_anchors = anchors.to_vec();
+    for anchor in anchors {
+        seen.insert(anchor.clone());
+    }
     for edge in &lineage {
-        if !touched_anchors.contains(&edge.from_anchor) {
+        if seen.insert(edge.from_anchor.clone()) {
             touched_anchors.push(edge.from_anchor.clone());
         }
-        if !touched_anchors.contains(&edge.to_anchor) {
+        if seen.insert(edge.to_anchor.clone()) {
             touched_anchors.push(edge.to_anchor.clone());
         }
     }
@@ -133,6 +137,7 @@ pub fn explain_by_anchor(
 mod tests {
     use super::*;
     use crate::index::lineage::LINK_THRESHOLD_DEFAULT;
+    use crate::index::lineage::{Cardinality, LocationDelta, SpanEdge};
     use crate::tape::event::{CodeEditEvent, FileRange, TapeEvent, TapeEventAt, TapeEventData};
 
     #[test]
@@ -148,6 +153,7 @@ mod tests {
                     after_range: Some(FileRange { start: 1, end: 1 }),
                     before_hash: Some("a".to_string()),
                     after_hash: Some("b".to_string()),
+                    similarity: Some(0.80),
                 }),
             },
         }];
@@ -192,6 +198,7 @@ mod tests {
                         after_range: Some(FileRange { start: 1, end: 1 }),
                         before_hash: Some("a".to_string()),
                         after_hash: Some("b".to_string()),
+                        similarity: Some(0.80),
                     }),
                 },
             },
@@ -205,6 +212,7 @@ mod tests {
                         after_range: Some(FileRange { start: 1, end: 1 }),
                         before_hash: Some("b".to_string()),
                         after_hash: Some("c".to_string()),
+                        similarity: Some(0.80),
                     }),
                 },
             },
@@ -240,5 +248,65 @@ mod tests {
         )
         .expect("explain two hops");
         assert_eq!(two_hops.lineage.len(), 2);
+
+        let one_hop_lineage_only = retrieve_lineage(
+            &index,
+            &["c".to_string()],
+            ExplainTraversal {
+                max_depth: 1,
+                ..ExplainTraversal::default()
+            },
+            false,
+        )
+        .expect("retrieve lineage");
+        assert_eq!(one_hop_lineage_only.len(), 1);
+    }
+
+    #[test]
+    fn lineage_traversal_honors_max_depth_with_explicit_edges() {
+        let index = SqliteIndex::open_in_memory().expect("sqlite");
+        index
+            .insert_edge(
+                &SpanEdge {
+                    from_anchor: "a".to_string(),
+                    to_anchor: "b".to_string(),
+                    confidence: 0.90,
+                    location_delta: LocationDelta::Moved,
+                    cardinality: Cardinality::OneToOne,
+                    agent_link: false,
+                    note: None,
+                },
+                LINK_THRESHOLD_DEFAULT,
+            )
+            .expect("insert edge a->b");
+        index
+            .insert_edge(
+                &SpanEdge {
+                    from_anchor: "b".to_string(),
+                    to_anchor: "c".to_string(),
+                    confidence: 0.90,
+                    location_delta: LocationDelta::Moved,
+                    cardinality: Cardinality::OneToOne,
+                    agent_link: false,
+                    note: None,
+                },
+                LINK_THRESHOLD_DEFAULT,
+            )
+            .expect("insert edge b->c");
+
+        let lineage = retrieve_lineage(
+            &index,
+            &["c".to_string()],
+            ExplainTraversal {
+                max_depth: 1,
+                ..ExplainTraversal::default()
+            },
+            false,
+        )
+        .expect("retrieve lineage");
+
+        assert_eq!(lineage.len(), 1);
+        assert_eq!(lineage[0].from_anchor, "b");
+        assert_eq!(lineage[0].to_anchor, "c");
     }
 }

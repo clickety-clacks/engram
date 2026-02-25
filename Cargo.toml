@@ -9,8 +9,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-time = { version = "0.3", features = ["formatting"] }
 zstd = "0.13"
+chrono = { version = "0.4", default-features = true }
 
 [dev-dependencies]
 tempfile = "3"
