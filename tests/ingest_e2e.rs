@@ -82,6 +82,21 @@ fn ingest_is_incremental_and_idempotent() {
     let third = run_json(repo, &["ingest"], None, &[]);
     assert_eq!(third["status"], "ok");
     assert_eq!(third["imported_tapes"], 1);
+
+    let cursor_state_path = repo
+        .join(".engram-cache")
+        .join("cursors")
+        .join("ingest-state.json");
+    let cursor_state = fs::read_to_string(cursor_state_path).expect("cursor state exists");
+    let parsed: Value = serde_json::from_str(&cursor_state).expect("cursor state is valid json");
+    assert!(
+        parsed
+            .get("files")
+            .and_then(Value::as_object)
+            .map(|m| !m.is_empty())
+            .unwrap_or(false),
+        "expected cursor state with tracked files"
+    );
 }
 
 #[test]

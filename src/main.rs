@@ -20,6 +20,7 @@ use engram::index::{EdgeRow, SqliteIndex};
 use engram::query::explain::{
     ExplainTraversal, PrettyConfidenceTier, explain_by_anchor, pretty_tier,
 };
+use engram::store::atomic::atomic_write;
 use engram::tape::adapter::{AdapterId, convert_with_adapter};
 use engram::tape::compress::{compress_jsonl, decompress_jsonl};
 use engram::tape::event::{TapeEventAt, TapeEventData, parse_jsonl_events};
@@ -328,7 +329,8 @@ fn cmd_ingest(cwd: &Path, paths: &RepoPaths) -> Result<(), CliError> {
         if !tape_file_exists {
             let compressed =
                 compress_jsonl(&normalized).map_err(|err| CliError::io("compress_error", err))?;
-            fs::write(&tape_path, &compressed).map_err(|err| CliError::io("write_error", err))?;
+            atomic_write(&tape_path, &compressed)
+                .map_err(|err| CliError::io("write_error", err))?;
         }
 
         let already_indexed = index.has_tape(&tape_id)?;
@@ -613,7 +615,7 @@ fn save_ingest_state(paths: &RepoPaths, state: &IngestState) -> Result<(), CliEr
     let state_path = paths.cursors.join(CURSOR_STATE_FILE);
     let content = serde_json::to_string_pretty(state)
         .map_err(|err| CliError::new("cursor_state_error", err.to_string()))?;
-    fs::write(state_path, content).map_err(|err| CliError::io("write_error", err))
+    atomic_write(&state_path, content.as_bytes()).map_err(|err| CliError::io("write_error", err))
 }
 
 fn record_transcript(
@@ -635,7 +637,7 @@ fn record_transcript(
     if !tape_file_exists {
         let compressed =
             compress_jsonl(transcript).map_err(|err| CliError::io("compress_error", err))?;
-        fs::write(&tape_path, &compressed).map_err(|err| CliError::io("write_error", err))?;
+        atomic_write(&tape_path, &compressed).map_err(|err| CliError::io("write_error", err))?;
     }
 
     let compressed_len = fs::metadata(&tape_path)
@@ -1206,7 +1208,7 @@ fn write_default_config(paths: &RepoPaths) -> Result<(), CliError> {
         StorageMode::RepoLocal => default_repo_config_yaml(),
         StorageMode::Global => default_global_config_yaml(),
     };
-    fs::write(config_path, default).map_err(|err| CliError::io("write_error", err))
+    atomic_write(config_path, default.as_bytes()).map_err(|err| CliError::io("write_error", err))
 }
 
 fn home_dir() -> Result<PathBuf, CliError> {
