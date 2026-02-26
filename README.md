@@ -99,6 +99,7 @@ engram explain src/lib.rs:10-20 --global
 - Never edit existing tape files.
 - Never commit `.engram-cache/`.
 - If tape filename already exists during import, skip (optional warning-only hash sanity check).
+- Engram persists tapes/config/cursor state with atomic write+rename (`fsync` file + parent dir) for safer behavior on local and NFS/shared paths.
 
 ### Adapter coverage (current)
 
