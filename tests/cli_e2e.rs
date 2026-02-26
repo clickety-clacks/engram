@@ -349,7 +349,11 @@ fn record_command_keeps_trace_for_failed_process() {
     let repo = temp.path();
     let _ = run_json(repo, &["init"], None);
 
-    let record = run_json(repo, &["record", "/bin/sh", "-c", "echo boom >&2; exit 7"], None);
+    let record = run_json(
+        repo,
+        &["record", "/bin/sh", "-c", "echo boom >&2; exit 7"],
+        None,
+    );
     assert_eq!(record["status"], "ok");
     assert_eq!(record["record"]["mode"], "command");
     assert_eq!(record["record"]["success"], false);

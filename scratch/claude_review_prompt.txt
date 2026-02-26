@@ -1,0 +1,1479 @@
+Adversarial code review task. Give severity-ranked findings only (Critical/High/Medium), with file:line, impact, and concrete fix.
+Review scope: deterministic mapping correctness, coverage-grade semantics, test realism.
+Specs:
+# Engram Event Contract (Core)
+
+Status: Draft (P0)
+
+## Purpose
+A harness-independent, deterministic event schema for provenance ingestion.
+
+## Required properties
+- Deterministic parsing (no LLM interpretation)
+- Stable IDs for event correlation where available
+- Explicit coverage signaling when partial
+
+## Event kinds
+- `meta`
+- `msg.in`
+- `msg.out`
+- `tool.call`
+- `tool.result`
+- `code.read`
+- `code.edit`
+- `span.link`
+
+## Required fields
+All events:
+- `t` (ISO timestamp)
+- `k` (event kind)
+- `source.harness` (e.g., `claude-code`, `codex-cli`)
+- `source.session_id` (if available)
+
+`tool.call`:
+- `tool`
+- `call_id` (if available)
+- `args` (verbatim serialized input)
+
+`tool.result`:
+- `tool`
+- `call_id` (if available)
+- `exit` (if available)
+- `stdout` / `stderr` (or artifact pointer)
+
+`code.read`:
+- `file`
+- `range` (line or byte range, declare basis)
+- `anchor_hashes` (if available)
+
+`code.edit`:
+- `file`
+- `before_hash` / `after_hash` (deterministic content hashes when possible)
+- `before_range` / `after_range` (if available)
+- `similarity` (optional deterministic score)
+
+`span.link`:
+- `from_file`, `from_range`
+- `to_file`, `to_range`
+- `note` (optional)
+
+## Coverage grades
+Each ingest run MUST emit coverage metadata:
+- `coverage.read`: `full|partial|none`
+- `coverage.edit`: `full|partial|none`
+- `coverage.tool`: `full|partial|none`
+
+Queries MUST surface coverage grade with results.
+
+## Determinism rule
+Adapters may only emit events derivable by deterministic transforms from harness artifacts. If uncertain, emit no event and mark coverage partial.
+
+# Adapter Spec: Codex CLI
+
+Status: P0 candidate (partial read/edit coverage)
+
+## Artifact locations
+- `~/.codex/sessions/YYYY/MM/DD/*.jsonl`
+- `~/.codex/history.jsonl` (history only)
+
+## Deterministic mapping
+- session metadata -> `meta`
+- message items -> `msg.in/msg.out`
+- function_call -> `tool.call`
+- function_call_output -> `tool.result` (pair by `call_id`)
+- `apply_patch` payload parsing -> `code.edit` file touches
+
+## Known gaps
+- Generic shell reads (`cat`, `sed`, `rg`, editor opens) are not universally structured as `code.read`.
+- Non-`apply_patch` writes/edits are not universally structured as `code.edit`.
+
+## Coverage expectation
+- `coverage.tool=full`
+- `coverage.read=partial`
+- `coverage.edit=partial`
+
+## P0 requirement for parity
+Codex-side structured read/edit event emission (or equivalent sidecar stream) is required to reach full span-level lineage guarantees.
+
+# Adapter Spec: Claude Code
+
+Status: P0 candidate (high coverage)
+
+## Artifact locations
+- `~/.claude/projects/<project>/<session>.jsonl`
+- optional large outputs: `~/.claude/projects/<project>/<session>/tool-results/*.txt`
+
+## Deterministic mapping
+- `assistant/text` -> `msg.out`
+- `assistant/tool_use` -> `tool.call`
+- `user/tool_result` -> `tool.result` (pair by `tool_use_id`)
+- `Read` tool -> `code.read`
+- `Edit/Write/MultiEdit` tools -> `code.edit`
+
+## Known gaps
+- Shell-side mutations outside structured edit tools are not guaranteed as explicit `code.edit` unless present in artifacts.
+
+## Coverage expectation
+- `coverage.tool=full`
+- `coverage.read=full` for structured `Read`
+- `coverage.edit=full` for structured edit tools
+
+# Adapter Spec: OpenCode
+
+Status: TODO (discovery required)
+
+## Required deliverables
+- artifact path discovery
+- schema sample set
+- deterministic mapping table to core event contract
+- coverage grade assessment
+
+# Adapter Spec: Gemini CLI
+
+Status: TODO (discovery required)
+
+## Required deliverables
+- artifact path discovery
+- schema sample set
+- deterministic mapping table to core event contract
+- coverage grade assessment
+
+# Adapter Spec: Cursor
+
+Status: TODO (discovery required)
+
+## Required deliverables
+- artifact path discovery
+- schema sample set
+- deterministic mapping table to core event contract
+- coverage grade assessment
+Code snippets:
+--- src/tape/adapter.rs:1-260 ---
+use std::path::{Path, PathBuf};
+
+use serde_json::{Value, json};
+
+use super::harness::{claude_jsonl_to_tape_jsonl, codex_jsonl_to_tape_jsonl};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AdapterId {
+    ClaudeCode,
+    CodexCli,
+    OpenCode,
+    GeminiCli,
+    Cursor,
+}
+
+impl AdapterId {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude-code",
+            Self::CodexCli => "codex-cli",
+            Self::OpenCode => "opencode",
+            Self::GeminiCli => "gemini-cli",
+            Self::Cursor => "cursor",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdapterStatus {
+    Implemented,
+    DiscoveryRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverageGrade {
+    Full,
+    Partial,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoverageGrades {
+    pub read: CoverageGrade,
+    pub edit: CoverageGrade,
+    pub tool: CoverageGrade,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MappingRule {
+    pub source: &'static str,
+    pub target: &'static str,
+    pub note: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdapterDescriptor {
+    pub id: AdapterId,
+    pub status: AdapterStatus,
+    pub artifact_path_templates: &'static [&'static str],
+    pub schema_sample_set: &'static [&'static str],
+    pub mapping_table: &'static [MappingRule],
+    pub coverage: CoverageGrades,
+}
+
+pub fn adapter_registry() -> &'static [AdapterDescriptor] {
+    &[
+        AdapterDescriptor {
+            id: AdapterId::ClaudeCode,
+            status: AdapterStatus::Implemented,
+            artifact_path_templates: &[
+                "~/.claude/projects/<project>/<session>.jsonl",
+                "~/.claude/projects/<project>/<session>/tool-results/*.txt",
+            ],
+            schema_sample_set: &["claude-jsonl"],
+            mapping_table: &[
+                MappingRule {
+                    source: "assistant/text",
+                    target: "msg.out",
+                    note: "text block",
+                },
+                MappingRule {
+                    source: "assistant/tool_use",
+                    target: "tool.call",
+                    note: "paired by tool_use.id",
+                },
+                MappingRule {
+                    source: "user/tool_result",
+                    target: "tool.result",
+                    note: "paired by tool_use_id",
+                },
+                MappingRule {
+                    source: "Read tool",
+                    target: "code.read",
+                    note: "structured file and range",
+                },
+                MappingRule {
+                    source: "Edit/Write/MultiEdit tool",
+                    target: "code.edit",
+                    note: "structured file mutation",
+                },
+            ],
+            coverage: CoverageGrades {
+                read: CoverageGrade::Full,
+                edit: CoverageGrade::Full,
+                tool: CoverageGrade::Full,
+            },
+        },
+        AdapterDescriptor {
+            id: AdapterId::CodexCli,
+            status: AdapterStatus::Implemented,
+            artifact_path_templates: &[
+                "~/.codex/sessions/YYYY/MM/DD/*.jsonl",
+                "~/.codex/history.jsonl",
+            ],
+            schema_sample_set: &["codex-jsonl"],
+            mapping_table: &[
+                MappingRule {
+                    source: "session metadata",
+                    target: "meta",
+                    note: "model/repo metadata",
+                },
+                MappingRule {
+                    source: "response_item/message",
+                    target: "msg.in|msg.out",
+                    note: "role-dependent",
+                },
+                MappingRule {
+                    source: "response_item/function_call",
+                    target: "tool.call",
+                    note: "name and arguments",
+                },
+                MappingRule {
+                    source: "response_item/function_call_output",
+                    target: "tool.result",
+                    note: "paired by call_id",
+                },
+                MappingRule {
+                    source: "apply_patch payload",
+                    target: "code.edit",
+                    note: "file touch extraction",
+                },
+            ],
+            coverage: CoverageGrades {
+                read: CoverageGrade::Partial,
+                edit: CoverageGrade::Partial,
+                tool: CoverageGrade::Full,
+            },
+        },
+        AdapterDescriptor {
+            id: AdapterId::OpenCode,
+            status: AdapterStatus::DiscoveryRequired,
+            artifact_path_templates: &["TODO: discovery required"],
+            schema_sample_set: &["TODO: discovery required"],
+            mapping_table: &[MappingRule {
+                source: "TODO: discovery required",
+                target: "TODO: event-contract mapping",
+                note: "deterministic mapping table pending",
+            }],
+            coverage: CoverageGrades {
+                read: CoverageGrade::None,
+                edit: CoverageGrade::None,
+                tool: CoverageGrade::None,
+            },
+        },
+        AdapterDescriptor {
+            id: AdapterId::GeminiCli,
+            status: AdapterStatus::DiscoveryRequired,
+            artifact_path_templates: &["TODO: discovery required"],
+            schema_sample_set: &["TODO: discovery required"],
+            mapping_table: &[MappingRule {
+                source: "TODO: discovery required",
+                target: "TODO: event-contract mapping",
+                note: "deterministic mapping table pending",
+            }],
+            coverage: CoverageGrades {
+                read: CoverageGrade::None,
+                edit: CoverageGrade::None,
+                tool: CoverageGrade::None,
+            },
+        },
+        AdapterDescriptor {
+            id: AdapterId::Cursor,
+            status: AdapterStatus::DiscoveryRequired,
+            artifact_path_templates: &["TODO: discovery required"],
+            schema_sample_set: &["TODO: discovery required"],
+            mapping_table: &[MappingRule {
+                source: "TODO: discovery required",
+                target: "TODO: event-contract mapping",
+                note: "deterministic mapping table pending",
+            }],
+            coverage: CoverageGrades {
+                read: CoverageGrade::None,
+                edit: CoverageGrade::None,
+                tool: CoverageGrade::None,
+            },
+        },
+    ]
+}
+
+pub fn descriptor_for(id: AdapterId) -> &'static AdapterDescriptor {
+    adapter_registry()
+        .iter()
+        .find(|descriptor| descriptor.id == id)
+        .expect("descriptor must exist")
+}
+
+pub fn discovery_scaffold(id: AdapterId, home_dir: &Path) -> Vec<PathBuf> {
+    descriptor_for(id)
+        .artifact_path_templates
+        .iter()
+        .map(|template| template.replace('~', &home_dir.to_string_lossy()))
+        .map(PathBuf::from)
+        .collect()
+}
+
+#[derive(Debug)]
+pub enum AdapterError {
+    Json(serde_json::Error),
+}
+
+impl std::fmt::Display for AdapterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Json(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for AdapterError {}
+
+impl From<serde_json::Error> for AdapterError {
+    fn from(value: serde_json::Error) -> Self {
+        Self::Json(value)
+    }
+}
+
+pub trait HarnessAdapter {
+    fn adapter_id(&self) -> AdapterId;
+
+    fn convert_to_tape_jsonl(&self, input: &str) -> Result<String, AdapterError>;
+
+    fn descriptor(&self) -> &'static AdapterDescriptor {
+        descriptor_for(self.adapter_id())
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ClaudeCodeAdapter;
+
+impl HarnessAdapter for ClaudeCodeAdapter {
+    fn adapter_id(&self) -> AdapterId {
+        AdapterId::ClaudeCode
+    }
+
+    fn convert_to_tape_jsonl(&self, input: &str) -> Result<String, AdapterError> {
+        Ok(claude_jsonl_to_tape_jsonl(input)?)
+    }
+}
+
+#[derive(Debug, Default)]
+--- src/tape/adapter.rs:260-560 ---
+#[derive(Debug, Default)]
+pub struct CodexCliAdapter;
+
+impl HarnessAdapter for CodexCliAdapter {
+    fn adapter_id(&self) -> AdapterId {
+        AdapterId::CodexCli
+    }
+
+    fn convert_to_tape_jsonl(&self, input: &str) -> Result<String, AdapterError> {
+        Ok(codex_jsonl_to_tape_jsonl(input)?)
+    }
+}
+
+pub fn convert_with_adapter(id: AdapterId, input: &str) -> Result<String, AdapterError> {
+    match id {
+        AdapterId::ClaudeCode => ClaudeCodeAdapter.convert_to_tape_jsonl(input),
+        AdapterId::CodexCli => CodexCliAdapter.convert_to_tape_jsonl(input),
+        AdapterId::OpenCode | AdapterId::GeminiCli | AdapterId::Cursor => {
+            Ok(discovery_adapter_jsonl(id, input)?)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConformanceIssue {
+    pub line: usize,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConformanceReport {
+    pub adapter: AdapterId,
+    pub event_count: usize,
+    pub coverage: CoverageGrades,
+    pub issues: Vec<ConformanceIssue>,
+}
+
+pub fn run_conformance(id: AdapterId, input: &str) -> Result<ConformanceReport, AdapterError> {
+    let normalized = convert_with_adapter(id, input)?;
+    let mut issues = Vec::new();
+    let mut event_count = 0usize;
+    let mut actual_coverage: Option<CoverageGrades> = None;
+
+    for (idx, line) in normalized.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        event_count += 1;
+        let row: Value = serde_json::from_str(line)?;
+
+        // Extract coverage from the first meta event the adapter actually emits.
+        if actual_coverage.is_none() && row.get("k").and_then(Value::as_str) == Some("meta") {
+            actual_coverage = parse_meta_coverage(&row);
+        }
+
+        validate_contract_row(idx + 1, &row, &mut issues);
+    }
+
+    Ok(ConformanceReport {
+        adapter: id,
+        event_count,
+        // Use actual adapter output; fall back to registry if meta is absent or
+        // its coverage fields cannot be parsed (which would also produce issues above).
+        coverage: actual_coverage.unwrap_or_else(|| descriptor_for(id).coverage),
+        issues,
+    })
+}
+
+fn parse_meta_coverage(meta: &Value) -> Option<CoverageGrades> {
+    let read = coverage_grade_from_str(meta.get("coverage.read").and_then(Value::as_str)?)?;
+    let edit = coverage_grade_from_str(meta.get("coverage.edit").and_then(Value::as_str)?)?;
+    let tool = coverage_grade_from_str(meta.get("coverage.tool").and_then(Value::as_str)?)?;
+    Some(CoverageGrades { read, edit, tool })
+}
+
+fn coverage_grade_from_str(s: &str) -> Option<CoverageGrade> {
+    match s {
+        "full" => Some(CoverageGrade::Full),
+        "partial" => Some(CoverageGrade::Partial),
+        "none" => Some(CoverageGrade::None),
+        _ => None,
+    }
+}
+
+fn validate_contract_row(line: usize, row: &Value, issues: &mut Vec<ConformanceIssue>) {
+    let Some(obj) = row.as_object() else {
+        issues.push(ConformanceIssue {
+            line,
+            detail: "row is not an object".to_string(),
+        });
+        return;
+    };
+
+    if !obj.get("t").is_some_and(Value::is_string) {
+        issues.push(ConformanceIssue {
+            line,
+            detail: "missing string field `t`".to_string(),
+        });
+    }
+    match obj.get("source").and_then(Value::as_object) {
+        Some(source) => {
+            if !source.get("harness").is_some_and(Value::is_string) {
+                issues.push(ConformanceIssue {
+                    line,
+                    detail: "missing string field `source.harness`".to_string(),
+                });
+            }
+        }
+        None => issues.push(ConformanceIssue {
+            line,
+            detail: "missing object field `source`".to_string(),
+        }),
+    }
+
+    let kind = obj.get("k").and_then(Value::as_str).unwrap_or("");
+    if kind.is_empty() {
+        issues.push(ConformanceIssue {
+            line,
+            detail: "missing string field `k`".to_string(),
+        });
+        return;
+    }
+
+    match kind {
+        "meta" => {
+            for field in ["coverage.read", "coverage.edit", "coverage.tool"] {
+                if !obj.get(field).is_some_and(Value::is_string) {
+                    issues.push(ConformanceIssue {
+                        line,
+                        detail: format!("meta missing string field `{field}`"),
+                    });
+                }
+            }
+        }
+        "msg.in" | "msg.out" => {}
+        "span.link" => {
+            if !obj.get("from_file").is_some_and(Value::is_string) {
+                issues.push(ConformanceIssue {
+                    line,
+                    detail: "span.link missing string field `from_file`".to_string(),
+                });
+            }
+            if !obj.get("from_range").is_some() {
+                issues.push(ConformanceIssue {
+                    line,
+                    detail: "span.link missing field `from_range`".to_string(),
+                });
+            }
+            if !obj.get("to_file").is_some_and(Value::is_string) {
+                issues.push(ConformanceIssue {
+                    line,
+                    detail: "span.link missing string field `to_file`".to_string(),
+                });
+            }
+            if !obj.get("to_range").is_some() {
+                issues.push(ConformanceIssue {
+                    line,
+                    detail: "span.link missing field `to_range`".to_string(),
+                });
+            }
+        }
+        "tool.call" => {
+            if !obj.get("tool").is_some_and(Value::is_string) {
+                issues.push(ConformanceIssue {
+                    line,
+                    detail: "tool.call missing string field `tool`".to_string(),
+                });
+            }
+            if !obj.get("args").is_some() {
+                issues.push(ConformanceIssue {
+                    line,
+                    detail: "tool.call missing field `args`".to_string(),
+                });
+            }
+        }
+        "tool.result" => {
+            if !obj.get("tool").is_some_and(Value::is_string) {
+                issues.push(ConformanceIssue {
+                    line,
+                    detail: "tool.result missing string field `tool`".to_string(),
+                });
+            }
+        }
+        "code.read" => {
+            if !obj.get("file").is_some_and(Value::is_string) {
+                issues.push(ConformanceIssue {
+                    line,
+                    detail: "code.read missing string field `file`".to_string(),
+                });
+            }
+            if !obj.get("range").is_some() {
+                issues.push(ConformanceIssue {
+                    line,
+                    detail: "code.read missing field `range`".to_string(),
+                });
+            }
+        }
+        "code.edit" => {
+            if !obj.get("file").is_some_and(Value::is_string) {
+                issues.push(ConformanceIssue {
+                    line,
+                    detail: "code.edit missing string field `file`".to_string(),
+                });
+            }
+        }
+        _ => issues.push(ConformanceIssue {
+            line,
+            detail: format!("unknown event kind `{kind}`"),
+        }),
+    }
+}
+
+fn discovery_adapter_jsonl(id: AdapterId, input: &str) -> Result<String, serde_json::Error> {
+    let mut first_timestamp = "1970-01-01T00:00:00Z".to_string();
+    for line in input.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: Value = serde_json::from_str(line)?;
+        if let Some(ts) = row.get("timestamp").and_then(Value::as_str) {
+            first_timestamp = ts.to_string();
+            break;
+        }
+        if let Some(ts) = row.get("t").and_then(Value::as_str) {
+            first_timestamp = ts.to_string();
+            break;
+        }
+    }
+
+    serde_json::to_string(&json!({
+        "t": first_timestamp,
+        "k": "meta",
+        "source": {"harness": id.as_str()},
+        "coverage.read": "none",
+        "coverage.edit": "none",
+        "coverage.tool": "none"
+    }))
+    .map(|line| format!("{line}\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AdapterId, AdapterStatus, CoverageGrade, adapter_registry, descriptor_for,
+        discovery_scaffold, run_conformance,
+    };
+
+    #[test]
+    fn codex_conformance_harness_passes() {
+        let input = r#"{"timestamp":"2026-02-22T00:00:00Z","type":"session_meta","payload":{"model_provider":"openai","git":{"commit_hash":"abc123"}}}
+{"timestamp":"2026-02-22T00:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call_1","arguments":"{\"cmd\":\"echo hi\"}"}}
+{"timestamp":"2026-02-22T00:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"Process exited with code 7\nOutput:\nboom"}}"#;
+
+        let report = run_conformance(AdapterId::CodexCli, input).expect("adapter should parse");
+        assert_eq!(report.adapter, AdapterId::CodexCli);
+        assert_eq!(report.event_count, 3, "expected meta + tool.call + tool.result");
+        assert!(report.issues.is_empty(), "issues={:?}", report.issues);
+        assert_eq!(report.coverage.tool, CoverageGrade::Full);
+        assert_eq!(report.coverage.read, CoverageGrade::Partial);
+        assert_eq!(report.coverage.edit, CoverageGrade::Partial);
+    }
+
+    #[test]
+    fn claude_conformance_harness_passes() {
+        let input = r#"{"type":"assistant","timestamp":"2026-02-22T00:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/repo/src/lib.rs","offset":10,"limit":5}}]}}
+{"type":"user","timestamp":"2026-02-22T00:00:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"10->line"}]}}"#;
+
+        let report = run_conformance(AdapterId::ClaudeCode, input).expect("adapter should parse");
+        assert_eq!(report.adapter, AdapterId::ClaudeCode);
+        assert!(report.event_count >= 2);
+        assert!(report.issues.is_empty(), "issues={:?}", report.issues);
+        assert_eq!(report.coverage.tool, CoverageGrade::Full);
+        assert_eq!(report.coverage.read, CoverageGrade::Full);
+        assert_eq!(report.coverage.edit, CoverageGrade::Full);
+    }
+
+    #[test]
+    fn long_tail_registry_entries_have_discovery_and_mapping_scaffolding() {
+        for adapter in [AdapterId::OpenCode, AdapterId::GeminiCli, AdapterId::Cursor] {
+            let descriptor = descriptor_for(adapter);
+            assert_eq!(descriptor.status, AdapterStatus::DiscoveryRequired);
+            assert!(!descriptor.artifact_path_templates.is_empty());
+            assert!(!descriptor.schema_sample_set.is_empty());
+            assert!(!descriptor.mapping_table.is_empty());
+            assert_eq!(descriptor.coverage.tool, CoverageGrade::None);
+            assert_eq!(descriptor.coverage.read, CoverageGrade::None);
+            assert_eq!(descriptor.coverage.edit, CoverageGrade::None);
+        }
+    }
+
+    #[test]
+    fn discovery_required_adapters_emit_deterministic_meta_with_none_coverage() {
+        for adapter in [AdapterId::OpenCode, AdapterId::GeminiCli, AdapterId::Cursor] {
+            let report = run_conformance(adapter, "{}\n").expect("adapter should normalize");
+            assert_eq!(report.event_count, 1);
+            assert!(report.issues.is_empty(), "issues={:?}", report.issues);
+            assert_eq!(report.coverage.tool, CoverageGrade::None);
+            assert_eq!(report.coverage.read, CoverageGrade::None);
+            assert_eq!(report.coverage.edit, CoverageGrade::None);
+        }
+--- src/tape/harness.rs:1-260 ---
+use std::collections::{HashMap, HashSet};
+
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+
+pub fn codex_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Error> {
+    let mut out = Vec::new();
+    let mut call_tools: HashMap<String, String> = HashMap::new();
+    let mut session_id: Option<String> = None;
+    let mut first_timestamp: Option<String> = None;
+    let mut emitted_meta = false;
+
+    for line in input.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: Value = serde_json::from_str(line)?;
+        if session_id.is_none() {
+            session_id = extract_codex_session_id(&row);
+        }
+        let timestamp = row
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .unwrap_or("1970-01-01T00:00:00Z");
+        if first_timestamp.is_none() {
+            first_timestamp = Some(timestamp.to_string());
+        }
+        let row_type = row.get("type").and_then(Value::as_str).unwrap_or("");
+
+        match row_type {
+            "session_meta" => {
+                let payload = row.get("payload").and_then(Value::as_object);
+                let model = payload
+                    .and_then(|obj| obj.get("model"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .or_else(|| {
+                        payload
+                            .and_then(|obj| obj.get("model_provider"))
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                    });
+                let repo_head = payload
+                    .and_then(|obj| obj.get("git"))
+                    .and_then(|git| git.get("commit_hash"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                let mut event = serde_json::Map::new();
+                event.insert("t".to_string(), json!(timestamp));
+                event.insert("k".to_string(), json!("meta"));
+                event.insert("source".to_string(), codex_source(session_id.as_deref()));
+                event.insert("model".to_string(), json!(model));
+                event.insert("repo_head".to_string(), json!(repo_head));
+                event.insert("coverage.tool".to_string(), json!("full"));
+                event.insert("coverage.read".to_string(), json!("partial"));
+                event.insert("coverage.edit".to_string(), json!("partial"));
+                out.push(Value::Object(event));
+                emitted_meta = true;
+            }
+            "response_item" => {
+                let payload = row.get("payload").and_then(Value::as_object);
+                let payload_type = payload
+                    .and_then(|obj| obj.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                match payload_type {
+                    "message" => {
+                        let role = payload
+                            .and_then(|obj| obj.get("role"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("assistant");
+                        let content = payload
+                            .and_then(|obj| obj.get("content"))
+                            .map(content_text)
+                            .unwrap_or_default();
+                        if !content.is_empty() {
+                            out.push(json!({
+                                "t": timestamp,
+                                "k": if role == "assistant" { "msg.out" } else { "msg.in" },
+                                "source": codex_source(session_id.as_deref()),
+                                "role": role,
+                                "content": content
+                            }));
+                        }
+                    }
+                    "function_call" => {
+                        let tool = payload
+                            .and_then(|obj| obj.get("name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown");
+                        let call_id = payload
+                            .and_then(|obj| obj.get("call_id"))
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned);
+                        let args = payload
+                            .and_then(|obj| obj.get("arguments"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        if let Some(call_id) = &call_id {
+                            call_tools.insert(call_id.clone(), tool.to_string());
+                        }
+                        let mut call_event = serde_json::Map::new();
+                        call_event.insert("t".to_string(), json!(timestamp));
+                        call_event.insert("k".to_string(), json!("tool.call"));
+                        call_event
+                            .insert("source".to_string(), codex_source(session_id.as_deref()));
+                        call_event.insert("tool".to_string(), json!(tool));
+                        call_event.insert("args".to_string(), json!(args));
+                        if let Some(call_id) = &call_id {
+                            call_event.insert("call_id".to_string(), json!(call_id));
+                        }
+                        out.push(Value::Object(call_event));
+                        if tool == "apply_patch" {
+                            for file in extract_apply_patch_files(&args) {
+                                out.push(json!({
+                                    "t": timestamp,
+                                    "k": "code.edit",
+                                    "source": codex_source(session_id.as_deref()),
+                                    "file": file
+                                }));
+                            }
+                        }
+                    }
+                    "function_call_output" => {
+                        let call_id = payload
+                            .and_then(|obj| obj.get("call_id"))
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned);
+                        let output = payload
+                            .and_then(|obj| obj.get("output"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let tool = call_id
+                            .as_ref()
+                            .and_then(|id| call_tools.get(id))
+                            .cloned()
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let mut result_event = serde_json::Map::new();
+                        result_event.insert("t".to_string(), json!(timestamp));
+                        result_event.insert("k".to_string(), json!("tool.result"));
+                        result_event
+                            .insert("source".to_string(), codex_source(session_id.as_deref()));
+                        result_event.insert("tool".to_string(), json!(tool));
+                        if let Some(call_id) = &call_id {
+                            result_event.insert("call_id".to_string(), json!(call_id));
+                        }
+                        if let Some(exit) = extract_exit_code(&output) {
+                            result_event.insert("exit".to_string(), json!(exit));
+                        }
+                        result_event.insert("stdout".to_string(), json!(output));
+                        result_event.insert("stderr".to_string(), json!(""));
+                        out.push(Value::Object(result_event));
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !emitted_meta {
+        out.insert(
+            0,
+            json!({
+                "t": first_timestamp.unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string()),
+                "k": "meta",
+                "source": codex_source(session_id.as_deref()),
+                "coverage.tool": "full",
+                "coverage.read": "partial",
+                "coverage.edit": "partial"
+            }),
+        );
+    }
+
+    to_jsonl(&out)
+}
+
+pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Error> {
+    let mut out = Vec::new();
+    let mut tool_by_id: HashMap<String, String> = HashMap::new();
+    let mut session_id: Option<String> = None;
+    let mut first_timestamp: Option<String> = None;
+
+    let mut read_total = 0u32;
+    let mut read_emitted = 0u32;
+    let mut edit_total = 0u32;
+    let mut edit_emitted = 0u32;
+
+    for line in input.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: Value = serde_json::from_str(line)?;
+        let timestamp = row
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .unwrap_or("1970-01-01T00:00:00Z");
+        if first_timestamp.is_none() {
+            first_timestamp = Some(timestamp.to_string());
+        }
+        if session_id.is_none() {
+            session_id = claude_session_id(&row);
+        }
+        let row_type = row.get("type").and_then(Value::as_str).unwrap_or("");
+
+        match row_type {
+            "user" => {
+                let message = row.get("message").and_then(Value::as_object);
+                let role = message
+                    .and_then(|obj| obj.get("role"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("user");
+                let content = message.and_then(|obj| obj.get("content"));
+                if let Some(text) = content.and_then(Value::as_str) {
+                    out.push(json!({
+                        "t": timestamp,
+                        "k": "msg.in",
+                        "source": source_block("claude-code", session_id.as_deref()),
+                        "role": role,
+                        "content": text
+                    }));
+                }
+                if let Some(blocks) = content.and_then(Value::as_array) {
+                    for block in blocks {
+                        if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                            continue;
+                        }
+                        let tool_use_id = block
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let tool = tool_by_id
+                            .get(&tool_use_id)
+                            .cloned()
+                            .unwrap_or_else(|| "unknown".to_string());
+                        out.push(json!({
+                            "t": timestamp,
+                            "k": "tool.result",
+                            "source": source_block("claude-code", session_id.as_deref()),
+                            "tool": tool,
+                            "call_id": if tool_use_id.is_empty() { Value::Null } else { Value::String(tool_use_id) },
+                            "exit": if block.get("is_error").and_then(Value::as_bool) == Some(true) { 1 } else { 0 },
+                            "stdout": content_text(block.get("content").unwrap_or(&Value::Null)),
+                            "stderr": ""
+                        }));
+                    }
+                }
+            }
+            "assistant" => {
+                let message = row.get("message").and_then(Value::as_object);
+                let role = message
+                    .and_then(|obj| obj.get("role"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("assistant");
+                if let Some(blocks) = message
+                    .and_then(|obj| obj.get("content"))
+                    .and_then(Value::as_array)
+--- src/tape/harness.rs:260-700 ---
+                    .and_then(Value::as_array)
+                {
+                    for block in blocks {
+                        let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
+                        match block_type {
+                            "text" => {
+                                let text = block
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+                                if !text.is_empty() {
+                                    out.push(json!({
+                                        "t": timestamp,
+                                        "k": "msg.out",
+                                        "source": source_block("claude-code", session_id.as_deref()),
+                                        "role": role,
+                                        "content": text
+                                    }));
+                                }
+                            }
+                            "tool_use" => {
+                                let tool = block
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("unknown");
+                                let tool_input = block.get("input").cloned().unwrap_or(Value::Null);
+                                let tool_use_id = block
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+                                tool_by_id.insert(tool_use_id.clone(), tool.to_string());
+
+                                out.push(json!({
+                                    "t": timestamp,
+                                    "k": "tool.call",
+                                    "source": source_block("claude-code", session_id.as_deref()),
+                                    "tool": tool,
+                                    "call_id": if tool_use_id.is_empty() { Value::Null } else { Value::String(tool_use_id.clone()) },
+                                    "args": serde_json::to_string(&tool_input).unwrap_or_else(|_| "{}".to_string())
+                                }));
+
+                                match tool {
+                                    "Read" => {
+                                        read_total = read_total.saturating_add(1);
+                                        if let Some(file) = tool_input
+                                            .get("file_path")
+                                            .and_then(Value::as_str)
+                                            .map(ToOwned::to_owned)
+                                        {
+                                            let start = tool_input
+                                                .get("offset")
+                                                .and_then(Value::as_u64)
+                                                .map(|n| n as u32)
+                                                .unwrap_or(1)
+                                                .max(1);
+                                            let end = tool_input
+                                                .get("limit")
+                                                .and_then(Value::as_u64)
+                                                .map(|n| {
+                                                    start.saturating_add(
+                                                        (n as u32).saturating_sub(1),
+                                                    )
+                                                })
+                                                .unwrap_or(start);
+                                            out.push(json!({
+                                                "t": timestamp,
+                                                "k": "code.read",
+                                                "source": source_block("claude-code", session_id.as_deref()),
+                                                "file": file,
+                                                "range": [start, end],
+                                                "range_basis": "line"
+                                            }));
+                                            read_emitted = read_emitted.saturating_add(1);
+                                        }
+                                    }
+                                    "Edit" => {
+                                        edit_total = edit_total.saturating_add(1);
+                                        if let Some(file) = tool_input
+                                            .get("file_path")
+                                            .and_then(Value::as_str)
+                                            .map(ToOwned::to_owned)
+                                        {
+                                            out.push(json!({
+                                                "t": timestamp,
+                                                "k": "code.edit",
+                                                "source": source_block("claude-code", session_id.as_deref()),
+                                                "file": file,
+                                                "before_hash": tool_input.get("old_string").and_then(Value::as_str).map(hash_text),
+                                                "after_hash": tool_input.get("new_string").and_then(Value::as_str).map(hash_text)
+                                            }));
+                                            edit_emitted = edit_emitted.saturating_add(1);
+                                        }
+                                    }
+                                    "Write" => {
+                                        edit_total = edit_total.saturating_add(1);
+                                        if let Some(file) = tool_input
+                                            .get("file_path")
+                                            .and_then(Value::as_str)
+                                            .map(ToOwned::to_owned)
+                                        {
+                                            out.push(json!({
+                                                "t": timestamp,
+                                                "k": "code.edit",
+                                                "source": source_block("claude-code", session_id.as_deref()),
+                                                "file": file,
+                                                "after_hash": tool_input.get("content").and_then(Value::as_str).map(hash_text)
+                                            }));
+                                            edit_emitted = edit_emitted.saturating_add(1);
+                                        }
+                                    }
+                                    "MultiEdit" => {
+                                        if let Some(file) = tool_input
+                                            .get("file_path")
+                                            .and_then(Value::as_str)
+                                            .map(ToOwned::to_owned)
+                                        {
+                                            if let Some(edits) =
+                                                tool_input.get("edits").and_then(Value::as_array)
+                                            {
+                                                edit_total =
+                                                    edit_total.saturating_add(edits.len() as u32);
+                                                if edits.is_empty() {
+                                                    continue;
+                                                }
+                                                for edit in edits {
+                                                    out.push(json!({
+                                                        "t": timestamp,
+                                                        "k": "code.edit",
+                                                        "source": source_block("claude-code", session_id.as_deref()),
+                                                        "file": file,
+                                                        "before_hash": edit.get("old_string").and_then(Value::as_str).map(hash_text),
+                                                        "after_hash": edit.get("new_string").and_then(Value::as_str).map(hash_text)
+                                                    }));
+                                                    edit_emitted = edit_emitted.saturating_add(1);
+                                                }
+                                            } else {
+                                                edit_total = edit_total.saturating_add(1);
+                                            }
+                                        } else {
+                                            edit_total = edit_total.saturating_add(1);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out.insert(
+        0,
+        json!({
+            "t": first_timestamp.unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string()),
+            "k": "meta",
+            "source": source_block("claude-code", session_id.as_deref()),
+            "coverage.read": coverage_grade(read_total, read_emitted),
+            "coverage.edit": coverage_grade(edit_total, edit_emitted),
+            "coverage.tool": "full"
+        }),
+    );
+
+    to_jsonl(&out)
+}
+
+fn source_block(harness: &str, session_id: Option<&str>) -> Value {
+    json!({
+        "harness": harness,
+        "session_id": session_id
+    })
+}
+
+fn coverage_grade(total: u32, emitted: u32) -> &'static str {
+    // total == 0 means no structured events of this type were seen; all zero
+    // of them were captured, so coverage is vacuously full.
+    if total == 0 || emitted == total {
+        "full"
+    } else {
+        "partial"
+    }
+}
+
+fn claude_session_id(row: &Value) -> Option<String> {
+    row.get("session_id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            row.get("sessionId")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn to_jsonl(events: &[Value]) -> Result<String, serde_json::Error> {
+    let mut out = String::new();
+    for event in events {
+        out.push_str(&serde_json::to_string(event)?);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+fn hash_text(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn content_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => {
+            let mut chunks = Vec::new();
+            for item in items {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    chunks.push(text.to_string());
+                }
+                if let Some(text) = item.get("input_text").and_then(Value::as_str) {
+                    chunks.push(text.to_string());
+                }
+                if let Some(text) = item.get("output_text").and_then(Value::as_str) {
+                    chunks.push(text.to_string());
+                }
+            }
+            chunks.join("\n")
+        }
+        _ => String::new(),
+    }
+}
+
+fn extract_exit_code(output: &str) -> Option<i64> {
+    const PREFIX: &str = "Process exited with code ";
+    output.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(PREFIX)
+            .and_then(|raw| raw.parse::<i64>().ok())
+    })
+}
+
+fn extract_codex_session_id(row: &Value) -> Option<String> {
+    row.get("session_id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            row.get("payload")
+                .and_then(|payload| payload.get("session_id"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| {
+            row.get("payload")
+                .and_then(|payload| payload.get("session"))
+                .and_then(|session| session.get("id"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn codex_source(session_id: Option<&str>) -> Value {
+    match session_id {
+        Some(session_id) => json!({
+            "harness": "codex-cli",
+            "session_id": session_id
+        }),
+        None => json!({
+            "harness": "codex-cli"
+        }),
+    }
+}
+
+fn extract_apply_patch_files(arguments: &str) -> Vec<String> {
+    let patch_body = serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("patch")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| arguments.to_string());
+
+    let mut files = Vec::new();
+    let mut seen = HashSet::new();
+    for line in patch_body.lines() {
+        let file = line
+            .strip_prefix("*** Update File: ")
+            .or_else(|| line.strip_prefix("*** Add File: "))
+            .or_else(|| line.strip_prefix("*** Delete File: "));
+        if let Some(path) = file.map(str::trim) {
+            if !path.is_empty() && seen.insert(path.to_string()) {
+                files.push(path.to_string());
+            }
+        }
+    }
+    files
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::{claude_jsonl_to_tape_jsonl, codex_jsonl_to_tape_jsonl};
+
+    #[test]
+    fn codex_adapter_emits_tool_and_apply_patch_edit() {
+        let input = r#"{"timestamp":"2026-02-22T00:00:00Z","type":"session_meta","payload":{"model_provider":"openai","git":{"commit_hash":"abc123"}}}
+{"timestamp":"2026-02-22T00:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call_1","arguments":"{\"cmd\":\"echo hi\"}"}}
+{"timestamp":"2026-02-22T00:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"Process exited with code 7\nOutput:\nboom"}}
+{"timestamp":"2026-02-22T00:00:03Z","type":"response_item","payload":{"type":"function_call","name":"apply_patch","call_id":"call_2","arguments":"*** Begin Patch\n*** Update File: src/main.rs\n*** End Patch\n"}} "#;
+
+        let out = codex_jsonl_to_tape_jsonl(input).expect("adapter should parse");
+        assert!(out.contains(r#""k":"meta""#), "out={out}");
+        assert!(out.contains(r#""k":"tool.call""#), "out={out}");
+        assert!(out.contains(r#""tool":"exec_command""#), "out={out}");
+        assert!(out.contains(r#""k":"tool.result""#), "out={out}");
+        assert!(out.contains(r#""exit":7"#), "out={out}");
+        assert!(out.contains(r#""k":"code.edit""#), "out={out}");
+        assert!(out.contains(r#""file":"src/main.rs""#), "out={out}");
+    }
+
+    #[test]
+    fn claude_adapter_emits_read_edit_and_tool_pairs() {
+        let input = include_str!("../../tests/fixtures/claude_adapter_input.jsonl");
+
+        let out = claude_jsonl_to_tape_jsonl(input).expect("adapter should parse");
+        let events: Vec<Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid JSON event"))
+            .collect();
+
+        let meta = events
+            .iter()
+            .find(|event| event.get("k").and_then(Value::as_str) == Some("meta"))
+            .expect("meta event");
+        assert_eq!(meta["coverage.tool"], "full");
+        assert_eq!(meta["coverage.read"], "full");
+        assert_eq!(meta["coverage.edit"], "full");
+        assert_eq!(meta["source"]["harness"], "claude-code");
+        assert_eq!(meta["source"]["session_id"], "session-claude-1");
+
+        let read_call = events
+            .iter()
+            .find(|event| {
+                event.get("k").and_then(Value::as_str) == Some("tool.call")
+                    && event.get("tool").and_then(Value::as_str) == Some("Read")
+            })
+            .expect("read call event");
+        assert_eq!(read_call["call_id"], "toolu_read_1");
+
+        let read = events
+            .iter()
+            .find(|event| event.get("k").and_then(Value::as_str) == Some("code.read"))
+            .expect("code.read event");
+        assert_eq!(read["file"], "/repo/src/lib.rs");
+        assert_eq!(read["range"], json!([10, 14]));
+        assert_eq!(read["range_basis"], "line");
+        assert_eq!(read["source"]["harness"], "claude-code");
+
+        let edit = events
+            .iter()
+            .find(|event| {
+                event.get("k").and_then(Value::as_str) == Some("code.edit")
+                    && event.get("file").and_then(Value::as_str) == Some("/repo/src/lib.rs")
+            })
+            .expect("code.edit event");
+        assert_eq!(edit["source"]["harness"], "claude-code");
+
+        let result = events
+            .iter()
+            .find(|event| event.get("k").and_then(Value::as_str) == Some("tool.result"))
+            .expect("tool.result event");
+        assert_eq!(result["call_id"], "toolu_read_1");
+        assert_eq!(result["tool"], "Read");
+        assert_eq!(result["source"]["session_id"], "session-claude-1");
+    }
+
+    #[test]
+    fn claude_adapter_marks_partial_when_structured_fields_missing() {
+        let input = include_str!("../../tests/fixtures/claude_adapter_partial_input.jsonl");
+        let out = claude_jsonl_to_tape_jsonl(input).expect("adapter should parse");
+        let events: Vec<Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid JSON event"))
+            .collect();
+        let meta = events
+            .iter()
+            .find(|event| event.get("k").and_then(Value::as_str) == Some("meta"))
+            .expect("meta event");
+        assert_eq!(meta["coverage.tool"], "full");
+        assert_eq!(meta["coverage.read"], "partial");
+        assert_eq!(meta["coverage.edit"], "partial");
+    }
+}
+--- tests/codex_adapter_fixtures.rs ---
+use std::fs;
+
+use engram::tape::harness::codex_jsonl_to_tape_jsonl;
+use serde_json::Value;
+
+fn load_fixture(path: &str) -> String {
+    fs::read_to_string(path).expect("fixture should load")
+}
+
+fn parse_output_events(output: &str) -> Vec<Value> {
+    output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<Value>(line).expect("event should parse"))
+        .collect()
+}
+
+#[test]
+fn codex_supported_paths_emit_deterministic_events_and_partial_coverage_meta() {
+    let input = load_fixture("tests/fixtures/codex/supported_paths.jsonl");
+    let output = codex_jsonl_to_tape_jsonl(&input).expect("adapter should parse fixture");
+    let events = parse_output_events(&output);
+
+    assert_eq!(events.len(), 7, "events={events:?}");
+
+    let meta = &events[0];
+    assert_eq!(meta["k"], "meta");
+    assert_eq!(meta["coverage.tool"], "full");
+    assert_eq!(meta["coverage.read"], "partial");
+    assert_eq!(meta["coverage.edit"], "partial");
+    assert_eq!(meta["source"]["harness"], "codex-cli");
+    assert_eq!(meta["source"]["session_id"], "sess_123");
+
+    assert_eq!(events[1]["k"], "tool.call");
+    assert_eq!(events[1]["tool"], "exec_command");
+    assert_eq!(events[1]["call_id"], "call_1");
+
+    assert_eq!(events[2]["k"], "tool.result");
+    assert_eq!(events[2]["tool"], "exec_command");
+    assert_eq!(events[2]["call_id"], "call_1");
+    assert_eq!(events[2]["exit"], 7);
+
+    assert_eq!(events[3]["k"], "tool.call");
+    assert_eq!(events[3]["tool"], "apply_patch");
+    assert_eq!(events[3]["call_id"], "call_2");
+
+    assert_eq!(events[4]["k"], "code.edit");
+    assert_eq!(events[4]["file"], "src/main.rs");
+    assert_eq!(events[5]["k"], "code.edit");
+    assert_eq!(events[5]["file"], "src/new.rs");
+
+    assert_eq!(events[6]["k"], "tool.result");
+    assert_eq!(events[6]["tool"], "apply_patch");
+    assert_eq!(events[6]["call_id"], "call_2");
+    assert!(events[6].get("exit").is_none(), "events={events:?}");
+
+    assert!(
+        events
+            .iter()
+            .all(|event| event["source"]["harness"] == "codex-cli"),
+        "events={events:?}"
+    );
+    assert!(
+        events.iter().all(|event| event["k"] != "code.read"),
+        "events={events:?}"
+    );
+}
+
+#[test]
+fn codex_unsupported_shell_read_and_edit_stay_unemitted() {
+    let input = load_fixture("tests/fixtures/codex/unsupported_paths.jsonl");
+    let output = codex_jsonl_to_tape_jsonl(&input).expect("adapter should parse fixture");
+    let events = parse_output_events(&output);
+
+    assert_eq!(events[0]["k"], "meta");
+    assert_eq!(events[0]["coverage.read"], "partial");
+    assert_eq!(events[0]["coverage.edit"], "partial");
+
+    assert!(
+        events.iter().all(|event| event["k"] != "code.read"),
+        "events={events:?}"
+    );
+    assert!(
+        events.iter().all(|event| event["k"] != "code.edit"),
+        "events={events:?}"
+    );
+
+    let tool_calls = events
+        .iter()
+        .filter(|event| event["k"] == "tool.call")
+        .count();
+    let tool_results = events
+        .iter()
+        .filter(|event| event["k"] == "tool.result")
+        .count();
+    assert_eq!(tool_calls, 2, "events={events:?}");
+    assert_eq!(tool_results, 2, "events={events:?}");
+}

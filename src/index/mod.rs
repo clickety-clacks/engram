@@ -5,8 +5,8 @@ use std::ops::Deref;
 use rusqlite::{Connection, params};
 
 use crate::index::lineage::{
-    Cardinality, EvidenceFragmentRef, EvidenceKind, LocationDelta, SpanEdge,
-    LINK_THRESHOLD_DEFAULT, StoredEdgeClass, Tombstone,
+    Cardinality, EvidenceFragmentRef, EvidenceKind, LINK_THRESHOLD_DEFAULT, LocationDelta,
+    SpanEdge, StoredEdgeClass, Tombstone,
 };
 use crate::tape::event::{FileRange, TapeEventAt, TapeEventData};
 
@@ -50,7 +50,9 @@ impl SqliteIndex {
             ",
         )?;
 
-        let version: i64 = self.conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let version: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version == 0 && self.table_exists("evidence")? {
             self.migrate_legacy_schema_to_v1()?;
         } else if version == 0 {
@@ -482,7 +484,9 @@ impl SqliteIndex {
                         )?;
                     }
 
-                    if edit.after_hash.is_none() && let Some(before_hash) = &edit.before_hash {
+                    if edit.after_hash.is_none()
+                        && let Some(before_hash) = &edit.before_hash
+                    {
                         let range = edit
                             .before_range
                             .or(edit.after_range)
@@ -693,7 +697,9 @@ mod tests {
         assert_eq!(read_refs.len(), 1);
         assert_eq!(read_refs[0].kind, EvidenceKind::Read);
 
-        let edit_refs = index.evidence_for_anchor("after").expect("edit evidence query");
+        let edit_refs = index
+            .evidence_for_anchor("after")
+            .expect("edit evidence query");
         assert_eq!(edit_refs.len(), 1);
         assert_eq!(edit_refs[0].kind, EvidenceKind::Edit);
         let before_refs = index
@@ -830,7 +836,10 @@ mod tests {
             .outbound_edges("before", 0.10, true)
             .expect("forensics query");
         assert_eq!(with_forensics.len(), 1);
-        assert_eq!(with_forensics[0].stored_class, StoredEdgeClass::LocationOnly);
+        assert_eq!(
+            with_forensics[0].stored_class,
+            StoredEdgeClass::LocationOnly
+        );
     }
 
     #[test]
