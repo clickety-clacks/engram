@@ -397,50 +397,54 @@ Output is raw transcript text — the actual messages and tool I/O from each ses
 
 Results may include windows from different tiers (orchestrator sessions alongside coding agent sessions) and from different repos. The output identifies each window's source tape, so consumers can distinguish tiers if they choose to.
 
-## Conversation Continuation Detection
+## Continuation Detection: Open Question
 
-### The problem
+### What we investigated
 
-Agent sessions compact, hit rate limits, or get resumed across multiple transcript files. A single logical task can span many tapes. Without detecting continuations, Engram treats each tape as isolated and may miss reasoning that started in an earlier session.
+We actively explored cross-compaction continuation detection — the idea that Engram should recognize when two tapes are segments of the same logical conversation split by a compaction boundary, rate limit, or session restart.
 
-This is a real problem: an agent might start discussing a design decision in session A, hit a compaction boundary, and implement the decision in session B. Without continuation detection, `engram explain` on the resulting code only finds session B — the implementation. The original reasoning from session A is invisible.
+Three approaches were considered:
 
-### The solution: fingerprint-based tape alignment
+1. **Fingerprint overlap at tape boundaries.** Compare tail anchors of tape A against head anchors of tape B. High overlap at the boundary suggests continuation — compaction summaries, repeated assistant text, and re-stated context produce matching fingerprints.
 
-Engram already fingerprints all tape content. The same mechanism detects continuations.
+2. **Timestamp proximity.** Tapes that end and begin within a narrow time window are continuation candidates. Useful for narrowing the search space but not sufficient alone.
 
-When session B is a continuation of session A, it typically contains carryover content — compaction summaries, repeated assistant text, re-stated context. This carryover content produces fingerprint anchors that match anchors in session A's tail. The overlap is the continuation signal.
+3. **Harness-specific markers.** Some harnesses emit explicit continuation signals — Codex CLI has `type: "compacted"` events with `replacement_history` payload; Claude Code emits compaction summaries and rate-limit terminal messages. When present, these are strong signals.
 
-This works because assistant messages are highly unique. Unlike user prompts (which may be short or repeated across unrelated sessions), assistant responses contain specific reasoning, specific code references, and specific decisions that are unlikely to appear by coincidence in an unrelated session.
+### What we found
 
-### Detection rules
+Fingerprint overlap alone is unreliable. Every harness injects repeated scaffolding — system prompts, AGENTS.md, environment context — into every session. This boilerplate produces matching fingerprints across completely unrelated sessions. Filtering boilerplate requires maintaining per-harness fingerprint exclusion sets, which is fragile and harness-version-dependent.
 
-1. **Fingerprint all tape content** (already done — Engram fingerprints everything).
-2. **Compare tail anchors of earlier tapes against head anchors of later tapes** across all configured sources.
-3. **Score continuation confidence** by overlap density:
-   - High anchor overlap at tail/head boundary → strong continuation signal
-   - Single shared phrase → weak/no signal
-   - Shared boilerplate (system prompts, AGENTS.md) must be excluded from matching
-4. **Store continuation edges** between tapes: `tape_a → tape_b` with confidence score.
-5. **`engram explain` traversal follows continuation edges** when walking backward, so the agent can reach reasoning from earlier sessions.
+Harness markers work when available but cannot be depended on. Not all harnesses emit them, formats change across versions, and the markers are an implementation detail of each harness — not a stable contract.
 
-### Boilerplate exclusion
+Timestamps help narrow candidates but don't confirm anything. Two tapes close in time might be continuations or might be two unrelated agents working concurrently.
 
-Every harness injects repeated scaffolding (system prompts, AGENTS.md, environment context) into every session. This content produces matching fingerprints across completely unrelated sessions.
+### Why continuation detection may not be necessary
 
-Mitigation: maintain a per-harness boilerplate fingerprint set (computed once from known scaffolding content). Exclude boilerplate anchors from continuation matching. Only non-boilerplate overlap counts toward continuation confidence.
+The deeper question: does Engram actually need to know that two tapes are "the same conversation"?
 
-### Harness-specific signals (supplemental, not required)
+Consider what the core query mechanism already does. When an agent asks `engram explain` for a code span, Engram finds all tapes whose fingerprints match that span — regardless of whether those tapes are related to each other. If tape A discussed the code and tape B edited it, both surface. The agent gets context from both. Whether A and B are segments of the same conversation or two completely unrelated agents is irrelevant to the provenance — the evidence is real either way.
 
-Some harnesses provide explicit continuation markers:
-- **Codex CLI**: `type: "compacted"` events with `replacement_history` payload
-- **Claude Code**: compaction summaries and rate-limit terminal messages are detectable
+The scenarios:
+- **Two tapes from the same conversation** — both touched the same code, both surface via fingerprint match. No continuation detection needed.
+- **Two tapes from unrelated agents** — both touched the same code, both surface via fingerprint match. Same result.
+- **Orchestrator tape + coding agent tape** — orchestrator discussed the code, agent edited it. Both surface via fingerprint overlap on the shared text. No continuation detection needed.
 
-When present, these boost continuation confidence. But the fingerprint overlap mechanism works independently — no harness cooperation is required.
+Chronological narrative construction — "first the agent thought X, then it realized Y, then it changed Z" — is a saliency layer concern. Engram returns raw evidence windows. The consuming agent or saliency layer can sort by timestamp and reconstruct narrative if it wants to. Engram doesn't need to pre-compute the narrative structure.
 
-### Query behavior across continuations
+### The one case that might matter
 
-When `engram explain` walks backward through lineage and reaches the beginning of a tape, it checks for continuation edges to earlier tapes. If found, traversal continues seamlessly into the earlier tape. The agent can use `engram view` to navigate backward across the boundary. Continuation edges are labeled in output so the agent knows it crossed a session boundary.
+There is one scenario where continuation detection could add value: an agent discusses a design decision in the first half of a session, the session compacts, and then in the resumed session the agent modifies code based on that earlier reasoning — but the reasoning happened before the agent ever read or touched the specific code file.
+
+In this case, the pre-compaction tape contains the reasoning but has no fingerprint anchor to the code (the agent hadn't interacted with the code yet). The post-compaction tape has the code anchors but only the implementation, not the original reasoning. Without a continuation link, `engram explain` on the code only finds the post-compaction tape.
+
+But how likely is this in practice? The agent almost certainly read the code before modifying it. That read event creates fingerprint anchors in the tape. If the read happened before compaction, those anchors already link the pre-compaction tape to the code. If the read happened after compaction, the post-compaction tape has the anchors. The gap only exists if the agent reasoned about code it had never read or quoted — which is unusual for coding agents that work by reading files, reasoning, then editing.
+
+### Current position
+
+We are not implementing continuation detection now. The core fingerprint mechanism — which already surfaces all tapes that touched a given span, regardless of their relationship to each other — may solve the problem well enough. Building continuation detection adds complexity (boilerplate exclusion, harness-specific parsers, boundary comparison logic) for a benefit that may already be covered by the simpler mechanism.
+
+We will revisit if real-world usage reveals gaps where important context is unreachable through normal fingerprint matching.
 
 ## Scope and Privacy
 
