@@ -1,0 +1,6 @@
+{"timestamp":"2026-02-26T01:00:00Z","type":"user","role":"user","session_id":"oc-123","content":"Investigate auth timeout in src/auth.rs"}
+{"timestamp":"2026-02-26T01:00:01Z","type":"tool.call","tool":"Read","args":{"file":"src/auth.rs","range":[40,80]},"session_id":"oc-123","call_id":"c1"}
+{"timestamp":"2026-02-26T01:00:02Z","type":"tool.result","tool":"Read","stdout":"fn verify_token ...","stderr":"","exit":0,"session_id":"oc-123","call_id":"c1"}
+{"timestamp":"2026-02-26T01:00:03Z","type":"code.read","file":"src/auth.rs","range":[40,80],"session_id":"oc-123"}
+{"timestamp":"2026-02-26T01:00:04Z","type":"code.edit","file":"src/auth.rs","before":"timeout = 30","after":"timeout = 120","similarity":0.78,"session_id":"oc-123","range":[55,55]}
+{"timestamp":"2026-02-26T01:00:05Z","type":"assistant","role":"assistant","session_id":"oc-123","content":"Raised token timeout to avoid premature expiry."}

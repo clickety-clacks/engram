@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use super::adapters::{
     claude_jsonl_to_tape_jsonl, codex_jsonl_to_tape_jsonl, cursor_jsonl_to_tape_jsonl,
-    gemini_json_to_tape_jsonl, opencode_json_to_tape_jsonl,
+    gemini_json_to_tape_jsonl, openclaw_jsonl_to_tape_jsonl, opencode_json_to_tape_jsonl,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -14,6 +14,7 @@ pub enum AdapterId {
     OpenCode,
     GeminiCli,
     Cursor,
+    OpenClaw,
 }
 
 impl AdapterId {
@@ -24,6 +25,7 @@ impl AdapterId {
             Self::OpenCode => "opencode",
             Self::GeminiCli => "gemini-cli",
             Self::Cursor => "cursor",
+            Self::OpenClaw => "openclaw",
         }
     }
 }
@@ -239,6 +241,37 @@ pub fn adapter_registry() -> &'static [AdapterDescriptor] {
             },
         },
         AdapterDescriptor {
+            id: AdapterId::OpenClaw,
+            status: AdapterStatus::Implemented,
+            artifact_path_templates: &[
+                "~/.openclaw/sessions/**/*.jsonl",
+                "~/.openclaw/logs/*.log",
+            ],
+            schema_sample_set: &["openclaw-session-jsonl", "openclaw-node-log"],
+            mapping_table: &[
+                MappingRule {
+                    source: "role/content",
+                    target: "msg.in|msg.out",
+                    note: "user/assistant transcript rows",
+                },
+                MappingRule {
+                    source: "tool.call/tool.result rows",
+                    target: "tool.call|tool.result",
+                    note: "deterministic serialization of args/stdout/stderr",
+                },
+                MappingRule {
+                    source: "code.read|code.edit rows",
+                    target: "code.read|code.edit",
+                    note: "structured file/range/hash fields when present",
+                },
+            ],
+            coverage: CoverageGrades {
+                read: CoverageGrade::Partial,
+                edit: CoverageGrade::Partial,
+                tool: CoverageGrade::Partial,
+            },
+        },
+        AdapterDescriptor {
             id: AdapterId::Cursor,
             status: AdapterStatus::Implemented,
             artifact_path_templates: &[
@@ -402,6 +435,19 @@ impl HarnessAdapter for GeminiCliAdapter {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct OpenClawAdapter;
+
+impl HarnessAdapter for OpenClawAdapter {
+    fn adapter_id(&self) -> AdapterId {
+        AdapterId::OpenClaw
+    }
+
+    fn convert_to_tape_jsonl(&self, input: &str) -> Result<String, AdapterError> {
+        Ok(openclaw_jsonl_to_tape_jsonl(input)?)
+    }
+}
+
 pub fn convert_with_adapter(id: AdapterId, input: &str) -> Result<String, AdapterError> {
     match id {
         AdapterId::ClaudeCode => ClaudeCodeAdapter.convert_to_tape_jsonl(input),
@@ -409,6 +455,7 @@ pub fn convert_with_adapter(id: AdapterId, input: &str) -> Result<String, Adapte
         AdapterId::OpenCode => OpenCodeAdapter.convert_to_tape_jsonl(input),
         AdapterId::Cursor => CursorAdapter.convert_to_tape_jsonl(input),
         AdapterId::GeminiCli => GeminiCliAdapter.convert_to_tape_jsonl(input),
+        AdapterId::OpenClaw => OpenClawAdapter.convert_to_tape_jsonl(input),
     }
 }
 
@@ -699,6 +746,15 @@ mod tests {
         assert!(!cursor.artifact_path_templates.is_empty());
         assert!(!cursor.schema_sample_set.is_empty());
         assert!(!cursor.mapping_table.is_empty());
+
+        let openclaw = descriptor_for(AdapterId::OpenClaw);
+        assert_eq!(openclaw.status, AdapterStatus::Implemented);
+        assert_eq!(openclaw.coverage.tool, CoverageGrade::Partial);
+        assert_eq!(openclaw.coverage.read, CoverageGrade::Partial);
+        assert_eq!(openclaw.coverage.edit, CoverageGrade::Partial);
+        assert!(!openclaw.artifact_path_templates.is_empty());
+        assert!(!openclaw.schema_sample_set.is_empty());
+        assert!(!openclaw.mapping_table.is_empty());
     }
 
     #[test]
@@ -806,7 +862,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_known_adapters() {
-        assert_eq!(adapter_registry().len(), 5);
+        assert_eq!(adapter_registry().len(), 6);
     }
 
     #[test]
