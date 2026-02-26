@@ -440,9 +440,21 @@ In this case, the pre-compaction tape contains the reasoning but has no fingerpr
 
 But how likely is this in practice? The agent almost certainly read the code before modifying it. That read event creates fingerprint anchors in the tape. If the read happened before compaction, those anchors already link the pre-compaction tape to the code. If the read happened after compaction, the post-compaction tape has the anchors. The gap only exists if the agent reasoned about code it had never read or quoted — which is unusual for coding agents that work by reading files, reasoning, then editing.
 
+### Facts vs analysis
+
+There is an important philosophical line here that clarifies what Engram should and should not do.
+
+Fingerprint-based continuation analysis — comparing tape boundaries, scoring overlap density, inferring that two tapes are segments of the same conversation — is **analysis**. It is interpretation of content similarity. Engram is an index, not an analyst. This kind of work belongs in the saliency or enrichment layer, not in core Engram. It violates the non-prescriptive storage principle (P2).
+
+However, if a harness provides a deterministic continuation marker — like a Codex `compacted` event that explicitly says "this is a continuation of session X" — then ingesting that marker **is** Engram's purview. It's storing a raw fact, not performing analysis. The harness told us. We record what we were told. This is the same pattern as `span.link`: if the agent declares lineage, we store it. We don't infer it.
+
+The line: Engram stores facts. Inferring continuations from content overlap is interpretation. Storing explicit continuation markers from harnesses is fact storage.
+
+If a harness emits a continuation marker, the adapter should emit a tape event for it and the indexer should store a continuation edge. If no harness emits one, Engram does not guess. An enrichment agent or saliency layer can perform the inference if it wants to — and store results in a sidecar, clearly labeled as derived.
+
 ### Current position
 
-We are not implementing continuation detection now. The core fingerprint mechanism — which already surfaces all tapes that touched a given span, regardless of their relationship to each other — may solve the problem well enough. Building continuation detection adds complexity (boilerplate exclusion, harness-specific parsers, boundary comparison logic) for a benefit that may already be covered by the simpler mechanism.
+We are not implementing continuation inference in core Engram. If harnesses provide explicit continuation markers, adapters will ingest them as raw facts. The core fingerprint mechanism — which already surfaces all tapes that touched a given span, regardless of their relationship to each other — may solve the remaining problem well enough.
 
 We will revisit if real-world usage reveals gaps where important context is unreachable through normal fingerprint matching.
 
