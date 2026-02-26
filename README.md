@@ -15,7 +15,7 @@ This section is intentionally agent-executable. If an agent follows these steps,
 - `.engram/` → **committed** immutable tape artifacts
 - `.engram-cache/` → **local only** derived cache/index (never committed)
 
-### One-time setup
+### One-time setup (repo-local mode)
 
 ```bash
 # from repo root
@@ -36,6 +36,18 @@ chmod +x .githooks/pre-commit .githooks/pre-push .githooks/post-merge
 git config core.hooksPath .githooks
 ```
 
+Configure sources in `.engram/config.yml`:
+
+```yaml
+sources:
+  - path: ~/.codex/sessions/**/*.jsonl
+    adapter: codex
+  - path: ~/.claude/projects/**/*.jsonl
+    adapter: claude
+exclude:
+  - ~/.claude/projects/**/personal-*
+```
+
 ### Git ↔ Engram hygiene mapping
 
 - `git commit` → pre-commit hook runs `engram ingest`
@@ -53,6 +65,34 @@ engram ingest
 engram explain <file>:<start>-<end>
 ```
 
+### System-wide mode (global index + OpenClaw)
+
+Use global mode when you want one index/tape root shared across repos.
+
+```bash
+# one-time global setup
+engram init --global
+
+# edit ~/.engram/config.yml
+cat > ~/.engram/config.yml <<'YAML'
+sources:
+  - path: ~/.codex/sessions/**/*.jsonl
+    adapter: codex
+  - path: ~/.claude/projects/**/*.jsonl
+    adapter: claude
+  - path: ~/.openclaw/sessions/**/*.jsonl
+    adapter: openclaw
+exclude:
+  - ~/.openclaw/sessions/personal-*
+YAML
+
+# ingest all configured sources into ~/.engram + ~/.engram-cache
+engram ingest --global
+
+# query from any repo using the shared global evidence index
+engram explain src/lib.rs:10-20 --global
+```
+
 ### Invariants
 
 - Tapes are write-once immutable.
@@ -67,6 +107,7 @@ engram explain <file>:<start>-<end>
 - OpenCode: adapter implemented/discovery-backed
 - Gemini CLI: adapter implemented/discovery-backed
 - Cursor: adapter implemented/discovery-backed
+- OpenClaw: minimum deterministic transcript/log adapter implemented
 
 See adapter specs for exact coverage semantics:
 - `specs/adapters/claude-code.md`
