@@ -8,6 +8,10 @@ use std::process::ExitCode;
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use engram::anchor::fingerprint_text;
+use engram::config::{
+    AdapterChoice, default_global_config_yaml, default_repo_config_yaml, expand_tilde,
+    load_effective_config,
+};
 use engram::index::lineage::{
     Cardinality, EvidenceFragmentRef, EvidenceKind, LINK_THRESHOLD_DEFAULT, LocationDelta,
     StoredEdgeClass,
@@ -16,13 +20,18 @@ use engram::index::{EdgeRow, SqliteIndex};
 use engram::query::explain::{
     ExplainTraversal, PrettyConfidenceTier, explain_by_anchor, pretty_tier,
 };
+use engram::tape::adapter::{AdapterId, convert_with_adapter};
 use engram::tape::compress::{compress_jsonl, decompress_jsonl};
 use engram::tape::event::{TapeEventAt, TapeEventData, parse_jsonl_events};
+use glob::glob;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
+use walkdir::WalkDir;
 
 const TAPE_SUFFIX: &str = ".jsonl.zst";
 const TRANSCRIPT_WINDOW_RADIUS: usize = 2;
+const CURSOR_STATE_FILE: &str = "ingest-state.json";
 
 #[derive(Debug)]
 struct CliError {
@@ -59,6 +68,8 @@ impl From<serde_json::Error> for CliError {
 #[command(name = "engram")]
 #[command(about = "A local-first causal index over code history")]
 struct Cli {
+    #[arg(long, global = true)]
+    global: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -66,6 +77,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     Init,
+    Ingest,
     Record(RecordArgs),
     Explain(ExplainArgs),
     Tapes,
@@ -115,6 +127,29 @@ struct RepoPaths {
     index: PathBuf,
     tapes: PathBuf,
     objects: PathBuf,
+    cache_root: PathBuf,
+    cursors: PathBuf,
+    repo_config: PathBuf,
+    user_config: PathBuf,
+    mode: StorageMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageMode {
+    RepoLocal,
+    Global,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct IngestState {
+    files: HashMap<String, IngestFileState>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IngestFileState {
+    input_hash: String,
+    adapter: String,
+    tape_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -142,30 +177,38 @@ fn main() -> ExitCode {
 fn run() -> Result<(), CliError> {
     let cli = Cli::parse();
     let cwd = std::env::current_dir().map_err(|err| CliError::io("cwd_error", err))?;
+    let paths = repo_paths(&cwd, cli.global)?;
     match cli.command {
-        Command::Init => cmd_init(&cwd),
-        Command::Record(args) => cmd_record(&cwd, args),
-        Command::Explain(args) => cmd_explain(&cwd, args),
-        Command::Tapes => cmd_tapes(&cwd),
-        Command::Show(args) => cmd_show(&cwd, args),
-        Command::Gc => cmd_gc(&cwd),
+        Command::Init => cmd_init(&paths),
+        Command::Ingest => cmd_ingest(&cwd, &paths),
+        Command::Record(args) => cmd_record(&cwd, &paths, args),
+        Command::Explain(args) => cmd_explain(&cwd, &paths, args),
+        Command::Tapes => cmd_tapes(&paths),
+        Command::Show(args) => cmd_show(&paths, args),
+        Command::Gc => cmd_gc(&paths),
     }
 }
 
-fn cmd_init(cwd: &Path) -> Result<(), CliError> {
-    let paths = repo_paths(cwd);
+fn cmd_init(paths: &RepoPaths) -> Result<(), CliError> {
     fs::create_dir_all(&paths.tapes).map_err(|err| CliError::io("mkdir_error", err))?;
     fs::create_dir_all(&paths.objects).map_err(|err| CliError::io("mkdir_error", err))?;
+    fs::create_dir_all(&paths.cursors).map_err(|err| CliError::io("mkdir_error", err))?;
     let _ = SqliteIndex::open(&path_string(&paths.index))?;
+    write_default_config(paths)?;
 
     print_json(&json!({
         "status": "ok",
         "engram_dir": paths.root,
+        "cache_dir": paths.cache_root,
         "index": paths.index,
+        "mode": match paths.mode {
+            StorageMode::RepoLocal => "repo",
+            StorageMode::Global => "global",
+        },
     }))
 }
 
-fn cmd_record(cwd: &Path, args: RecordArgs) -> Result<(), CliError> {
+fn cmd_record(cwd: &Path, paths: &RepoPaths, args: RecordArgs) -> Result<(), CliError> {
     if args.stdin && !args.command.is_empty() {
         return Err(CliError::new(
             "invalid_record_args",
@@ -173,7 +216,7 @@ fn cmd_record(cwd: &Path, args: RecordArgs) -> Result<(), CliError> {
         ));
     }
 
-    let paths = require_initialized_paths(cwd)?;
+    require_initialized_paths(paths)?;
     if args.stdin {
         let mut stdin_buf = String::new();
         io::stdin()
@@ -209,6 +252,116 @@ fn cmd_record(cwd: &Path, args: RecordArgs) -> Result<(), CliError> {
     )
 }
 
+fn cmd_ingest(cwd: &Path, paths: &RepoPaths) -> Result<(), CliError> {
+    require_initialized_paths(paths)?;
+    let home = home_dir()?;
+    let config = load_effective_config(Some(&paths.repo_config), Some(&paths.user_config))
+        .map_err(|err| CliError::new("config_error", err.to_string()))?;
+    if config.sources.is_empty() {
+        return Err(CliError::new(
+            "missing_sources",
+            "no ingest sources configured; add sources in .engram/config.yml or ~/.engram/config.yml",
+        ));
+    }
+
+    let candidates = resolve_source_files(cwd, &home, &config.sources, &config.exclude)?;
+    let mut state = load_ingest_state(paths)?;
+    let index = SqliteIndex::open(&path_string(&paths.index))?;
+
+    let mut scanned = 0usize;
+    let mut imported = 0usize;
+    let mut skipped_unchanged = 0usize;
+    let mut skipped_existing_tape = 0usize;
+    let mut failures = Vec::new();
+
+    for candidate in candidates {
+        scanned += 1;
+        let input = match fs::read_to_string(&candidate.path) {
+            Ok(content) => content,
+            Err(err) => {
+                failures.push(json!({
+                    "path": candidate.path,
+                    "error": err.to_string(),
+                }));
+                continue;
+            }
+        };
+        let input_hash = sha256_hex(&input);
+        let state_key = format!(
+            "{}:{}",
+            candidate.adapter.as_str(),
+            candidate.path.to_string_lossy()
+        );
+        if let Some(prev) = state.files.get(&state_key) {
+            if prev.input_hash == input_hash {
+                skipped_unchanged += 1;
+                continue;
+            }
+        }
+
+        let normalized = match convert_with_adapter(candidate.adapter, &input) {
+            Ok(output) => output,
+            Err(err) => {
+                failures.push(json!({
+                    "path": candidate.path,
+                    "adapter": candidate.adapter.as_str(),
+                    "error": err.to_string(),
+                }));
+                continue;
+            }
+        };
+        let events = match parse_jsonl_events(&normalized) {
+            Ok(events) => events,
+            Err(err) => {
+                failures.push(json!({
+                    "path": candidate.path,
+                    "adapter": candidate.adapter.as_str(),
+                    "error": err.to_string(),
+                }));
+                continue;
+            }
+        };
+
+        let tape_id = tape_id_for_contents(&normalized);
+        let tape_path = tape_path_for_id(paths, &tape_id);
+        let tape_file_exists = tape_path.exists();
+        if !tape_file_exists {
+            let compressed =
+                compress_jsonl(&normalized).map_err(|err| CliError::io("compress_error", err))?;
+            fs::write(&tape_path, &compressed).map_err(|err| CliError::io("write_error", err))?;
+        }
+
+        let already_indexed = index.has_tape(&tape_id)?;
+        if !already_indexed {
+            index.ingest_tape_events(&tape_id, &events, LINK_THRESHOLD_DEFAULT)?;
+            imported += 1;
+        } else {
+            skipped_existing_tape += 1;
+        }
+
+        state.files.insert(
+            state_key,
+            IngestFileState {
+                input_hash,
+                adapter: candidate.adapter.as_str().to_string(),
+                tape_id,
+            },
+        );
+    }
+
+    save_ingest_state(paths, &state)?;
+
+    print_json(&json!({
+        "status": if failures.is_empty() { "ok" } else { "partial" },
+        "scanned_inputs": scanned,
+        "imported_tapes": imported,
+        "skipped_unchanged": skipped_unchanged,
+        "skipped_existing_tape": skipped_existing_tape,
+        "failure_count": failures.len(),
+        "failures": failures,
+    }))
+}
+
 struct CapturedCommandTape {
     raw_jsonl: String,
     argv: Vec<String>,
@@ -216,6 +369,12 @@ struct CapturedCommandTape {
     success: bool,
     stdout_bytes: usize,
     stderr_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+struct IngestCandidate {
+    path: PathBuf,
+    adapter: AdapterId,
 }
 
 fn capture_command_tape(cwd: &Path, command: &[String]) -> Result<CapturedCommandTape, CliError> {
@@ -280,6 +439,181 @@ fn capture_command_tape(cwd: &Path, command: &[String]) -> Result<CapturedComman
         stdout_bytes: output.stdout.len(),
         stderr_bytes: output.stderr.len(),
     })
+}
+
+fn resolve_source_files(
+    cwd: &Path,
+    home: &Path,
+    sources: &[engram::config::SourceSpec],
+    exclude_patterns: &[String],
+) -> Result<Vec<IngestCandidate>, CliError> {
+    let mut out = Vec::new();
+    let excludes = compile_excludes(cwd, home, exclude_patterns)?;
+
+    for source in sources {
+        let raw_path = source.path.trim();
+        if raw_path.is_empty() {
+            continue;
+        }
+        let expanded = expand_tilde(raw_path, home);
+        let source_files = if looks_like_glob(raw_path) {
+            glob_paths(&expanded)?
+        } else if expanded.is_dir() {
+            WalkDir::new(&expanded)
+                .into_iter()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path().to_path_buf())
+                .filter(|path| path.is_file())
+                .collect::<Vec<_>>()
+        } else if expanded.is_file() {
+            vec![expanded]
+        } else {
+            Vec::new()
+        };
+
+        for path in source_files {
+            if is_excluded(&path, &excludes) {
+                continue;
+            }
+            let adapter = match source.adapter {
+                AdapterChoice::Auto => {
+                    let input = fs::read_to_string(&path)
+                        .map_err(|err| CliError::new("read_source_error", err.to_string()))?;
+                    detect_adapter_for_input(&path, &input).ok_or_else(|| {
+                        CliError::new(
+                            "adapter_detection_error",
+                            format!("unable to detect adapter for {}", path.display()),
+                        )
+                    })?
+                }
+                AdapterChoice::Codex => AdapterId::CodexCli,
+                AdapterChoice::Claude => AdapterId::ClaudeCode,
+                AdapterChoice::Cursor => AdapterId::Cursor,
+                AdapterChoice::Gemini => AdapterId::GeminiCli,
+                AdapterChoice::OpenCode => AdapterId::OpenCode,
+                AdapterChoice::OpenClaw => AdapterId::OpenClaw,
+            };
+            out.push(IngestCandidate { path, adapter });
+        }
+    }
+
+    out.sort_by(|a, b| {
+        let a_key = format!("{}:{}", a.adapter.as_str(), a.path.to_string_lossy());
+        let b_key = format!("{}:{}", b.adapter.as_str(), b.path.to_string_lossy());
+        a_key.cmp(&b_key)
+    });
+    out.dedup_by(|a, b| a.path == b.path && a.adapter == b.adapter);
+    Ok(out)
+}
+
+fn looks_like_glob(path: &str) -> bool {
+    ['*', '?', '[', ']', '{', '}']
+        .iter()
+        .any(|ch| path.contains(*ch))
+}
+
+fn glob_paths(pattern: &Path) -> Result<Vec<PathBuf>, CliError> {
+    let pattern_str = pattern.to_string_lossy();
+    let mut out = Vec::new();
+    let entries = glob(&pattern_str)
+        .map_err(|err| CliError::new("glob_error", format!("{} ({pattern_str})", err.msg)))?;
+    for entry in entries {
+        match entry {
+            Ok(path) if path.is_file() => out.push(path),
+            Ok(_) => {}
+            Err(err) => {
+                return Err(CliError::new("glob_error", err.to_string()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn compile_excludes(
+    cwd: &Path,
+    home: &Path,
+    patterns: &[String],
+) -> Result<Vec<glob::Pattern>, CliError> {
+    let mut compiled = Vec::new();
+    for pattern in patterns {
+        let raw = pattern.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let expanded = expand_tilde(raw, home);
+        let normalized = if expanded.is_absolute() {
+            expanded.to_string_lossy().to_string()
+        } else {
+            cwd.join(expanded).to_string_lossy().to_string()
+        };
+        let compiled_pattern = glob::Pattern::new(&normalized)
+            .map_err(|err| CliError::new("exclude_glob_error", err.to_string()))?;
+        compiled.push(compiled_pattern);
+    }
+    Ok(compiled)
+}
+
+fn is_excluded(path: &Path, excludes: &[glob::Pattern]) -> bool {
+    excludes.iter().any(|pattern| pattern.matches_path(path))
+}
+
+fn detect_adapter_for_input(path: &Path, input: &str) -> Option<AdapterId> {
+    let lower_path = path.to_string_lossy().to_ascii_lowercase();
+    let preferred = if lower_path.contains(".codex/sessions") || lower_path.ends_with("history.jsonl")
+    {
+        Some(AdapterId::CodexCli)
+    } else if lower_path.contains(".claude/projects") {
+        Some(AdapterId::ClaudeCode)
+    } else if lower_path.contains("opencode") {
+        Some(AdapterId::OpenCode)
+    } else if lower_path.contains("cursor") {
+        Some(AdapterId::Cursor)
+    } else if lower_path.contains("gemini") {
+        Some(AdapterId::GeminiCli)
+    } else if lower_path.contains(".openclaw") || lower_path.contains("openclaw") {
+        Some(AdapterId::OpenClaw)
+    } else {
+        None
+    };
+
+    if let Some(adapter) = preferred {
+        if convert_with_adapter(adapter, input).is_ok() {
+            return Some(adapter);
+        }
+    }
+
+    for adapter in [
+        AdapterId::CodexCli,
+        AdapterId::ClaudeCode,
+        AdapterId::OpenCode,
+        AdapterId::Cursor,
+        AdapterId::GeminiCli,
+        AdapterId::OpenClaw,
+    ] {
+        if convert_with_adapter(adapter, input).is_ok() {
+            return Some(adapter);
+        }
+    }
+    None
+}
+
+fn load_ingest_state(paths: &RepoPaths) -> Result<IngestState, CliError> {
+    fs::create_dir_all(&paths.cursors).map_err(|err| CliError::io("mkdir_error", err))?;
+    let state_path = paths.cursors.join(CURSOR_STATE_FILE);
+    if !state_path.exists() {
+        return Ok(IngestState::default());
+    }
+    let content = fs::read_to_string(&state_path).map_err(|err| CliError::io("read_error", err))?;
+    serde_json::from_str::<IngestState>(&content)
+        .map_err(|err| CliError::new("cursor_state_error", err.to_string()))
+}
+
+fn save_ingest_state(paths: &RepoPaths, state: &IngestState) -> Result<(), CliError> {
+    fs::create_dir_all(&paths.cursors).map_err(|err| CliError::io("mkdir_error", err))?;
+    let state_path = paths.cursors.join(CURSOR_STATE_FILE);
+    let content = serde_json::to_string_pretty(state)
+        .map_err(|err| CliError::new("cursor_state_error", err.to_string()))?;
+    fs::write(state_path, content).map_err(|err| CliError::io("write_error", err))
 }
 
 fn record_transcript(
@@ -353,8 +687,8 @@ fn git_head(cwd: &Path) -> Option<String> {
     }
 }
 
-fn cmd_tapes(cwd: &Path) -> Result<(), CliError> {
-    let paths = require_initialized_paths(cwd)?;
+fn cmd_tapes(paths: &RepoPaths) -> Result<(), CliError> {
+    require_initialized_paths(paths)?;
     let mut tapes = Vec::new();
 
     let entries = fs::read_dir(&paths.tapes).map_err(|err| CliError::io("read_dir_error", err))?;
@@ -401,8 +735,8 @@ fn cmd_tapes(cwd: &Path) -> Result<(), CliError> {
     print_json(&json!({ "tapes": tapes }))
 }
 
-fn cmd_show(cwd: &Path, args: ShowArgs) -> Result<(), CliError> {
-    let paths = require_initialized_paths(cwd)?;
+fn cmd_show(paths: &RepoPaths, args: ShowArgs) -> Result<(), CliError> {
+    require_initialized_paths(paths)?;
     let tape_path = tape_path_for_id(&paths, &args.tape_id);
     if !tape_path.exists() {
         return Err(CliError::new(
@@ -433,8 +767,8 @@ fn cmd_show(cwd: &Path, args: ShowArgs) -> Result<(), CliError> {
     }))
 }
 
-fn cmd_gc(cwd: &Path) -> Result<(), CliError> {
-    let paths = require_initialized_paths(cwd)?;
+fn cmd_gc(paths: &RepoPaths) -> Result<(), CliError> {
+    require_initialized_paths(paths)?;
     let index = SqliteIndex::open(&path_string(&paths.index))?;
     let referenced = index
         .referenced_tape_ids()?
@@ -470,8 +804,8 @@ fn cmd_gc(cwd: &Path) -> Result<(), CliError> {
     }))
 }
 
-fn cmd_explain(cwd: &Path, args: ExplainArgs) -> Result<(), CliError> {
-    let paths = require_initialized_paths(cwd)?;
+fn cmd_explain(cwd: &Path, paths: &RepoPaths, args: ExplainArgs) -> Result<(), CliError> {
+    require_initialized_paths(paths)?;
     let anchors = resolve_explain_anchors(cwd, &args)?;
 
     let index = SqliteIndex::open(&path_string(&paths.index))?;
@@ -818,25 +1152,67 @@ fn edge_to_json(edge: &EdgeRow) -> Value {
     })
 }
 
-fn repo_paths(cwd: &Path) -> RepoPaths {
-    let root = cwd.join(".engram");
-    RepoPaths {
+fn repo_paths(cwd: &Path, global: bool) -> Result<RepoPaths, CliError> {
+    let home = home_dir()?;
+    let (root, cache_root, mode) = if global {
+        (
+            home.join(".engram"),
+            home.join(".engram-cache"),
+            StorageMode::Global,
+        )
+    } else {
+        (
+            cwd.join(".engram"),
+            cwd.join(".engram-cache"),
+            StorageMode::RepoLocal,
+        )
+    };
+
+    Ok(RepoPaths {
         index: root.join("index.sqlite"),
         tapes: root.join("tapes"),
         objects: root.join("objects"),
+        cursors: cache_root.join("cursors"),
+        repo_config: cwd.join(".engram").join("config.yml"),
+        user_config: home.join(".engram").join("config.yml"),
         root,
-    }
+        cache_root,
+        mode,
+    })
 }
 
-fn require_initialized_paths(cwd: &Path) -> Result<RepoPaths, CliError> {
-    let paths = repo_paths(cwd);
+fn require_initialized_paths(paths: &RepoPaths) -> Result<(), CliError> {
     if !paths.root.exists() || !paths.index.exists() || !paths.tapes.exists() {
         return Err(CliError::new(
             "not_initialized",
             "repository is not initialized; run `engram init`",
         ));
     }
-    Ok(paths)
+    Ok(())
+}
+
+fn write_default_config(paths: &RepoPaths) -> Result<(), CliError> {
+    let config_path = match paths.mode {
+        StorageMode::RepoLocal => &paths.repo_config,
+        StorageMode::Global => &paths.user_config,
+    };
+    if config_path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| CliError::io("mkdir_error", err))?;
+    }
+    let default = match paths.mode {
+        StorageMode::RepoLocal => default_repo_config_yaml(),
+        StorageMode::Global => default_global_config_yaml(),
+    };
+    fs::write(config_path, default).map_err(|err| CliError::io("write_error", err))
+}
+
+fn home_dir() -> Result<PathBuf, CliError> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| CliError::new("home_error", "HOME environment variable is not set"))
 }
 
 fn tape_path_for_id(paths: &RepoPaths, tape_id: &str) -> PathBuf {
@@ -864,6 +1240,10 @@ fn print_json(value: &Value) -> Result<(), CliError> {
 }
 
 fn tape_id_for_contents(input: &str) -> String {
+    sha256_hex(input)
+}
+
+fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     let digest = hasher.finalize();
