@@ -49,6 +49,18 @@ fn tape_id_for_contents(input: &str) -> String {
     out
 }
 
+fn sha256_hex(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
 #[test]
 fn init_record_tapes_show_and_explain_roundtrip() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -93,11 +105,51 @@ fn init_record_tapes_show_and_explain_roundtrip() {
 
     let explain = run_json(repo, &["explain", "src/lib.rs:2-2"], None);
     let query_anchors = explain["query"]["anchors"].as_array().expect("anchors");
-    assert_eq!(query_anchors.len(), 1);
-    assert_eq!(query_anchors[0], span_anchor);
+    assert!(query_anchors.len() >= 1);
+    assert!(query_anchors.iter().any(|anchor| anchor == &span_anchor));
     let sessions = explain["sessions"].as_array().expect("sessions");
     assert_eq!(sessions.len(), 1);
     assert!(sessions[0]["touch_count"].as_u64().unwrap_or(0) >= 1);
+}
+
+#[test]
+fn explain_matches_legacy_sha_edit_anchor_for_span_targets() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+    fs::create_dir_all(repo.join("src")).expect("src dir");
+    fs::write(repo.join("src/lib.rs"), "alpha\nomega\nzeta\n").expect("seed file");
+
+    let _ = run_json(repo, &["init"], None);
+
+    let legacy_sha_anchor = sha256_hex("omega");
+    let transcript = format!(
+        concat!(
+            "{{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"code.edit\",\"file\":\"src/lib.rs\",",
+            "\"before_range\":[2,2],\"after_range\":[2,2],",
+            "\"before_hash\":\"deadbeef\",\"after_hash\":\"{0}\",\"similarity\":0.95}}\n"
+        ),
+        legacy_sha_anchor
+    );
+    let _ = run_json(repo, &["record", "--stdin"], Some(&transcript));
+
+    let explain = run_json(repo, &["explain", "src/lib.rs:2-2"], None);
+    let query_anchors = explain["query"]["anchors"].as_array().expect("anchors");
+    assert!(
+        query_anchors
+            .iter()
+            .any(|anchor| anchor == &Value::String(legacy_sha_anchor.clone())),
+        "expected sha anchor fallback in query anchors"
+    );
+    assert_eq!(
+        explain["sessions"].as_array().expect("sessions").len(),
+        1,
+        "expected explain to recover session via legacy sha edit anchor"
+    );
+    assert_eq!(
+        explain["lineage"].as_array().expect("lineage").len(),
+        1,
+        "expected inbound edit linkage for matched anchor"
+    );
 }
 
 #[test]

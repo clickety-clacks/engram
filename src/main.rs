@@ -1049,8 +1049,31 @@ fn resolve_explain_anchors(cwd: &Path, args: &ExplainArgs) -> Result<Vec<String>
     let (file, start, end) = parse_file_range_target(&args.target)?;
     let file_path = cwd.join(file);
     let span_text = read_file_span(&file_path, start, end)?;
-    let anchor = fingerprint_text(&span_text);
-    Ok(vec![anchor.fingerprint])
+    Ok(derive_anchor_candidates(&span_text))
+}
+
+fn derive_anchor_candidates(span_text: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+
+    let fingerprint = fingerprint_text(span_text).fingerprint;
+    if seen.insert(fingerprint.clone()) {
+        out.push(fingerprint);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(span_text.as_bytes());
+    let digest = hasher.finalize();
+    let mut sha = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut sha, "{byte:02x}");
+    }
+    if seen.insert(sha.clone()) {
+        out.push(sha);
+    }
+
+    out
 }
 
 fn parse_file_range_target(target: &str) -> Result<(&str, u32, u32), CliError> {
