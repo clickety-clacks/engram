@@ -153,8 +153,10 @@ fn global_mode_uses_home_roots_and_explain_queries_ingested_evidence() {
         &source_path,
         format!(
             concat!(
-                "{{\"timestamp\":\"2026-02-26T00:00:00Z\",\"type\":\"user\",\"role\":\"user\",\"session_id\":\"oc-g1\",\"content\":\"Investigate span\"}}\n",
-                "{{\"timestamp\":\"2026-02-26T00:00:01Z\",\"type\":\"code.edit\",\"file\":\"src/lib.rs\",\"before_hash\":\"x\",\"after_hash\":\"{0}\",\"similarity\":0.91}}\n"
+                "{{\"type\":\"session\",\"id\":\"oc-g1\",\"timestamp\":\"2026-02-26T00:00:00Z\"}}\n",
+                "{{\"type\":\"message\",\"id\":\"m1\",\"timestamp\":\"2026-02-26T00:00:00Z\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"Investigate span\"}}]}}}}\n",
+                "{{\"type\":\"message\",\"id\":\"m2\",\"timestamp\":\"2026-02-26T00:00:01Z\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"Preparing tool call\"}},{{\"type\":\"toolCall\",\"id\":\"call-g1\",\"name\":\"Apply\",\"arguments\":{{\"file\":\"src/lib.rs\",\"after_hash\":\"{0}\"}}}}]}}}}\n",
+                "{{\"type\":\"message\",\"id\":\"m3\",\"timestamp\":\"2026-02-26T00:00:02Z\",\"message\":{{\"role\":\"toolResult\",\"toolCallId\":\"call-g1\",\"toolName\":\"Apply\",\"content\":[{{\"type\":\"text\",\"text\":\"ok\"}}],\"isError\":false}}}}\n"
             ),
             anchor
         ),
