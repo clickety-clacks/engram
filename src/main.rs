@@ -256,12 +256,12 @@ fn cmd_record(cwd: &Path, paths: &RepoPaths, args: RecordArgs) -> Result<(), Cli
 fn cmd_ingest(cwd: &Path, paths: &RepoPaths) -> Result<(), CliError> {
     require_initialized_paths(paths)?;
     let home = home_dir()?;
-    let config = load_effective_config(Some(&paths.repo_config), Some(&paths.user_config))
+    let config = load_effective_config(cwd, Some(&paths.repo_config), Some(&paths.user_config))
         .map_err(|err| CliError::new("config_error", err.to_string()))?;
     if config.sources.is_empty() {
         return Err(CliError::new(
             "missing_sources",
-            "no ingest sources configured; add sources in .engram/config.yml or ~/.engram/config.yml",
+            "no ingest sources configured; add sources in ~/.engram/config.yml, nearest .engram.project.yml, or .engram/config.yml",
         ));
     }
 

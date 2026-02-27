@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -29,9 +30,9 @@ pub struct EffectiveConfig {
 #[derive(Debug, Deserialize)]
 struct RawConfig {
     #[serde(default)]
-    sources: Vec<RawSourceSpec>,
+    sources: Option<Vec<RawSourceSpec>>,
     #[serde(default)]
-    exclude: Vec<String>,
+    exclude: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,7 +91,14 @@ impl From<serde_yaml::Error> for ConfigError {
     }
 }
 
+#[derive(Debug)]
+struct ConfigLayer {
+    sources: Vec<SourceSpec>,
+    exclude: Option<Vec<String>>,
+}
+
 pub fn load_effective_config(
+    cwd: &Path,
     repo_config: Option<&Path>,
     user_config: Option<&Path>,
 ) -> Result<EffectiveConfig, ConfigError> {
@@ -99,35 +107,82 @@ pub fn load_effective_config(
         exclude: Vec::new(),
     };
 
-    if let Some(path) = user_config {
-        if path.exists() {
-            let cfg = load_config_file(path)?;
-            merged.sources.extend(cfg.sources);
-            merged.exclude.extend(cfg.exclude);
-        }
+    if let Some(path) = user_config.filter(|path| path.exists()) {
+        let cfg = load_config_layer(path)?;
+        merge_layer(&mut merged, cfg);
     }
 
-    if let Some(path) = repo_config {
-        if path.exists() {
-            let cfg = load_config_file(path)?;
-            merged.sources.extend(cfg.sources);
-            merged.exclude.extend(cfg.exclude);
-        }
+    if let Some(path) = find_nearest_project_config(cwd) {
+        let cfg = load_config_layer(&path)?;
+        merge_layer(&mut merged, cfg);
+    }
+
+    if let Some(path) = repo_config.filter(|path| path.exists()) {
+        let cfg = load_config_layer(path)?;
+        merge_layer(&mut merged, cfg);
     }
 
     Ok(merged)
 }
 
-pub fn load_config_file(path: &Path) -> Result<EffectiveConfig, ConfigError> {
+pub fn find_nearest_project_config(start: &Path) -> Option<PathBuf> {
+    for dir in start.ancestors() {
+        let candidate = dir.join(".engram.project.yml");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn merge_layer(merged: &mut EffectiveConfig, layer: ConfigLayer) {
+    merge_sources_dedup(&mut merged.sources, layer.sources);
+    if let Some(exclude) = layer.exclude {
+        merged.exclude = exclude;
+    }
+}
+
+fn merge_sources_dedup(existing: &mut Vec<SourceSpec>, incoming: Vec<SourceSpec>) {
+    let mut indices = HashMap::new();
+    for (idx, source) in existing.iter().enumerate() {
+        indices.insert(source.path.clone(), idx);
+    }
+
+    for source in incoming {
+        if let Some(idx) = indices.get(&source.path).copied() {
+            existing[idx] = source;
+        } else {
+            let idx = existing.len();
+            indices.insert(source.path.clone(), idx);
+            existing.push(source);
+        }
+    }
+}
+
+fn load_config_layer(path: &Path) -> Result<ConfigLayer, ConfigError> {
     let content = fs::read_to_string(path)?;
-    let raw: RawConfig = serde_yaml::from_str(&content)?;
-    let mut sources = Vec::with_capacity(raw.sources.len());
-    for source in raw.sources {
+    parse_config_layer(&content)
+}
+
+fn parse_config_layer(content: &str) -> Result<ConfigLayer, ConfigError> {
+    let raw: RawConfig = serde_yaml::from_str(content)?;
+    let raw_sources = raw.sources.unwrap_or_default();
+    let mut sources = Vec::with_capacity(raw_sources.len());
+    for source in raw_sources {
         sources.push(source.into_source()?);
     }
-    Ok(EffectiveConfig {
+    Ok(ConfigLayer {
         sources,
         exclude: raw.exclude,
+    })
+}
+
+pub fn load_config_file(path: &Path) -> Result<EffectiveConfig, ConfigError> {
+    let content = fs::read_to_string(path)?;
+    let layer = parse_config_layer(&content)?;
+    Ok(EffectiveConfig {
+        sources: layer.sources,
+        exclude: layer.exclude.unwrap_or_default(),
     })
 }
 
@@ -181,7 +236,8 @@ fn parse_adapter_choice(raw: &str) -> Result<AdapterChoice, ConfigError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AdapterChoice, expand_tilde, load_config_file};
+    use super::{AdapterChoice, expand_tilde, load_config_file, load_effective_config};
+    use std::path::Path;
 
     #[test]
     fn parses_source_schema_and_excludes() {
@@ -209,7 +265,112 @@ exclude:
 
     #[test]
     fn expands_tilde_paths() {
-        let expanded = expand_tilde("~/sessions", std::path::Path::new("/home/tester"));
-        assert_eq!(expanded, std::path::Path::new("/home/tester/sessions"));
+        let expanded = expand_tilde("~/sessions", Path::new("/home/tester"));
+        assert_eq!(expanded, Path::new("/home/tester/sessions"));
+    }
+
+    #[test]
+    fn merges_global_project_and_repo_with_deduped_sources() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let repo = root.join("workspace/repo");
+        std::fs::create_dir_all(repo.join(".engram")).expect("repo config dir");
+        std::fs::create_dir_all(root.join("home/.engram")).expect("home config dir");
+
+        let user_cfg = root.join("home/.engram/config.yml");
+        std::fs::write(
+            &user_cfg,
+            r#"sources:
+  - path: /shared/global.jsonl
+    adapter: codex
+  - path: /shared/dup.jsonl
+    adapter: openclaw
+exclude:
+  - "user-*"
+"#,
+        )
+        .expect("write user config");
+
+        let project_cfg = root.join("workspace/.engram.project.yml");
+        std::fs::write(
+            &project_cfg,
+            r#"sources:
+  - path: /shared/project.jsonl
+    adapter: cursor
+  - path: /shared/dup.jsonl
+    adapter: claude
+exclude:
+  - "project-*"
+"#,
+        )
+        .expect("write project config");
+
+        let repo_cfg = repo.join(".engram/config.yml");
+        std::fs::write(
+            &repo_cfg,
+            r#"sources:
+  - path: /shared/repo.jsonl
+    adapter: gemini
+  - path: /shared/dup.jsonl
+    adapter: codex
+exclude:
+  - "repo-*"
+"#,
+        )
+        .expect("write repo config");
+
+        let merged =
+            load_effective_config(&repo, Some(&repo_cfg), Some(&user_cfg)).expect("merge config");
+        assert_eq!(merged.sources.len(), 4);
+        assert_eq!(merged.sources[0].path, "/shared/global.jsonl");
+        assert_eq!(merged.sources[1].path, "/shared/dup.jsonl");
+        assert_eq!(merged.sources[1].adapter, AdapterChoice::Codex);
+        assert_eq!(merged.sources[2].path, "/shared/project.jsonl");
+        assert_eq!(merged.sources[3].path, "/shared/repo.jsonl");
+        assert_eq!(merged.exclude, vec!["repo-*".to_string()]);
+    }
+
+    #[test]
+    fn uses_nearest_project_config_when_walking_parents() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let repo = root.join("workspace/repo");
+        std::fs::create_dir_all(repo.join(".engram")).expect("repo config dir");
+        std::fs::create_dir_all(root.join("home/.engram")).expect("home config dir");
+
+        let user_cfg = root.join("home/.engram/config.yml");
+        std::fs::write(
+            &user_cfg,
+            r#"sources:
+  - path: /shared/user.jsonl
+    adapter: codex
+"#,
+        )
+        .expect("write user config");
+
+        std::fs::write(
+            root.join(".engram.project.yml"),
+            r#"sources:
+  - path: /shared/root-project.jsonl
+    adapter: codex
+"#,
+        )
+        .expect("write root project config");
+
+        std::fs::write(
+            root.join("workspace/.engram.project.yml"),
+            r#"sources:
+  - path: /shared/nearest-project.jsonl
+    adapter: claude
+"#,
+        )
+        .expect("write nearest project config");
+
+        let merged =
+            load_effective_config(&repo, None, Some(&user_cfg)).expect("merge with nearest");
+        assert_eq!(merged.sources.len(), 2);
+        assert_eq!(merged.sources[0].path, "/shared/user.jsonl");
+        assert_eq!(merged.sources[1].path, "/shared/nearest-project.jsonl");
+        assert_eq!(merged.sources[1].adapter, AdapterChoice::Claude);
     }
 }

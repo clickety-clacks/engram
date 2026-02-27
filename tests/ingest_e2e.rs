@@ -229,3 +229,64 @@ fn ingest_merges_user_and_repo_config_sources() {
     assert_eq!(ingest["status"], "ok");
     assert_eq!(ingest["imported_tapes"], 2);
 }
+
+#[test]
+fn ingest_walks_project_config_and_dedupes_sources_by_path() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    fs::create_dir_all(home.join(".engram")).expect("user engram");
+
+    let workspace = temp.path().join("workspace");
+    let repo = workspace.join("repo");
+    fs::create_dir_all(repo.join(".engram")).expect("repo engram");
+
+    let codex_source = repo.join("shared-source.jsonl");
+    fs::write(
+        &codex_source,
+        include_str!("fixtures/codex/supported_paths.jsonl"),
+    )
+    .expect("source fixture");
+
+    let home_str = home.to_string_lossy().to_string();
+    let envs = [("HOME", home_str.as_str())];
+    let _ = run_json(&repo, &["init"], None, &envs);
+
+    fs::write(
+        home.join(".engram/config.yml"),
+        format!(
+            "sources:\n  - path: {}\n    adapter: openclaw\nexclude:\n  - user-only\n",
+            codex_source.display()
+        ),
+    )
+    .expect("user config");
+
+    fs::write(
+        temp.path().join(".engram.project.yml"),
+        "sources:\n  - path: /does/not/exist.jsonl\n    adapter: codex\nexclude:\n  - root-only\n",
+    )
+    .expect("root project config");
+
+    fs::write(
+        workspace.join(".engram.project.yml"),
+        format!(
+            "sources:\n  - path: {}\n    adapter: cursor\nexclude:\n  - project-only\n",
+            codex_source.display()
+        ),
+    )
+    .expect("nearest project config");
+
+    fs::write(
+        repo.join(".engram/config.yml"),
+        format!(
+            "sources:\n  - path: {}\n    adapter: codex\nexclude: []\n",
+            codex_source.display()
+        ),
+    )
+    .expect("repo config");
+
+    let ingest = run_json(&repo, &["ingest"], None, &envs);
+    assert_eq!(ingest["status"], "ok");
+    assert_eq!(ingest["scanned_inputs"], 1);
+    assert_eq!(ingest["imported_tapes"], 1);
+    assert_eq!(ingest["failure_count"], 0);
+}
