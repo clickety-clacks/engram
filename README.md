@@ -93,6 +93,22 @@ engram ingest --global
 engram explain src/lib.rs:10-20 --global
 ```
 
+## Deployment Model
+
+Engram uses a two-layer architecture:
+
+- **Layer 1: portable repo tapes**  
+  `.engram/tapes` lives in the repository and is meant to be checked in with git. This is the portable baseline provenance that travels with the repo.
+- **Layer 2: private overlays (not checked in)**  
+  Extra tape folders come from `sources:` in config (user/global/project-local/shared paths). These remain outside git and are machine/user specific by default.
+
+Effective ingest sources are:
+
+- repo tapes (`.engram/tapes`)
+- overlay sources from config (`sources:`)
+
+For multi-machine setups, share tape folders with NFS or file sync and let each machine build and maintain its own local index (`.engram-cache` or `~/.engram-cache`).
+
 ### Invariants
 
 - Tapes are write-once immutable.
