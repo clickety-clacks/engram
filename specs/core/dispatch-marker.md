@@ -99,8 +99,7 @@ with a fade when they scroll back to the bottom...
 ## Multi-Level Chains
 
 The convention composes across arbitrary depth. Each handoff embeds a UUID;
-each UUID independently links two adjacent transcripts. Engram can traverse
-the full chain at query time:
+each UUID independently links two adjacent transcripts.
 
 ```
 Session A ──[uuid-1]──▶ Session B ──[uuid-2]──▶ Session C ──edits──▶ file.swift
@@ -108,10 +107,12 @@ Session A ──[uuid-1]──▶ Session B ──[uuid-2]──▶ Session C �
        links A↔B                links B↔C
 ```
 
-`engram explain file.swift:220-240` finds Session C, scans for dispatch markers,
-finds `uuid-2`, retrieves Session B, scans Session B for markers, finds `uuid-1`,
-retrieves Session A. The full chain surfaces without any of the intermediate
-sessions needing to know about each other.
+Explain resolves the full chain in a single call via UUID expansion: find all
+`[engram:src=<uuid>]` markers in the result sessions, search all indexed tapes
+for those UUIDs, add any new sessions found, extract their markers, and repeat
+until the set is stable. Since all tapes share the same index regardless of
+which tool or party produced them, each UUID lookup is a flat text search —
+no hierarchy traversal required.
 
 ## Query Modes
 
