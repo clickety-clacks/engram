@@ -2,28 +2,76 @@
 
 Status: Draft
 
-## Problem
+## Problem: Multi-Party Transcript Splitting
 
-Engram can explain which agent sessions touched a span of code. It cannot explain
-*why* those sessions existed — what orchestrator conversation originated the work.
+Modern AI-assisted development rarely happens in a single conversation. A piece
+of work typically crosses several distinct sessions before it touches code:
 
-In vibe-coding workflows, the reasoning behind a code change lives in the
-orchestrator conversation (e.g., a CLU stream discussing a bug or feature), not
-in the coding agent session that made the edit. These are separate transcripts
-with no structural link between them.
+```
+┌─────────────────────┐     ┌─────────────────────┐     ┌──────────────┐
+│  Planning session   │     │  Coding agent        │     │  Source code │
+│                     │     │                      │     │              │
+│  "The scroll        │────▶│  Reads ChatView.swift│────▶│  ChatView    │
+│   indicator should  │     │  Edits lines 220-240 │     │  .swift      │
+│   appear after one  │     │  Runs tests          │     │  (modified)  │
+│   screen of scroll" │     │                      │     │              │
+└─────────────────────┘     └─────────────────────┘     └──────────────┘
+       Transcript A                Transcript B
+     (the reasoning)           (the implementation)
+```
 
-## Solution
+These sessions produce **separate transcripts** with no inherent link between
+them. File-level provenance tools can trace a code change back to Transcript B
+— the coding agent. But Transcript A — the conversation where the requirement
+was discussed, the tradeoffs weighed, and the decision made — is invisible.
 
-A dispatch marker is a UUID embedded by the orchestrator in the prompt it sends to
-a coding agent. Because the prompt becomes the first message in the agent's
-transcript, the UUID appears verbatim in both:
+This gets worse as the chain grows:
 
-1. The orchestrator's tape (as part of the tool call / message that sent the prompt)
-2. The agent's tape (as the opening text of the session)
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────┐
+│  Product     │     │  Orchestrator│     │  Coding      │     │ Code │
+│  discussion  │────▶│  planning    │────▶│  agent       │────▶│      │
+│  session     │     │  session     │     │  session     │     │      │
+└──────────────┘     └──────────────┘     └──────────────┘     └──────┘
+  Transcript A         Transcript B         Transcript C
+```
 
-No coordination between orchestrator and Engram is required at dispatch time.
-The link is discovered at query time by pattern-matching the UUID across indexed
-tapes.
+File-level evidence reaches only Transcript C. Transcripts A and B are lost.
+
+## The Handoff Gap
+
+The link is lost at each handoff because nothing in the downstream transcript
+records *where it came from*. The coding agent's first message is the task
+prompt — but nothing in that prompt ties it back to the conversation that
+originated the work.
+
+Without an explicit link, the only recovery paths are:
+- **Timestamp proximity**: guess which upstream session overlaps in time
+- **Vocabulary overlap**: hope that file names or function names appear in both
+
+These are probabilistic and fail on common terms.
+
+## Solution: Dispatch Marker
+
+A **dispatch marker** is a UUID that the upstream party embeds in the handoff
+message. Because the handoff message becomes the opening content of the
+downstream session, the UUID appears verbatim in both transcripts:
+
+```
+Upstream session                    Downstream session
+─────────────────                   ──────────────────
+...conversation...                  [engram:src=f47ac10b-...]  ← same UUID
+                                    Fix the scroll indicator...
+tool_call: send_prompt(
+  "[engram:src=f47ac10b-...]        ...agent work...
+   Fix the scroll indicator..."
+)                        ─────────▶
+...                                 ...
+```
+
+No coordination with Engram is required at dispatch time. The UUID is just text.
+Engram discovers the link at query time by searching all indexed transcripts for
+the UUID string.
 
 ## Marker Format
 
@@ -31,100 +79,108 @@ tapes.
 [engram:src=<uuid>]
 ```
 
-- `<uuid>` is a freshly generated UUID v4, unique per dispatch
-- The marker is prepended to the agent prompt text
-- The UUID identifies the specific dispatch event, not the orchestrator session
+Where `<uuid>` is a UUID v4 generated fresh for each dispatch event.
 
-**Example prompt:**
+The marker is prepended to the handoff message. One UUID per dispatch — not
+per session. A session that was dispatched multiple times (e.g., after a
+compaction/context reset) may have multiple UUIDs, each linking back to the
+upstream context that re-initiated it.
+
+**Example handoff message:**
 
 ```
 [engram:src=f47ac10b-58cc-4372-a567-0e02b2c3d479]
 
-Fix the scroll-to-bottom indicator in ChatView.swift. The indicator
-should appear when the user is scrolled up by more than one screen height...
+Implement the scroll indicator feature. It should appear when the user
+has scrolled up by more than one full viewport height, and disappear
+with a fade when they scroll back to the bottom...
 ```
 
-## Why UUID, Not Session Key
+## Multi-Level Chains
 
-A session key identifies the orchestrator session as a whole, which may contain
-discussions about many unrelated topics. The dispatch UUID identifies the specific
-work unit — the moment the orchestrator decided to dispatch this particular task.
-This gives `explain` the right granularity: the CLU context around that specific
-dispatch, not the entire conversation.
+The convention composes across arbitrary depth. Each handoff embeds a UUID;
+each UUID independently links two adjacent transcripts. Engram can traverse
+the full chain at query time:
 
-## Ingest Behavior
+```
+Session A ──[uuid-1]──▶ Session B ──[uuid-2]──▶ Session C ──edits──▶ file.swift
+              ↑                        ↑
+       links A↔B                links B↔C
+```
 
-No changes required. The marker is plain text and is indexed by existing adapters
-as part of `msg.in` / `msg.out` events. Both the orchestrator tape and the agent
-tape naturally contain the UUID string.
+`engram explain file.swift:220-240` finds Session C, scans for dispatch markers,
+finds `uuid-2`, retrieves Session B, scans Session B for markers, finds `uuid-1`,
+retrieves Session A. The full chain surfaces without any of the intermediate
+sessions needing to know about each other.
 
-## Explain Behavior
+## Query Modes
 
-When `engram explain <target>` returns a set of sessions, the explain query
-additionally:
+### File/span query (developer-facing)
 
-1. Scans each result session's tape events for the pattern `[engram:src=<uuid>]`
-2. For each UUID found, searches all indexed tapes for the same UUID string
-3. Runs explain on any tapes containing the UUID (the orchestrator tapes)
-4. Merges the orchestrator sessions into the explain result, annotated as
-   `tier: orchestrator`
+```
+engram explain <file>:<start>-<end>
+```
 
-This chain is one level deep by default. Recursive chaining (orchestrator →
-meta-orchestrator) is not required initially but is not precluded by this design.
+Finds coding sessions that touched the span, then traverses dispatch markers
+upstream. Returns the full chain: code evidence at the bottom, orchestrator
+conversations at the top.
 
-## General Convention
-
-The dispatch marker is not specific to CLU or any particular orchestrator. Any
-agent that dispatches work to another agent can embed `[engram:src=<uuid>]` in
-the prompt. Engram will discover and surface the link without needing to know
-anything about the orchestrator's identity or session structure.
-
-## Open Questions
-
-- Should the explain result distinguish between "agent touched this code" and
-  "orchestrator originated this work"? (Likely yes — `tier` field in result.)
-- Should a single agent session be allowed to have multiple dispatch UUIDs (e.g.,
-  one per compaction boundary)? (Yes — the marker appears in each resumed
-  session's opening context.)
-- Recursion depth: should explain follow chains deeper than one tier if an
-  orchestrator was itself dispatched by a meta-orchestrator? (Out of scope for
-  initial impl.)
-
-## Implementation Checklist
-
-- [ ] Marker embedding: orchestrator prepends `[engram:src=<uuid>]` to every
-      dispatch prompt (e.g., in `submitter-eezo`)
-- [ ] Chain-explain: `engram explain` scans result tapes for marker, pattern-
-      matches UUID across all indexed tapes, merges orchestrator results
-- [ ] Result schema: add `tier` field to session results (`agent` | `orchestrator`)
-- [ ] Tests: end-to-end fixture with orchestrator tape + agent tape sharing a UUID,
-      verify explain surfaces both
-- [ ] Docs: document the convention in README / DESIGN.md
-
-## Orchestrator Query Mode
-
-File paths are not a natural entry point for orchestrators operating in vibe-coding
-workflows. The orchestrator dispatches work, but does not inspect code locations.
-The dispatch UUID is the orchestrator's native handle for a work unit.
-
-`engram explain` therefore supports a second query mode:
+### Dispatch query (orchestrator-facing)
 
 ```
 engram explain --dispatch <uuid>
 ```
 
-This returns the full provenance picture for a specific dispatch:
+Entry point is the work unit, not a file location. Returns:
+- The upstream session(s) containing the UUID (where the work was originated)
+- The downstream session(s) containing the UUID (where the work was done)
+- All code spans touched by those downstream sessions
 
-- The orchestrator tape(s) containing the UUID (the "why")
-- The agent tape(s) containing the UUID (the "what was dispatched")
-- All code spans touched by those agent sessions (the "what changed")
+This is the natural interface for anyone who dispatched the work and wants to
+review what it produced — no file paths required.
 
-This is the primary interface for orchestrators. The file:line query mode remains
-available for developers who work directly with code locations.
+## General Convention
 
-### UUID Availability
+The dispatch marker is not tied to any specific tool, framework, or workflow.
+Any party that hands work to another party can embed `[engram:src=<uuid>]` in
+the handoff. Engram will discover and surface the link without needing to know
+anything about the parties involved.
 
-The dispatch UUID is generated by the orchestrator at dispatch time and embedded
-in the prompt. It therefore appears in the orchestrator's own tape (in the tool
-call or message that sent the prompt) without any additional recording step. The
-orchestrator can recover the UUID from its own tape history when needed.
+Compatible with any workflow where:
+- One session (human+AI chat, script, CI system, orchestrator agent) dispatches
+  work to another session
+- Both sessions produce transcripts that Engram can ingest
+
+## Worked Example: Two-Tier Vibe Coding
+
+One instantiation of this pattern: a chat session (where a human and an AI
+discuss requirements) dispatches to a coding agent (which implements them).
+
+```
+Chat session (TARS)                   Coding agent (eezo)
+───────────────────                   ───────────────────
+Human: "The barge-in behavior         [engram:src=a3f2...]
+  is broken — tapping during          Fix barge-in: tapping during
+  speech should interrupt,            .speaking state must route to
+  not cancel"                         bargeIn(), not stop()...
+                                      
+AI generates UUID a3f2...             Reads WatchMainView.swift
+AI dispatches prompt with marker  ──▶ Edits line 229
+                    UUID a3f2...      Runs build
+  appears in this                     UUID a3f2... appears in
+  session's tool call                 this session's first message
+```
+
+Later: `engram explain --dispatch a3f2...` returns both the chat discussion
+and the coding session — the full picture from requirement to implementation.
+
+## Implementation Checklist
+
+- [ ] Marker embedding: upstream party prepends `[engram:src=<uuid>]` to
+      each dispatch (e.g., in orchestrator tooling)
+- [ ] Chain-explain: `engram explain` scans result sessions for marker
+      pattern, traverses upstream, merges results with `tier` annotation
+- [ ] `explain --dispatch <uuid>` query mode
+- [ ] `tier` field on session results: `agent` | `orchestrator`
+- [ ] Tests: multi-session fixture sharing UUIDs at each level
+- [ ] Docs: reference in README and DESIGN.md
