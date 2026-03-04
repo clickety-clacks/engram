@@ -71,8 +71,8 @@ tool_call: send_prompt(
 
 No coordination with Engram is required at dispatch time. The UUID is just text.
 Engram discovers the link at query time by searching all indexed transcripts for
-the UUID string. Direction (received vs sent) is determined from message position
-in the transcript — no transport-layer metadata required.
+the UUID string. Direction is determined from the ordinal turn index of the UUID's first
+appearance in each transcript — no transport-layer metadata required.
 
 ## Marker Format
 
@@ -101,47 +101,51 @@ with a fade when they scroll back to the bottom...
 rather than content to reason about, making the marker less likely to influence
 model behavior.
 
-## Positional Direction Detection
+## Direction Detection: First-Turn-Index
 
-Engram determines whether a session received or sent a UUID from its position
-in the transcript — a structural fact, not a semantic interpretation:
+Engram determines direction from a structural fact about when the UUID first
+appears in each session's transcript — not from message role or content.
 
-- **`received`**: UUID found in a **user/human message** (the injected prompt
-  becomes the first human turn; the UUID appears there)
-- **`sent`**: UUID found in an **assistant message or tool call** (the
-  orchestrator included it while dispatching outward)
+**The invariant**: the sender generates the UUID mid-conversation (at a high
+turn index) and the receiver gets it as its task prompt (at a low turn index).
+This holds by construction: you cannot receive a UUID before it is generated.
 
-No transport metadata required. When CLU injects a prompt into a coding agent
-via tmux or sessions_spawn, the prompt becomes message[0] or message[1] of
-that session's transcript. The UUID appears in a human-role message = received.
-The same UUID appears in CLU's transcript in the tool call body = sent.
-
-The `dispatch_links` table records both:
+At ingest, Engram records the turn index of the first occurrence of each UUID
+in each tape — where "turn index" is the ordinal position of the message object
+in the transcript array (0-based). No content interpretation is required; this
+is a structural measurement of the conversation array.
 
 ```sql
 CREATE TABLE dispatch_links (
-  tape_id  TEXT NOT NULL,
-  uuid     TEXT NOT NULL,
-  position TEXT NOT NULL CHECK(position IN ('received', 'sent')),
+  tape_id          TEXT    NOT NULL,
+  uuid             TEXT    NOT NULL,
+  first_turn_index INTEGER NOT NULL,
   PRIMARY KEY (tape_id, uuid)
 );
 CREATE INDEX dispatch_links_uuid ON dispatch_links(uuid);
-CREATE INDEX dispatch_links_tape_received ON dispatch_links(tape_id, position);
+CREATE INDEX dispatch_links_tape ON dispatch_links(tape_id);
 ```
 
-Ingest scans every `<engram-src>` occurrence in every tape and records it with
-its position. No interpretation of role — only where in the message sequence
-the UUID was found.
+Ingest scans every `<engram-src>` occurrence in every tape and records the
+index of the message object containing the first occurrence. The message role
+(human vs assistant) is irrelevant — only the ordinal position matters.
 
-**Traversal rule**: follow only `received` edges when expanding the chain.
-This ensures that when the explain algorithm reaches an orchestrator session,
-it follows UUIDs the orchestrator *received* (further upstream) and ignores
-UUIDs the orchestrator *sent* (other downstream dispatches unrelated to the
-current query).
+**Traversal rule (query-rooted BFS + first-UUID pruning)**:
 
-**Design principle**: UUID presence and position in a tape are facts.
-The `received/sent` classification is determined mechanically from message
-role (human vs assistant), not from content interpretation.
+From any session S in the result set, follow only S's UUID with the
+**lowest `first_turn_index`**. This is S's received UUID — the one it was
+given at the start of the task. UUIDs at higher turn indices are UUIDs S
+dispatched outward; they are not followed.
+
+This ensures the traversal walks strictly upstream. When the algorithm reaches
+an orchestrator session, it follows the UUID the orchestrator *received*
+(further upstream) and ignores all UUIDs the orchestrator dispatched to other
+sessions (siblings of the starting session, unrelated to the current query).
+
+**Design principle**: UUID presence and `first_turn_index` in a tape are facts.
+Direction is recovered by comparing turn indices across tapes sharing a UUID —
+the structurally earlier occurrence is the receiver. No message-role parsing,
+no content interpretation, no transport metadata required.
 
 ## Multi-Level Chains
 
@@ -157,14 +161,14 @@ Session A ──[uuid-1]──▶ Session B ──[uuid-2]──▶ Session C �
 Explain resolves the full chain by iterating along `received` edges only:
 
 1. Start with coding session C (found via file fingerprint)
-2. Find all UUIDs in C where `position = 'received'`
-3. For each UUID: find all tapes where that UUID also appears (any position)
+2. Find the UUID in C with the lowest `first_turn_index` (C's received UUID)
+3. Find all tapes where that UUID also appears
 4. Add new sessions to result set; for each newly added session, go to step 2
 5. Repeat until no new sessions are added
 
-Filtering on `received` ensures the traversal only walks upstream: each
-session contributes only the UUIDs it was *given*, not the UUIDs it
-dispatched to other sessions. This prevents unrelated downstream work
+Pruning to the lowest-index UUID per session ensures the traversal only
+walks upstream: each session contributes only the UUID it was *given*, not
+the UUIDs it dispatched to other sessions. This prevents sibling dispatches
 from polluting the result set.
 
 Since all tapes share the same index, each UUID lookup is a flat text
@@ -229,15 +233,15 @@ AI dispatches prompt with marker  ──▶ Edits line 229
 ```
 
 Later: `engram explain --dispatch a3f2...` returns both sessions — the full
-picture from requirement to implementation. Direction was inferred from message
-position at ingest time; no transport metadata was needed.
+picture from requirement to implementation. Direction was inferred from turn index at ingest time; no transport metadata
+or message-role parsing was needed.
 
 ## Implementation Checklist
 
 - [ ] Marker embedding: sending party prepends `<engram-src id="<uuid>"/>` to
       each dispatch (e.g., in orchestrator tooling)
 - [ ] Ingest: extract all `<engram-src>` patterns from tapes into `dispatch_links`
-      table with `position` (`received` if in human message, `sent` if in assistant/tool)
+      table with `first_turn_index` (ordinal index of message object where UUID first appears)
 - [ ] Chain-explain: `engram explain` expands along `received` edges only,
       iterating until result set is stable
 - [ ] `explain --dispatch <uuid>` query mode
