@@ -71,7 +71,8 @@ tool_call: send_prompt(
 
 No coordination with Engram is required at dispatch time. The UUID is just text.
 Engram discovers the link at query time by searching all indexed transcripts for
-the UUID string — no direction inference needed.
+the UUID string. Direction (received vs sent) is determined from message position
+in the transcript — no transport-layer metadata required.
 
 ## Marker Format
 
@@ -100,33 +101,47 @@ with a fade when they scroll back to the bottom...
 rather than content to reason about, making the marker less likely to influence
 model behavior.
 
-## Direction-Agnostic Lookup
+## Positional Direction Detection
 
-The lookup algorithm requires no knowledge of which party sent vs received:
+Engram determines whether a session received or sent a UUID from its position
+in the transcript — a structural fact, not a semantic interpretation:
 
-1. Find coding session C from file fingerprint (evidence table)
-2. Scan C's tape for ALL `<engram-src>` UUIDs — no direction inference
-3. For each UUID: `SELECT tape_id FROM dispatch_links WHERE uuid = ?` → all tapes containing that UUID
-4. Filter out C itself → everything else is connected context
-5. Done
+- **`received`**: UUID found in a **user/human message** (the injected prompt
+  becomes the first human turn; the UUID appears there)
+- **`sent`**: UUID found in an **assistant message or tool call** (the
+  orchestrator included it while dispatching outward)
 
-The `dispatch_links` table is maximally simple — no direction column:
+No transport metadata required. When CLU injects a prompt into a coding agent
+via tmux or sessions_spawn, the prompt becomes message[0] or message[1] of
+that session's transcript. The UUID appears in a human-role message = received.
+The same UUID appears in CLU's transcript in the tool call body = sent.
+
+The `dispatch_links` table records both:
 
 ```sql
 CREATE TABLE dispatch_links (
-  tape_id TEXT NOT NULL,
-  uuid    TEXT NOT NULL,
+  tape_id  TEXT NOT NULL,
+  uuid     TEXT NOT NULL,
+  position TEXT NOT NULL CHECK(position IN ('received', 'sent')),
   PRIMARY KEY (tape_id, uuid)
 );
 CREATE INDEX dispatch_links_uuid ON dispatch_links(uuid);
+CREATE INDEX dispatch_links_tape_received ON dispatch_links(tape_id, position);
 ```
 
-Ingest extracts every `<engram-src>` pattern from every tape and records it.
-No interpretation of role or direction.
+Ingest scans every `<engram-src>` occurrence in every tape and records it with
+its position. No interpretation of role — only where in the message sequence
+the UUID was found.
 
-**Design principle**: UUID presence in a tape is a fact. Which role the tape
-played in the handoff is an interpretation. Engram stores facts, not
-interpretations.
+**Traversal rule**: follow only `received` edges when expanding the chain.
+This ensures that when the explain algorithm reaches an orchestrator session,
+it follows UUIDs the orchestrator *received* (further upstream) and ignores
+UUIDs the orchestrator *sent* (other downstream dispatches unrelated to the
+current query).
+
+**Design principle**: UUID presence and position in a tape are facts.
+The `received/sent` classification is determined mechanically from message
+role (human vs assistant), not from content interpretation.
 
 ## Multi-Level Chains
 
@@ -139,10 +154,21 @@ Session A ──[uuid-1]──▶ Session B ──[uuid-2]──▶ Session C �
        links A↔B                links B↔C
 ```
 
-Explain resolves the full chain by iterating: for each connected session found,
-scan its tape for additional UUIDs, look up those UUIDs, add any new sessions,
-repeat until the set is stable. Since all tapes share the same index, each UUID
-lookup is a flat text search — no hierarchy traversal required.
+Explain resolves the full chain by iterating along `received` edges only:
+
+1. Start with coding session C (found via file fingerprint)
+2. Find all UUIDs in C where `position = 'received'`
+3. For each UUID: find all tapes where that UUID also appears (any position)
+4. Add new sessions to result set; for each newly added session, go to step 2
+5. Repeat until no new sessions are added
+
+Filtering on `received` ensures the traversal only walks upstream: each
+session contributes only the UUIDs it was *given*, not the UUIDs it
+dispatched to other sessions. This prevents unrelated downstream work
+from polluting the result set.
+
+Since all tapes share the same index, each UUID lookup is a flat text
+search — no hierarchy traversal required.
 
 ## Query Modes
 
@@ -173,8 +199,9 @@ review what it produced — no file paths required.
 
 The dispatch marker is not tied to any specific tool, framework, or workflow.
 Any party that hands work to another party can embed `<engram-src id="<uuid>"/>`
-in the handoff. Engram will discover and surface the link without needing to
-know anything about the parties involved or which direction work flowed.
+in the handoff. Engram discovers the link at ingest time from transcript
+structure alone — the position of the UUID within the message sequence
+determines direction without any out-of-band metadata.
 
 Compatible with any workflow where:
 - One session (human+AI chat, script, CI system, orchestrator agent) dispatches
@@ -202,15 +229,17 @@ AI dispatches prompt with marker  ──▶ Edits line 229
 ```
 
 Later: `engram explain --dispatch a3f2...` returns both sessions — the full
-picture from requirement to implementation, with no direction inference needed.
+picture from requirement to implementation. Direction was inferred from message
+position at ingest time; no transport metadata was needed.
 
 ## Implementation Checklist
 
 - [ ] Marker embedding: sending party prepends `<engram-src id="<uuid>"/>` to
       each dispatch (e.g., in orchestrator tooling)
-- [ ] Ingest: extract all `<engram-src>` patterns from tapes into `dispatch_links` table
-- [ ] Chain-explain: `engram explain` scans result sessions for marker
-      pattern, expands via UUID lookup, merges results
+- [ ] Ingest: extract all `<engram-src>` patterns from tapes into `dispatch_links`
+      table with `position` (`received` if in human message, `sent` if in assistant/tool)
+- [ ] Chain-explain: `engram explain` expands along `received` edges only,
+      iterating until result set is stable
 - [ ] `explain --dispatch <uuid>` query mode
 - [ ] Tests: multi-session fixture sharing UUIDs at each level
 - [ ] Docs: reference in README and DESIGN.md
