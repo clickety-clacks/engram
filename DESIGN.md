@@ -333,6 +333,22 @@ The killer query. Given a span, return ranked evidence trails with transcript co
 
 Output is machine-readable by default, human-readable with `--pretty`.
 
+Dispatch markers are applied during this query as an additional causal layer:
+- For each code-edit touch, Engram finds the most recent `received` dispatch UUID before that edit turn.
+- It follows that UUID to the tape where it was `sent`.
+- It repeats upstream (`received` before `sent`) until no parent exists.
+- Upstream dispatch sessions are returned alongside evidence sessions.
+
+### `engram explain --dispatch <uuid>`
+
+Dispatch-centric query mode. Entry point is a dispatch marker UUID.
+
+Returns:
+- all sessions containing that UUID (`sent` and `received`)
+- code spans touched in those sessions
+
+This is the orchestrator-facing path when the caller has a work-unit UUID but no file/span yet.
+
 #### Window parameters
 
 Agent context windows are finite and expensive. Dumping entire transcripts wastes tokens. Instead, `explain` returns a focused window around the anchor point — just enough context for the agent to understand the reasoning. The agent controls how much it sees, and can always expand if the initial window isn't enough.

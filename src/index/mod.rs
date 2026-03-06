@@ -22,6 +22,27 @@ pub struct EdgeRow {
     pub stored_class: StoredEdgeClass,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchDirection {
+    Received,
+    Sent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchLink {
+    pub uuid: String,
+    pub first_turn_index: i64,
+    pub direction: DispatchDirection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchLinkRow {
+    pub tape_id: String,
+    pub uuid: String,
+    pub first_turn_index: i64,
+    pub direction: DispatchDirection,
+}
+
 pub struct SqliteIndex {
     conn: Connection,
 }
@@ -53,15 +74,24 @@ impl SqliteIndex {
         let version: i64 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version == 0 && self.table_exists("evidence")? {
-            self.migrate_legacy_schema_to_v1()?;
-        } else if version == 0 {
-            self.create_schema_v1()?;
-            self.conn.execute_batch("PRAGMA user_version = 1;")?;
-        } else if version == 1 {
-            self.create_schema_v1()?;
-        } else {
-            return Err(rusqlite::Error::InvalidQuery);
+        match version {
+            0 => {
+                if self.table_exists("evidence")? {
+                    self.migrate_legacy_schema_to_v1()?;
+                } else {
+                    self.create_schema_v1()?;
+                    self.conn.execute_batch("PRAGMA user_version = 1;")?;
+                }
+                self.migrate_v1_to_v2()?;
+            }
+            1 => {
+                self.create_schema_v1()?;
+                self.migrate_v1_to_v2()?;
+            }
+            2 => {
+                self.create_schema_v2()?;
+            }
+            _ => return Err(rusqlite::Error::InvalidQuery),
         }
         Ok(())
     }
@@ -122,6 +152,33 @@ impl SqliteIndex {
             );
             ",
         )?;
+        Ok(())
+    }
+
+    fn create_schema_v2(&self) -> rusqlite::Result<()> {
+        self.create_schema_v1()?;
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS dispatch_links (
+                tape_id TEXT NOT NULL,
+                uuid TEXT NOT NULL,
+                first_turn_index INTEGER NOT NULL,
+                direction TEXT NOT NULL CHECK(direction IN ('received', 'sent')),
+                PRIMARY KEY (tape_id, uuid)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_dispatch_links_uuid ON dispatch_links(uuid);
+            CREATE INDEX IF NOT EXISTS idx_dispatch_links_tape ON dispatch_links(tape_id);
+            CREATE INDEX IF NOT EXISTS idx_dispatch_links_received
+                ON dispatch_links(tape_id, direction, first_turn_index);
+            ",
+        )?;
+        Ok(())
+    }
+
+    fn migrate_v1_to_v2(&self) -> rusqlite::Result<()> {
+        self.create_schema_v2()?;
+        self.conn.execute_batch("PRAGMA user_version = 2;")?;
         Ok(())
     }
 
@@ -256,6 +313,32 @@ impl SqliteIndex {
                 ],
             )?;
         }
+        Ok(())
+    }
+
+    pub fn insert_dispatch_link(
+        &self,
+        tape_id: &str,
+        link: &DispatchLink,
+    ) -> rusqlite::Result<()> {
+        Self::insert_dispatch_link_on(&self.conn, tape_id, link)
+    }
+
+    fn insert_dispatch_link_on(
+        conn: &Connection,
+        tape_id: &str,
+        link: &DispatchLink,
+    ) -> rusqlite::Result<()> {
+        conn.execute(
+            "INSERT OR IGNORE INTO dispatch_links (tape_id, uuid, first_turn_index, direction)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                tape_id,
+                link.uuid,
+                link.first_turn_index,
+                encode_dispatch_direction(link.direction)
+            ],
+        )?;
         Ok(())
     }
 
@@ -422,6 +505,16 @@ impl SqliteIndex {
         events: &[TapeEventAt],
         link_threshold: f32,
     ) -> rusqlite::Result<()> {
+        self.ingest_tape_events_with_dispatch(tape_id, events, &[], link_threshold)
+    }
+
+    pub fn ingest_tape_events_with_dispatch(
+        &self,
+        tape_id: &str,
+        events: &[TapeEventAt],
+        dispatch_links: &[DispatchLink],
+        link_threshold: f32,
+    ) -> rusqlite::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         for item in events {
             match &item.event.data {
@@ -529,6 +622,10 @@ impl SqliteIndex {
             }
         }
 
+        for link in dispatch_links {
+            Self::insert_dispatch_link_on(tx.deref(), tape_id, link)?;
+        }
+
         tx.execute(
             "INSERT OR IGNORE INTO tapes (tape_id) VALUES (?1)",
             params![tape_id],
@@ -536,6 +633,91 @@ impl SqliteIndex {
 
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn dispatch_links_for_tape(&self, tape_id: &str) -> rusqlite::Result<Vec<DispatchLink>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT uuid, first_turn_index, direction
+             FROM dispatch_links
+             WHERE tape_id = ?1
+             ORDER BY first_turn_index ASC, uuid ASC",
+        )?;
+        let mut rows = stmt.query(params![tape_id])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(DispatchLink {
+                uuid: row.get(0)?,
+                first_turn_index: row.get(1)?,
+                direction: decode_dispatch_direction(&row.get::<_, String>(2)?),
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn dispatch_links_for_uuid(&self, uuid: &str) -> rusqlite::Result<Vec<DispatchLinkRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tape_id, uuid, first_turn_index, direction
+             FROM dispatch_links
+             WHERE uuid = ?1
+             ORDER BY first_turn_index ASC, tape_id ASC",
+        )?;
+        let mut rows = stmt.query(params![uuid])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(DispatchLinkRow {
+                tape_id: row.get(0)?,
+                uuid: row.get(1)?,
+                first_turn_index: row.get(2)?,
+                direction: decode_dispatch_direction(&row.get::<_, String>(3)?),
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn latest_received_dispatch_before_turn(
+        &self,
+        tape_id: &str,
+        turn_index: i64,
+    ) -> rusqlite::Result<Option<DispatchLink>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT uuid, first_turn_index, direction
+             FROM dispatch_links
+             WHERE tape_id = ?1
+               AND direction = 'received'
+               AND first_turn_index < ?2
+             ORDER BY first_turn_index DESC, uuid ASC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![tape_id, turn_index])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(DispatchLink {
+                uuid: row.get(0)?,
+                first_turn_index: row.get(1)?,
+                direction: decode_dispatch_direction(&row.get::<_, String>(2)?),
+            }));
+        }
+        Ok(None)
+    }
+
+    pub fn sent_dispatch_for_uuid(&self, uuid: &str) -> rusqlite::Result<Option<DispatchLinkRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tape_id, uuid, first_turn_index, direction
+             FROM dispatch_links
+             WHERE uuid = ?1
+               AND direction = 'sent'
+             ORDER BY first_turn_index DESC, tape_id ASC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![uuid])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(DispatchLinkRow {
+                tape_id: row.get(0)?,
+                uuid: row.get(1)?,
+                first_turn_index: row.get(2)?,
+                direction: decode_dispatch_direction(&row.get::<_, String>(3)?),
+            }));
+        }
+        Ok(None)
     }
 }
 
@@ -615,6 +797,20 @@ fn decode_cardinality(raw: &str) -> Cardinality {
         "1:N" => Cardinality::OneToMany,
         "N:1" => Cardinality::ManyToOne,
         _ => Cardinality::OneToOne,
+    }
+}
+
+fn encode_dispatch_direction(direction: DispatchDirection) -> &'static str {
+    match direction {
+        DispatchDirection::Received => "received",
+        DispatchDirection::Sent => "sent",
+    }
+}
+
+fn decode_dispatch_direction(raw: &str) -> DispatchDirection {
+    match raw {
+        "sent" => DispatchDirection::Sent,
+        _ => DispatchDirection::Received,
     }
 }
 
@@ -859,5 +1055,181 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[test]
+    fn ingest_persists_dispatch_links_and_queries_by_tape_and_uuid() {
+        let index = SqliteIndex::open_in_memory().expect("in-memory sqlite");
+        let events = vec![read_event("anchor-1", "src/lib.rs", 0)];
+        let links = vec![
+            DispatchLink {
+                uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+                first_turn_index: 0,
+                direction: DispatchDirection::Received,
+            },
+            DispatchLink {
+                uuid: "22222222-2222-4222-8222-222222222222".to_string(),
+                first_turn_index: 3,
+                direction: DispatchDirection::Sent,
+            },
+        ];
+
+        index
+            .ingest_tape_events_with_dispatch("tape-dispatch", &events, &links, LINK_THRESHOLD_DEFAULT)
+            .expect("ingest dispatch links");
+
+        let by_tape = index
+            .dispatch_links_for_tape("tape-dispatch")
+            .expect("dispatch links by tape");
+        assert_eq!(by_tape.len(), 2);
+        assert_eq!(by_tape[0].direction, DispatchDirection::Received);
+        assert_eq!(by_tape[1].direction, DispatchDirection::Sent);
+
+        let by_uuid = index
+            .dispatch_links_for_uuid("22222222-2222-4222-8222-222222222222")
+            .expect("dispatch links by uuid");
+        assert_eq!(by_uuid.len(), 1);
+        assert_eq!(by_uuid[0].tape_id, "tape-dispatch");
+        assert_eq!(by_uuid[0].direction, DispatchDirection::Sent);
+    }
+
+    #[test]
+    fn latest_received_dispatch_before_turn_selects_most_recent_prior() {
+        let index = SqliteIndex::open_in_memory().expect("in-memory sqlite");
+        index
+            .insert_dispatch_link(
+                "tape-a",
+                &DispatchLink {
+                    uuid: "a".to_string(),
+                    first_turn_index: 1,
+                    direction: DispatchDirection::Received,
+                },
+            )
+            .expect("insert");
+        index
+            .insert_dispatch_link(
+                "tape-a",
+                &DispatchLink {
+                    uuid: "b".to_string(),
+                    first_turn_index: 7,
+                    direction: DispatchDirection::Received,
+                },
+            )
+            .expect("insert");
+        index
+            .insert_dispatch_link(
+                "tape-a",
+                &DispatchLink {
+                    uuid: "c".to_string(),
+                    first_turn_index: 9,
+                    direction: DispatchDirection::Sent,
+                },
+            )
+            .expect("insert");
+
+        let link = index
+            .latest_received_dispatch_before_turn("tape-a", 8)
+            .expect("query")
+            .expect("link");
+        assert_eq!(link.uuid, "b");
+        assert_eq!(link.direction, DispatchDirection::Received);
+    }
+
+    #[test]
+    fn dispatch_links_are_idempotent_on_repeat_ingest() {
+        let index = SqliteIndex::open_in_memory().expect("sqlite");
+        let events = vec![read_event("anchor-1", "src/lib.rs", 0)];
+        let links = vec![DispatchLink {
+            uuid: "33333333-3333-4333-8333-333333333333".to_string(),
+            first_turn_index: 2,
+            direction: DispatchDirection::Received,
+        }];
+
+        index
+            .ingest_tape_events_with_dispatch("tape-repeat", &events, &links, LINK_THRESHOLD_DEFAULT)
+            .expect("first ingest");
+        index
+            .ingest_tape_events_with_dispatch("tape-repeat", &events, &links, LINK_THRESHOLD_DEFAULT)
+            .expect("second ingest");
+
+        let by_tape = index
+            .dispatch_links_for_tape("tape-repeat")
+            .expect("query");
+        assert_eq!(by_tape.len(), 1);
+        assert_eq!(by_tape[0].uuid, "33333333-3333-4333-8333-333333333333");
+    }
+
+    #[test]
+    fn sent_dispatch_for_uuid_is_none_when_uuid_is_only_received() {
+        let index = SqliteIndex::open_in_memory().expect("sqlite");
+        index
+            .insert_dispatch_link(
+                "tape-r1",
+                &DispatchLink {
+                    uuid: "44444444-4444-4444-8444-444444444444".to_string(),
+                    first_turn_index: 0,
+                    direction: DispatchDirection::Received,
+                },
+            )
+            .expect("insert");
+        index
+            .insert_dispatch_link(
+                "tape-r2",
+                &DispatchLink {
+                    uuid: "44444444-4444-4444-8444-444444444444".to_string(),
+                    first_turn_index: 1,
+                    direction: DispatchDirection::Received,
+                },
+            )
+            .expect("insert");
+
+        let parent = index
+            .sent_dispatch_for_uuid("44444444-4444-4444-8444-444444444444")
+            .expect("query parent");
+        assert!(parent.is_none());
+    }
+
+    #[test]
+    fn latest_received_dispatch_before_turn_handles_long_running_tapes() {
+        let index = SqliteIndex::open_in_memory().expect("sqlite");
+        for i in 0..25 {
+            index
+                .insert_dispatch_link(
+                    "tape-long",
+                    &DispatchLink {
+                        uuid: format!("long-{i:02}"),
+                        first_turn_index: i,
+                        direction: DispatchDirection::Received,
+                    },
+                )
+                .expect("insert");
+        }
+
+        let picked = index
+            .latest_received_dispatch_before_turn("tape-long", 21)
+            .expect("query")
+            .expect("picked");
+        assert_eq!(picked.first_turn_index, 20);
+        assert_eq!(picked.uuid, "long-20");
+    }
+
+    #[test]
+    fn latest_received_dispatch_before_turn_returns_none_when_edit_precedes_dispatch() {
+        let index = SqliteIndex::open_in_memory().expect("sqlite");
+        index
+            .insert_dispatch_link(
+                "tape-pre",
+                &DispatchLink {
+                    uuid: "later-dispatch".to_string(),
+                    first_turn_index: 10,
+                    direction: DispatchDirection::Received,
+                },
+            )
+            .expect("insert");
+
+        let picked = index
+            .latest_received_dispatch_before_turn("tape-pre", 3)
+            .expect("query");
+        assert!(picked.is_none());
     }
 }

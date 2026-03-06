@@ -63,7 +63,20 @@ If needed manually:
 ```bash
 engram ingest
 engram explain <file>:<start>-<end>
+engram explain --dispatch <uuid>
 ```
+
+### Dispatch marker chain tracing
+
+Engram supports explicit cross-session dispatch markers:
+
+```text
+<engram-src id="f47ac10b-58cc-4372-a567-0e02b2c3d479"/>
+```
+
+- Ingest records per-tape dispatch links with direction (`received`/`sent`) and first turn index.
+- `engram explain <file>:<start>-<end>` now adds upstream dispatch lineage sessions before the edit turn.
+- `engram explain --dispatch <uuid>` starts from a dispatch UUID and returns all sessions sharing it plus code spans touched in those sessions.
 
 ### System-wide mode (global index + OpenClaw)
 
