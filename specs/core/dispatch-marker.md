@@ -1,6 +1,6 @@
 # Engram Dispatch Marker
 
-Status: Draft
+Status: Approved
 
 ## Problem: Multi-Party Transcript Splitting
 
@@ -101,51 +101,75 @@ with a fade when they scroll back to the bottom...
 rather than content to reason about, making the marker less likely to influence
 model behavior.
 
-## Direction Detection: First-Turn-Index
+## Direction Detection: Structural Nesting Depth
 
-Engram determines direction from a structural fact about when the UUID first
-appears in each session's transcript — not from message role or content.
+Engram determines whether a UUID was *received* or *sent* by measuring where
+in the message structure it appears — not from message role, content, or any
+transport-layer metadata.
 
-**The invariant**: the sender generates the UUID mid-conversation (at a high
-turn index) and the receiver gets it as its task prompt (at a low turn index).
-This holds by construction: you cannot receive a UUID before it is generated.
+**The key structural fact**: in this system's dispatch SOP, a session can only
+send a UUID in one way and receive it in one way:
 
-At ingest, Engram records the turn index of the first occurrence of each UUID
-in each tape — where "turn index" is the ordinal position of the message object
-in the transcript array (0-based). No content interpretation is required; this
-is a structural measurement of the conversation array.
+- **Sent**: the orchestrator embeds the UUID inside a tool call — specifically
+  inside an `exec`/bash tool call whose body contains the tmux send-keys
+  command. The UUID is nested inside tool_use JSON, then a shell command string.
+  Nesting depth: 2 or more layers of JSON/quoting wrappers.
+- **Received**: the coding agent receives the UUID as plain pasted text at the
+  top level of a human-turn message. No wrappers. Nesting depth: 0.
+
+These two cases are mutually exclusive by construction. The orchestrator
+*cannot* dispatch without going through a tool call. The agent *cannot* receive
+a prompt any other way than as plain text at the message surface.
+
+At ingest, Engram measures structural nesting depth for each UUID occurrence:
+count the layers of JSON object nesting, tool-call wrappers, and shell quoting
+surrounding the UUID within its message object. A depth of 0 means the UUID
+appears directly in the message content string. A depth ≥ 1 means it is
+embedded inside tool infrastructure.
 
 ```sql
 CREATE TABLE dispatch_links (
   tape_id          TEXT    NOT NULL,
   uuid             TEXT    NOT NULL,
   first_turn_index INTEGER NOT NULL,
+  direction        TEXT    NOT NULL CHECK(direction IN ('received', 'sent')),
   PRIMARY KEY (tape_id, uuid)
 );
 CREATE INDEX dispatch_links_uuid ON dispatch_links(uuid);
 CREATE INDEX dispatch_links_tape ON dispatch_links(tape_id);
+CREATE INDEX dispatch_links_received ON dispatch_links(tape_id, direction, first_turn_index);
 ```
 
-Ingest scans every `<engram-src>` occurrence in every tape and records the
-index of the message object containing the first occurrence. The message role
-(human vs assistant) is irrelevant — only the ordinal position matters.
+Ingest scans every `<engram-src>` occurrence, records the turn index, and
+classifies direction from nesting depth. No message-role parsing. No content
+interpretation. The direction column is a structural measurement.
 
-**Traversal rule (query-rooted BFS + first-UUID pruning)**:
+**Traversal rule — causal preceding UUID**:
 
-From any session S in the result set, follow only S's UUID with the
-**lowest `first_turn_index`**. This is S's received UUID — the one it was
-given at the start of the task. UUIDs at higher turn indices are UUIDs S
-dispatched outward; they are not followed.
+To traverse from a code edit at turn N in session S:
 
-This ensures the traversal walks strictly upstream. When the algorithm reaches
-an orchestrator session, it follows the UUID the orchestrator *received*
-(further upstream) and ignores all UUIDs the orchestrator dispatched to other
-sessions (siblings of the starting session, unrelated to the current query).
+1. Find all UUIDs in S where `direction = 'received'` AND
+   `first_turn_index < N`
+2. Take the one with the **highest `first_turn_index`** — the most recently
+   received dispatch before the edit. This is the causal upstream link.
+3. Find the tape(s) where that UUID appears with `direction = 'sent'` — that
+   is the parent session.
+4. In the parent session, find the turn where the UUID appears (its
+   `first_turn_index` in the parent, direction=sent). Call that turn M.
+5. From the parent, find the most recently received UUID before turn M.
+   Follow that further upstream.
+6. Repeat until no further upstream sessions exist.
 
-**Design principle**: UUID presence and `first_turn_index` in a tape are facts.
-Direction is recovered by comparing turn indices across tapes sharing a UUID —
-the structurally earlier occurrence is the receiver. No message-role parsing,
-no content interpretation, no transport metadata required.
+This handles multi-dispatch agents correctly: a coding agent may receive
+many UUIDs over its lifetime (one per task), and the traversal selects
+the specific dispatch that preceded the relevant code change — not just
+the first dispatch ever received.
+
+**Design principle**: UUID direction is a structural fact derived from
+the dispatch mechanism itself. No inference, no heuristics, no model
+cooperation required. The nesting depth of a UUID occurrence in the
+transcript JSON is a deterministic reflection of whether that session
+originated the dispatch or received it.
 
 ## Multi-Level Chains
 
@@ -160,16 +184,20 @@ Session A ──[uuid-1]──▶ Session B ──[uuid-2]──▶ Session C �
 
 Explain resolves the full chain by iterating along `received` edges only:
 
-1. Start with coding session C (found via file fingerprint)
-2. Find the UUID in C with the lowest `first_turn_index` (C's received UUID)
-3. Find all tapes where that UUID also appears
-4. Add new sessions to result set; for each newly added session, go to step 2
-5. Repeat until no new sessions are added
+1. Start with coding session C (found via file fingerprint); note the edit turn E
+2. In C, find all UUIDs with `direction = 'received'` and `first_turn_index < E`;
+   take the one with the highest `first_turn_index` (the causal dispatch)
+3. Find the tape where that UUID appears with `direction = 'sent'` — that is
+   session B (C's parent)
+4. In B, note the turn M at which B sent the UUID to C; find all UUIDs in B
+   with `direction = 'received'` and `first_turn_index < M`; take the highest
+5. Follow that UUID upstream to session A; repeat
+6. Stop when no further received UUIDs exist upstream
 
-Pruning to the lowest-index UUID per session ensures the traversal only
-walks upstream: each session contributes only the UUID it was *given*, not
-the UUIDs it dispatched to other sessions. This prevents sibling dispatches
-from polluting the result set.
+This ensures the traversal selects the specific causal dispatch at each hop —
+critical for multi-dispatch agents that handle many tasks in the same session.
+Sibling dispatches are excluded because they appear as 'sent' in the
+orchestrator's transcript, never as 'received'.
 
 Since all tapes share the same index, each UUID lookup is a flat text
 search — no hierarchy traversal required.
@@ -242,8 +270,11 @@ or message-role parsing was needed.
       each dispatch (e.g., in orchestrator tooling)
 - [ ] Ingest: extract all `<engram-src>` patterns from tapes into `dispatch_links`
       table with `first_turn_index` (ordinal index of message object where UUID first appears)
-- [ ] Chain-explain: `engram explain` expands along `received` edges only,
-      iterating until result set is stable
+      and `direction` ('received' if UUID appears at nesting depth 0 in message content;
+      'sent' if UUID appears inside tool_use/exec infrastructure at depth ≥ 1)
+- [ ] Chain-explain: `engram explain` traverses upstream via causal preceding UUID:
+      for each session at edit turn N, find highest-first_turn_index received UUID
+      before N; follow to parent; repeat
 - [ ] `explain --dispatch <uuid>` query mode
 - [ ] Tests: multi-session fixture sharing UUIDs at each level
 - [ ] Docs: reference in README and DESIGN.md
