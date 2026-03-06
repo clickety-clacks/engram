@@ -8,6 +8,24 @@ Engram is a causal index over code for agent-driven development. It captures the
 
 Engram answers: **"why does this code span exist?"**
 
+## Core commands
+
+These are the three commands that make the system go:
+
+### `engram ingest`
+
+Scan configured transcript sources, extract evidence (reads, edits, tool calls, dispatch markers), and update the local causal index.
+
+### `engram explain <file>:<start>-<end>`
+
+Start from a code span, find the sessions that touched it, then walk outward through linked evidence so you can see the conversations, prompts, and follow-on work that produced it.
+
+### `engram explain --dispatch <uuid>`
+
+Start from a dispatch marker and recover the full handoff chain across sessions. This is how Engram follows work across planner → implementer boundaries.
+
+Under the hood, `ingest` builds the index and `explain` walks it.
+
 ## Agent integration (recommended default)
 
 This section is intentionally agent-executable. If an agent follows these steps, the repo gets a good-hygiene Engram setup with Git-coupled operations, without overwriting existing repo hooks.
