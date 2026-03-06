@@ -1,6 +1,8 @@
 # Engram
 
-**Agentic engineering needs memory.**
+**How did we get here?**
+
+*An automatically built index into why your code is the way it is.*
 
 Engram is a causal index over code for agent-driven development. It captures the full execution trail agents already emit — prompts, tool calls, reads, edits, and results — then makes that trail queryable at span level.
 
