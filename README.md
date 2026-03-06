@@ -4,6 +4,8 @@
 
 *An automatically built index into why your code is the way it is.*
 
+Your code started as a conversation. Every agent reasoning through a problem, every decision handed off, every rationale spoken aloud — that's the exhaust of agentic engineering, and it carries more signal than the code itself. Engram fingerprints and indexes that exhaust across conversations, creating a foundation for institutional knowledge — the kind you forget is there until you realize nothing works without it.
+
 Engram answers one question: **why does this code span exist?**
 
 ## 1. What it is
