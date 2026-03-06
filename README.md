@@ -1,62 +1,52 @@
 # Engram
 
-**How did we get here?**
+Engram answers one question: **why does this code span exist?**
 
-*An automatically built index into why your code is the way it is.*
+## 1. What it is
 
-Engram is a causal index over code for agent-driven development. It captures the full execution trail agents already emit — prompts, tool calls, reads, edits, and results — then makes that trail queryable at span level.
+Engram is a local provenance index for agent-driven software work.
 
-Engram answers: **"why does this code span exist?"**
+It ingests deterministic transcript/log artifacts (messages, tool calls, reads, edits, results), stores them as immutable tapes, builds a derived evidence index, and lets you query from a code span back to the sessions that caused it.
 
-## Core commands
+Core ideas:
+- Tapes are immutable files.
+- The index is derived and rebuildable.
+- Provenance is additive: more sources give better recall.
+- Engram is harness-agnostic; it does not require one vendor workflow.
 
-These are the three commands that make the system go:
+## 2. How you use it
 
-### `engram ingest`
-
-Scan configured transcript sources, extract evidence (reads, edits, tool calls, dispatch markers), and update the local causal index.
-
-### `engram explain <file>:<start>-<end>`
-
-Start from a code span, find the sessions that touched it, then walk outward through linked evidence so you can see the conversations, prompts, and follow-on work that produced it.
-
-### `engram explain --dispatch <uuid>`
-
-Start from a dispatch marker and recover the full handoff chain across sessions. This is how Engram follows work across planner → implementer boundaries.
-
-Under the hood, `ingest` builds the index and `explain` walks it.
-
-## Agent integration (recommended default)
-
-This section is intentionally agent-executable. If an agent follows these steps, the repo gets a good-hygiene Engram setup with Git-coupled operations, without overwriting existing repo hooks.
-
-### Repo layout
-
-- `.engram/` → **committed** immutable tape artifacts
-- `.engram-cache/` → **local only** derived cache/index (never committed)
-
-### One-time setup (repo-local mode)
+Typical flow:
 
 ```bash
-# from repo root
+# one-time setup in a repo
 engram init
-mkdir -p .engram .engram-cache .githooks
 
-# install hook scripts shipped in this repo
-# non-destructive install: do not overwrite existing hooks
-for h in pre-commit pre-push post-merge; do
-  if [ -f ".githooks/$h" ]; then
-    echo "[engram] .githooks/$h already exists; leaving as-is"
-  else
-    cp "scripts/hooks/$h" ".githooks/$h"
-  fi
-done
-chmod +x .githooks/pre-commit .githooks/pre-push .githooks/post-merge
+# import new transcript/log evidence from configured sources
+engram ingest
 
-git config core.hooksPath .githooks
+# ask why a span exists
+engram explain src/auth.rs:40-78
 ```
 
-Configure sources in `.engram/config.yml`:
+What the "magic" is:
+- `engram ingest` parses configured source files with deterministic adapters, writes normalized tapes, and updates the evidence index.
+- `engram explain <file>:<start>-<end>` fingerprints the selected code span, finds matching evidence in tapes, and returns ranked session context and lineage.
+- `engram explain --dispatch <uuid>` starts from a dispatch marker UUID and returns sessions/spans tied to that work item.
+
+Global mode (shared index/tapes across repos):
+
+```bash
+engram init --global
+engram ingest --global
+engram explain src/lib.rs:10-20 --global
+```
+
+## 3. How you configure it
+
+Engram reads YAML config from repo-level and user-level locations (repo-local and global workflows can be layered).
+
+Minimum schema:
 
 ```yaml
 sources:
@@ -64,183 +54,69 @@ sources:
     adapter: codex
   - path: ~/.claude/projects/**/*.jsonl
     adapter: claude
+  - path: ~/.openclaw/agents/main/sessions/**/*.jsonl
+    adapter: openclaw
 exclude:
   - ~/.claude/projects/**/personal-*
 ```
 
-### Git ↔ Engram hygiene mapping
+Field meanings:
+- `sources`: list of evidence inputs Engram should ingest.
+- `sources[].path`: a file path or glob for transcript/log artifacts.
+- `sources[].adapter`: parser to use for that source (`auto|codex|claude|cursor|gemini|opencode|openclaw`).
+- `exclude`: globs removed from ingest even if they match a source path.
 
-- `git commit` → pre-commit hook runs `engram ingest`
-- `git push` → pre-push hook runs `engram ingest` and freshness check
-- `git merge` / `git pull` → post-merge hook rebuilds local `.engram-cache` index from `.engram` tapes
+Practical rule: use `sources` to set your provenance boundary, and `exclude` to enforce privacy/noise boundaries.
 
-### Daily workflow
+## 4. How you install it
 
-Use Git normally. Hooks should handle Engram hygiene.
-
-If needed manually:
+Build from source:
 
 ```bash
-engram ingest
-engram explain <file>:<start>-<end>
-engram explain --dispatch <uuid>
+git clone https://github.com/clickety-clacks/engram.git
+cd engram
+cargo build --release
 ```
 
-### Dispatch marker linking
+Install the binary for your user:
 
-Linking is how Engram connects related sessions when work moves across boundaries (planner -> implementer, one agent -> another, one run -> follow-up run).
+```bash
+cargo install --path .
+# or copy target/release/engram into a directory on PATH
+```
 
-Dispatch markers are explicit handoff tags:
+Verify:
+
+```bash
+engram --help
+```
+
+## 5. How you link multiple levels of agents together
+
+When work is handed across sessions, include a shared marker in transcript content:
 
 ```text
 <engram-src id="f47ac10b-58cc-4372-a567-0e02b2c3d479"/>
 ```
 
-Why this matters:
-- Fingerprint overlap is often enough, but explicit markers make causal handoffs unambiguous.
-- `explain` can show not only "where this code was edited" but also "which upstream session dispatched this work."
+Human model:
+1. Upstream session creates a work item UUID and sends a task.
+2. Downstream session receives the marker and performs code work.
+3. Engram records where that UUID was received/sent in each tape.
+4. `engram explain` can walk upstream from the edit to parent sessions.
 
-How it works:
-- Ingest records per-tape dispatch links with direction (`received`/`sent`) and first turn index.
-- `engram explain <file>:<start>-<end>` adds upstream dispatch lineage sessions before the edit turn.
-- `engram explain --dispatch <uuid>` starts from a dispatch UUID and returns all sessions sharing it plus code spans touched in those sessions.
+Concrete chain example:
+- Session A (planner) dispatches auth refactor with `<engram-src id="..."/>`.
+- Session B (implementer) edits `src/auth.rs` while carrying the same marker.
+- Session C (follow-up fixer) keeps the marker for bugfixes.
+- Querying B/C edits can recover A -> B -> C causal lineage.
 
-Concrete example flow:
-1. Upstream session creates work item `f47ac10b-58cc-4372-a567-0e02b2c3d479`.
-2. Dispatched prompt includes `<engram-src id="f47ac10b-58cc-4372-a567-0e02b2c3d479"/>`.
-3. Downstream coding session receives that marker and edits `src/auth.rs`.
-4. `engram explain src/auth.rs:40-78` can walk from the edit to the received marker, then to the upstream session where that UUID was sent.
-
-OpenClaw note: an OpenClaw submitter can pass this UUID via a header and include the `<engram-src .../>` tag in dispatched text. That is a sample integration pattern, not Engram-specific behavior. Any harness/orchestrator can use the same marker contract.
-
-### System-wide mode (global index + OpenClaw)
-
-Use global mode when you want one index/tape root shared across repos.
-
-```bash
-# one-time global setup
-engram init --global
-
-# edit ~/.engram/config.yml
-cat > ~/.engram/config.yml <<'YAML'
-sources:
-  - path: ~/.codex/sessions/**/*.jsonl
-    adapter: codex
-  - path: ~/.claude/projects/**/*.jsonl
-    adapter: claude
-  - path: ~/.openclaw/sessions/**/*.jsonl
-    adapter: openclaw
-exclude:
-  - ~/.openclaw/sessions/personal-*
-YAML
-
-# ingest all configured sources into ~/.engram + ~/.engram-cache
-engram ingest --global
-
-# query from any repo using the shared global evidence index
-engram explain src/lib.rs:10-20 --global
-```
-
-## Deployment Model
-
-Engram uses a two-layer architecture:
-
-- **Layer 1: portable repo tapes**  
-  `.engram/tapes` lives in the repository and is meant to be checked in with git. This is the portable baseline provenance that travels with the repo.
-- **Layer 2: private overlays (not checked in)**  
-  Extra tape folders come from `sources:` in config (user/global/project-local/shared paths). These remain outside git and are machine/user specific by default.
-
-Effective ingest sources are:
-
-- repo tapes (`.engram/tapes`)
-- overlay sources from config (`sources:`)
-
-For multi-machine setups, share tape folders with NFS or file sync and let each machine build and maintain its own local index (`.engram-cache` or `~/.engram-cache`).
-
-### Invariants
-
-- Tapes are write-once immutable.
-- Never edit existing tape files.
-- Never commit `.engram-cache/`.
-- If tape filename already exists during import, skip (optional warning-only hash sanity check).
-- Engram persists tapes/config/cursor state with atomic write+rename (`fsync` file + parent dir) for safer behavior on local and NFS/shared paths.
-
-### Adapter coverage (current)
-
-- Claude Code: deterministic adapter path implemented
-- Codex CLI: deterministic adapter path implemented (partial read/edit by harness limits)
-- OpenCode: adapter implemented/discovery-backed
-- Gemini CLI: adapter implemented/discovery-backed
-- Cursor: adapter implemented/discovery-backed
-- OpenClaw: minimum deterministic transcript/log adapter implemented
-
-See adapter specs for exact coverage semantics:
-- `specs/adapters/claude-code.md`
-- `specs/adapters/codex-cli.md`
-- `specs/adapters/opencode.md`
-- `specs/adapters/gemini-cli.md`
-- `specs/adapters/cursor.md`
-
-### Value proposition
-
-Modern agents are strong at local reasoning but weak at longitudinal memory. Engram turns prior work into retrievable context so each new task can start warm instead of cold.
-
-- Preserve full causal history, not just commit diffs
-- Retrieve the exact evidence behind any span before refactoring
-- Warm future agent context with real prior decisions, constraints, and tradeoffs
-- Reduce repeated mistakes caused by missing historical intent
-
-## Status
-
-Early implementation, actively evolving.
-
-Current capabilities include:
-- Tape event parsing and storage
-- SQLite-backed evidence/lineage/tombstone indexing
-- Span linkage model with confidence thresholds
-- Query-side traversal primitives for explain flows
-- CLI and E2E test scaffolding
-
-## Core model
-
-- **Trace tapes**: append-only event logs (`msg.in`, `msg.out`, `tool.call`, `tool.result`, `code.read`, `code.edit`, `span.link`, `meta`)
-- **Span linkage**: lineage edges with confidence + explicit `agent_link` override
-- **Tombstones**: deleted spans are preserved as provenance, never erased
-- **Query defaults**: machine-first filtering to reduce noise while preserving causality
-
-## Why this exists
-
-Git tells you *what changed*.
-Engram is for *why this span is here*.
-
-## Local dev
-
-```bash
-# from repo root
-cargo test
-cargo run -- --help
-```
-
-## Roadmap focus
-
-- Complete `engram explain <file>:<start>-<end>` end-to-end UX
-- Tune anchor/similarity thresholds against real codebases
-- Harden tape ingestion adapters for agent workflows
-- Add release-quality docs and examples
-
-## Repo
-
-https://github.com/clickety-clacks/engram
+OpenClaw note (example only):
+- An OpenClaw submitter can propagate the UUID in a dispatch header and mirror it in message content as `<engram-src .../>`.
+- That submitter/header pattern is an integration example, not Engram core behavior. Any orchestrator or harness can implement the same marker contract.
 
 ## Specs
 
 - Core event contract: `specs/core/event-contract.md`
-- Claude Code adapter: `specs/adapters/claude-code.md`
-- Codex CLI adapter: `specs/adapters/codex-cli.md`
-- OpenCode adapter: `specs/adapters/opencode.md`
-- Gemini CLI adapter: `specs/adapters/gemini-cli.md`
-- Cursor adapter: `specs/adapters/cursor.md`
-
-## Slideshow
-
-https://clawline.chat/engram-slides.html
+- Dispatch marker: `specs/core/dispatch-marker.md`
+- Adapter contracts: `specs/adapters/*.md`
