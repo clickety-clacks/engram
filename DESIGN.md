@@ -239,6 +239,28 @@ In practice:
 - Orchestrator + multiple coding agents across repos → many tapes, fingerprints link what overlaps → works
 - Engram doesn't care about the topology
 
+### Dispatch-marker linking (explicit handoff path)
+
+Fingerprint overlap is the default linking mechanism, but some handoffs need an explicit causal marker. Engram supports this with inline dispatch tags:
+
+```text
+<engram-src id="f47ac10b-58cc-4372-a567-0e02b2c3d479"/>
+```
+
+Plain-language model:
+- A sender session emits a UUID when it dispatches work.
+- A receiver session includes that UUID in incoming message content.
+- Engram ingest records where each UUID was first `received` and where it was later `sent`.
+- During `explain`, Engram can walk upstream via those markers to recover parent sessions that led to the edit.
+
+Concrete flow:
+1. Session A dispatches work and includes `<engram-src id="..."/>`.
+2. Session B receives the marker, performs code edits, and optionally forwards the same marker downstream.
+3. `engram explain <file>:<start>-<end>` in Session B can return Session A as upstream causal context.
+4. `engram explain --dispatch <uuid>` returns all sessions sharing that UUID plus touched code spans.
+
+This contract is harness-agnostic. Engram only requires the marker text in transcript content; it does not require a specific vendor protocol.
+
 ### Tier metadata
 
 Tapes can carry an optional `tier` field in their `meta` event (`orchestrator`, `agent`, or omitted). This is informational — it helps consumers understand the provenance source but does not affect indexing or matching. A tape without a tier field is indexed identically.
@@ -641,6 +663,8 @@ Each adapter maintains a supported version matrix (min, max-tested, known-bad). 
 | Cursor | Agent | Discovery | Adapter scaffolded, needs real-world validation |
 
 The OpenClaw adapter is notable because it captures orchestrator-tier provenance — the decisions and reasoning that drive coding agents. Its tapes typically contain dispatched prompts, agent selection logic, and high-level architectural reasoning. These produce fingerprints that overlap with coding agent tapes, enabling the automatic cross-tier linking described in Multi-Tier Provenance.
+
+OpenClaw-specific submitter/header propagation is an example integration pattern, not part of Engram core semantics. Any orchestrator or harness can implement the same dispatch-marker contract by embedding `<engram-src id="..."/>` in deterministic transcript content.
 
 See `adapters/ADAPTERS.md` for the full adapter contract and `specs/adapters/*.md` for per-harness details.
 

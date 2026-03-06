@@ -66,17 +66,32 @@ engram explain <file>:<start>-<end>
 engram explain --dispatch <uuid>
 ```
 
-### Dispatch marker chain tracing
+### Dispatch marker linking
 
-Engram supports explicit cross-session dispatch markers:
+Linking is how Engram connects related sessions when work moves across boundaries (planner -> implementer, one agent -> another, one run -> follow-up run).
+
+Dispatch markers are explicit handoff tags:
 
 ```text
 <engram-src id="f47ac10b-58cc-4372-a567-0e02b2c3d479"/>
 ```
 
+Why this matters:
+- Fingerprint overlap is often enough, but explicit markers make causal handoffs unambiguous.
+- `explain` can show not only "where this code was edited" but also "which upstream session dispatched this work."
+
+How it works:
 - Ingest records per-tape dispatch links with direction (`received`/`sent`) and first turn index.
-- `engram explain <file>:<start>-<end>` now adds upstream dispatch lineage sessions before the edit turn.
+- `engram explain <file>:<start>-<end>` adds upstream dispatch lineage sessions before the edit turn.
 - `engram explain --dispatch <uuid>` starts from a dispatch UUID and returns all sessions sharing it plus code spans touched in those sessions.
+
+Concrete example flow:
+1. Upstream session creates work item `f47ac10b-58cc-4372-a567-0e02b2c3d479`.
+2. Dispatched prompt includes `<engram-src id="f47ac10b-58cc-4372-a567-0e02b2c3d479"/>`.
+3. Downstream coding session receives that marker and edits `src/auth.rs`.
+4. `engram explain src/auth.rs:40-78` can walk from the edit to the received marker, then to the upstream session where that UUID was sent.
+
+OpenClaw note: an OpenClaw submitter can pass this UUID via a header and include the `<engram-src .../>` tag in dispatched text. That is a sample integration pattern, not Engram-specific behavior. Any harness/orchestrator can use the same marker contract.
 
 ### System-wide mode (global index + OpenClaw)
 
