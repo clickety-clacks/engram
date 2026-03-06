@@ -1,5 +1,9 @@
 # Engram
 
+**How did we get here?**
+
+*An automatically built index into why your code is the way it is.*
+
 Engram answers one question: **why does this code span exist?**
 
 ## 1. What it is
@@ -93,6 +97,9 @@ engram --help
 
 ## 5. How you link multiple levels of agents together
 
+This is how Engram follows work across agent and agent-harness boundaries.
+
+
 When work is handed across sessions, include a shared marker in transcript content:
 
 ```text
@@ -106,10 +113,10 @@ Human model:
 4. `engram explain` can walk upstream from the edit to parent sessions.
 
 Concrete chain example:
-- Session A (planner) dispatches auth refactor with `<engram-src id="..."/>`.
-- Session B (implementer) edits `src/auth.rs` while carrying the same marker.
-- Session C (follow-up fixer) keeps the marker for bugfixes.
-- Querying B/C edits can recover A -> B -> C causal lineage.
+- Session A dispatches auth refactor with `<engram-src id="..."/>`.
+- Session B edits `src/auth.rs` while carrying the same marker.
+- Session C keeps the marker for follow-up fixes.
+- Querying B/C edits can recover A -> B -> C causal lineage across agent and agent-harness boundaries.
 
 OpenClaw note (example only):
 - An OpenClaw submitter can propagate the UUID in a dispatch header and mirror it in message content as `<engram-src .../>`.
