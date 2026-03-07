@@ -9,7 +9,7 @@ These are hard constraints. Everything else in this document follows from them.
 3. **Tapes are immutable.** Once written, never modified or deleted. This enables safe merging, deduplication, and trust in provenance chains.
 4. **The index is derived.** Delete it, rebuild it from tapes. Change calibration parameters, rebuild it. The index is a cache, not a source of truth.
 5. **Provenance is additive.** Start with zero. Add repo tapes. Add orchestrator tapes. Add cross-project tapes. Each layer enriches. None is required. Some > none, always.
-6. **Scope is user-defined.** You declare what Engram can see via source paths. Exclude something = Engram can't see it. Trade recall for privacy. Your choice, not Engram's.
+6. **Scope is user-defined.** You control what Engram can see by where you run ingest and fingerprint. If you haven't processed it, Engram can't see it. Trade recall for privacy. Your choice, not Engram's.
 
 ## The Problem
 
@@ -64,8 +64,10 @@ Tapes are zstd-compressed. Large tool outputs are content-addressed and deduplic
 ### P5. Append-only tapes
 Trace tapes are immutable once written. They can be created and read, never modified or deleted. This is a hard invariant — it enables safe merging, deduplication, and trust in provenance chains.
 
+<!-- CHANGED: P6 rewritten. Old: "engram init creates configuration and directories."
+     New: auto-create on first invocation, no explicit init step. -->
 ### P6. Zero-config start
-`engram init` creates configuration and directories. That's it. All settings have sensible defaults. An agent should be able to start using Engram without reading a config file.
+On first invocation, Engram auto-creates `~/.engram/` with a default config and DB. No explicit init step. An agent should be able to start using Engram without running a setup command or reading a config file.
 
 ### P7. Local-first, offline-only
 No network required. No accounts. No servers. Everything runs locally. This is a tool, not a service.
@@ -79,13 +81,17 @@ Engram must work with the dominant agent harnesses (at minimum: Codex CLI and Cl
 ### P10. No project taxonomy
 Engram doesn't know what a "project" is. There are tapes. There are fingerprints. A match is a match. Cross-project connections surface automatically because the text overlaps. Users control boundaries through source configuration, not through Engram's internal model.
 
+<!-- CHANGED: New principle P11. -->
+### P11. Config conspicuity
+Every command prints its resolved config path and DB path as the first lines of output. The user always knows which config was resolved and which DB is being read from or written to. No silent defaults.
+
 ## How It Works: A Story
 
 An agent is about to refactor a function. Before touching it, it asks Engram: "Why is this code here?"
 
 1. **Fingerprint the span.** Engram reads the selected code and chops it into small overlapping word patterns (k-grams). Each pattern gets hashed. The result is a bag of hashes — a unique fingerprint of that exact code.
 
-2. **Check the index.** Engram looks up those hashes in its index. The index was built from tapes — potentially from this repo, from other repos, from orchestrator sessions, from wherever the user configured Engram to look. Every time an agent read, edited, or even discussed code, Engram chopped that content into the same kind of word patterns and stored them alongside a pointer to that moment in the transcript.
+2. **Check the index.** Engram looks up those hashes in its index. The index was built from tapes — potentially from this repo, from other repos, from orchestrator sessions, from wherever fingerprints have been contributed. Every time an agent read, edited, or even discussed code, Engram chopped that content into the same kind of word patterns and stored them alongside a pointer to that moment in the transcript.
 
 3. **Find matches.** Results come back: "Tape 7, event 42 has 92% of the same word patterns." That's high confidence — almost certainly the same code. "Tape 3, event 18 has 60% match." That's a partial match — maybe an earlier version before some edits. Tape 7 might be from the coding agent that wrote the function. Tape 3 might be from an orchestrator session where the architect discussed the design. Both are just tapes.
 
@@ -94,6 +100,94 @@ An agent is about to refactor a function. Before touching it, it asks Engram: "W
 5. **Navigate if needed.** If the window isn't enough context, the agent can expand it — walking backward or forward through the transcript, or following continuation links to earlier sessions.
 
 Now the agent knows *why this code exists* before changing it. It won't accidentally undo the timeout fix, and it understands the architectural intent behind the consolidation.
+
+<!-- CHANGED: New section. Replaces the old "Source resolution" subsection in On-Disk Layout
+     and the old "Per-repo vs global config" subsection in Scope and Privacy. -->
+## Config System
+
+### Walk-Up Resolution
+
+When any Engram command runs, it resolves config by walking up from the current
+working directory:
+
+1. Check for `.engram/config.yml` in the current directory
+2. Walk parent directories, checking each for `.engram/config.yml`
+3. Fall back to `~/.engram/config.yml` (system config)
+
+**First config found wins. No merging.** If a directory has its own config,
+that is the complete config for commands run there. This follows the same
+pattern as `.npmrc`, `.editorconfig`, and `tsconfig.json`.
+
+In practice, most directories have no `.engram/config.yml`. Walk-up falls
+through to the system config. This is the zero-config default experience.
+
+### Auto-Creation
+
+On first invocation, if `~/.engram/config.yml` does not exist, Engram
+auto-creates it with a default `db:` pointing at `~/.engram/index.sqlite`.
+No explicit init step is required.
+
+### DB Override
+
+The config file specifies where fingerprints are stored via the `db:` key:
+
+```yaml
+db: ~/.engram/index.sqlite
+```
+
+Any config at any level can override `db:` to point elsewhere. This is the
+mechanism for isolation: a repo or shared folder that wants its own segregated
+fingerprint DB declares `db:` in its local `.engram/config.yml`.
+
+If no config in the walk-up chain specifies `db:`, the default
+`~/.engram/index.sqlite` is used.
+
+The "single system DB" experience is not a hard architectural constraint —
+it is the emergent result of most directories not overriding `db:`. Everything
+falls through to the global default.
+
+### Additional Stores
+
+For explain queries that should search beyond the resolved `db:`, a config
+can declare additional stores:
+
+```yaml
+additional_stores:
+  - /nfs/team/engram/index.sqlite
+  - /mnt/shared/engram/index.sqlite
+```
+
+`engram explain` queries the primary `db:` plus all `additional_stores:`,
+merges and deduplicates results. Ingest and fingerprint commands write only
+to the primary `db:`.
+
+### Example Configs
+
+**System config (`~/.engram/config.yml`) — typical developer machine:**
+
+```yaml
+db: ~/.engram/index.sqlite
+```
+
+**Repo override (`.engram/config.yml` in a client project) — isolated DB:**
+
+```yaml
+db: .engram/index.sqlite
+```
+
+**Team config (`.engram/config.yml` on a shared mount) — team DB:**
+
+```yaml
+db: /nfs/team/engram/index.sqlite
+```
+
+**Developer who wants to also search a team DB:**
+
+```yaml
+db: ~/.engram/index.sqlite
+additional_stores:
+  - /nfs/team/engram/index.sqlite
+```
 
 ## Fingerprinting: The Core Mechanism
 
@@ -251,15 +345,23 @@ Plain-language model:
 - A sender session emits a UUID when it dispatches work.
 - A receiver session includes that UUID in incoming message content.
 - Engram ingest records where each UUID was first `received` and where it was later `sent`.
-- During `explain`, Engram can walk upstream via those markers to recover parent sessions that led to the edit.
+- During `explain`, Engram walks upstream via those markers automatically as part of normal link traversal to recover parent sessions that led to the edit.
 
 Concrete flow:
 1. Session A dispatches work and includes `<engram-src id="..."/>`.
 2. Session B receives the marker, performs code edits, and optionally forwards the same marker downstream.
-3. `engram explain <file>:<start>-<end>` in Session B can return Session A as upstream causal context.
-4. `engram explain --dispatch <uuid>` returns all sessions sharing that UUID plus touched code spans.
+3. `engram explain <file>:<start>-<end>` finds Session B via fingerprint, then follows the dispatch marker link upstream to Session A automatically.
+
+<!-- CHANGED: Removed "engram explain --dispatch <uuid>" mode.
+     Dispatch markers are followed as part of normal explain link traversal.
+     If someone needs to look up a UUID directly, that is a search/lookup
+     operation, not an explain operation. -->
 
 This contract is harness-agnostic. Engram only requires the marker text in transcript content; it does not require a specific vendor protocol.
+
+See `specs/core/dispatch-marker.md` for the full dispatch marker specification,
+including direction detection via structural nesting depth and causal preceding
+UUID traversal rules.
 
 ### Tier metadata
 
@@ -275,9 +377,9 @@ anchor_hash → [(tape_id, event_offset, kind, file_path, timestamp), ...]
 
 Many-to-many. A span returns many sessions; a session touches many anchors.
 
-Stored in SQLite (single file, no daemon, fast lookups). The index lives in `.engram-cache/index.sqlite` — it is a derived artifact, never committed to source control, and can be rebuilt from tapes at any time.
+Stored in SQLite (single file, no daemon, fast lookups). The index is a derived artifact, never committed to source control, and can be rebuilt from tapes at any time.
 
-The index is built from whatever tapes the user has configured as sources. It may span a single repo, many repos, orchestrator logs, or any combination. The index doesn't know or care about source boundaries — it's all just anchor hashes pointing at tape events.
+The index is built from whatever tapes have been fingerprinted into the resolved DB. It may span a single repo, many repos, orchestrator logs, or any combination. The index doesn't know or care about source boundaries — it's all just anchor hashes pointing at tape events.
 
 ### Multiple indices
 
@@ -329,47 +431,112 @@ BFS fan-out is capped at `MAX_FANOUT` (default `50`) edges per node. When a node
 
 ## CLI Commands
 
-### `engram init`
+<!-- CHANGED: engram init deprecated. Auto-creation replaces it. -->
+### `engram init` (deprecated)
 
-Create Engram directories and a default configuration. When run inside a git repo, creates `.engram/` alongside `.git/` and adds it as a source. When run outside a repo (or with `--global`), creates or updates `~/.engram/`. Either way, sensible defaults. An agent should be able to run this and start using Engram immediately.
+Previously created Engram directories and a default configuration. Now a
+no-op that prints a deprecation notice. The system store at `~/.engram/`
+is auto-created on first invocation of any Engram command. Repo-level
+`.engram/config.yml` files are created manually when isolation is needed.
 
+<!-- CHANGED: engram ingest rewritten. Now local-scoped, operates on the folder
+     you're in and its subfolders. No global sweep. Creates tapes + fingerprints. -->
 ### `engram ingest`
 
-Import new harness logs into tapes and rebuild the index from configured sources. This is the primary way tapes enter the system during normal development. Adapters detect installed harnesses, parse their logs deterministically, and normalize events into Engram tape format.
+Import raw harness transcripts from the current directory and its subdirectories
+into tapes and fingerprint them into the resolved DB.
 
-Ingest is incremental — it tracks what has already been imported and only processes new content. Running it multiple times with no new harness activity is effectively a no-op (idempotent given unchanged inputs).
+This command is **local-scoped** — it operates on the folder you're standing in,
+not on a global source list. It discovers transcript files in the current
+directory tree, parses them via the appropriate adapter, writes normalized tapes,
+and fingerprints those tapes into the DB resolved via config walk-up.
+
+```bash
+cd ~/src/clawline
+engram ingest
+# config: ~/.engram/config.yml (walk-up)
+# db: ~/.engram/index.sqlite
+# ingested: 47 tapes, 3201 fingerprints
+```
+
+Ingest is incremental — it tracks what has already been imported and only
+processes new content. Running it multiple times with no new harness activity
+is effectively a no-op (idempotent given unchanged inputs).
+
+The ingest cadence is local hygiene — each repo or folder decides when to run
+it. Typical triggers:
+- Git hooks (`post-checkout`, `post-merge`)
+- Cron (for shared/mounted transcript folders)
+- Manual after a work session
+
+<!-- CHANGED: New command. Indexes existing tapes only, no transcript parsing. -->
+### `engram fingerprint`
+
+Index existing tapes in the current directory's `.engram/tapes/` into the
+resolved DB. No transcript parsing, no tape creation — just fingerprinting.
+
+This is the command for consuming tapes that arrived from elsewhere:
+- Committed `.engram/tapes/` from a cloned repo
+- Tapes on an NFS mount from another machine
+- Tapes someone sent you
+
+```bash
+cd ~/src/colleague-project
+engram fingerprint
+# config: ~/.engram/config.yml (walk-up)
+# db: ~/.engram/index.sqlite
+# fingerprinted: 23 tapes
+```
+
+Idempotent — skips tapes already fingerprinted in the resolved DB.
+
+To fingerprint tapes in the system store (e.g., tapes dropped into
+`~/.engram/tapes/`), run `engram fingerprint` from `~/.engram/`.
 
 ### `engram record <command>`
 
 Run a command and capture a live tape. Captures stdin/stdout/stderr, file diffs, tool invocations. Writes tape to the appropriate tape directory. Alternatively: `engram record --stdin` to pipe in a pre-existing session transcript.
 
+<!-- CHANGED: engram explain rewritten. Global by nature (queries resolved DB which
+     accumulates all contributions). Removed --dispatch mode. Added config conspicuity.
+     Added additional_stores fan-out. -->
 ### `engram explain <file>:<start>-<end>`
 
 The killer query. Given a span, return ranked evidence trails with transcript context.
 
-1. Compute anchors for selected text
-2. Direct index lookup
-3. Lineage ancestor traversal (configurable depth)
-4. For each anchor, return a transcript window around the anchor event
-5. Return ranked evidence fragments grouped by session
+**Explain is global by nature.** It queries the resolved DB — which contains
+the accumulated fingerprints from every `ingest` and `fingerprint` command
+ever run against that DB, from any folder, any repo, any machine that
+contributed. The user does not need to know or remember what was configured
+or where transcripts came from. The DB is the sum of all local contributions.
 
-Output is machine-readable by default, human-readable with `--pretty`.
+If `additional_stores:` is configured, explain also queries those DBs and
+merges results.
 
-Dispatch markers are applied during this query as an additional causal layer:
-- For each code-edit touch, Engram finds the most recent `received` dispatch UUID before that edit turn.
-- It follows that UUID to the tape where it was `sent`.
-- It repeats upstream (`received` before `sent`) until no parent exists.
-- Upstream dispatch sessions are returned alongside evidence sessions.
+This is the reasoning behind global explain: on any system, you don't
+necessarily know or remember all the transcript locations that were configured
+— possibly by an admin, possibly months ago, possibly via automated hooks.
+Explain searches everything so you don't have to reconstruct the provenance
+surface manually.
 
-### `engram explain --dispatch <uuid>`
+Algorithm:
 
-Dispatch-centric query mode. Entry point is a dispatch marker UUID.
+1. Print resolved config path and DB path
+2. Compute anchors for selected text
+3. DIRECT: lookup each anchor in evidence index → collect matching sessions
+4. LINEAGE: BFS backward through lineage links (depth limit, default 10)
+   - Excludes edges with confidence < --min-confidence (default 0.50)
+   - Always includes agent_link edges regardless of confidence
+   - Respects MAX_FANOUT and MAX_EDGES traversal limits
+   - Follows dispatch marker links upstream automatically
+   - For each ancestor anchor, collect additional sessions
+5. ORDER: sort sessions by (touch count DESC, most recent touch DESC)
+6. FOR EACH session: extract transcript window around each touch event
+7. OUTPUT: ordered list of raw transcript windows, one block per session
 
-Returns:
-- all sessions containing that UUID (`sent` and `received`)
-- code spans touched in those sessions
+Output is raw transcript text — the actual messages and tool I/O from each session that touched the span. No scoring. No summarization. No interpretation. The consumer decides what matters.
 
-This is the orchestrator-facing path when the caller has a work-unit UUID but no file/span yet.
+Results may include windows from different tiers (orchestrator sessions alongside coding agent sessions) and from different repos. The output identifies each window's source tape, so consumers can distinguish tiers if they choose to.
 
 #### Window parameters
 
@@ -412,28 +579,6 @@ Garbage-collect unreferenced content-addressed blobs. Keeps index entries and li
 ### `engram search <query>` (future)
 
 Concept search over tape contents. Requires optional vector index bolt-on.
-
-## Query Algorithm
-
-```
-INPUT: file path + line range (current working tree)
-
-1. Extract text from current file at given range
-2. Compute span anchors for that text
-3. DIRECT: lookup each anchor in evidence index → collect matching sessions
-4. LINEAGE: BFS backward through lineage links (depth limit, default 10)
-   - Excludes edges with confidence < --min-confidence (default 0.50)
-   - Always includes agent_link edges regardless of confidence
-   - Respects MAX_FANOUT and MAX_EDGES traversal limits
-   - For each ancestor anchor, collect additional sessions
-5. ORDER: sort sessions by (touch count DESC, most recent touch DESC)
-6. FOR EACH session: extract transcript window around each touch event
-7. OUTPUT: ordered list of raw transcript windows, one block per session
-```
-
-Output is raw transcript text — the actual messages and tool I/O from each session that touched the span. No scoring. No summarization. No interpretation. The consumer decides what matters.
-
-Results may include windows from different tiers (orchestrator sessions alongside coding agent sessions) and from different repos. The output identifies each window's source tape, so consumers can distinguish tiers if they choose to.
 
 ## Continuation Detection: Open Question
 
@@ -504,34 +649,25 @@ Wider scope means better recall. If Engram can see tapes from all your repos and
 
 But wider scope also means more exposure. Orchestrator tapes may contain private discussions. Cross-project tapes may reveal internal decisions about other work.
 
-Engram's answer: **you draw the line, not us.** Source configuration is an explicit include list. Anything not included is invisible to Engram. There is no ambient discovery, no automatic expansion, no "helpful" scanning of your filesystem.
+Engram's answer: **you draw the line, not us.** What gets fingerprinted into the DB depends on where you run `ingest` and `fingerprint`. Anything you haven't explicitly ingested is invisible to Engram. There is no ambient discovery, no automatic expansion, no "helpful" scanning of your filesystem.
 
-### How scoping works
+<!-- CHANGED: "Per-repo vs global config" subsection replaced with walk-up reference. -->
+### Config and scoping
 
-The config file declares sources — directories containing tapes:
+Config walk-up resolution (see Config System section) determines which DB
+receives fingerprints and which DB is queried. By default, everything goes
+to `~/.engram/index.sqlite`. A repo or folder that needs isolation overrides
+`db:` in its local `.engram/config.yml`.
 
-```yaml
-sources:
-  - ~/src/engram/.engram/tapes
-  - ~/src/clawline/.engram/tapes
-  - ~/src/clawdbot/.engram/tapes
-  - ~/.openclaw/sessions
-exclude:
-  - ~/.openclaw/sessions/personal-*
-```
-
-`engram ingest` reads tapes from all configured sources and builds one unified index. That's it. Add a source path → those tapes enter the index. Remove it → next rebuild excludes them. Glob-based exclude patterns filter within included sources.
-
-### Per-repo vs global config
-
-- **Per-repo config** (`.engram/config.yml`) — typically lists only the local repo's tapes. Travels with the repo.
-- **Global config** (`~/.engram/config.yml`) — lists cross-project sources, orchestrator logs, personal tapes. Private to this machine.
-
-When both exist, sources merge. Excludes merge. The resulting source set is the union minus exclusions.
+Privacy boundaries are controlled by two mechanisms:
+- **Where you run ingest/fingerprint** — only folders you explicitly process
+  contribute to the DB
+- **DB isolation via config override** — sensitive work can use a separate DB
+  that is never queried by default from other directories
 
 ### Privacy guarantees
 
-Engram never phones home. It never reads paths not listed in sources. It never indexes tapes it wasn't pointed at. The index is local. Tapes don't leave your machine unless you explicitly copy them.
+Engram never phones home. It never reads paths you haven't explicitly processed. It never indexes tapes it wasn't pointed at. The index is local. Tapes don't leave your machine unless you explicitly copy them.
 
 If you share a repo that contains `.engram/tapes/`, recipients get those tapes — that's intentional (provenance travels with code). If you don't want that, exclude `.engram/` from distribution or move tapes to `~/.engram/` (home-only, never committed).
 
@@ -541,24 +677,24 @@ If you share a repo that contains `.engram/tapes/`, recipients get those tapes �
 
 Provenance sharing is file copying. No protocol. No sync service. No accounts.
 
-Want to share provenance with a collaborator? Zip the tapes. Send them. The recipient drops them in a directory, adds that directory to their sources, runs `engram ingest`. Done. The index rebuilds with the new tapes included.
+Want to share provenance with a collaborator? Zip the tapes. Send them. The recipient drops them in a directory, runs `engram fingerprint` in that directory. Done. The fingerprints enter their resolved DB.
 
-Want to share provenance with a repo? Commit tapes in `.engram/tapes/`. Anyone who clones the repo gets the provenance. Their local `engram ingest` picks up the tapes and indexes them.
+Want to share provenance with a repo? Commit tapes in `.engram/tapes/`. Anyone who clones the repo gets the provenance. They run `engram fingerprint` in the repo and the tapes are indexed.
 
 ### Additive layering
 
 Provenance layers stack:
 
-1. **Repo tapes** — baseline. What happened in this repo. Travels with `git clone`.
-2. **Cross-project tapes** — enrichment. What happened in related repos. Added via source config.
-3. **Orchestrator tapes** — enrichment. Why things happened. Added via source config.
-4. **Shared tapes** — enrichment. What collaborators did. Dropped in a folder.
+1. **Repo tapes** — baseline. What happened in this repo. Travels with `git clone`. Indexed via `engram fingerprint`.
+2. **Cross-project tapes** — enrichment. What happened in related repos. Indexed by running `ingest` or `fingerprint` in those repos.
+3. **Orchestrator tapes** — enrichment. Why things happened. Indexed by running `ingest` in the orchestrator's transcript folder.
+4. **Shared tapes** — enrichment. What collaborators did. Dropped in a folder, indexed via `engram fingerprint`.
 
 Each layer is optional. Each adds recall. The order doesn't matter — fingerprints match regardless of when tapes were added to the index.
 
 ### No merge conflicts
 
-Tapes are immutable files with content-addressed names. "Merging" provenance from two sources means having both directories in your source list. There is nothing to merge, reconcile, or deduplicate at the tape level. If two sources contain the same tape (same hash), it's the same file. If they contain different tapes, they're different sessions.
+Tapes are immutable files with content-addressed names. "Merging" provenance from two sources means having both in your DB. There is nothing to merge, reconcile, or deduplicate at the tape level. If two sources contain the same tape (same hash), it's the same file. If they contain different tapes, they're different sessions.
 
 The index rebuilds from the combined set. That's the merge.
 
@@ -674,20 +810,24 @@ Engram integrates with git but does not depend on it. For repos that use git, En
 
 ### Folder model (in-repo)
 
-- `.engram/` — **committed** to source control. Contains immutable tapes and optional config.
-- `.engram-cache/` — **never committed**. Contains the derived SQLite index, temp files, and rebuild artifacts.
+- `.engram/tapes/` — **committed** to source control. Contains immutable tapes.
+- `.engram/config.yml` — **committed** if the repo needs config overrides (isolation, custom DB path). Most repos do not have this file.
+- `.engram-cache/` — **never committed**. Contains derived artifacts, temp files.
 
-This split means provenance travels with the code (tapes are committed), but the derived index is local and rebuildable.
+<!-- CHANGED: Clarified that the fingerprint DB is NOT committed. It is derived
+     and lives in the system store or a location specified by config. -->
+The fingerprint DB (`index.sqlite`) is never committed to the repo. It is
+derived and lives at the location specified by the resolved config's `db:`
+key — typically `~/.engram/index.sqlite`.
 
 ### Git hook integration
 
-For repos that want automatic ingestion, Engram can hook into git operations:
+For repos that want automatic ingestion, Engram hooks into git operations:
 
 | Git operation | Engram hook | What it does |
 |--------------|-------------|-------------|
-| `git commit` | pre-commit | Runs `engram ingest` — captures latest harness logs |
-| `git push` | pre-push | Runs `engram ingest` — freshness check |
-| `git merge/pull` | post-merge | Rebuilds `.engram-cache/` index from merged tapes |
+| `git checkout` | post-checkout | Runs `engram ingest` — captures latest harness logs |
+| `git pull/merge` | post-merge | Runs `engram ingest` + `engram fingerprint` — processes new transcripts and indexes incoming tapes |
 
 Hooks are non-destructive — they never overwrite existing repo hooks. Install via `scripts/install-hooks-safe.sh`.
 
@@ -695,68 +835,55 @@ Hooks are non-destructive — they never overwrite existing repo hooks. Install 
 
 On a branch, new tapes accumulate as immutable files. On merge, Git merges tape files like any other files — since tapes are write-once, there are no content conflicts. If the same tape filename exists on both sides, it should be identical (write-once invariant). Optional hash-check emits a warning on mismatch but never blocks.
 
-After merge, run `engram ingest` to rebuild the local index from the combined tape set.
+After merge, run `engram fingerprint` to index any newly arrived tapes into the resolved DB.
 
 ### Fork divergence and convergence
 
 When forks diverge long-term:
 - Keep committing tapes in each fork
 - When a fork merges upstream, tape files merge as artifacts
-- Destination repo rebuilds its index locally
+- Recipient runs `engram fingerprint` to index the new tapes
 - No SQLite DB merge needed — ever
 
 This stays easy because tapes are immutable and the index is derived. The hard merge work stays in Git where it belongs.
 
+<!-- CHANGED: On-Disk Layout simplified. Removed per-repo index.sqlite.
+     Reflects single system DB as default with config-based override. -->
 ## On-Disk Layout
 
-Engram's storage spans multiple locations. No single directory is required — any combination works.
+### System store (auto-created on first use)
 
-### Per-repo (inside a git repository)
+```
+~/.engram/
+  config.yml               # system config: db path, additional_stores, defaults
+  index.sqlite             # default fingerprint DB
+  tapes/                   # system-level tapes (orchestrator, cross-project, personal)
+  sidecars/
+    <tape_id>.sidecar.jsonl
+```
+
+### Per-repo (inside a git repository, optional)
 
 ```
 repo/
   .git/
   .engram/
-    config.yml             # optional: sources, overrides (all have defaults)
+    config.yml             # optional: db override for isolation. Most repos omit this.
     tapes/
       <hash>.jsonl.zst     # compressed trace tapes (immutable, committed)
     sidecars/
       <tape_id>.sidecar.jsonl  # enrichment files (immutable, committed)
   .engram-cache/
-    index.sqlite           # evidence index + lineage links (derived, local)
-    cursors/               # per-harness ingest state (local)
-    tmp/                   # scratch (local)
+    cursors/               # per-harness ingest state (local, never committed)
+    tmp/                   # scratch (local, never committed)
 ```
 
-### Home directory (system-wide, private)
+### Key rule
 
-```
-~/.engram/
-  config.yml               # global sources, excludes, defaults
-  tapes/
-    <hash>.jsonl.zst       # orchestrator tapes, cross-project tapes, personal tapes
-  sidecars/
-    <tape_id>.sidecar.jsonl
-```
-
-### Cache (always local, always rebuildable)
-
-```
-~/.engram-cache/
-  index.sqlite             # unified index built from ALL configured sources
-  cursors/
-  tmp/
-```
-
-### Source resolution
-
-When `engram ingest` runs, it:
-1. Reads config from the current directory's `.engram/config.yml` (if present)
-2. Reads config from `~/.engram/config.yml` (if present)
-3. Merges sources (union) and excludes (union)
-4. Indexes all tapes from all resolved source paths into a single index
-
-The index location depends on context. Inside a repo, it lives in `.engram-cache/`. For global use, it lives in `~/.engram-cache/`. The separation is a convenience, not an architectural requirement — both are derived and rebuildable.
+The fingerprint DB (`index.sqlite`) is **never** stored in a repo. It lives
+at the path specified by the resolved config's `db:` key. By default, that
+is `~/.engram/index.sqlite`. Tapes are the portable artifact. The DB is
+derived and machine-local.
 
 ## What Engram Does NOT Do
 
@@ -771,7 +898,9 @@ The index location depends on context. Inside a repo, it lives in `.engram-cache
 - Promise deterministic replay
 - Require harness cooperation for basic functionality
 - Define or enforce project boundaries
-- Automatically discover tapes outside configured sources
+- Automatically discover tapes outside explicitly processed directories
+<!-- CHANGED: Added "Run a global sweep" to the not-do list -->
+- Run a global ingest sweep — ingestion is always local to the folder you're in
 
 ## Implementation Language
 
@@ -800,7 +929,7 @@ engram/
     store/
       mod.rs             # content-addressed object store
     config/
-      mod.rs             # source resolution, config merge
+      mod.rs             # config walk-up resolution, db override
     adapters/
       mod.rs             # adapter trait + registry
       claude_code.rs     # Claude Code adapter
@@ -818,4 +947,104 @@ engram/
 - **Vector search bolt-on**: when to add, what embedding model, local-only constraint.
 - **Secrets redaction**: what should tapes exclude? Redaction strategy for sensitive content.
 - **Incremental ingest cursors**: per-harness state tracking for efficient re-scan (partially designed, not fully implemented).
-- **Index location strategy**: when a user has both per-repo and global config, should there be one unified index or separate per-context indices? Current design says unified, but there may be performance or isolation reasons to separate.
+
+<!-- CHANGED: Removed old open question about index location strategy.
+     That question is now answered: walk-up config resolution with overridable db: key.
+     Default is single system DB at ~/.engram/index.sqlite. -->
+
+---
+
+## Appendix: Revision 2 Changelog (2026-03-07)
+
+*This appendix summarizes all changes from the original design document,
+for impl and review agents.*
+
+### Summary of changes
+
+1. **New section: Config System** — defines walk-up resolution, auto-creation,
+   `db:` override, and `additional_stores:`. Replaces the old "Source resolution"
+   and "Per-repo vs global config" subsections.
+
+2. **New principle: P11 (Config conspicuity)** — every command prints resolved
+   config path and DB path.
+
+3. **P6 (Zero-config start) rewritten** — auto-creation replaces `engram init`.
+
+4. **`engram init` deprecated** — auto-creation on first invocation replaces it.
+
+5. **`engram ingest` rewritten** — now local-scoped (operates on current folder
+   and subfolders). No global sweep. Creates tapes + fingerprints.
+
+6. **New command: `engram fingerprint`** — indexes existing tapes only. No
+   transcript parsing. For consuming tapes from clones, mounts, or shares.
+
+7. **`engram explain` rewritten** — global by nature (queries resolved DB).
+   Removed `--dispatch <uuid>` mode (dispatch markers are followed as normal
+   links during traversal). Added config conspicuity. Added `additional_stores`
+   fan-out.
+
+8. **On-Disk Layout simplified** — removed per-repo `index.sqlite`. DB lives
+   at the resolved config's `db:` path (default `~/.engram/index.sqlite`).
+
+9. **Scope and Privacy updated** — scoping now controlled by where you run
+   ingest/fingerprint + config walk-up DB isolation, not by source config lists.
+
+10. **Sharing Provenance updated** — references `engram fingerprint` instead
+    of `engram ingest` for consuming shared tapes.
+
+11. **Git Integration updated** — hooks run `ingest` + `fingerprint`. Post-merge
+    runs `fingerprint` to index incoming tapes.
+
+12. **Removed open question** about index location strategy (now answered:
+    walk-up with overridable `db:`).
+
+13. **"What Engram Does NOT Do" updated** — added "run a global ingest sweep."
+
+### Concepts removed
+
+- Per-repo fingerprint DB as default behavior
+- `--global` flag on any command
+- `engram init` as a required setup step
+- `--dispatch <uuid>` explain mode
+- Global source list in config (replaced by local-scoped ingest)
+- Config merging between repo and global levels (replaced by first-found-wins walk-up)
+
+### Concepts added
+
+- Single system DB as emergent default (not hard constraint)
+- Config walk-up resolution (first found wins)
+- `db:` override at any config level for isolation
+- `additional_stores:` for multi-DB explain fan-out
+- `engram fingerprint` command
+- Local-scoped ingest (folder you're in, not global sweep)
+- Config conspicuity on every command
+- Auto-creation of system store on first invocation
+
+### What impl agents need to change
+
+| Area | Before | After |
+|------|--------|-------|
+| Store init | `engram init` creates `.engram/` in cwd | Auto-create `~/.engram/` on first invocation; deprecate `init` |
+| Config location | Repo `.engram/config.yml` + global `~/.engram/config.yml`, merged | Walk-up resolution, first found wins, no merging |
+| DB location | Per-repo `.engram/index.sqlite` or global | Default `~/.engram/index.sqlite`, overridable via `db:` |
+| Ingest scope | Global source list or repo-local | Local to cwd and subfolders |
+| New command | N/A | `engram fingerprint` — index existing tapes only |
+| Explain scope | Repo-local or `--global` | Always queries resolved DB + `additional_stores` |
+| Explain dispatch | `--dispatch <uuid>` mode | Removed; dispatch links followed during normal traversal |
+| Output | Silent about config/DB | Every command prints resolved config + DB path |
+
+### What review agents should verify
+
+- `--global` flag is fully removed from CLI parsing and help text
+- `engram init` is deprecated (no-op with message) or removed
+- Config walk-up stops at filesystem root or `~/.engram/`, whichever comes first
+- `engram ingest` only processes files in cwd and subdirectories
+- `engram fingerprint` only processes tapes in cwd's `.engram/tapes/`
+- `engram explain` queries resolved DB + all `additional_stores`, deduplicates
+- `--dispatch` flag is removed from explain
+- Dispatch marker links are followed during normal explain traversal
+- Every command's first output lines show resolved config path and DB path
+- No per-repo `index.sqlite` — DB always at resolved `db:` path
+- Auto-creation of `~/.engram/` happens on first invocation of any command
+- Internal consistency: no remaining references to `--global`, `engram init` as
+  required, per-repo DB as default, or `--dispatch` mode anywhere in the document
