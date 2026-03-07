@@ -102,7 +102,10 @@ fn explain_dispatch_chain_includes_a_to_b_to_c_and_excludes_sibling() {
     let dispatch_lineage = explain["dispatch_lineage"]
         .as_array()
         .expect("dispatch lineage array");
-    assert!(dispatch_lineage.len() >= 2, "dispatch_lineage={dispatch_lineage:?}");
+    assert!(
+        dispatch_lineage.len() >= 2,
+        "dispatch_lineage={dispatch_lineage:?}"
+    );
     assert!(
         dispatch_lineage
             .iter()

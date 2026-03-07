@@ -3,15 +3,13 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-use engram::anchor::fingerprint_text;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
-fn run_cli(repo: &Path, args: &[&str], stdin: Option<&str>, envs: &[(&str, &str)]) -> Output {
+fn run_cli(repo: &Path, args: &[&str], stdin: Option<&str>, home: &Path) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_engram"));
-    cmd.current_dir(repo).args(args);
-    for (key, value) in envs {
-        cmd.env(key, value);
-    }
+    fs::create_dir_all(home).expect("home dir");
+    cmd.current_dir(repo).args(args).env("HOME", home);
     if stdin.is_none() {
         return cmd.output().expect("command runs");
     }
@@ -28,8 +26,8 @@ fn run_cli(repo: &Path, args: &[&str], stdin: Option<&str>, envs: &[(&str, &str)
     child.wait_with_output().expect("command output")
 }
 
-fn run_json(repo: &Path, args: &[&str], stdin: Option<&str>, envs: &[(&str, &str)]) -> Value {
-    let output = run_cli(repo, args, stdin, envs);
+fn run_json(repo: &Path, args: &[&str], stdin: Option<&str>, home: &Path) -> Value {
+    let output = run_cli(repo, args, stdin, home);
     assert!(
         output.status.success(),
         "command failed: args={args:?}\nstdout={}\nstderr={}",
@@ -39,33 +37,46 @@ fn run_json(repo: &Path, args: &[&str], stdin: Option<&str>, envs: &[(&str, &str
     serde_json::from_slice(&output.stdout).expect("json stdout")
 }
 
+fn sha256_hex(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
 #[test]
-fn ingest_is_incremental_and_idempotent() {
+fn ingest_is_local_scoped_incremental_and_idempotent() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let repo = temp.path();
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(&repo).expect("repo");
+    fs::create_dir_all(&outside).expect("outside");
+
     let source_path = repo.join("input.codex.jsonl");
     fs::write(
         &source_path,
         include_str!("fixtures/codex/supported_paths.jsonl"),
     )
     .expect("seed source");
-
-    let _ = run_json(repo, &["init"], None, &[]);
     fs::write(
-        repo.join(".engram/config.yml"),
-        format!(
-            "sources:\n  - path: {}\n    adapter: codex\nexclude: []\n",
-            source_path.display()
-        ),
+        outside.join("outside.codex.jsonl"),
+        include_str!("fixtures/codex/supported_paths.jsonl"),
     )
-    .expect("write config");
+    .expect("outside source");
 
-    let first = run_json(repo, &["ingest"], None, &[]);
+    let first = run_json(&repo, &["ingest"], None, &home);
     assert_eq!(first["status"], "ok");
     assert_eq!(first["imported_tapes"], 1);
     assert_eq!(first["skipped_unchanged"], 0);
+    assert_eq!(first["skipped_non_transcript"], 0);
 
-    let second = run_json(repo, &["ingest"], None, &[]);
+    let second = run_json(&repo, &["ingest"], None, &home);
     assert_eq!(second["status"], "ok");
     assert_eq!(second["imported_tapes"], 0);
     assert_eq!(second["skipped_unchanged"], 1);
@@ -79,216 +90,165 @@ fn ingest_is_incremental_and_idempotent() {
         )
         .expect("append");
 
-    let third = run_json(repo, &["ingest"], None, &[]);
+    let third = run_json(&repo, &["ingest"], None, &home);
     assert_eq!(third["status"], "ok");
     assert_eq!(third["imported_tapes"], 1);
-
-    let cursor_state_path = repo
-        .join(".engram-cache")
-        .join("cursors")
-        .join("ingest-state.json");
-    let cursor_state = fs::read_to_string(cursor_state_path).expect("cursor state exists");
-    let parsed: Value = serde_json::from_str(&cursor_state).expect("cursor state is valid json");
-    assert!(
-        parsed
-            .get("files")
-            .and_then(Value::as_object)
-            .map(|m| !m.is_empty())
-            .unwrap_or(false),
-        "expected cursor state with tracked files"
-    );
 }
 
 #[test]
-fn ingest_honors_exclude_patterns() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let repo = temp.path();
-    let src_dir = repo.join("fixtures");
-    fs::create_dir_all(&src_dir).expect("fixtures dir");
-    fs::write(
-        src_dir.join("keep.codex.jsonl"),
-        include_str!("fixtures/codex/supported_paths.jsonl"),
-    )
-    .expect("keep file");
-    fs::write(
-        src_dir.join("ignore.codex.jsonl"),
-        include_str!("fixtures/codex/supported_paths.jsonl"),
-    )
-    .expect("ignore file");
-
-    let _ = run_json(repo, &["init"], None, &[]);
-    fs::write(
-        repo.join(".engram/config.yml"),
-        format!(
-            "sources:\n  - path: {}/**/*.jsonl\n    adapter: codex\nexclude:\n  - {}/ignore*.jsonl\n",
-            src_dir.display(),
-            src_dir.display()
-        ),
-    )
-    .expect("write config");
-
-    let ingest = run_json(repo, &["ingest"], None, &[]);
-    assert_eq!(ingest["status"], "ok");
-    assert_eq!(ingest["scanned_inputs"], 1);
-    assert_eq!(ingest["imported_tapes"], 1);
-}
-
-#[test]
-fn global_mode_uses_home_roots_and_explain_queries_ingested_evidence() {
+fn config_walkup_first_found_wins_with_db_override() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
-    fs::create_dir_all(&home).expect("home dir");
-
-    let repo = temp.path().join("repo");
-    fs::create_dir_all(repo.join("src")).expect("repo src");
-    fs::write(repo.join("src/lib.rs"), "alpha\nomega\nzeta\n").expect("seed file");
-
-    let home_str = home.to_string_lossy().to_string();
-    let envs = [("HOME", home_str.as_str())];
-    let _ = run_json(&repo, &["init", "--global"], None, &envs);
-
-    let anchor = fingerprint_text("omega").fingerprint;
-    let source_path = home.join("openclaw-session.jsonl");
-    fs::write(
-        &source_path,
-        format!(
-            concat!(
-                "{{\"type\":\"session\",\"id\":\"oc-g1\",\"timestamp\":\"2026-02-26T00:00:00Z\"}}\n",
-                "{{\"type\":\"message\",\"id\":\"m1\",\"timestamp\":\"2026-02-26T00:00:00Z\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"Investigate span\"}}]}}}}\n",
-                "{{\"type\":\"message\",\"id\":\"m2\",\"timestamp\":\"2026-02-26T00:00:01Z\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"Preparing tool call\"}},{{\"type\":\"toolCall\",\"id\":\"call-g1\",\"name\":\"Apply\",\"arguments\":{{\"file\":\"src/lib.rs\",\"after_hash\":\"{0}\"}}}}]}}}}\n",
-                "{{\"type\":\"message\",\"id\":\"m3\",\"timestamp\":\"2026-02-26T00:00:02Z\",\"message\":{{\"role\":\"toolResult\",\"toolCallId\":\"call-g1\",\"toolName\":\"Apply\",\"content\":[{{\"type\":\"text\",\"text\":\"ok\"}}],\"isError\":false}}}}\n"
-            ),
-            anchor
-        ),
-    )
-    .expect("write source");
-
-    fs::write(
-        home.join(".engram/config.yml"),
-        format!(
-            "sources:\n  - path: {}\n    adapter: openclaw\nexclude: []\n",
-            source_path.display()
-        ),
-    )
-    .expect("write global config");
-
-    let ingest = run_json(&repo, &["ingest", "--global"], None, &envs);
-    assert_eq!(ingest["status"], "ok");
-    assert_eq!(ingest["imported_tapes"], 1);
-
-    let explain = run_json(&repo, &["explain", "src/lib.rs:2-2", "--global"], None, &envs);
-    let sessions = explain["sessions"].as_array().expect("sessions");
-    assert_eq!(sessions.len(), 1);
-    assert_eq!(sessions[0]["touch_count"], 1);
-}
-
-#[test]
-fn ingest_merges_user_and_repo_config_sources() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let home = temp.path().join("home");
-    fs::create_dir_all(&home).expect("home dir");
-    fs::create_dir_all(home.join(".engram")).expect("user engram");
-
-    let repo = temp.path().join("repo");
-    fs::create_dir_all(&repo).expect("repo dir");
-
-    let codex_source = repo.join("repo-source.jsonl");
-    fs::write(
-        &codex_source,
-        include_str!("fixtures/codex/supported_paths.jsonl"),
-    )
-    .expect("codex source");
-
-    let openclaw_source = repo.join("user-source.jsonl");
-    fs::write(
-        &openclaw_source,
-        include_str!("fixtures/openclaw/session_log.jsonl"),
-    )
-    .expect("openclaw source");
-
-    let home_str = home.to_string_lossy().to_string();
-    let envs = [("HOME", home_str.as_str())];
-    let _ = run_json(&repo, &["init"], None, &envs);
-
-    fs::write(
-        repo.join(".engram/config.yml"),
-        format!(
-            "sources:\n  - path: {}\n    adapter: codex\nexclude: []\n",
-            codex_source.display()
-        ),
-    )
-    .expect("repo config");
-    fs::write(
-        home.join(".engram/config.yml"),
-        format!(
-            "sources:\n  - path: {}\n    adapter: openclaw\nexclude: []\n",
-            openclaw_source.display()
-        ),
-    )
-    .expect("user config");
-
-    let ingest = run_json(&repo, &["ingest"], None, &envs);
-    assert_eq!(ingest["status"], "ok");
-    assert_eq!(ingest["imported_tapes"], 2);
-}
-
-#[test]
-fn ingest_walks_project_config_and_dedupes_sources_by_path() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let home = temp.path().join("home");
-    fs::create_dir_all(home.join(".engram")).expect("user engram");
-
     let workspace = temp.path().join("workspace");
     let repo = workspace.join("repo");
-    fs::create_dir_all(repo.join(".engram")).expect("repo engram");
-
-    let codex_source = repo.join("shared-source.jsonl");
-    fs::write(
-        &codex_source,
-        include_str!("fixtures/codex/supported_paths.jsonl"),
-    )
-    .expect("source fixture");
-
-    let home_str = home.to_string_lossy().to_string();
-    let envs = [("HOME", home_str.as_str())];
-    let _ = run_json(&repo, &["init"], None, &envs);
+    fs::create_dir_all(repo.join(".engram")).expect("repo .engram");
+    fs::create_dir_all(workspace.join(".engram")).expect("workspace .engram");
+    fs::create_dir_all(home.join(".engram")).expect("home .engram");
 
     fs::write(
         home.join(".engram/config.yml"),
-        format!(
-            "sources:\n  - path: {}\n    adapter: openclaw\nexclude:\n  - user-only\n",
-            codex_source.display()
-        ),
+        "db: ~/.engram/global.sqlite\n",
     )
-    .expect("user config");
+    .expect("home config");
+    fs::write(
+        workspace.join(".engram/config.yml"),
+        "db: /tmp/workspace.sqlite\n",
+    )
+    .expect("workspace config");
+    fs::write(repo.join(".engram/config.yml"), "db: .engram/repo.sqlite\n").expect("repo config");
 
     fs::write(
-        temp.path().join(".engram.project.yml"),
-        "sources:\n  - path: /does/not/exist.jsonl\n    adapter: codex\nexclude:\n  - root-only\n",
+        repo.join("input.codex.jsonl"),
+        include_str!("fixtures/codex/supported_paths.jsonl"),
     )
-    .expect("root project config");
+    .expect("input");
+
+    let ingest = run_cli(&repo, &["ingest"], None, &home);
+    assert!(
+        ingest.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&ingest.stdout),
+        String::from_utf8_lossy(&ingest.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&ingest.stderr);
+    assert!(stderr.contains("config: "));
+    assert!(stderr.contains("db: "));
+    assert!(stderr.contains(repo.join(".engram/config.yml").to_string_lossy().as_ref()));
+    assert!(stderr.contains(repo.join(".engram/repo.sqlite").to_string_lossy().as_ref()));
+    assert!(repo.join(".engram/repo.sqlite").exists());
+}
+
+#[test]
+fn fingerprint_indexes_only_local_tapes() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(repo.join(".engram/tapes")).expect("repo tapes");
+    fs::create_dir_all(outside.join(".engram/tapes")).expect("outside tapes");
+
+    let transcript = concat!(
+        r#"{"t":"2026-02-22T00:00:00Z","k":"code.read","file":"src/lib.rs","range":[1,1],"anchor_hashes":["fp-anchor"]}"#,
+        "\n"
+    );
+    let tape_id = sha256_hex(transcript);
+    let compressed = zstd::stream::encode_all(transcript.as_bytes(), 0).expect("compress");
+    fs::write(
+        repo.join(".engram/tapes")
+            .join(format!("{tape_id}.jsonl.zst")),
+        compressed.clone(),
+    )
+    .expect("repo tape");
+    fs::write(
+        outside
+            .join(".engram/tapes")
+            .join(format!("{tape_id}-outside.jsonl.zst")),
+        compressed,
+    )
+    .expect("outside tape");
+
+    let fingerprint = run_json(&repo, &["fingerprint"], None, &home);
+    assert_eq!(fingerprint["status"], "ok");
+    assert_eq!(fingerprint["scanned_tapes"], 1);
+    assert_eq!(fingerprint["fingerprinted_tapes"], 1);
+    assert_eq!(fingerprint["skipped_existing_tapes"], 0);
+}
+
+#[test]
+fn explain_fans_out_to_additional_stores_and_dedupes() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let project_a = temp.path().join("project-a");
+    let project_b = temp.path().join("project-b");
+    fs::create_dir_all(project_a.join(".engram/tapes")).expect("a tapes");
+    fs::create_dir_all(project_b.join(".engram/tapes")).expect("b tapes");
+    fs::create_dir_all(home.join(".engram")).expect("home .engram");
+
+    let primary_db = home.join(".engram/primary.sqlite");
+    let extra_db = home.join(".engram/extra.sqlite");
+    fs::write(
+        home.join(".engram/config.yml"),
+        format!("db: {}\n", primary_db.to_string_lossy()),
+    )
+    .expect("home config");
+
+    let anchor = "shared-anchor";
+    let transcript_a = concat!(
+        r#"{"t":"2026-02-22T00:00:00Z","k":"code.read","file":"src/a.rs","range":[1,1],"anchor_hashes":["shared-anchor"]}"#,
+        "\n"
+    );
+    let transcript_b = concat!(
+        r#"{"t":"2026-02-22T00:00:01Z","k":"code.edit","file":"src/b.rs","before_range":[1,1],"after_range":[1,1],"before_hash":"old","after_hash":"shared-anchor","similarity":0.91}"#,
+        "\n"
+    );
+    let tape_a = sha256_hex(transcript_a);
+    let tape_b = sha256_hex(transcript_b);
 
     fs::write(
-        workspace.join(".engram.project.yml"),
-        format!(
-            "sources:\n  - path: {}\n    adapter: cursor\nexclude:\n  - project-only\n",
-            codex_source.display()
-        ),
+        project_a
+            .join(".engram/tapes")
+            .join(format!("{tape_a}.jsonl.zst")),
+        zstd::stream::encode_all(transcript_a.as_bytes(), 0).expect("compress a"),
     )
-    .expect("nearest project config");
+    .expect("write tape a");
+    fs::write(
+        project_b
+            .join(".engram/tapes")
+            .join(format!("{tape_b}.jsonl.zst")),
+        zstd::stream::encode_all(transcript_b.as_bytes(), 0).expect("compress b"),
+    )
+    .expect("write tape b");
+
+    let fp_a = run_json(&project_a, &["fingerprint"], None, &home);
+    assert_eq!(fp_a["fingerprinted_tapes"], 1);
 
     fs::write(
-        repo.join(".engram/config.yml"),
+        project_b.join(".engram/config.yml"),
+        format!("db: {}\n", extra_db.to_string_lossy()),
+    )
+    .expect("project b config");
+    let fp_b = run_json(&project_b, &["fingerprint"], None, &home);
+    assert_eq!(fp_b["fingerprinted_tapes"], 1);
+
+    fs::write(
+        project_a.join(".engram/config.yml"),
         format!(
-            "sources:\n  - path: {}\n    adapter: codex\nexclude: []\n",
-            codex_source.display()
+            "db: {}\nadditional_stores:\n  - {}\n",
+            primary_db.to_string_lossy(),
+            extra_db.to_string_lossy()
         ),
     )
-    .expect("repo config");
+    .expect("project a config");
 
-    let ingest = run_json(&repo, &["ingest"], None, &envs);
-    assert_eq!(ingest["status"], "ok");
-    assert_eq!(ingest["scanned_inputs"], 1);
-    assert_eq!(ingest["imported_tapes"], 1);
-    assert_eq!(ingest["failure_count"], 0);
+    let explain = run_json(&project_a, &["explain", anchor, "--anchor"], None, &home);
+    assert_eq!(explain["stores_queried"], 2);
+    let sessions = explain["sessions"].as_array().expect("sessions");
+    assert!(
+        sessions.iter().any(|session| session["tape_id"] == tape_a),
+        "sessions={sessions:?}"
+    );
+    assert!(
+        sessions.iter().any(|session| session["tape_id"] == tape_b),
+        "sessions={sessions:?}"
+    );
 }

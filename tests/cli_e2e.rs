@@ -9,7 +9,10 @@ use sha2::{Digest, Sha256};
 
 fn run_cli(repo: &Path, args: &[&str], stdin: Option<&str>) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_engram"));
+    let isolated_home = repo.join(".home");
+    fs::create_dir_all(&isolated_home).expect("home dir");
     cmd.current_dir(repo).args(args);
+    cmd.env("HOME", &isolated_home);
     if stdin.is_none() {
         return cmd.output().expect("command runs");
     }
@@ -347,6 +350,7 @@ fn record_recovers_when_tape_file_exists_but_index_missing() {
         .join(".engram")
         .join("tapes")
         .join(format!("{tape_id}.jsonl.zst"));
+    fs::create_dir_all(tape_path.parent().expect("tape parent")).expect("tape dir");
     let compressed = zstd::stream::encode_all(transcript.as_bytes(), 0).expect("compress");
     fs::write(&tape_path, compressed).expect("write tape");
 
@@ -419,4 +423,20 @@ fn record_command_keeps_trace_for_failed_process() {
     assert!(raw.contains("\"k\":\"tool.result\""), "raw={raw}");
     assert!(raw.contains("\"exit\":7"), "raw={raw}");
     assert!(raw.contains("\"stderr\":\"boom\\n\""), "raw={raw}");
+}
+
+#[test]
+fn global_and_dispatch_flags_are_removed_from_cli() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+
+    let ingest_global = run_cli(repo, &["ingest", "--global"], None);
+    assert!(!ingest_global.status.success());
+    let ingest_err = String::from_utf8_lossy(&ingest_global.stderr);
+    assert!(ingest_err.contains("--global"), "stderr={ingest_err}");
+
+    let explain_dispatch = run_cli(repo, &["explain", "--dispatch", "abc"], None);
+    assert!(!explain_dispatch.status.success());
+    let explain_err = String::from_utf8_lossy(&explain_dispatch.stderr);
+    assert!(explain_err.contains("--dispatch"), "stderr={explain_err}");
 }

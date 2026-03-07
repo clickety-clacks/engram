@@ -1,78 +1,68 @@
 # Engram
 
-**How did we get here?**
-
-*An automatically built index into why your code is the way it is.*
-
-Your code started as a conversation. Every agent reasoning through a problem, every decision handed off, every rationale spoken aloud — that's the exhaust of agentic engineering, and it carries more signal than the code itself. Engram fingerprints and indexes that exhaust across conversations, creating a foundation for institutional knowledge — the kind you forget is there until you realize nothing works without it.
-
 Engram answers one question: **why does this code span exist?**
 
 ## 1. What it is
 
-Engram is a local provenance index for agent-driven software work.
+Engram is a deterministic provenance index for agent-driven software work.
 
-It ingests deterministic transcript/log artifacts (messages, tool calls, reads, edits, results), stores them as immutable tapes, builds a derived evidence index, and lets you query from a code span back to the sessions that caused it.
+It stores immutable tapes and indexes their fingerprints in SQLite so a code-span query can return the sessions that causally produced that span.
 
-Core ideas:
+Core model:
 - Tapes are immutable files.
-- The index is derived and rebuildable.
-- Provenance is additive: more sources give better recall.
-- Engram is harness-agnostic; it does not require one vendor workflow.
+- The DB is derived from tapes and can be rebuilt.
+- Ingest/fingerprint are local contribution commands.
+- Explain is global retrieval over the resolved DB plus optional additional stores.
 
 ## 2. How you use it
 
-Typical flow:
+Normal loop:
 
 ```bash
-# one-time setup in a repo
-engram init
-
-# import new transcript/log evidence from configured sources
+# from the folder you are working in
 engram ingest
 
 # ask why a span exists
 engram explain src/auth.rs:40-78
 ```
 
-What the "magic" is:
-- `engram ingest` parses configured source files with deterministic adapters, writes normalized tapes, and updates the evidence index.
-- `engram explain <file>:<start>-<end>` fingerprints the selected code span, finds matching evidence in tapes, and returns ranked session context and lineage.
-- `engram explain --dispatch <uuid>` starts from a dispatch marker UUID and returns sessions/spans tied to that work item.
+How commands work:
+- `engram ingest`: local-scoped. Walks the current directory tree for transcript files, converts recognized harness logs into tapes, and fingerprints those tapes into the resolved DB.
+- `engram fingerprint`: local-scoped. Indexes existing `./.engram/tapes/*.jsonl.zst` into the resolved DB (no transcript parsing, no tape creation).
+- `engram explain <file>:<start>-<end>`: computes anchors for the selected span, queries the resolved DB, follows lineage and dispatch-marker links, and returns evidence sessions/windows.
 
-Global mode (shared index/tapes across repos):
+Dispatch markers are traversed during normal explain:
 
-```bash
-engram init --global
-engram ingest --global
-engram explain src/lib.rs:10-20 --global
+```text
+<engram-src id="f47ac10b-58cc-4372-a567-0e02b2c3d479"/>
 ```
+
+There is no separate `--dispatch` explain mode.
 
 ## 3. How you configure it
 
-Engram reads YAML config from repo-level and user-level locations (repo-local and global workflows can be layered).
+Config resolution is walk-up, first-found-wins:
+1. `./.engram/config.yml`
+2. parent directories’ `.engram/config.yml`
+3. fallback `~/.engram/config.yml`
 
-Minimum schema:
+No merge between levels.
+
+On first invocation, Engram auto-creates `~/.engram/config.yml` if missing.
+
+Primary schema:
 
 ```yaml
-sources:
-  - path: ~/.codex/sessions/**/*.jsonl
-    adapter: codex
-  - path: ~/.claude/projects/**/*.jsonl
-    adapter: claude
-  - path: ~/.openclaw/agents/main/sessions/**/*.jsonl
-    adapter: openclaw
-exclude:
-  - ~/.claude/projects/**/personal-*
+db: ~/.engram/index.sqlite
+additional_stores:
+  - /nfs/team/engram/index.sqlite
 ```
 
 Field meanings:
-- `sources`: list of evidence inputs Engram should ingest.
-- `sources[].path`: a file path or glob for transcript/log artifacts.
-- `sources[].adapter`: parser to use for that source (`auto|codex|claude|cursor|gemini|opencode|openclaw`).
-- `exclude`: globs removed from ingest even if they match a source path.
+- `db`: primary SQLite store this directory writes to and reads from.
+- `additional_stores`: extra read-only stores queried by `engram explain` (fan-out + dedupe).
 
-Practical rule: use `sources` to set your provenance boundary, and `exclude` to enforce privacy/noise boundaries.
+Every command prints resolved config path and DB path before command output.
 
 ## 4. How you install it
 
@@ -84,11 +74,11 @@ cd engram
 cargo build --release
 ```
 
-Install the binary for your user:
+Install for your user:
 
 ```bash
 cargo install --path .
-# or copy target/release/engram into a directory on PATH
+# or copy target/release/engram to a directory on PATH
 ```
 
 Verify:
@@ -97,32 +87,25 @@ Verify:
 engram --help
 ```
 
+`engram init` is deprecated and not required.
+
 ## 5. How you link multiple levels of agents together
 
-This is how Engram follows work across agent and agent-harness boundaries.
-
-
-When work is handed across sessions, include a shared marker in transcript content:
+Include the same marker in handoff content across sessions:
 
 ```text
 <engram-src id="f47ac10b-58cc-4372-a567-0e02b2c3d479"/>
 ```
 
 Human model:
-1. Upstream session creates a work item UUID and sends a task.
-2. Downstream session receives the marker and performs code work.
-3. Engram records where that UUID was received/sent in each tape.
-4. `engram explain` can walk upstream from the edit to parent sessions.
-
-Concrete chain example:
-- Session A dispatches auth refactor with `<engram-src id="..."/>`.
-- Session B edits `src/auth.rs` while carrying the same marker.
-- Session C keeps the marker for follow-up fixes.
-- Querying B/C edits can recover A -> B -> C causal lineage across agent and agent-harness boundaries.
+1. Upstream session sends work with marker `X`.
+2. Downstream session receives marker `X` and edits code.
+3. A later session continues with marker `X`.
+4. `engram explain` on touched code follows dispatch links upstream and returns the causal chain.
 
 OpenClaw note (example only):
-- An OpenClaw submitter can propagate the UUID in a dispatch header and mirror it in message content as `<engram-src .../>`.
-- That submitter/header pattern is an integration example, not Engram core behavior. Any orchestrator or harness can implement the same marker contract.
+- An OpenClaw submitter can propagate the UUID in a header and mirror it in message content as `<engram-src .../>`.
+- That submitter/header pattern is an integration example, not Engram core behavior.
 
 ## Specs
 

@@ -8,10 +8,7 @@ use std::process::ExitCode;
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use engram::anchor::fingerprint_text;
-use engram::config::{
-    AdapterChoice, default_global_config_yaml, default_repo_config_yaml, expand_tilde,
-    load_effective_config,
-};
+use engram::config::load_effective_config;
 use engram::index::lineage::{
     Cardinality, EvidenceFragmentRef, EvidenceKind, LINK_THRESHOLD_DEFAULT, LocationDelta,
     StoredEdgeClass,
@@ -24,7 +21,6 @@ use engram::store::atomic::atomic_write;
 use engram::tape::adapter::{AdapterId, convert_with_adapter};
 use engram::tape::compress::{compress_jsonl, decompress_jsonl};
 use engram::tape::event::{TapeEventAt, TapeEventData, parse_jsonl_events};
-use glob::glob;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -69,8 +65,6 @@ impl From<serde_json::Error> for CliError {
 #[command(name = "engram")]
 #[command(about = "A local-first causal index over code history")]
 struct Cli {
-    #[arg(long, global = true)]
-    global: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -79,6 +73,7 @@ struct Cli {
 enum Command {
     Init,
     Ingest,
+    Fingerprint,
     Record(RecordArgs),
     Explain(ExplainArgs),
     Tapes,
@@ -105,8 +100,6 @@ struct ShowArgs {
 struct ExplainArgs {
     target: Option<String>,
     #[arg(long)]
-    dispatch: Option<String>,
-    #[arg(long)]
     anchor: bool,
     #[arg(long, default_value_t = 0.50)]
     min_confidence: f32,
@@ -127,20 +120,16 @@ struct ExplainArgs {
 #[derive(Debug, Clone)]
 struct RepoPaths {
     root: PathBuf,
-    index: PathBuf,
     tapes: PathBuf,
     objects: PathBuf,
-    cache_root: PathBuf,
     cursors: PathBuf,
-    repo_config: PathBuf,
-    user_config: PathBuf,
-    mode: StorageMode,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StorageMode {
-    RepoLocal,
-    Global,
+#[derive(Debug, Clone)]
+struct RuntimeContext {
+    config_path: PathBuf,
+    db_path: PathBuf,
+    additional_stores: Vec<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -180,38 +169,35 @@ fn main() -> ExitCode {
 fn run() -> Result<(), CliError> {
     let cli = Cli::parse();
     let cwd = std::env::current_dir().map_err(|err| CliError::io("cwd_error", err))?;
-    let paths = repo_paths(&cwd, cli.global)?;
+    let paths = repo_paths(&cwd)?;
+    let context = resolve_runtime_context(&cwd)?;
     match cli.command {
-        Command::Init => cmd_init(&paths),
-        Command::Ingest => cmd_ingest(&cwd, &paths),
-        Command::Record(args) => cmd_record(&cwd, &paths, args),
-        Command::Explain(args) => cmd_explain(&cwd, &paths, args),
-        Command::Tapes => cmd_tapes(&paths),
-        Command::Show(args) => cmd_show(&paths, args),
-        Command::Gc => cmd_gc(&paths),
+        Command::Init => cmd_init(&context),
+        Command::Ingest => cmd_ingest(&cwd, &paths, &context),
+        Command::Fingerprint => cmd_fingerprint(&paths, &context),
+        Command::Record(args) => cmd_record(&cwd, &paths, &context, args),
+        Command::Explain(args) => cmd_explain(&cwd, &paths, &context, args),
+        Command::Tapes => cmd_tapes(&paths, &context),
+        Command::Show(args) => cmd_show(&paths, &context, args),
+        Command::Gc => cmd_gc(&paths, &context),
     }
 }
 
-fn cmd_init(paths: &RepoPaths) -> Result<(), CliError> {
-    fs::create_dir_all(&paths.tapes).map_err(|err| CliError::io("mkdir_error", err))?;
-    fs::create_dir_all(&paths.objects).map_err(|err| CliError::io("mkdir_error", err))?;
-    fs::create_dir_all(&paths.cursors).map_err(|err| CliError::io("mkdir_error", err))?;
-    let _ = SqliteIndex::open(&path_string(&paths.index))?;
-    write_default_config(paths)?;
-
+fn cmd_init(context: &RuntimeContext) -> Result<(), CliError> {
+    print_context_conspicuity(context);
     print_json(&json!({
         "status": "ok",
-        "engram_dir": paths.root,
-        "cache_dir": paths.cache_root,
-        "index": paths.index,
-        "mode": match paths.mode {
-            StorageMode::RepoLocal => "repo",
-            StorageMode::Global => "global",
-        },
+        "deprecated": true,
+        "message": "`engram init` is deprecated; Engram auto-creates ~/.engram/config.yml on first invocation",
     }))
 }
 
-fn cmd_record(cwd: &Path, paths: &RepoPaths, args: RecordArgs) -> Result<(), CliError> {
+fn cmd_record(
+    cwd: &Path,
+    paths: &RepoPaths,
+    context: &RuntimeContext,
+    args: RecordArgs,
+) -> Result<(), CliError> {
     if args.stdin && !args.command.is_empty() {
         return Err(CliError::new(
             "invalid_record_args",
@@ -219,13 +205,20 @@ fn cmd_record(cwd: &Path, paths: &RepoPaths, args: RecordArgs) -> Result<(), Cli
         ));
     }
 
-    require_initialized_paths(paths)?;
+    ensure_local_store(paths)?;
+    print_context_conspicuity(context);
     if args.stdin {
         let mut stdin_buf = String::new();
         io::stdin()
             .read_to_string(&mut stdin_buf)
             .map_err(|err| CliError::io("stdin_error", err))?;
-        return record_transcript(&paths, &stdin_buf, json!({ "mode": "stdin" }), None);
+        return record_transcript(
+            paths,
+            &context.db_path,
+            &stdin_buf,
+            json!({ "mode": "stdin" }),
+            None,
+        );
     }
 
     if args.command.is_empty() {
@@ -237,7 +230,8 @@ fn cmd_record(cwd: &Path, paths: &RepoPaths, args: RecordArgs) -> Result<(), Cli
 
     let transcript = capture_command_tape(cwd, &args.command)?;
     record_transcript(
-        &paths,
+        paths,
+        &context.db_path,
         &transcript.raw_jsonl,
         json!({
             "mode": "command",
@@ -255,46 +249,39 @@ fn cmd_record(cwd: &Path, paths: &RepoPaths, args: RecordArgs) -> Result<(), Cli
     )
 }
 
-fn cmd_ingest(cwd: &Path, paths: &RepoPaths) -> Result<(), CliError> {
-    require_initialized_paths(paths)?;
-    let home = home_dir()?;
-    let config = load_effective_config(cwd, Some(&paths.repo_config), Some(&paths.user_config))
-        .map_err(|err| CliError::new("config_error", err.to_string()))?;
-    if config.sources.is_empty() {
-        return Err(CliError::new(
-            "missing_sources",
-            "no ingest sources configured; add sources in ~/.engram/config.yml, nearest .engram.project.yml, or .engram/config.yml",
-        ));
-    }
-
-    let candidates = resolve_source_files(cwd, &home, &config.sources, &config.exclude)?;
+fn cmd_ingest(cwd: &Path, paths: &RepoPaths, context: &RuntimeContext) -> Result<(), CliError> {
+    ensure_local_store(paths)?;
+    print_context_conspicuity(context);
+    let candidates = discover_local_transcript_candidates(cwd)?;
     let mut state = load_ingest_state(paths)?;
-    let index = SqliteIndex::open(&path_string(&paths.index))?;
+    ensure_db_parent(&context.db_path)?;
+    let index = SqliteIndex::open(&path_string(&context.db_path))?;
 
     let mut scanned = 0usize;
     let mut imported = 0usize;
     let mut skipped_unchanged = 0usize;
     let mut skipped_existing_tape = 0usize;
+    let mut skipped_non_transcript = 0usize;
     let mut failures = Vec::new();
 
-    for candidate in candidates {
+    for path in candidates {
         scanned += 1;
-        let input = match fs::read_to_string(&candidate.path) {
+        let input = match fs::read_to_string(&path) {
             Ok(content) => content,
             Err(err) => {
                 failures.push(json!({
-                    "path": candidate.path,
+                    "path": path,
                     "error": err.to_string(),
                 }));
                 continue;
             }
         };
+        let Some(adapter) = detect_adapter_for_input(&path, &input) else {
+            skipped_non_transcript += 1;
+            continue;
+        };
         let input_hash = sha256_hex(&input);
-        let state_key = format!(
-            "{}:{}",
-            candidate.adapter.as_str(),
-            candidate.path.to_string_lossy()
-        );
+        let state_key = path.to_string_lossy().to_string();
         if let Some(prev) = state.files.get(&state_key) {
             if prev.input_hash == input_hash {
                 skipped_unchanged += 1;
@@ -302,12 +289,12 @@ fn cmd_ingest(cwd: &Path, paths: &RepoPaths) -> Result<(), CliError> {
             }
         }
 
-        let normalized = match convert_with_adapter(candidate.adapter, &input) {
+        let normalized = match convert_with_adapter(adapter, &input) {
             Ok(output) => output,
             Err(err) => {
                 failures.push(json!({
-                    "path": candidate.path,
-                    "adapter": candidate.adapter.as_str(),
+                    "path": path,
+                    "adapter": adapter.as_str(),
                     "error": err.to_string(),
                 }));
                 continue;
@@ -317,8 +304,8 @@ fn cmd_ingest(cwd: &Path, paths: &RepoPaths) -> Result<(), CliError> {
             Ok(events) => events,
             Err(err) => {
                 failures.push(json!({
-                    "path": candidate.path,
-                    "adapter": candidate.adapter.as_str(),
+                    "path": path,
+                    "adapter": adapter.as_str(),
                     "error": err.to_string(),
                 }));
                 continue;
@@ -353,7 +340,7 @@ fn cmd_ingest(cwd: &Path, paths: &RepoPaths) -> Result<(), CliError> {
             state_key,
             IngestFileState {
                 input_hash,
-                adapter: candidate.adapter.as_str().to_string(),
+                adapter: adapter.as_str().to_string(),
                 tape_id,
             },
         );
@@ -367,6 +354,7 @@ fn cmd_ingest(cwd: &Path, paths: &RepoPaths) -> Result<(), CliError> {
         "imported_tapes": imported,
         "skipped_unchanged": skipped_unchanged,
         "skipped_existing_tape": skipped_existing_tape,
+        "skipped_non_transcript": skipped_non_transcript,
         "failure_count": failures.len(),
         "failures": failures,
     }))
@@ -379,12 +367,6 @@ struct CapturedCommandTape {
     success: bool,
     stdout_bytes: usize,
     stderr_bytes: usize,
-}
-
-#[derive(Debug, Clone)]
-struct IngestCandidate {
-    path: PathBuf,
-    adapter: AdapterId,
 }
 
 fn capture_command_tape(cwd: &Path, command: &[String]) -> Result<CapturedCommandTape, CliError> {
@@ -451,140 +433,47 @@ fn capture_command_tape(cwd: &Path, command: &[String]) -> Result<CapturedComman
     })
 }
 
-fn resolve_source_files(
-    cwd: &Path,
-    home: &Path,
-    sources: &[engram::config::SourceSpec],
-    exclude_patterns: &[String],
-) -> Result<Vec<IngestCandidate>, CliError> {
+fn discover_local_transcript_candidates(cwd: &Path) -> Result<Vec<PathBuf>, CliError> {
     let mut out = Vec::new();
-    let excludes = compile_excludes(cwd, home, exclude_patterns)?;
-
-    for source in sources {
-        let raw_path = source.path.trim();
-        if raw_path.is_empty() {
+    for entry in WalkDir::new(cwd).into_iter().filter_map(Result::ok) {
+        let path = entry.path();
+        if entry.file_type().is_dir() {
             continue;
         }
-        let expanded = expand_tilde(raw_path, home);
-        let source_files = if looks_like_glob(raw_path) {
-            glob_paths(&expanded)?
-        } else if expanded.is_dir() {
-            WalkDir::new(&expanded)
-                .into_iter()
-                .filter_map(Result::ok)
-                .map(|entry| entry.path().to_path_buf())
-                .filter(|path| path.is_file())
-                .collect::<Vec<_>>()
-        } else if expanded.is_file() {
-            vec![expanded]
-        } else {
-            Vec::new()
-        };
-
-        for path in source_files {
-            if is_excluded(&path, &excludes) {
-                continue;
-            }
-            let adapter = match source.adapter {
-                AdapterChoice::Auto => {
-                    let input = fs::read_to_string(&path)
-                        .map_err(|err| CliError::new("read_source_error", err.to_string()))?;
-                    detect_adapter_for_input(&path, &input).ok_or_else(|| {
-                        CliError::new(
-                            "adapter_detection_error",
-                            format!("unable to detect adapter for {}", path.display()),
-                        )
-                    })?
-                }
-                AdapterChoice::Codex => AdapterId::CodexCli,
-                AdapterChoice::Claude => AdapterId::ClaudeCode,
-                AdapterChoice::Cursor => AdapterId::Cursor,
-                AdapterChoice::Gemini => AdapterId::GeminiCli,
-                AdapterChoice::OpenCode => AdapterId::OpenCode,
-                AdapterChoice::OpenClaw => AdapterId::OpenClaw,
-            };
-            out.push(IngestCandidate { path, adapter });
-        }
-    }
-
-    out.sort_by(|a, b| {
-        let a_key = format!("{}:{}", a.adapter.as_str(), a.path.to_string_lossy());
-        let b_key = format!("{}:{}", b.adapter.as_str(), b.path.to_string_lossy());
-        a_key.cmp(&b_key)
-    });
-    out.dedup_by(|a, b| a.path == b.path && a.adapter == b.adapter);
-    Ok(out)
-}
-
-fn looks_like_glob(path: &str) -> bool {
-    ['*', '?', '[', ']', '{', '}']
-        .iter()
-        .any(|ch| path.contains(*ch))
-}
-
-fn glob_paths(pattern: &Path) -> Result<Vec<PathBuf>, CliError> {
-    let pattern_str = pattern.to_string_lossy();
-    let mut out = Vec::new();
-    let entries = glob(&pattern_str)
-        .map_err(|err| CliError::new("glob_error", format!("{} ({pattern_str})", err.msg)))?;
-    for entry in entries {
-        match entry {
-            Ok(path) if path.is_file() => out.push(path),
-            Ok(_) => {}
-            Err(err) => {
-                return Err(CliError::new("glob_error", err.to_string()));
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn compile_excludes(
-    cwd: &Path,
-    home: &Path,
-    patterns: &[String],
-) -> Result<Vec<glob::Pattern>, CliError> {
-    let mut compiled = Vec::new();
-    for pattern in patterns {
-        let raw = pattern.trim();
-        if raw.is_empty() {
+        if path.starts_with(cwd.join(".engram")) {
             continue;
         }
-        let expanded = expand_tilde(raw, home);
-        let normalized = if expanded.is_absolute() {
-            expanded.to_string_lossy().to_string()
-        } else {
-            cwd.join(expanded).to_string_lossy().to_string()
-        };
-        let compiled_pattern = glob::Pattern::new(&normalized)
-            .map_err(|err| CliError::new("exclude_glob_error", err.to_string()))?;
-        compiled.push(compiled_pattern);
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase());
+        if matches!(extension.as_deref(), Some("json") | Some("jsonl")) {
+            out.push(path.to_path_buf());
+        }
     }
-    Ok(compiled)
-}
-
-fn is_excluded(path: &Path, excludes: &[glob::Pattern]) -> bool {
-    excludes.iter().any(|pattern| pattern.matches_path(path))
+    out.sort();
+    out.dedup();
+    Ok(out)
 }
 
 fn detect_adapter_for_input(path: &Path, input: &str) -> Option<AdapterId> {
     let lower_path = path.to_string_lossy().to_ascii_lowercase();
-    let preferred = if lower_path.contains(".codex/sessions") || lower_path.ends_with("history.jsonl")
-    {
-        Some(AdapterId::CodexCli)
-    } else if lower_path.contains(".claude/projects") {
-        Some(AdapterId::ClaudeCode)
-    } else if lower_path.contains("opencode") {
-        Some(AdapterId::OpenCode)
-    } else if lower_path.contains("cursor") {
-        Some(AdapterId::Cursor)
-    } else if lower_path.contains("gemini") {
-        Some(AdapterId::GeminiCli)
-    } else if lower_path.contains(".openclaw") || lower_path.contains("openclaw") {
-        Some(AdapterId::OpenClaw)
-    } else {
-        None
-    };
+    let preferred =
+        if lower_path.contains(".codex/sessions") || lower_path.ends_with("history.jsonl") {
+            Some(AdapterId::CodexCli)
+        } else if lower_path.contains(".claude/projects") {
+            Some(AdapterId::ClaudeCode)
+        } else if lower_path.contains("opencode") {
+            Some(AdapterId::OpenCode)
+        } else if lower_path.contains("cursor") {
+            Some(AdapterId::Cursor)
+        } else if lower_path.contains("gemini") {
+            Some(AdapterId::GeminiCli)
+        } else if lower_path.contains(".openclaw") || lower_path.contains("openclaw") {
+            Some(AdapterId::OpenClaw)
+        } else {
+            None
+        };
 
     if let Some(adapter) = preferred {
         if convert_with_adapter(adapter, input).is_ok() {
@@ -605,6 +494,73 @@ fn detect_adapter_for_input(path: &Path, input: &str) -> Option<AdapterId> {
         }
     }
     None
+}
+
+fn cmd_fingerprint(paths: &RepoPaths, context: &RuntimeContext) -> Result<(), CliError> {
+    ensure_local_store(paths)?;
+    print_context_conspicuity(context);
+    ensure_db_parent(&context.db_path)?;
+    let index = SqliteIndex::open(&path_string(&context.db_path))?;
+
+    let mut scanned = 0usize;
+    let mut fingerprinted = 0usize;
+    let mut skipped_existing = 0usize;
+    let mut failures = Vec::new();
+
+    let entries = fs::read_dir(&paths.tapes).map_err(|err| CliError::io("read_dir_error", err))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| CliError::io("read_dir_error", err))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(tape_id) = tape_id_from_path(&path) else {
+            continue;
+        };
+        scanned += 1;
+        if index.has_tape(&tape_id)? {
+            skipped_existing += 1;
+            continue;
+        }
+
+        let content = match read_tape_content(&path) {
+            Ok(value) => value,
+            Err(err) => {
+                failures.push(json!({
+                    "path": path,
+                    "error": err.message,
+                }));
+                continue;
+            }
+        };
+        let events = match parse_jsonl_events(&content) {
+            Ok(value) => value,
+            Err(err) => {
+                failures.push(json!({
+                    "path": path,
+                    "error": err.to_string(),
+                }));
+                continue;
+            }
+        };
+        let dispatch_links = extract_dispatch_links_from_transcript(&content);
+        index.ingest_tape_events_with_dispatch(
+            &tape_id,
+            &events,
+            &dispatch_links,
+            LINK_THRESHOLD_DEFAULT,
+        )?;
+        fingerprinted += 1;
+    }
+
+    print_json(&json!({
+        "status": if failures.is_empty() { "ok" } else { "partial" },
+        "scanned_tapes": scanned,
+        "fingerprinted_tapes": fingerprinted,
+        "skipped_existing_tapes": skipped_existing,
+        "failure_count": failures.len(),
+        "failures": failures,
+    }))
 }
 
 fn load_ingest_state(paths: &RepoPaths) -> Result<IngestState, CliError> {
@@ -628,6 +584,7 @@ fn save_ingest_state(paths: &RepoPaths, state: &IngestState) -> Result<(), CliEr
 
 fn record_transcript(
     paths: &RepoPaths,
+    db_path: &Path,
     transcript: &str,
     extra: Value,
     command_summary: Option<Value>,
@@ -637,7 +594,8 @@ fn record_transcript(
     let tape_id = tape_id_for_contents(transcript);
     let tape_path = tape_path_for_id(paths, &tape_id);
     let tape_file_exists = tape_path.exists();
-    let index = SqliteIndex::open(&path_string(&paths.index))?;
+    ensure_db_parent(db_path)?;
+    let index = SqliteIndex::open(&path_string(db_path))?;
     let already_indexed = index.has_tape(&tape_id)?;
 
     if !already_indexed {
@@ -703,8 +661,9 @@ fn git_head(cwd: &Path) -> Option<String> {
     }
 }
 
-fn cmd_tapes(paths: &RepoPaths) -> Result<(), CliError> {
-    require_initialized_paths(paths)?;
+fn cmd_tapes(paths: &RepoPaths, context: &RuntimeContext) -> Result<(), CliError> {
+    ensure_local_store(paths)?;
+    print_context_conspicuity(context);
     let mut tapes = Vec::new();
 
     let entries = fs::read_dir(&paths.tapes).map_err(|err| CliError::io("read_dir_error", err))?;
@@ -751,8 +710,9 @@ fn cmd_tapes(paths: &RepoPaths) -> Result<(), CliError> {
     print_json(&json!({ "tapes": tapes }))
 }
 
-fn cmd_show(paths: &RepoPaths, args: ShowArgs) -> Result<(), CliError> {
-    require_initialized_paths(paths)?;
+fn cmd_show(paths: &RepoPaths, context: &RuntimeContext, args: ShowArgs) -> Result<(), CliError> {
+    ensure_local_store(paths)?;
+    print_context_conspicuity(context);
     let tape_path = tape_path_for_id(&paths, &args.tape_id);
     if !tape_path.exists() {
         return Err(CliError::new(
@@ -783,9 +743,11 @@ fn cmd_show(paths: &RepoPaths, args: ShowArgs) -> Result<(), CliError> {
     }))
 }
 
-fn cmd_gc(paths: &RepoPaths) -> Result<(), CliError> {
-    require_initialized_paths(paths)?;
-    let index = SqliteIndex::open(&path_string(&paths.index))?;
+fn cmd_gc(paths: &RepoPaths, context: &RuntimeContext) -> Result<(), CliError> {
+    ensure_local_store(paths)?;
+    print_context_conspicuity(context);
+    ensure_db_parent(&context.db_path)?;
+    let index = SqliteIndex::open(&path_string(&context.db_path))?;
     let referenced = index
         .referenced_tape_ids()?
         .into_iter()
@@ -820,48 +782,58 @@ fn cmd_gc(paths: &RepoPaths) -> Result<(), CliError> {
     }))
 }
 
-fn cmd_explain(cwd: &Path, paths: &RepoPaths, args: ExplainArgs) -> Result<(), CliError> {
-    require_initialized_paths(paths)?;
-    let index = SqliteIndex::open(&path_string(&paths.index))?;
-    if let Some(uuid) = args.dispatch.as_deref() {
-        return cmd_explain_dispatch(paths, &index, uuid);
+fn cmd_explain(
+    cwd: &Path,
+    paths: &RepoPaths,
+    context: &RuntimeContext,
+    args: ExplainArgs,
+) -> Result<(), CliError> {
+    ensure_local_store(paths)?;
+    print_context_conspicuity(context);
+    ensure_db_parent(&context.db_path)?;
+    let mut indexes = Vec::new();
+    indexes.push(SqliteIndex::open(&path_string(&context.db_path))?);
+    for store in &context.additional_stores {
+        if store.exists() {
+            indexes.push(SqliteIndex::open(&path_string(store))?);
+        }
     }
     let anchors = resolve_explain_anchors(cwd, &args)?;
-    let target = args.target.clone().ok_or_else(|| {
-        CliError::new(
-            "invalid_explain_target",
-            "target is required unless --dispatch is provided",
-        )
-    })?;
+    let target = args
+        .target
+        .clone()
+        .ok_or_else(|| CliError::new("invalid_explain_target", "target is required"))?;
     let traversal = ExplainTraversal {
         min_confidence: args.min_confidence,
         max_fanout: args.max_fanout,
         max_edges: args.max_edges,
         max_depth: args.depth,
     };
-    let result = explain_by_anchor(&index, &anchors, traversal, args.forensics)?;
+    let result = explain_across_indexes(&indexes, &anchors, traversal, args.forensics)?;
 
-    let touches = collect_touch_evidence(&index, &result.direct, &result.touched_anchors)?;
+    let touches = collect_touch_evidence(&indexes, &result.direct, &result.touched_anchors)?;
     let mut sessions = build_session_windows(&paths, touches)?;
     let (dispatch_lineage, dispatch_sessions) =
-        collect_dispatch_upstream_sessions(paths, &index, &sessions)?;
+        collect_dispatch_upstream_sessions(paths, &indexes[0], &sessions)?;
     sessions.extend(dispatch_sessions);
 
     let mut tombstones = Vec::new();
     if args.include_deleted {
         for anchor in &result.touched_anchors {
-            for tombstone in index.tombstones_for_anchor(anchor)? {
-                tombstones.push(json!({
-                    "anchor": anchor,
-                    "tape_id": tombstone.tape_id,
-                    "event_offset": tombstone.event_offset,
-                    "file_path": tombstone.file_path,
-                    "range": {
-                        "start": tombstone.range_at_deletion.start,
-                        "end": tombstone.range_at_deletion.end
-                    },
-                    "timestamp": tombstone.timestamp,
-                }));
+            for index in &indexes {
+                for tombstone in index.tombstones_for_anchor(anchor)? {
+                    tombstones.push(json!({
+                        "anchor": anchor,
+                        "tape_id": tombstone.tape_id,
+                        "event_offset": tombstone.event_offset,
+                        "file_path": tombstone.file_path,
+                        "range": {
+                            "start": tombstone.range_at_deletion.start,
+                            "end": tombstone.range_at_deletion.end
+                        },
+                        "timestamp": tombstone.timestamp,
+                    }));
+                }
             }
         }
     }
@@ -889,81 +861,7 @@ fn cmd_explain(cwd: &Path, paths: &RepoPaths, args: ExplainArgs) -> Result<(), C
         "lineage": lineage,
         "dispatch_lineage": dispatch_lineage,
         "tombstones": tombstones,
-    }))
-}
-
-fn cmd_explain_dispatch(paths: &RepoPaths, index: &SqliteIndex, uuid: &str) -> Result<(), CliError> {
-    let links = index.dispatch_links_for_uuid(uuid)?;
-    let mut sessions = Vec::new();
-    let mut spans = Vec::<Value>::new();
-    let mut seen_spans = HashSet::new();
-
-    for link in links {
-        let tape_path = tape_path_for_id(paths, &link.tape_id);
-        if !tape_path.exists() {
-            continue;
-        }
-        let content = read_tape_content(&tape_path)?;
-        let rows = parse_jsonl_rows(&content)?;
-        let events = parse_jsonl_events(&content)?;
-        let anchor_offset = message_turn_to_event_offset(&rows, link.first_turn_index)
-            .or_else(|| rows.last().map(|row| row.offset))
-            .unwrap_or(0);
-        let windows = event_window(&rows, anchor_offset, TRANSCRIPT_WINDOW_RADIUS)
-            .into_iter()
-            .collect::<Vec<_>>();
-
-        sessions.push(json!({
-            "tape_id": link.tape_id,
-            "dispatch_uuid": link.uuid,
-            "direction": dispatch_direction_name(link.direction),
-            "first_turn_index": link.first_turn_index,
-            "windows": windows,
-        }));
-
-        for item in events {
-            match item.event.data {
-                TapeEventData::CodeRead(read) => {
-                    let key = format!(
-                        "read:{}:{}:{}",
-                        read.file, read.range.start, read.range.end
-                    );
-                    if seen_spans.insert(key) {
-                        spans.push(json!({
-                            "kind": "read",
-                            "file": read.file,
-                            "range": {
-                                "start": read.range.start,
-                                "end": read.range.end
-                            }
-                        }));
-                    }
-                }
-                TapeEventData::CodeEdit(edit) => {
-                    let key = format!(
-                        "edit:{}:{:?}:{:?}",
-                        edit.file, edit.before_range, edit.after_range
-                    );
-                    if seen_spans.insert(key) {
-                        spans.push(json!({
-                            "kind": "edit",
-                            "file": edit.file,
-                            "before_range": edit.before_range.as_ref().map(|r| json!({"start": r.start, "end": r.end})),
-                            "after_range": edit.after_range.as_ref().map(|r| json!({"start": r.start, "end": r.end})),
-                        }));
-                    }
-                }
-                TapeEventData::SpanLink(_) | TapeEventData::Meta(_) | TapeEventData::Other { .. } => {}
-            }
-        }
-    }
-
-    print_json(&json!({
-        "query": {
-            "dispatch": uuid,
-        },
-        "sessions": sessions,
-        "spans": spans,
+        "stores_queried": indexes.len(),
     }))
 }
 
@@ -998,7 +896,8 @@ fn collect_dispatch_upstream_sessions(
             let Some(edit_offset) = touch.get("event_offset").and_then(Value::as_u64) else {
                 continue;
             };
-            let edit_turn = message_turn_before_offset(paths, &mut rows_cache, tape_id, edit_offset)?;
+            let edit_turn =
+                message_turn_before_offset(paths, &mut rows_cache, tape_id, edit_offset)?;
 
             let mut current_tape = tape_id.to_string();
             let mut current_turn = edit_turn;
@@ -1068,7 +967,7 @@ fn build_dispatch_session(
 }
 
 fn collect_touch_evidence(
-    index: &SqliteIndex,
+    indexes: &[SqliteIndex],
     direct: &[EvidenceFragmentRef],
     touched_anchors: &[String],
 ) -> Result<Vec<EvidenceFragmentRef>, CliError> {
@@ -1083,15 +982,74 @@ fn collect_touch_evidence(
     }
 
     for anchor in touched_anchors {
-        for fragment in index.evidence_for_anchor(anchor)? {
-            let key = touch_key(&fragment);
-            if dedup.insert(key) {
-                out.push(fragment);
+        for index in indexes {
+            for fragment in index.evidence_for_anchor(anchor)? {
+                let key = touch_key(&fragment);
+                if dedup.insert(key) {
+                    out.push(fragment);
+                }
             }
         }
     }
 
     Ok(out)
+}
+
+fn explain_across_indexes(
+    indexes: &[SqliteIndex],
+    anchors: &[String],
+    traversal: ExplainTraversal,
+    include_forensics: bool,
+) -> Result<engram::query::explain::ExplainResult, CliError> {
+    let mut direct = Vec::new();
+    let mut lineage = Vec::new();
+    let mut touched_anchors = Vec::new();
+
+    let mut seen_direct = HashSet::new();
+    let mut seen_lineage = HashSet::new();
+    let mut seen_anchors = HashSet::new();
+
+    for anchor in anchors {
+        if seen_anchors.insert(anchor.clone()) {
+            touched_anchors.push(anchor.clone());
+        }
+    }
+
+    for index in indexes {
+        let result = explain_by_anchor(index, anchors, traversal, include_forensics)?;
+        for fragment in result.direct {
+            let key = touch_key(&fragment);
+            if seen_direct.insert(key) {
+                direct.push(fragment);
+            }
+        }
+        for edge in result.lineage {
+            let key = format!(
+                "{}:{}:{:.6}:{}:{}:{}:{}",
+                edge.from_anchor,
+                edge.to_anchor,
+                edge.confidence,
+                location_delta_name(edge.location_delta),
+                cardinality_name(edge.cardinality),
+                edge.agent_link,
+                edge.note.clone().unwrap_or_default()
+            );
+            if seen_lineage.insert(key) {
+                lineage.push(edge);
+            }
+        }
+        for anchor in result.touched_anchors {
+            if seen_anchors.insert(anchor.clone()) {
+                touched_anchors.push(anchor);
+            }
+        }
+    }
+
+    Ok(engram::query::explain::ExplainResult {
+        direct,
+        lineage,
+        touched_anchors,
+    })
 }
 
 fn touch_key(fragment: &EvidenceFragmentRef) -> String {
@@ -1121,17 +1079,18 @@ fn build_session_windows(
     for (tape_id, mut tape_touches) in by_tape {
         tape_touches.sort_by_key(|t| t.event_offset);
         let tape_path = tape_path_for_id(paths, &tape_id);
-        if !tape_path.exists() {
-            continue;
-        }
-
-        let content = read_tape_content(&tape_path)?;
-        let rows = parse_jsonl_rows(&content)?;
-
-        let windows = tape_touches
-            .iter()
-            .filter_map(|touch| event_window(&rows, touch.event_offset, TRANSCRIPT_WINDOW_RADIUS))
-            .collect::<Vec<_>>();
+        let windows = if tape_path.exists() {
+            let content = read_tape_content(&tape_path)?;
+            let rows = parse_jsonl_rows(&content)?;
+            tape_touches
+                .iter()
+                .filter_map(|touch| {
+                    event_window(&rows, touch.event_offset, TRANSCRIPT_WINDOW_RADIUS)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
 
         let latest_touch_timestamp = tape_touches
             .iter()
@@ -1154,6 +1113,7 @@ fn build_session_windows(
 
         sessions.push(json!({
             "tape_id": tape_id,
+            "tape_present_locally": tape_path.exists(),
             "touch_count": tape_touches.len(),
             "latest_touch_timestamp": latest_touch_timestamp,
             "touches": touches_json,
@@ -1253,12 +1213,10 @@ fn resolve_explain_anchors(cwd: &Path, args: &ExplainArgs) -> Result<Vec<String>
         return Ok(vec![target]);
     }
 
-    let target = args.target.as_deref().ok_or_else(|| {
-        CliError::new(
-            "invalid_explain_target",
-            "target is required unless --dispatch is provided",
-        )
-    })?;
+    let target = args
+        .target
+        .as_deref()
+        .ok_or_else(|| CliError::new("invalid_explain_target", "target is required"))?;
     let (file, start, end) = parse_file_range_target(target)?;
     let file_path = cwd.join(file);
     let span_text = read_file_span(&file_path, start, end)?;
@@ -1655,61 +1613,45 @@ fn edge_to_json(edge: &EdgeRow) -> Value {
     })
 }
 
-fn repo_paths(cwd: &Path, global: bool) -> Result<RepoPaths, CliError> {
-    let home = home_dir()?;
-    let (root, cache_root, mode) = if global {
-        (
-            home.join(".engram"),
-            home.join(".engram-cache"),
-            StorageMode::Global,
-        )
-    } else {
-        (
-            cwd.join(".engram"),
-            cwd.join(".engram-cache"),
-            StorageMode::RepoLocal,
-        )
-    };
-
+fn repo_paths(cwd: &Path) -> Result<RepoPaths, CliError> {
+    let root = cwd.join(".engram");
     Ok(RepoPaths {
-        index: root.join("index.sqlite"),
         tapes: root.join("tapes"),
         objects: root.join("objects"),
-        cursors: cache_root.join("cursors"),
-        repo_config: cwd.join(".engram").join("config.yml"),
-        user_config: home.join(".engram").join("config.yml"),
+        cursors: root.join("cursors"),
         root,
-        cache_root,
-        mode,
     })
 }
 
-fn require_initialized_paths(paths: &RepoPaths) -> Result<(), CliError> {
-    if !paths.root.exists() || !paths.index.exists() || !paths.tapes.exists() {
-        return Err(CliError::new(
-            "not_initialized",
-            "repository is not initialized; run `engram init`",
-        ));
+fn resolve_runtime_context(cwd: &Path) -> Result<RuntimeContext, CliError> {
+    let home = home_dir()?;
+    let config = load_effective_config(cwd, &home)
+        .map_err(|err| CliError::new("config_error", err.to_string()))?;
+    Ok(RuntimeContext {
+        config_path: config.path,
+        db_path: config.db,
+        additional_stores: config.additional_stores,
+    })
+}
+
+fn ensure_local_store(paths: &RepoPaths) -> Result<(), CliError> {
+    fs::create_dir_all(&paths.root).map_err(|err| CliError::io("mkdir_error", err))?;
+    fs::create_dir_all(&paths.tapes).map_err(|err| CliError::io("mkdir_error", err))?;
+    fs::create_dir_all(&paths.objects).map_err(|err| CliError::io("mkdir_error", err))?;
+    fs::create_dir_all(&paths.cursors).map_err(|err| CliError::io("mkdir_error", err))?;
+    Ok(())
+}
+
+fn ensure_db_parent(db_path: &Path) -> Result<(), CliError> {
+    if let Some(parent) = db_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| CliError::io("mkdir_error", err))?;
     }
     Ok(())
 }
 
-fn write_default_config(paths: &RepoPaths) -> Result<(), CliError> {
-    let config_path = match paths.mode {
-        StorageMode::RepoLocal => &paths.repo_config,
-        StorageMode::Global => &paths.user_config,
-    };
-    if config_path.exists() {
-        return Ok(());
-    }
-    if let Some(parent) = config_path.parent() {
-        fs::create_dir_all(parent).map_err(|err| CliError::io("mkdir_error", err))?;
-    }
-    let default = match paths.mode {
-        StorageMode::RepoLocal => default_repo_config_yaml(),
-        StorageMode::Global => default_global_config_yaml(),
-    };
-    atomic_write(config_path, default.as_bytes()).map_err(|err| CliError::io("write_error", err))
+fn print_context_conspicuity(context: &RuntimeContext) {
+    eprintln!("config: {}", context.config_path.display());
+    eprintln!("db: {}", context.db_path.display());
 }
 
 fn home_dir() -> Result<PathBuf, CliError> {
