@@ -7,7 +7,10 @@ use serde_json::Value;
 
 fn run_cli(repo: &Path, args: &[&str], stdin: Option<&str>) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_engram"));
+    let isolated_home = repo.join(".home");
+    fs::create_dir_all(&isolated_home).expect("home dir");
     cmd.current_dir(repo).args(args);
+    cmd.env("HOME", &isolated_home);
     if stdin.is_none() {
         return cmd.output().expect("command runs");
     }

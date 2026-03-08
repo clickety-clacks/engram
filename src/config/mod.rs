@@ -5,23 +5,6 @@ use crate::store::atomic::atomic_write;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AdapterChoice {
-    Auto,
-    Claude,
-    Codex,
-    Cursor,
-    Gemini,
-    OpenCode,
-    OpenClaw,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SourceSpec {
-    pub path: String,
-    pub adapter: AdapterChoice,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveConfig {
     pub path: PathBuf,
     pub db: PathBuf,
@@ -32,52 +15,21 @@ pub struct EffectiveConfig {
 pub struct ParsedConfig {
     pub db: Option<String>,
     pub additional_stores: Vec<String>,
-    pub sources: Vec<SourceSpec>,
-    pub exclude: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawConfig {
     #[serde(default)]
     db: Option<String>,
     #[serde(default)]
     additional_stores: Option<Vec<String>>,
-    #[serde(default)]
-    sources: Option<Vec<RawSourceSpec>>,
-    #[serde(default)]
-    exclude: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawSourceSpec {
-    path: String,
-    #[serde(default = "default_adapter")]
-    adapter: String,
-}
-
-fn default_adapter() -> String {
-    String::new()
-}
-
-impl RawSourceSpec {
-    fn into_source(self) -> Result<SourceSpec, ConfigError> {
-        let adapter = if self.adapter.is_empty() {
-            AdapterChoice::Auto
-        } else {
-            parse_adapter_choice(&self.adapter)?
-        };
-        Ok(SourceSpec {
-            path: self.path,
-            adapter,
-        })
-    }
 }
 
 #[derive(Debug)]
 pub enum ConfigError {
     Io(std::io::Error),
     Yaml(serde_yaml::Error),
-    InvalidAdapter(String),
     InvalidPath(String),
 }
 
@@ -86,7 +38,6 @@ impl std::fmt::Display for ConfigError {
         match self {
             Self::Io(err) => write!(f, "{err}"),
             Self::Yaml(err) => write!(f, "{err}"),
-            Self::InvalidAdapter(value) => write!(f, "unknown adapter `{value}`"),
             Self::InvalidPath(value) => write!(f, "invalid path `{value}`"),
         }
     }
@@ -197,16 +148,9 @@ fn normalize_path(path: &Path) -> PathBuf {
 
 fn parse_config(content: &str) -> Result<ParsedConfig, ConfigError> {
     let raw: RawConfig = serde_yaml::from_str(content)?;
-    let raw_sources = raw.sources.unwrap_or_default();
-    let mut sources = Vec::with_capacity(raw_sources.len());
-    for source in raw_sources {
-        sources.push(source.into_source()?);
-    }
     Ok(ParsedConfig {
         db: raw.db,
         additional_stores: raw.additional_stores.unwrap_or_default(),
-        sources,
-        exclude: raw.exclude.unwrap_or_default(),
     })
 }
 
@@ -229,45 +173,10 @@ pub fn expand_tilde(path: &str, home: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn parse_adapter_choice(raw: &str) -> Result<AdapterChoice, ConfigError> {
-    let normalized = raw.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "auto" => Ok(AdapterChoice::Auto),
-        "codex" => Ok(AdapterChoice::Codex),
-        "claude" => Ok(AdapterChoice::Claude),
-        "cursor" => Ok(AdapterChoice::Cursor),
-        "gemini" => Ok(AdapterChoice::Gemini),
-        "opencode" => Ok(AdapterChoice::OpenCode),
-        "openclaw" => Ok(AdapterChoice::OpenClaw),
-        _ => Err(ConfigError::InvalidAdapter(raw.to_string())),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{AdapterChoice, expand_tilde, find_walkup_config, load_effective_config};
+    use super::{expand_tilde, find_walkup_config, load_effective_config, load_parsed_config_file};
     use std::path::Path;
-
-    #[test]
-    fn parses_source_schema_and_excludes_without_affecting_db_fields() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let home = dir.path().join("home");
-        std::fs::create_dir_all(home.join(".engram")).expect("home .engram");
-        std::fs::write(
-            home.join(".engram/config.yml"),
-            r#"db: ~/.engram/index.sqlite
-sources:
-  - path: ~/.codex/sessions/**/*.jsonl
-    adapter: codex
-exclude:
-  - "**/private-*"
-"#,
-        )
-        .expect("write config");
-        let cfg = load_effective_config(dir.path(), &home).expect("resolve config");
-        assert_eq!(cfg.path, home.join(".engram/config.yml"));
-        assert_eq!(cfg.db, home.join(".engram/index.sqlite"));
-    }
 
     #[test]
     fn expands_tilde_paths() {
@@ -357,7 +266,7 @@ exclude:
     }
 
     #[test]
-    fn adapter_choice_parser_still_supports_legacy_source_schema() {
+    fn rejects_legacy_pre_rev2_source_schema() {
         let dir = tempfile::tempdir().expect("tempdir");
         let home = dir.path().join("home");
         std::fs::create_dir_all(home.join(".engram")).expect("home");
@@ -367,10 +276,11 @@ exclude:
         )
         .expect("config");
 
-        let cfg = load_effective_config(dir.path(), &home).expect("resolve config");
-        assert_eq!(cfg.path, home.join(".engram/config.yml"));
-        let parsed = super::load_parsed_config_file(&cfg.path).expect("parsed");
-        assert_eq!(parsed.sources.len(), 1);
-        assert_eq!(parsed.sources[0].adapter, AdapterChoice::Codex);
+        let err = load_parsed_config_file(&home.join(".engram/config.yml"))
+            .expect_err("legacy schema should be rejected");
+        assert!(
+            err.to_string().contains("unknown field"),
+            "err={err}"
+        );
     }
 }

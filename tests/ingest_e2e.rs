@@ -37,6 +37,15 @@ fn run_json(repo: &Path, args: &[&str], stdin: Option<&str>, home: &Path) -> Val
     serde_json::from_slice(&output.stdout).expect("json stdout")
 }
 
+fn stderr_json_line(stderr: &[u8]) -> Value {
+    let text = String::from_utf8_lossy(stderr);
+    let line = text
+        .lines()
+        .find(|candidate| candidate.trim_start().starts_with('{'))
+        .expect("json line in stderr");
+    serde_json::from_str(line).expect("stderr json")
+}
+
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
@@ -75,6 +84,10 @@ fn ingest_is_local_scoped_incremental_and_idempotent() {
     assert_eq!(first["imported_tapes"], 1);
     assert_eq!(first["skipped_unchanged"], 0);
     assert_eq!(first["skipped_non_transcript"], 0);
+    assert!(
+        home.join(".engram/config.yml").exists(),
+        "expected auto-created user config"
+    );
 
     let second = run_json(&repo, &["ingest"], None, &home);
     assert_eq!(second["status"], "ok");
@@ -251,4 +264,67 @@ fn explain_fans_out_to_additional_stores_and_dedupes() {
         sessions.iter().any(|session| session["tape_id"] == tape_b),
         "sessions={sessions:?}"
     );
+}
+
+#[test]
+fn ingest_errors_when_db_parent_is_not_directory() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join(".engram")).expect("repo");
+    fs::create_dir_all(home.join(".engram")).expect("home");
+    fs::write(
+        repo.join("input.codex.jsonl"),
+        include_str!("fixtures/codex/supported_paths.jsonl"),
+    )
+    .expect("input");
+
+    let file_parent = temp.path().join("not-a-dir");
+    fs::write(&file_parent, "x").expect("file parent");
+    fs::write(
+        repo.join(".engram/config.yml"),
+        format!("db: {}/index.sqlite\n", file_parent.to_string_lossy()),
+    )
+    .expect("config");
+
+    let output = run_cli(&repo, &["ingest"], None, &home);
+    assert!(
+        !output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let err = stderr_json_line(&output.stderr);
+    assert_eq!(err["error"]["code"], "mkdir_error");
+}
+
+#[test]
+fn explain_errors_when_additional_store_is_not_sqlite_database() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join(".engram")).expect("repo .engram");
+    fs::create_dir_all(home.join(".engram")).expect("home .engram");
+
+    let bad_store = temp.path().join("bad-store");
+    fs::create_dir_all(&bad_store).expect("bad store directory");
+    fs::write(
+        home.join(".engram/config.yml"),
+        format!(
+            "db: ~/.engram/index.sqlite\nadditional_stores:\n  - {}\n",
+            bad_store.to_string_lossy()
+        ),
+    )
+    .expect("home config");
+    fs::write(repo.join("src.rs"), "fn main() {}\n").expect("source");
+
+    let output = run_cli(&repo, &["explain", "src.rs:1-1"], None, &home);
+    assert!(
+        !output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let err = stderr_json_line(&output.stderr);
+    assert_eq!(err["error"]["code"], "sqlite_error");
 }

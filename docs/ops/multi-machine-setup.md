@@ -1,15 +1,13 @@
 # Engram Multi-Machine Setup Runbook
 
-This runbook is operator-focused and command-first.
+This runbook is command-first and aligned with DESIGN.md rev2 semantics.
 
-## 1) EEZO-first ingest with git-cycle hooks (repo-local mode)
+## 1) EEZO-first ingest with git-cycle hooks (local-scoped contribution)
 
-Run in each repo that should carry `.engram/` tapes with the code.
+Run in each repo that should contribute provenance.
 
 ```bash
 cd ~/src/engram
-engram init
-
 mkdir -p .githooks
 for h in pre-commit pre-push post-merge; do
   if [ ! -f ".githooks/$h" ]; then
@@ -20,87 +18,60 @@ chmod +x .githooks/pre-commit .githooks/pre-push .githooks/post-merge
 git config core.hooksPath .githooks
 ```
 
-Set repo-local sources in `.engram/config.yml`:
+If no config exists yet, first command invocation auto-creates `~/.engram/config.yml`.
 
-```yaml
-sources:
-  - path: ~/.codex/sessions/**/*.jsonl
-    adapter: codex
-  - path: ~/.claude/projects/**/*.jsonl
-    adapter: claude
-exclude:
-  - ~/.claude/projects/**/sessions-index.json
-```
-
-Manual first ingest:
+Manual first pass:
 
 ```bash
 engram ingest
+engram fingerprint
 engram tapes | jq '.tapes | length'
-```
-
-Validate explain on repo code span:
-
-```bash
 engram explain src/store/mod.rs:1-2
 ```
 
-## 2) TARS global ingest with OpenClaw transcripts
+## 2) TARS ingest for OpenClaw transcripts (example path)
 
-Use one shared global index/tape root on TARS.
+Use directory-local config walk-up to point transcript folders at the shared DB.
+
+```bash
+mkdir -p ~/.openclaw/.engram
+cat > ~/.openclaw/.engram/config.yml <<'YAML'
+db: ~/.engram/index.sqlite
+additional_stores:
+  - /mnt/team/engram/index.sqlite
+YAML
+```
+
+Run ingest from the transcript root so scope is `cwd + subfolders`:
+
+```bash
+cd ~/.openclaw
+engram ingest
+```
+
+Query from any repo (walk-up resolved DB + additional stores):
 
 ```bash
 cd ~/src/engram
-engram init --global
+engram explain src/store/mod.rs:1-2
 ```
 
-Edit `~/.engram/config.yml`:
+## 3) Optional NFS/shared-tape model
 
-```yaml
-sources:
-  - path: ~/.codex/sessions/**/*.jsonl
-    adapter: codex
-  - path: ~/.claude/projects/**/*.jsonl
-    adapter: claude
-  - path: ~/.openclaw/sessions/**/*.jsonl
-    adapter: openclaw
-exclude:
-  - ~/.claude/projects/**/sessions-index.json
-  - ~/.openclaw/sessions/personal-*
-```
-
-Ingest + query:
+When machines share immutable tapes, index them with `fingerprint` from that folder.
 
 ```bash
-engram ingest --global
-engram explain ~/src/engram/src/store/mod.rs:1-2 --global
+cd /mnt/engram-shared
+engram fingerprint
 ```
 
-## 3) Optional NFS/shared-tape path model
+Recommended pattern:
 
-When multiple machines should read a common tape pool, store source tapes on shared/NFS and keep each machine’s index/cache local.
-
-Example:
-
-```yaml
-sources:
-  - path: /mnt/engram-shared/codex/**/*.jsonl
-    adapter: codex
-  - path: /mnt/engram-shared/claude/**/*.jsonl
-    adapter: claude
-  - path: /mnt/engram-shared/openclaw/**/*.jsonl
-    adapter: openclaw
-exclude:
-  - /mnt/engram-shared/**/sessions-index.json
-```
-
-Recommended operator pattern:
-
-1. EEZO/TARS write tape artifacts to shared path.
-2. Each machine runs `engram ingest --global` locally.
-3. Each machine keeps its own `~/.engram-cache/` and cursor state.
+1. EEZO/TARS produce local tapes via `engram ingest`.
+2. Copy or sync tape files (`.jsonl.zst`) into shared tape folders.
+3. Each machine runs `engram fingerprint` where those tapes are mounted.
+4. Keep DB files machine-local unless explicitly operating a shared SQLite path.
 
 Notes:
-- Engram persisted state writes use atomic temp-write + fsync + rename + parent-dir fsync.
-- Keep shared path for source artifacts; avoid sharing `~/.engram-cache/`.
-
+- Engram persisted state uses atomic write + fsync + rename + parent-dir fsync.
+- No `--global` mode in rev2. Scope is controlled by where commands are run and which `db` is selected by config walk-up.
