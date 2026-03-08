@@ -152,6 +152,94 @@ fn config_walkup_first_found_wins_with_db_override() {
 }
 
 #[test]
+fn init_creates_local_config_and_store_dirs() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+
+    let init = run_cli(&repo, &["init"], None, &home);
+    assert!(
+        init.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&init.stdout),
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&init.stdout).expect("json");
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["created"], true);
+
+    let config_path = repo.join(".engram/config.yml");
+    assert_eq!(
+        fs::read_to_string(&config_path).expect("config"),
+        "db: .engram/index.sqlite\n"
+    );
+    assert!(repo.join(".engram").is_dir());
+    assert!(repo.join(".engram/tapes").is_dir());
+    assert!(repo.join(".engram/objects").is_dir());
+    assert!(repo.join(".engram/cursors").is_dir());
+
+    let stderr = String::from_utf8_lossy(&init.stderr);
+    assert!(stderr.contains(config_path.to_string_lossy().as_ref()));
+    assert!(
+        stderr.contains(repo.join(".engram/index.sqlite").to_string_lossy().as_ref()),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn init_is_idempotent_when_local_config_exists() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+
+    let first = run_json(&repo, &["init"], None, &home);
+    assert_eq!(first["created"], true);
+    let second = run_json(&repo, &["init"], None, &home);
+    assert_eq!(second["status"], "ok");
+    assert_eq!(second["created"], false);
+    assert!(
+        second["message"]
+            .as_str()
+            .expect("message")
+            .contains("already exists")
+    );
+}
+
+#[test]
+fn ingest_after_init_uses_local_db() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    let _ = run_json(&repo, &["init"], None, &home);
+    fs::write(
+        repo.join("input.codex.jsonl"),
+        include_str!("fixtures/codex/supported_paths.jsonl"),
+    )
+    .expect("input");
+
+    let ingest = run_cli(&repo, &["ingest"], None, &home);
+    assert!(
+        ingest.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&ingest.stdout),
+        String::from_utf8_lossy(&ingest.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&ingest.stderr);
+    assert!(
+        stderr.contains(repo.join(".engram/config.yml").to_string_lossy().as_ref()),
+        "stderr={stderr}"
+    );
+    assert!(
+        stderr.contains(repo.join(".engram/index.sqlite").to_string_lossy().as_ref()),
+        "stderr={stderr}"
+    );
+    assert!(repo.join(".engram/index.sqlite").exists());
+}
+
+#[test]
 fn fingerprint_indexes_only_local_tapes() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");

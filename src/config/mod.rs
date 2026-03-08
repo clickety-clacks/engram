@@ -94,7 +94,7 @@ pub fn find_walkup_config(start: &Path, home: &Path) -> Option<PathBuf> {
     None
 }
 
-fn ensure_user_config(home: &Path) -> Result<PathBuf, ConfigError> {
+pub fn ensure_user_config(home: &Path) -> Result<PathBuf, ConfigError> {
     let user_root = home.join(".engram");
     let config_path = user_root.join("config.yml");
     if config_path.exists() {

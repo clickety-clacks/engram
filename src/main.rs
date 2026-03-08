@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use engram::anchor::fingerprint_text;
-use engram::config::load_effective_config;
+use engram::config::{ensure_user_config, load_effective_config};
 use engram::index::lineage::{
     Cardinality, EvidenceFragmentRef, EvidenceKind, LINK_THRESHOLD_DEFAULT, LocationDelta,
     StoredEdgeClass,
@@ -170,25 +170,66 @@ fn run() -> Result<(), CliError> {
     let cli = Cli::parse();
     let cwd = std::env::current_dir().map_err(|err| CliError::io("cwd_error", err))?;
     let paths = repo_paths(&cwd)?;
-    let context = resolve_runtime_context(&cwd)?;
     match cli.command {
-        Command::Init => cmd_init(&context),
-        Command::Ingest => cmd_ingest(&cwd, &paths, &context),
-        Command::Fingerprint => cmd_fingerprint(&paths, &context),
-        Command::Record(args) => cmd_record(&cwd, &paths, &context, args),
-        Command::Explain(args) => cmd_explain(&cwd, &paths, &context, args),
-        Command::Tapes => cmd_tapes(&paths, &context),
-        Command::Show(args) => cmd_show(&paths, &context, args),
-        Command::Gc => cmd_gc(&paths, &context),
+        Command::Init => cmd_init(&paths),
+        Command::Ingest => {
+            let context = resolve_runtime_context(&cwd)?;
+            cmd_ingest(&cwd, &paths, &context)
+        }
+        Command::Fingerprint => {
+            let context = resolve_runtime_context(&cwd)?;
+            cmd_fingerprint(&paths, &context)
+        }
+        Command::Record(args) => {
+            let context = resolve_runtime_context(&cwd)?;
+            cmd_record(&cwd, &paths, &context, args)
+        }
+        Command::Explain(args) => {
+            let context = resolve_runtime_context(&cwd)?;
+            cmd_explain(&cwd, &paths, &context, args)
+        }
+        Command::Tapes => {
+            let context = resolve_runtime_context(&cwd)?;
+            cmd_tapes(&paths, &context)
+        }
+        Command::Show(args) => {
+            let context = resolve_runtime_context(&cwd)?;
+            cmd_show(&paths, &context, args)
+        }
+        Command::Gc => {
+            let context = resolve_runtime_context(&cwd)?;
+            cmd_gc(&paths, &context)
+        }
     }
 }
 
-fn cmd_init(context: &RuntimeContext) -> Result<(), CliError> {
-    print_context_conspicuity(context);
+fn cmd_init(paths: &RepoPaths) -> Result<(), CliError> {
+    let home = home_dir()?;
+    ensure_user_config(&home).map_err(|err| CliError::new("config_error", err.to_string()))?;
+    ensure_local_store(paths)?;
+    let context = RuntimeContext {
+        config_path: paths.root.join("config.yml"),
+        db_path: paths.root.join("index.sqlite"),
+        additional_stores: Vec::new(),
+    };
+    print_context_conspicuity(&context);
+    if context.config_path.exists() {
+        return print_json(&json!({
+            "status": "ok",
+            "created": false,
+            "message": "local workspace config already exists",
+        }));
+    }
+
+    atomic_write(
+        &context.config_path,
+        b"db: .engram/index.sqlite\n",
+    )
+    .map_err(|err| CliError::io("write_error", err))?;
     print_json(&json!({
         "status": "ok",
-        "deprecated": true,
-        "message": "`engram init` is deprecated; Engram auto-creates ~/.engram/config.yml on first invocation",
+        "created": true,
+        "message": "created local workspace config at .engram/config.yml",
     }))
 }
 

@@ -64,10 +64,12 @@ Tapes are zstd-compressed. Large tool outputs are content-addressed and deduplic
 ### P5. Append-only tapes
 Trace tapes are immutable once written. They can be created and read, never modified or deleted. This is a hard invariant — it enables safe merging, deduplication, and trust in provenance chains.
 
-<!-- CHANGED: P6 rewritten. Old: "engram init creates configuration and directories."
-     New: auto-create on first invocation, no explicit init step. -->
+<!-- CHANGED: P6 keeps zero-config auto-create while allowing explicit local init. -->
 ### P6. Zero-config start
-On first invocation, Engram auto-creates `~/.engram/` with a default config and DB. No explicit init step. An agent should be able to start using Engram without running a setup command or reading a config file.
+On first invocation, Engram auto-creates `~/.engram/` with a default config and DB.
+No setup step is required. `engram init` is optional and creates a local
+workspace store (`./.engram/config.yml` with `db: .engram/index.sqlite`) when a
+user explicitly wants self-contained local provenance.
 
 ### P7. Local-first, offline-only
 No network required. No accounts. No servers. Everything runs locally. This is a tool, not a service.
@@ -431,13 +433,16 @@ BFS fan-out is capped at `MAX_FANOUT` (default `50`) edges per node. When a node
 
 ## CLI Commands
 
-<!-- CHANGED: engram init deprecated. Auto-creation replaces it. -->
-### `engram init` (deprecated)
+### `engram init`
 
-Previously created Engram directories and a default configuration. Now a
-no-op that prints a deprecation notice. The system store at `~/.engram/`
-is auto-created on first invocation of any Engram command. Repo-level
-`.engram/config.yml` files are created manually when isolation is needed.
+Create a local Engram workspace rooted at the current directory:
+- Creates `./.engram/` directory structure
+- Creates `./.engram/config.yml` with `db: .engram/index.sqlite`
+- Prints conspicuity lines (`config`, `db`) like all commands
+- Idempotent: if `./.engram/config.yml` already exists, reports and exits cleanly
+
+This command is optional. The system store at `~/.engram/` is still
+auto-created on first command invocation for zero-config startup.
 
 <!-- CHANGED: engram ingest rewritten. Now local-scoped, operates on the folder
      you're in and its subfolders. No global sweep. Creates tapes + fingerprints. -->
@@ -968,9 +973,11 @@ for impl and review agents.*
 2. **New principle: P11 (Config conspicuity)** — every command prints resolved
    config path and DB path.
 
-3. **P6 (Zero-config start) rewritten** — auto-creation replaces `engram init`.
+3. **P6 (Zero-config start) rewritten** — auto-creation remains, and `engram init`
+   is optional explicit local workspace creation.
 
-4. **`engram init` deprecated** — auto-creation on first invocation replaces it.
+4. **`engram init` reintroduced as a real command** — creates local
+   `./.engram/config.yml` with `db: .engram/index.sqlite`, plus local store dirs.
 
 5. **`engram ingest` rewritten** — now local-scoped (operates on current folder
    and subfolders). No global sweep. Creates tapes + fingerprints.
@@ -1024,7 +1031,7 @@ for impl and review agents.*
 
 | Area | Before | After |
 |------|--------|-------|
-| Store init | `engram init` creates `.engram/` in cwd | Auto-create `~/.engram/` on first invocation; deprecate `init` |
+| Store init | `engram init` creates `.engram/` in cwd | Keep auto-create `~/.engram/` on first use; `engram init` explicitly creates local workspace config/dirs |
 | Config location | Repo `.engram/config.yml` + global `~/.engram/config.yml`, merged | Walk-up resolution, first found wins, no merging |
 | DB location | Per-repo `.engram/index.sqlite` or global | Default `~/.engram/index.sqlite`, overridable via `db:` |
 | Ingest scope | Global source list or repo-local | Local to cwd and subfolders |
@@ -1036,7 +1043,7 @@ for impl and review agents.*
 ### What review agents should verify
 
 - `--global` flag is fully removed from CLI parsing and help text
-- `engram init` is deprecated (no-op with message) or removed
+- `engram init` creates local `./.engram/config.yml` + store dirs and is idempotent
 - Config walk-up stops at filesystem root or `~/.engram/`, whichever comes first
 - `engram ingest` only processes files in cwd and subdirectories
 - `engram fingerprint` only processes tapes in cwd's `.engram/tapes/`

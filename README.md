@@ -19,6 +19,9 @@ Core model:
 Normal loop:
 
 ```bash
+# optional: create an explicit local workspace store
+engram init
+
 # from the folder you are working in
 engram ingest
 
@@ -87,7 +90,7 @@ Verify:
 engram --help
 ```
 
-`engram init` is deprecated and not required.
+`engram init` is optional: it creates `./.engram/config.yml` with `db: .engram/index.sqlite` and local store directories.
 
 ## 5. How you link multiple levels of agents together
 
