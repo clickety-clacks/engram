@@ -114,14 +114,17 @@ working directory:
 
 1. Check for `.engram/config.yml` in the current directory
 2. Walk parent directories, checking each for `.engram/config.yml`
-3. Fall back to `~/.engram/config.yml` (system config)
+3. Continue to `~` and include `~/.engram/config.yml` if present
+4. Fall back to `~/.engram/config.yml` (system config) if no config file exists in the chain
 
-**First config found wins. No merging.** If a directory has its own config,
-that is the complete config for commands run there. This follows the same
-pattern as `.npmrc`, `.editorconfig`, and `tsconfig.json`.
+**Walk-up is a cascading merge.** Engram collects all configs in that chain and
+merges keys nearest-to-farthest:
+- Nearest config wins for any key it explicitly sets
+- Missing keys inherit from the next config up the chain
+- Hardcoded defaults apply only when no config in the chain sets a value
 
-In practice, most directories have no `.engram/config.yml`. Walk-up falls
-through to the system config. This is the zero-config default experience.
+**Outside-home edge case:** if the current working directory is outside `~`,
+walk-up is skipped entirely and Engram uses `~/.engram/config.yml` directly.
 
 ### Auto-Creation
 
@@ -141,7 +144,7 @@ Any config at any level can override `db:` to point elsewhere. This is the
 mechanism for isolation: a repo or shared folder that wants its own segregated
 fingerprint DB declares `db:` in its local `.engram/config.yml`.
 
-If no config in the walk-up chain specifies `db:`, the default
+If no config in the walk-up chain specifies `db:`, the hardcoded default
 `~/.engram/index.sqlite` is used.
 
 The "single system DB" experience is not a hard architectural constraint —
@@ -1014,12 +1017,12 @@ for impl and review agents.*
 - `engram init` as a required setup step
 - `--dispatch <uuid>` explain mode
 - Global source list in config (replaced by local-scoped ingest)
-- Config merging between repo and global levels (replaced by first-found-wins walk-up)
+- First-found-stop config walk-up (replaced by cascading merge walk-up)
 
 ### Concepts added
 
 - Single system DB as emergent default (not hard constraint)
-- Config walk-up resolution (first found wins)
+- Config walk-up resolution (cascading merge, nearest key wins)
 - `db:` override at any config level for isolation
 - `additional_stores:` for multi-DB explain fan-out
 - `engram fingerprint` command
@@ -1032,7 +1035,7 @@ for impl and review agents.*
 | Area | Before | After |
 |------|--------|-------|
 | Store init | `engram init` creates `.engram/` in cwd | Keep auto-create `~/.engram/` on first use; `engram init` explicitly creates local workspace config/dirs |
-| Config location | Repo `.engram/config.yml` + global `~/.engram/config.yml`, merged | Walk-up resolution, first found wins, no merging |
+| Config location | Repo `.engram/config.yml` + global `~/.engram/config.yml`, merged | Walk-up resolution with cascading merge (nearest key wins, missing keys inherit) |
 | DB location | Per-repo `.engram/index.sqlite` or global | Default `~/.engram/index.sqlite`, overridable via `db:` |
 | Ingest scope | Global source list or repo-local | Local to cwd and subfolders |
 | New command | N/A | `engram fingerprint` — index existing tapes only |
@@ -1044,7 +1047,8 @@ for impl and review agents.*
 
 - `--global` flag is fully removed from CLI parsing and help text
 - `engram init` creates local `./.engram/config.yml` + store dirs and is idempotent
-- Config walk-up stops at filesystem root or `~/.engram/`, whichever comes first
+- Config walk-up collects all configs from cwd up to `~` and merges them
+- If cwd is outside `~`, walk-up is skipped and `~/.engram/config.yml` is used directly
 - `engram ingest` only processes files in cwd and subdirectories
 - `engram fingerprint` only processes tapes in cwd's `.engram/tapes/`
 - `engram explain` queries resolved DB + all `additional_stores`, deduplicates

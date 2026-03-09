@@ -59,39 +59,41 @@ impl From<serde_yaml::Error> for ConfigError {
 
 pub fn load_effective_config(cwd: &Path, home: &Path) -> Result<EffectiveConfig, ConfigError> {
     let user_config_path = ensure_user_config(home)?;
-    let config_path = find_walkup_config(cwd, home).unwrap_or(user_config_path);
-    let parsed = load_parsed_config_file(&config_path)?;
-    let base_dir = config_base_dir(&config_path)?;
+    let config_chain = config_chain(cwd, home, &user_config_path);
+    let config_path = config_chain
+        .first()
+        .cloned()
+        .unwrap_or_else(|| user_config_path.clone());
     let default_db = home.join(".engram").join("index.sqlite");
-    let db = parsed
-        .db
-        .as_deref()
-        .map(|raw| resolve_path(raw, &base_dir, home))
-        .transpose()?
-        .unwrap_or(default_db);
-    let mut additional_stores = Vec::new();
-    for raw in parsed.additional_stores {
-        additional_stores.push(resolve_path(&raw, &base_dir, home)?);
+    let mut db = None;
+    let mut additional_stores = None;
+
+    for layer_path in &config_chain {
+        let raw = load_raw_config_file(layer_path)?;
+        let base_dir = config_base_dir(layer_path)?;
+        if db.is_none() && let Some(raw_db) = raw.db.as_deref() {
+            db = Some(resolve_path(raw_db, &base_dir, home)?);
+        }
+        if additional_stores.is_none()
+            && let Some(raw_stores) = raw.additional_stores.as_ref()
+        {
+            let mut resolved = Vec::new();
+            for raw_store in raw_stores {
+                resolved.push(resolve_path(raw_store, &base_dir, home)?);
+            }
+            additional_stores = Some(resolved);
+        }
     }
 
     Ok(EffectiveConfig {
         path: config_path,
-        db,
-        additional_stores,
+        db: db.unwrap_or(default_db),
+        additional_stores: additional_stores.unwrap_or_default(),
     })
 }
 
 pub fn find_walkup_config(start: &Path, home: &Path) -> Option<PathBuf> {
-    for dir in start.ancestors() {
-        let candidate = dir.join(".engram").join("config.yml");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        if dir == home {
-            break;
-        }
-    }
-    None
+    walkup_config_paths(start, home).into_iter().next()
 }
 
 pub fn ensure_user_config(home: &Path) -> Result<PathBuf, ConfigError> {
@@ -159,6 +161,51 @@ pub fn load_parsed_config_file(path: &Path) -> Result<ParsedConfig, ConfigError>
     parse_config(&content)
 }
 
+fn load_raw_config_file(path: &Path) -> Result<RawConfig, ConfigError> {
+    let content = fs::read_to_string(path)?;
+    Ok(serde_yaml::from_str(&content)?)
+}
+
+fn config_chain(cwd: &Path, home: &Path, user_config_path: &Path) -> Vec<PathBuf> {
+    if !is_within_home(cwd, home) {
+        return vec![user_config_path.to_path_buf()];
+    }
+    let chain = walkup_config_paths(cwd, home);
+    if chain.is_empty() {
+        vec![user_config_path.to_path_buf()]
+    } else {
+        chain
+    }
+}
+
+fn walkup_config_paths(start: &Path, home: &Path) -> Vec<PathBuf> {
+    if !is_within_home(start, home) {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for dir in start.ancestors() {
+        let candidate = dir.join(".engram").join("config.yml");
+        if candidate.is_file() {
+            out.push(candidate);
+        }
+        if dir == home {
+            break;
+        }
+    }
+    out
+}
+
+fn is_within_home(path: &Path, home: &Path) -> bool {
+    let normalized_path = canonicalize_or_normalize(path);
+    let normalized_home = canonicalize_or_normalize(home);
+    normalized_path.starts_with(&normalized_home)
+}
+
+fn canonicalize_or_normalize(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
+}
+
 pub fn default_user_config_yaml() -> String {
     "db: ~/.engram/index.sqlite\n".to_string()
 }
@@ -175,7 +222,10 @@ pub fn expand_tilde(path: &str, home: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_tilde, find_walkup_config, load_effective_config, load_parsed_config_file};
+    use super::{
+        config_chain, expand_tilde, find_walkup_config, load_effective_config,
+        load_parsed_config_file, walkup_config_paths,
+    };
     use std::path::Path;
 
     #[test]
@@ -185,15 +235,16 @@ mod tests {
     }
 
     #[test]
-    fn walk_up_uses_first_found_config_without_merging() {
+    fn walk_up_collects_all_configs_from_nearest_to_home() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
         let home = root.join("home");
-        let repo = root.join("workspace/repo");
+        let workspace = home.join("workspace");
+        let repo = workspace.join("repo");
         let child = repo.join("nested/deeper");
         std::fs::create_dir_all(child.clone()).expect("child");
         std::fs::create_dir_all(home.join(".engram")).expect("home");
-        std::fs::create_dir_all(root.join("workspace/.engram")).expect("workspace cfg dir");
+        std::fs::create_dir_all(workspace.join(".engram")).expect("workspace cfg dir");
         std::fs::create_dir_all(repo.join(".engram")).expect("repo cfg dir");
         std::fs::write(
             home.join(".engram/config.yml"),
@@ -201,7 +252,7 @@ mod tests {
         )
         .expect("home config");
         std::fs::write(
-            root.join("workspace/.engram/config.yml"),
+            workspace.join(".engram/config.yml"),
             "db: /tmp/workspace.sqlite\n",
         )
         .expect("workspace config");
@@ -211,12 +262,13 @@ mod tests {
         )
         .expect("repo config");
 
+        let collected = walkup_config_paths(&child, &home);
+        assert_eq!(collected.len(), 3);
+        assert_eq!(collected[0], repo.join(".engram/config.yml"));
+        assert_eq!(collected[1], workspace.join(".engram/config.yml"));
+        assert_eq!(collected[2], home.join(".engram/config.yml"));
         let nearest = find_walkup_config(&child, &home).expect("nearest walkup config");
         assert_eq!(nearest, repo.join(".engram/config.yml"));
-
-        let resolved = load_effective_config(&child, &home).expect("resolved");
-        assert_eq!(resolved.path, repo.join(".engram/config.yml"));
-        assert_eq!(resolved.db, repo.join(".engram/index.sqlite"));
     }
 
     #[test]
@@ -238,7 +290,7 @@ mod tests {
     fn supports_additional_stores_resolution() {
         let dir = tempfile::tempdir().expect("tempdir");
         let home = dir.path().join("home");
-        let workspace = dir.path().join("workspace");
+        let workspace = home.join("workspace");
         std::fs::create_dir_all(workspace.join(".engram")).expect("workspace cfg dir");
         std::fs::create_dir_all(home.join(".engram")).expect("home");
         std::fs::write(
@@ -261,8 +313,99 @@ mod tests {
         );
         assert_eq!(
             cfg.additional_stores[1],
-            dir.path().join("shared/engram.sqlite")
+            home.join("shared/engram.sqlite")
         );
+    }
+
+    #[test]
+    fn cascade_merge_inherits_missing_keys_from_parent_configs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let home = root.join("home");
+        let workspace = home.join("workspace");
+        let repo = workspace.join("repo");
+        let child = repo.join("nested");
+        std::fs::create_dir_all(child.clone()).expect("child");
+        std::fs::create_dir_all(home.join(".engram")).expect("home");
+        std::fs::create_dir_all(workspace.join(".engram")).expect("workspace");
+        std::fs::create_dir_all(repo.join(".engram")).expect("repo");
+
+        std::fs::write(
+            home.join(".engram/config.yml"),
+            "db: ~/.engram/home.sqlite\nadditional_stores:\n  - /nfs/home.sqlite\n",
+        )
+        .expect("home config");
+        std::fs::write(
+            workspace.join(".engram/config.yml"),
+            "additional_stores:\n  - ../team/workspace.sqlite\n",
+        )
+        .expect("workspace config");
+        std::fs::write(repo.join(".engram/config.yml"), "db: .engram/repo.sqlite\n")
+            .expect("repo config");
+
+        let cfg = load_effective_config(&child, &home).expect("resolved");
+        assert_eq!(cfg.path, repo.join(".engram/config.yml"));
+        assert_eq!(cfg.db, repo.join(".engram/repo.sqlite"));
+        assert_eq!(cfg.additional_stores, vec![home.join("team/workspace.sqlite")]);
+    }
+
+    #[test]
+    fn nearest_config_wins_when_it_specifies_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let home = root.join("home");
+        let workspace = home.join("workspace");
+        let repo = workspace.join("repo");
+        std::fs::create_dir_all(repo.join(".engram")).expect("repo");
+        std::fs::create_dir_all(workspace.join(".engram")).expect("workspace");
+        std::fs::create_dir_all(home.join(".engram")).expect("home");
+        std::fs::write(
+            home.join(".engram/config.yml"),
+            "db: ~/.engram/home.sqlite\nadditional_stores:\n  - /nfs/home.sqlite\n",
+        )
+        .expect("home config");
+        std::fs::write(
+            workspace.join(".engram/config.yml"),
+            "db: /tmp/workspace.sqlite\nadditional_stores:\n  - /tmp/workspace-store.sqlite\n",
+        )
+        .expect("workspace config");
+        std::fs::write(
+            repo.join(".engram/config.yml"),
+            "additional_stores: []\n",
+        )
+        .expect("repo config");
+
+        let cfg = load_effective_config(&repo, &home).expect("resolved");
+        assert_eq!(cfg.path, repo.join(".engram/config.yml"));
+        assert_eq!(cfg.db, Path::new("/tmp/workspace.sqlite").to_path_buf());
+        assert!(cfg.additional_stores.is_empty());
+    }
+
+    #[test]
+    fn outside_home_uses_user_config_directly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let home = root.join("home");
+        let outside = root.join("outside/workspace");
+        std::fs::create_dir_all(outside.join(".engram")).expect("outside");
+        std::fs::create_dir_all(home.join(".engram")).expect("home");
+        std::fs::write(
+            home.join(".engram/config.yml"),
+            "db: ~/.engram/home.sqlite\n",
+        )
+        .expect("home config");
+        std::fs::write(
+            outside.join(".engram/config.yml"),
+            "db: /tmp/outside.sqlite\n",
+        )
+        .expect("outside config");
+
+        let cfg = load_effective_config(&outside, &home).expect("resolved");
+        assert_eq!(cfg.path, home.join(".engram/config.yml"));
+        assert_eq!(cfg.db, home.join(".engram/home.sqlite"));
+
+        let chain = config_chain(&outside, &home, &home.join(".engram/config.yml"));
+        assert_eq!(chain, vec![home.join(".engram/config.yml")]);
     }
 
     #[test]

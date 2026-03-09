@@ -109,10 +109,10 @@ fn ingest_is_local_scoped_incremental_and_idempotent() {
 }
 
 #[test]
-fn config_walkup_first_found_wins_with_db_override() {
+fn config_walkup_cascades_with_nearest_key_wins() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
-    let workspace = temp.path().join("workspace");
+    let workspace = home.join("workspace");
     let repo = workspace.join("repo");
     fs::create_dir_all(repo.join(".engram")).expect("repo .engram");
     fs::create_dir_all(workspace.join(".engram")).expect("workspace .engram");
@@ -211,7 +211,7 @@ fn init_is_idempotent_when_local_config_exists() {
 fn ingest_after_init_uses_local_db() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
-    let repo = temp.path().join("repo");
+    let repo = home.join("repo");
     fs::create_dir_all(&repo).expect("repo");
     let _ = run_json(&repo, &["init"], None, &home);
     fs::write(
@@ -279,8 +279,8 @@ fn fingerprint_indexes_only_local_tapes() {
 fn explain_fans_out_to_additional_stores_and_dedupes() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
-    let project_a = temp.path().join("project-a");
-    let project_b = temp.path().join("project-b");
+    let project_a = home.join("project-a");
+    let project_b = home.join("project-b");
     fs::create_dir_all(project_a.join(".engram/tapes")).expect("a tapes");
     fs::create_dir_all(project_b.join(".engram/tapes")).expect("b tapes");
     fs::create_dir_all(home.join(".engram")).expect("home .engram");
@@ -358,7 +358,7 @@ fn explain_fans_out_to_additional_stores_and_dedupes() {
 fn ingest_errors_when_db_parent_is_not_directory() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
-    let repo = temp.path().join("repo");
+    let repo = home.join("repo");
     fs::create_dir_all(repo.join(".engram")).expect("repo");
     fs::create_dir_all(home.join(".engram")).expect("home");
     fs::write(
