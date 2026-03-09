@@ -166,6 +166,25 @@ additional_stores:
 merges and deduplicates results. Ingest and fingerprint commands write only
 to the primary `db:`.
 
+### Tapes Output Directory (`tapes_dir`)
+
+By default, ingest writes compiled tapes to the standard local tapes path for
+the working directory.
+
+Config can optionally override this with:
+
+```yaml
+tapes_dir: /path/to/tapes
+```
+
+`tapes_dir` follows the same path resolution rules as `db:`:
+- `~/...` expands from home
+- relative paths resolve from the config base directory
+
+Motivating use case: source transcripts live on NFS, but compiled tapes should
+be written to local disk (for example, eezo-local SSD) to avoid NFS write
+amplification.
+
 ### Example Configs
 
 **System config (`~/.engram/config.yml`) — typical developer machine:**
@@ -192,6 +211,13 @@ db: /nfs/team/engram/index.sqlite
 db: ~/.engram/index.sqlite
 additional_stores:
   - /nfs/team/engram/index.sqlite
+```
+
+**Developer ingesting NFS transcripts but writing tapes locally:**
+
+```yaml
+db: ~/.engram/index.sqlite
+tapes_dir: ~/.engram/local-tapes
 ```
 
 ## Fingerprinting: The Core Mechanism
@@ -1024,6 +1050,7 @@ for impl and review agents.*
 - Single system DB as emergent default (not hard constraint)
 - Config walk-up resolution (cascading merge, nearest key wins)
 - `db:` override at any config level for isolation
+- `tapes_dir:` optional override for ingest tape output location
 - `additional_stores:` for multi-DB explain fan-out
 - `engram fingerprint` command
 - Local-scoped ingest (folder you're in, not global sweep)
@@ -1052,6 +1079,8 @@ for impl and review agents.*
 - `engram ingest` only processes files in cwd and subdirectories
 - `engram fingerprint` only processes tapes in cwd's `.engram/tapes/`
 - `engram explain` queries resolved DB + all `additional_stores`, deduplicates
+- `tapes_dir` defaults to standard local tapes location when unset
+- `tapes_dir` path resolution matches `db:` rules (tilde + relative-to-config-base)
 - `--dispatch` flag is removed from explain
 - Dispatch marker links are followed during normal explain traversal
 - Every command's first output lines show resolved config path and DB path

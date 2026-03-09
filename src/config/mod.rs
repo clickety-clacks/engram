@@ -8,12 +8,14 @@ use serde::Deserialize;
 pub struct EffectiveConfig {
     pub path: PathBuf,
     pub db: PathBuf,
+    pub tapes_dir: PathBuf,
     pub additional_stores: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedConfig {
     pub db: Option<String>,
+    pub tapes_dir: Option<String>,
     pub additional_stores: Vec<String>,
 }
 
@@ -22,6 +24,8 @@ pub struct ParsedConfig {
 struct RawConfig {
     #[serde(default)]
     db: Option<String>,
+    #[serde(default)]
+    tapes_dir: Option<String>,
     #[serde(default)]
     additional_stores: Option<Vec<String>>,
 }
@@ -65,7 +69,9 @@ pub fn load_effective_config(cwd: &Path, home: &Path) -> Result<EffectiveConfig,
         .cloned()
         .unwrap_or_else(|| user_config_path.clone());
     let default_db = home.join(".engram").join("index.sqlite");
+    let default_tapes_dir = cwd.join(".engram").join("tapes");
     let mut db = None;
+    let mut tapes_dir = None;
     let mut additional_stores = None;
 
     for layer_path in &config_chain {
@@ -83,11 +89,15 @@ pub fn load_effective_config(cwd: &Path, home: &Path) -> Result<EffectiveConfig,
             }
             additional_stores = Some(resolved);
         }
+        if tapes_dir.is_none() && let Some(raw_tapes_dir) = raw.tapes_dir.as_deref() {
+            tapes_dir = Some(resolve_path(raw_tapes_dir, &base_dir, home)?);
+        }
     }
 
     Ok(EffectiveConfig {
         path: config_path,
         db: db.unwrap_or(default_db),
+        tapes_dir: tapes_dir.unwrap_or(default_tapes_dir),
         additional_stores: additional_stores.unwrap_or_default(),
     })
 }
@@ -152,6 +162,7 @@ fn parse_config(content: &str) -> Result<ParsedConfig, ConfigError> {
     let raw: RawConfig = serde_yaml::from_str(content)?;
     Ok(ParsedConfig {
         db: raw.db,
+        tapes_dir: raw.tapes_dir,
         additional_stores: raw.additional_stores.unwrap_or_default(),
     })
 }
@@ -284,6 +295,7 @@ mod tests {
         assert!(user_config.exists());
         assert_eq!(resolved.path, user_config);
         assert_eq!(resolved.db, home.join(".engram/index.sqlite"));
+        assert_eq!(resolved.tapes_dir, cwd.join(".engram/tapes"));
     }
 
     #[test]
@@ -306,6 +318,7 @@ mod tests {
 
         let cfg = load_effective_config(&workspace, &home).expect("config");
         assert_eq!(cfg.db, workspace.join(".engram/index.sqlite"));
+        assert_eq!(cfg.tapes_dir, workspace.join(".engram/tapes"));
         assert_eq!(cfg.additional_stores.len(), 2);
         assert_eq!(
             cfg.additional_stores[0],
@@ -346,6 +359,7 @@ mod tests {
         let cfg = load_effective_config(&child, &home).expect("resolved");
         assert_eq!(cfg.path, repo.join(".engram/config.yml"));
         assert_eq!(cfg.db, repo.join(".engram/repo.sqlite"));
+        assert_eq!(cfg.tapes_dir, child.join(".engram/tapes"));
         assert_eq!(cfg.additional_stores, vec![home.join("team/workspace.sqlite")]);
     }
 
@@ -378,6 +392,7 @@ mod tests {
         let cfg = load_effective_config(&repo, &home).expect("resolved");
         assert_eq!(cfg.path, repo.join(".engram/config.yml"));
         assert_eq!(cfg.db, Path::new("/tmp/workspace.sqlite").to_path_buf());
+        assert_eq!(cfg.tapes_dir, repo.join(".engram/tapes"));
         assert!(cfg.additional_stores.is_empty());
     }
 
@@ -403,9 +418,49 @@ mod tests {
         let cfg = load_effective_config(&outside, &home).expect("resolved");
         assert_eq!(cfg.path, home.join(".engram/config.yml"));
         assert_eq!(cfg.db, home.join(".engram/home.sqlite"));
+        assert_eq!(cfg.tapes_dir, outside.join(".engram/tapes"));
 
         let chain = config_chain(&outside, &home, &home.join(".engram/config.yml"));
         assert_eq!(chain, vec![home.join(".engram/config.yml")]);
+    }
+
+    #[test]
+    fn resolves_tapes_dir_from_relative_config_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        let workspace = home.join("workspace");
+        std::fs::create_dir_all(workspace.join(".engram")).expect("workspace cfg dir");
+        std::fs::create_dir_all(home.join(".engram")).expect("home");
+        std::fs::write(
+            home.join(".engram/config.yml"),
+            "db: ~/.engram/index.sqlite\n",
+        )
+        .expect("home config");
+        std::fs::write(
+            workspace.join(".engram/config.yml"),
+            "tapes_dir: ../compiled/tapes\n",
+        )
+        .expect("workspace config");
+
+        let cfg = load_effective_config(&workspace, &home).expect("config");
+        assert_eq!(cfg.tapes_dir, home.join("compiled/tapes"));
+    }
+
+    #[test]
+    fn resolves_tapes_dir_from_tilde_config_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        let workspace = home.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(home.join(".engram")).expect("home");
+        std::fs::write(
+            home.join(".engram/config.yml"),
+            "db: ~/.engram/index.sqlite\ntapes_dir: ~/compiled/tapes\n",
+        )
+        .expect("home config");
+
+        let cfg = load_effective_config(&workspace, &home).expect("config");
+        assert_eq!(cfg.tapes_dir, home.join("compiled/tapes"));
     }
 
     #[test]

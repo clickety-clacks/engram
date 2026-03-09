@@ -129,6 +129,7 @@ struct RepoPaths {
 struct RuntimeContext {
     config_path: PathBuf,
     db_path: PathBuf,
+    tapes_dir: PathBuf,
     additional_stores: Vec<PathBuf>,
 }
 
@@ -210,6 +211,7 @@ fn cmd_init(paths: &RepoPaths) -> Result<(), CliError> {
     let context = RuntimeContext {
         config_path: paths.root.join("config.yml"),
         db_path: paths.root.join("index.sqlite"),
+        tapes_dir: paths.root.join("tapes"),
         additional_stores: Vec::new(),
     };
     print_context_conspicuity(&context);
@@ -293,6 +295,7 @@ fn cmd_record(
 fn cmd_ingest(cwd: &Path, paths: &RepoPaths, context: &RuntimeContext) -> Result<(), CliError> {
     ensure_local_store(paths)?;
     print_context_conspicuity(context);
+    fs::create_dir_all(&context.tapes_dir).map_err(|err| CliError::io("mkdir_error", err))?;
     let candidates = discover_local_transcript_candidates(cwd)?;
     let mut state = load_ingest_state(paths)?;
     ensure_db_parent(&context.db_path)?;
@@ -355,7 +358,7 @@ fn cmd_ingest(cwd: &Path, paths: &RepoPaths, context: &RuntimeContext) -> Result
         let dispatch_links = extract_dispatch_links_from_transcript(&input);
 
         let tape_id = tape_id_for_contents(&normalized);
-        let tape_path = tape_path_for_id(paths, &tape_id);
+        let tape_path = tape_path_for_tapes_dir(&context.tapes_dir, &tape_id);
         let tape_file_exists = tape_path.exists();
         if !tape_file_exists {
             let compressed =
@@ -1671,6 +1674,7 @@ fn resolve_runtime_context(cwd: &Path) -> Result<RuntimeContext, CliError> {
     Ok(RuntimeContext {
         config_path: config.path,
         db_path: config.db,
+        tapes_dir: config.tapes_dir,
         additional_stores: config.additional_stores,
     })
 }
@@ -1703,6 +1707,10 @@ fn home_dir() -> Result<PathBuf, CliError> {
 
 fn tape_path_for_id(paths: &RepoPaths, tape_id: &str) -> PathBuf {
     paths.tapes.join(format!("{tape_id}{TAPE_SUFFIX}"))
+}
+
+fn tape_path_for_tapes_dir(tapes_dir: &Path, tape_id: &str) -> PathBuf {
+    tapes_dir.join(format!("{tape_id}{TAPE_SUFFIX}"))
 }
 
 fn tape_id_from_path(path: &Path) -> Option<String> {

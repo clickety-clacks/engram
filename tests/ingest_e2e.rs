@@ -84,6 +84,13 @@ fn ingest_is_local_scoped_incremental_and_idempotent() {
     assert_eq!(first["imported_tapes"], 1);
     assert_eq!(first["skipped_unchanged"], 0);
     assert_eq!(first["skipped_non_transcript"], 0);
+    let default_tapes = repo.join(".engram/tapes");
+    let tape_count = fs::read_dir(&default_tapes)
+        .expect("tapes dir")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_file())
+        .count();
+    assert_eq!(tape_count, 1, "expected ingest to write repo-local tape");
     assert!(
         home.join(".engram/config.yml").exists(),
         "expected auto-created user config"
@@ -106,6 +113,80 @@ fn ingest_is_local_scoped_incremental_and_idempotent() {
     let third = run_json(&repo, &["ingest"], None, &home);
     assert_eq!(third["status"], "ok");
     assert_eq!(third["imported_tapes"], 1);
+}
+
+#[test]
+fn ingest_writes_to_configured_tapes_dir() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let workspace = home.join("workspace");
+    let repo = workspace.join("repo");
+    fs::create_dir_all(repo.join(".engram")).expect("repo .engram");
+    fs::create_dir_all(home.join(".engram")).expect("home .engram");
+    fs::write(home.join(".engram/config.yml"), "db: ~/.engram/index.sqlite\n").expect("home config");
+    fs::write(
+        repo.join(".engram/config.yml"),
+        "db: .engram/repo.sqlite\ntapes_dir: ~/.engram/compiled-tapes\n",
+    )
+    .expect("repo config");
+    fs::write(
+        repo.join("input.codex.jsonl"),
+        include_str!("fixtures/codex/supported_paths.jsonl"),
+    )
+    .expect("input");
+
+    let ingest = run_json(&repo, &["ingest"], None, &home);
+    assert_eq!(ingest["status"], "ok");
+    assert_eq!(ingest["imported_tapes"], 1);
+
+    let compiled = home.join(".engram/compiled-tapes");
+    let compiled_count = fs::read_dir(&compiled)
+        .expect("compiled tapes dir")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_file())
+        .count();
+    assert_eq!(compiled_count, 1, "expected one compiled tape in tapes_dir");
+
+    let default_repo_tapes = repo.join(".engram/tapes");
+    let repo_count = fs::read_dir(&default_repo_tapes)
+        .expect("repo tapes dir")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_file())
+        .count();
+    assert_eq!(repo_count, 0, "expected no ingest tape in default repo tapes dir");
+}
+
+#[test]
+fn ingest_resolves_relative_tapes_dir_from_config_base() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let workspace = home.join("workspace");
+    let repo = workspace.join("repo");
+    fs::create_dir_all(repo.join(".engram")).expect("repo .engram");
+    fs::create_dir_all(home.join(".engram")).expect("home .engram");
+    fs::write(home.join(".engram/config.yml"), "db: ~/.engram/index.sqlite\n").expect("home config");
+    fs::write(
+        repo.join(".engram/config.yml"),
+        "db: .engram/repo.sqlite\ntapes_dir: ../compiled-relative\n",
+    )
+    .expect("repo config");
+    fs::write(
+        repo.join("input.codex.jsonl"),
+        include_str!("fixtures/codex/supported_paths.jsonl"),
+    )
+    .expect("input");
+
+    let ingest = run_json(&repo, &["ingest"], None, &home);
+    assert_eq!(ingest["status"], "ok");
+    assert_eq!(ingest["imported_tapes"], 1);
+
+    let compiled = workspace.join("compiled-relative");
+    let compiled_count = fs::read_dir(&compiled)
+        .expect("compiled tapes dir")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_file())
+        .count();
+    assert_eq!(compiled_count, 1, "expected one compiled tape in relative tapes_dir");
 }
 
 #[test]
