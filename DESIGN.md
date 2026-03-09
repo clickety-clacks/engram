@@ -129,8 +129,15 @@ walk-up is skipped entirely and Engram uses `~/.engram/config.yml` directly.
 ### Auto-Creation
 
 On first invocation, if `~/.engram/config.yml` does not exist, Engram
-auto-creates it with a default `db:` pointing at `~/.engram/index.sqlite`.
-No explicit init step is required.
+auto-creates it with explicit defaults:
+
+```yaml
+db: ~/.engram/index.sqlite
+tapes_dir: .engram/tapes
+```
+
+The explicit `tapes_dir` keeps walk-up behavior deterministic and consistent
+with `db:` resolution.
 
 ### DB Override
 
@@ -168,9 +175,6 @@ to the primary `db:`.
 
 ### Tapes Output Directory (`tapes_dir`)
 
-By default, ingest writes compiled tapes to the standard local tapes path for
-the working directory.
-
 Config can optionally override this with:
 
 ```yaml
@@ -180,6 +184,15 @@ tapes_dir: /path/to/tapes
 `tapes_dir` follows the same path resolution rules as `db:`:
 - `~/...` expands from home
 - relative paths resolve from the config base directory
+
+`tapes_dir` also participates in cascading walk-up merge exactly like `db:`:
+- nearest config wins if it sets `tapes_dir`
+- if omitted, value inherits from parent configs up the chain
+- hardcoded fallback applies only if no config in chain sets `tapes_dir`
+
+Auto-generated configs (`engram init` local config and first-run
+`~/.engram/config.yml`) always include explicit `tapes_dir: .engram/tapes`.
+So inheritance is mainly for manually-authored configs that omit the key.
 
 Motivating use case: source transcripts live on NFS, but compiled tapes should
 be written to local disk (for example, eezo-local SSD) to avoid NFS write
@@ -191,6 +204,7 @@ amplification.
 
 ```yaml
 db: ~/.engram/index.sqlite
+tapes_dir: .engram/tapes
 ```
 
 **Repo override (`.engram/config.yml` in a client project) — isolated DB:**
@@ -466,7 +480,9 @@ BFS fan-out is capped at `MAX_FANOUT` (default `50`) edges per node. When a node
 
 Create a local Engram workspace rooted at the current directory:
 - Creates `./.engram/` directory structure
-- Creates `./.engram/config.yml` with `db: .engram/index.sqlite`
+- Creates `./.engram/config.yml` with:
+  - `db: .engram/index.sqlite`
+  - `tapes_dir: .engram/tapes`
 - Prints conspicuity lines (`config`, `db`) like all commands
 - Idempotent: if `./.engram/config.yml` already exists, reports and exits cleanly
 
@@ -1079,7 +1095,8 @@ for impl and review agents.*
 - `engram ingest` only processes files in cwd and subdirectories
 - `engram fingerprint` only processes tapes in cwd's `.engram/tapes/`
 - `engram explain` queries resolved DB + all `additional_stores`, deduplicates
-- `tapes_dir` defaults to standard local tapes location when unset
+- `tapes_dir` participates in cascading merge and inherits like `db:`
+- auto-generated configs include explicit `tapes_dir: .engram/tapes`
 - `tapes_dir` path resolution matches `db:` rules (tilde + relative-to-config-base)
 - `--dispatch` flag is removed from explain
 - Dispatch marker links are followed during normal explain traversal

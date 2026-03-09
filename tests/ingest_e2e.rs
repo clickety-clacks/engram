@@ -84,16 +84,19 @@ fn ingest_is_local_scoped_incremental_and_idempotent() {
     assert_eq!(first["imported_tapes"], 1);
     assert_eq!(first["skipped_unchanged"], 0);
     assert_eq!(first["skipped_non_transcript"], 0);
-    let default_tapes = repo.join(".engram/tapes");
+    let default_tapes = home.join(".engram/tapes");
     let tape_count = fs::read_dir(&default_tapes)
         .expect("tapes dir")
         .filter_map(Result::ok)
         .filter(|entry| entry.path().is_file())
         .count();
-    assert_eq!(tape_count, 1, "expected ingest to write repo-local tape");
-    assert!(
-        home.join(".engram/config.yml").exists(),
-        "expected auto-created user config"
+    assert_eq!(tape_count, 1, "expected ingest to write home-scoped tape");
+    let user_config_path = home.join(".engram/config.yml");
+    assert!(user_config_path.exists(), "expected auto-created user config");
+    assert_eq!(
+        fs::read_to_string(user_config_path).expect("user config"),
+        "db: ~/.engram/index.sqlite\ntapes_dir: .engram/tapes\n",
+        "expected auto-generated user config to carry explicit tapes_dir"
     );
 
     let second = run_json(&repo, &["ingest"], None, &home);
@@ -253,7 +256,12 @@ fn init_creates_local_config_and_store_dirs() {
     let config_path = repo.join(".engram/config.yml");
     assert_eq!(
         fs::read_to_string(&config_path).expect("config"),
-        "db: .engram/index.sqlite\n"
+        "db: .engram/index.sqlite\ntapes_dir: .engram/tapes\n"
+    );
+    assert_eq!(
+        fs::read_to_string(home.join(".engram/config.yml")).expect("home config"),
+        "db: ~/.engram/index.sqlite\ntapes_dir: .engram/tapes\n",
+        "expected auto-generated user config to carry explicit tapes_dir"
     );
     assert!(repo.join(".engram").is_dir());
     assert!(repo.join(".engram/tapes").is_dir());

@@ -218,7 +218,7 @@ fn canonicalize_or_normalize(path: &Path) -> PathBuf {
 }
 
 pub fn default_user_config_yaml() -> String {
-    "db: ~/.engram/index.sqlite\n".to_string()
+    "db: ~/.engram/index.sqlite\ntapes_dir: .engram/tapes\n".to_string()
 }
 
 pub fn expand_tilde(path: &str, home: &Path) -> PathBuf {
@@ -293,9 +293,13 @@ mod tests {
         let resolved = load_effective_config(&cwd, &home).expect("resolve config");
         let user_config = home.join(".engram/config.yml");
         assert!(user_config.exists());
+        assert_eq!(
+            std::fs::read_to_string(&user_config).expect("user config content"),
+            "db: ~/.engram/index.sqlite\ntapes_dir: .engram/tapes\n"
+        );
         assert_eq!(resolved.path, user_config);
         assert_eq!(resolved.db, home.join(".engram/index.sqlite"));
-        assert_eq!(resolved.tapes_dir, cwd.join(".engram/tapes"));
+        assert_eq!(resolved.tapes_dir, home.join(".engram/tapes"));
     }
 
     #[test]
@@ -350,7 +354,7 @@ mod tests {
         .expect("home config");
         std::fs::write(
             workspace.join(".engram/config.yml"),
-            "additional_stores:\n  - ../team/workspace.sqlite\n",
+            "tapes_dir: ../workspace-tapes\nadditional_stores:\n  - ../team/workspace.sqlite\n",
         )
         .expect("workspace config");
         std::fs::write(repo.join(".engram/config.yml"), "db: .engram/repo.sqlite\n")
@@ -359,7 +363,7 @@ mod tests {
         let cfg = load_effective_config(&child, &home).expect("resolved");
         assert_eq!(cfg.path, repo.join(".engram/config.yml"));
         assert_eq!(cfg.db, repo.join(".engram/repo.sqlite"));
-        assert_eq!(cfg.tapes_dir, child.join(".engram/tapes"));
+        assert_eq!(cfg.tapes_dir, home.join("workspace-tapes"));
         assert_eq!(cfg.additional_stores, vec![home.join("team/workspace.sqlite")]);
     }
 

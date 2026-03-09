@@ -225,7 +225,7 @@ fn cmd_init(paths: &RepoPaths) -> Result<(), CliError> {
 
     atomic_write(
         &context.config_path,
-        b"db: .engram/index.sqlite\n",
+        b"db: .engram/index.sqlite\ntapes_dir: .engram/tapes\n",
     )
     .map_err(|err| CliError::io("write_error", err))?;
     print_json(&json!({
