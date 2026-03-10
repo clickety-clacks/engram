@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use serde_json::Value;
@@ -58,6 +58,12 @@ fn sha256_hex(input: &str) -> String {
     out
 }
 
+fn cursor_state_path(repo: &Path, transcript: &Path) -> PathBuf {
+    let absolute = fs::canonicalize(transcript).expect("canonical transcript path");
+    let key = sha256_hex(absolute.to_string_lossy().as_ref());
+    repo.join(".engram/cursors").join(format!("{key}.json"))
+}
+
 #[test]
 fn ingest_is_local_scoped_incremental_and_idempotent() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -92,11 +98,20 @@ fn ingest_is_local_scoped_incremental_and_idempotent() {
         .count();
     assert_eq!(tape_count, 1, "expected ingest to write home-scoped tape");
     let user_config_path = home.join(".engram/config.yml");
-    assert!(user_config_path.exists(), "expected auto-created user config");
+    assert!(
+        user_config_path.exists(),
+        "expected auto-created user config"
+    );
     assert_eq!(
         fs::read_to_string(user_config_path).expect("user config"),
         "db: ~/.engram/index.sqlite\ntapes_dir: .engram/tapes\n",
         "expected auto-generated user config to carry explicit tapes_dir"
+    );
+    let cursor_path = cursor_state_path(&repo, &source_path);
+    assert!(cursor_path.exists(), "expected per-file cursor state");
+    assert!(
+        !repo.join(".engram/cursors/ingest-state.json").exists(),
+        "legacy monolithic cursor state should not be written"
     );
 
     let second = run_json(&repo, &["ingest"], None, &home);
@@ -116,6 +131,162 @@ fn ingest_is_local_scoped_incremental_and_idempotent() {
     let third = run_json(&repo, &["ingest"], None, &home);
     assert_eq!(third["status"], "ok");
     assert_eq!(third["imported_tapes"], 1);
+}
+
+#[test]
+fn ingest_path_args_respect_local_scope_and_limit_candidates() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(&repo).expect("repo");
+    fs::create_dir_all(&outside).expect("outside");
+
+    fs::write(
+        repo.join("a.codex.jsonl"),
+        include_str!("fixtures/codex/supported_paths.jsonl"),
+    )
+    .expect("repo transcript");
+    fs::write(
+        outside.join("outside.codex.jsonl"),
+        include_str!("fixtures/codex/supported_paths.jsonl"),
+    )
+    .expect("outside transcript");
+
+    let selected = run_json(&repo, &["ingest", "a.codex.jsonl"], None, &home);
+    assert_eq!(selected["status"], "ok");
+    assert_eq!(selected["scanned_inputs"], 1);
+    assert_eq!(selected["imported_tapes"], 1);
+    assert_eq!(selected["failure_count"], 0);
+
+    let rejected = run_json(
+        &repo,
+        &[
+            "ingest",
+            outside
+                .join("outside.codex.jsonl")
+                .to_string_lossy()
+                .as_ref(),
+        ],
+        None,
+        &home,
+    );
+    assert_eq!(rejected["status"], "partial");
+    assert_eq!(rejected["scanned_inputs"], 0);
+    assert_eq!(rejected["failure_count"], 1);
+    let failures = rejected["failures"].as_array().expect("failures");
+    assert!(
+        failures[0]["error"]
+            .as_str()
+            .expect("error")
+            .contains("outside local ingest scope"),
+        "failures={failures:?}"
+    );
+}
+
+#[test]
+fn ingest_handles_partial_trailing_record_without_advancing_cursor() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+
+    let source_path = repo.join("input.codex.jsonl");
+    let appended_line = "{\"timestamp\":\"2026-02-22T00:00:09Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"tail\"}]}}\n";
+    let split_at = appended_line.len() / 2;
+    fs::write(
+        &source_path,
+        format!(
+            "{}{}",
+            include_str!("fixtures/codex/supported_paths.jsonl"),
+            &appended_line[..split_at]
+        ),
+    )
+    .expect("seed with partial tail");
+
+    let first = run_json(&repo, &["ingest"], None, &home);
+    assert_eq!(first["status"], "ok");
+    assert_eq!(first["imported_tapes"], 1);
+
+    let cursor_path = cursor_state_path(&repo, &source_path);
+    let cursor_before: Value =
+        serde_json::from_str(&fs::read_to_string(&cursor_path).expect("cursor file"))
+            .expect("cursor json");
+    let byte_cursor_before = cursor_before["byte_cursor"].as_u64().expect("byte_cursor");
+    let file_len_before = fs::metadata(&source_path).expect("source metadata").len();
+    assert!(
+        byte_cursor_before < file_len_before,
+        "cursor should not advance into incomplete trailing record"
+    );
+
+    let second = run_json(&repo, &["ingest"], None, &home);
+    assert_eq!(second["status"], "ok");
+    assert_eq!(second["imported_tapes"], 0);
+    assert_eq!(second["skipped_unchanged"], 1);
+
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&source_path)
+        .expect("open source")
+        .write_all(appended_line[split_at..].as_bytes())
+        .expect("append completion bytes");
+
+    let third = run_json(&repo, &["ingest"], None, &home);
+    assert_eq!(third["status"], "ok");
+    assert_eq!(third["imported_tapes"], 1);
+
+    let cursor_after: Value =
+        serde_json::from_str(&fs::read_to_string(&cursor_path).expect("cursor file"))
+            .expect("cursor json");
+    let byte_cursor_after = cursor_after["byte_cursor"].as_u64().expect("byte_cursor");
+    let file_len_after = fs::metadata(&source_path).expect("source metadata").len();
+    assert_eq!(
+        byte_cursor_after, file_len_after,
+        "cursor should advance after trailing record becomes complete"
+    );
+}
+
+#[test]
+fn ingest_guard_mismatch_triggers_full_fallback_reingest() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+
+    let source_path = repo.join("input.codex.jsonl");
+    fs::write(
+        &source_path,
+        include_str!("fixtures/codex/supported_paths.jsonl"),
+    )
+    .expect("seed source");
+
+    let first = run_json(&repo, &["ingest"], None, &home);
+    assert_eq!(first["status"], "ok");
+    assert_eq!(first["imported_tapes"], 1);
+
+    let cursor_path = cursor_state_path(&repo, &source_path);
+    let cursor_before: Value =
+        serde_json::from_str(&fs::read_to_string(&cursor_path).expect("cursor file"))
+            .expect("cursor json");
+    let tape_id_before = cursor_before["tape_id"]
+        .as_str()
+        .expect("tape_id")
+        .to_string();
+
+    let mut rewritten = fs::read_to_string(&source_path).expect("source");
+    rewritten = rewritten.replace("\"output\":\"Done.\"", "\"output\":\"Done?\"");
+    fs::write(&source_path, rewritten).expect("rewrite source before cursor boundary");
+
+    let second = run_json(&repo, &["ingest"], None, &home);
+    assert_eq!(second["status"], "ok");
+    assert_eq!(second["imported_tapes"], 1);
+    assert_eq!(second["skipped_unchanged"], 0);
+
+    let cursor_after: Value =
+        serde_json::from_str(&fs::read_to_string(&cursor_path).expect("cursor file"))
+            .expect("cursor json");
+    let tape_id_after = cursor_after["tape_id"].as_str().expect("tape_id");
+    assert_ne!(tape_id_before, tape_id_after);
 }
 
 #[test]
@@ -158,7 +329,11 @@ fn ingest_writes_to_configured_tapes_dir() {
     let repo = workspace.join("repo");
     fs::create_dir_all(repo.join(".engram")).expect("repo .engram");
     fs::create_dir_all(home.join(".engram")).expect("home .engram");
-    fs::write(home.join(".engram/config.yml"), "db: ~/.engram/index.sqlite\n").expect("home config");
+    fs::write(
+        home.join(".engram/config.yml"),
+        "db: ~/.engram/index.sqlite\n",
+    )
+    .expect("home config");
     fs::write(
         repo.join(".engram/config.yml"),
         "db: .engram/repo.sqlite\ntapes_dir: ~/.engram/compiled-tapes\n",
@@ -188,7 +363,10 @@ fn ingest_writes_to_configured_tapes_dir() {
         .filter_map(Result::ok)
         .filter(|entry| entry.path().is_file())
         .count();
-    assert_eq!(repo_count, 0, "expected no ingest tape in default repo tapes dir");
+    assert_eq!(
+        repo_count, 0,
+        "expected no ingest tape in default repo tapes dir"
+    );
 }
 
 #[test]
@@ -199,7 +377,11 @@ fn ingest_resolves_relative_tapes_dir_from_config_base() {
     let repo = workspace.join("repo");
     fs::create_dir_all(repo.join(".engram")).expect("repo .engram");
     fs::create_dir_all(home.join(".engram")).expect("home .engram");
-    fs::write(home.join(".engram/config.yml"), "db: ~/.engram/index.sqlite\n").expect("home config");
+    fs::write(
+        home.join(".engram/config.yml"),
+        "db: ~/.engram/index.sqlite\n",
+    )
+    .expect("home config");
     fs::write(
         repo.join(".engram/config.yml"),
         "db: .engram/repo.sqlite\ntapes_dir: ../compiled-relative\n",
@@ -221,7 +403,10 @@ fn ingest_resolves_relative_tapes_dir_from_config_base() {
         .filter_map(Result::ok)
         .filter(|entry| entry.path().is_file())
         .count();
-    assert_eq!(compiled_count, 1, "expected one compiled tape in relative tapes_dir");
+    assert_eq!(
+        compiled_count, 1,
+        "expected one compiled tape in relative tapes_dir"
+    );
 }
 
 #[test]
