@@ -1,6 +1,11 @@
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use walkdir::WalkDir;
 
 use super::adapters::{
     claude_jsonl_to_tape_jsonl, codex_jsonl_to_tape_jsonl, cursor_jsonl_to_tape_jsonl,
@@ -339,6 +344,353 @@ pub fn discovery_scaffold(id: AdapterId, home_dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = out.pop();
+            }
+            Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
+                out.push(component.as_os_str())
+            }
+        }
+    }
+    out
+}
+
+fn canonicalize_or_normalize(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
+}
+
+fn sorted_unique(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn list_files_by_extension_recursive(root: &Path, extension: &str) -> Vec<PathBuf> {
+    if !root.exists() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case(extension))
+        {
+            out.push(path.to_path_buf());
+        }
+    }
+    sorted_unique(out)
+}
+
+fn list_files_by_extension_shallow(root: &Path, extension: &str) -> Vec<PathBuf> {
+    if !root.exists() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case(extension))
+        {
+            out.push(path);
+        }
+    }
+    sorted_unique(out)
+}
+
+fn path_contains_component(path: &Path, component: &str) -> bool {
+    path.components().any(|part| {
+        part.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(component)
+    })
+}
+
+fn sha256_hex(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn read_first_matching_codex_cwd(path: &Path) -> Option<PathBuf> {
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    for line in reader.lines().map_while(Result::ok) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let row: Value = serde_json::from_str(trimmed).ok()?;
+        if row.get("type").and_then(Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        let cwd = row
+            .get("payload")
+            .and_then(Value::as_object)
+            .and_then(|payload| payload.get("cwd"))
+            .and_then(Value::as_str)?;
+        return Some(canonicalize_or_normalize(Path::new(cwd)));
+    }
+    None
+}
+
+fn path_matches_repo_scope(candidate: &Path, repo_path: &Path) -> bool {
+    let candidate = canonicalize_or_normalize(candidate);
+    let repo = canonicalize_or_normalize(repo_path);
+    candidate == repo || candidate.starts_with(&repo) || repo.starts_with(&candidate)
+}
+
+fn discover_codex_sessions(repo_path: &Path, home_dir: &Path) -> Vec<PathBuf> {
+    let sessions_root = home_dir.join(".codex").join("sessions");
+    if !sessions_root.exists() {
+        return Vec::new();
+    }
+    let repo = canonicalize_or_normalize(repo_path);
+    let mut out = Vec::new();
+    for candidate in list_files_by_extension_recursive(&sessions_root, "jsonl") {
+        let Some(session_cwd) = read_first_matching_codex_cwd(&candidate) else {
+            continue;
+        };
+        if path_matches_repo_scope(&session_cwd, &repo) {
+            out.push(candidate);
+        }
+    }
+    sorted_unique(out)
+}
+
+fn discover_claude_sessions(repo_path: &Path, home_dir: &Path) -> Vec<PathBuf> {
+    let repo = canonicalize_or_normalize(repo_path);
+    let key = repo.to_string_lossy().replace('/', "-");
+    let project_root = home_dir.join(".claude").join("projects").join(key);
+    if !project_root.exists() {
+        return Vec::new();
+    }
+    let mut out = list_files_by_extension_shallow(&project_root, "jsonl");
+    for candidate in list_files_by_extension_recursive(&project_root, "jsonl") {
+        if path_contains_component(&candidate, "memory") {
+            continue;
+        }
+        if path_contains_component(&candidate, "subagents") {
+            out.push(candidate);
+        }
+    }
+    sorted_unique(out)
+}
+
+fn discover_gemini_sessions(repo_path: &Path, home_dir: &Path) -> Vec<PathBuf> {
+    let repo = canonicalize_or_normalize(repo_path);
+    let project_hash = sha256_hex(&repo.to_string_lossy());
+    let bucket = home_dir.join(".gemini").join("tmp").join(project_hash);
+    if !bucket.exists() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let chats = bucket.join("chats");
+    if chats.exists() {
+        for candidate in list_files_by_extension_shallow(&chats, "json") {
+            let name = candidate.file_name().and_then(|value| value.to_str()).unwrap_or("");
+            if name.starts_with("session-") {
+                out.push(candidate);
+            }
+        }
+    }
+    let logs = bucket.join("logs.json");
+    if logs.is_file() {
+        out.push(logs);
+    }
+    sorted_unique(out)
+}
+
+fn read_matches_repo_hint(path: &Path, repo_path: &Path) -> bool {
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    let reader = BufReader::new(file);
+    let repo = canonicalize_or_normalize(repo_path);
+    let repo_text = repo.to_string_lossy();
+    for line in reader.lines().map_while(Result::ok).take(80) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(row) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if value_contains_repo_path_hint(&row, &repo_text) {
+            return true;
+        }
+    }
+    false
+}
+
+fn value_contains_repo_path_hint(value: &Value, repo_text: &str) -> bool {
+    match value {
+        Value::String(text) => {
+            text == repo_text
+                || text.starts_with(repo_text)
+                || repo_text.starts_with(text)
+                || text.contains(repo_text)
+        }
+        Value::Array(items) => items
+            .iter()
+            .any(|item| value_contains_repo_path_hint(item, repo_text)),
+        Value::Object(map) => map
+            .iter()
+            .filter(|(key, _)| {
+                let lower = key.to_ascii_lowercase();
+                lower.contains("cwd")
+                    || lower.contains("repo")
+                    || lower.contains("workspace")
+                    || lower.contains("path")
+            })
+            .any(|(_, nested)| value_contains_repo_path_hint(nested, repo_text)),
+        _ => false,
+    }
+}
+
+fn discover_openclaw_sessions(repo_path: &Path, home_dir: &Path) -> Vec<PathBuf> {
+    let sessions_root = home_dir.join(".openclaw").join("sessions");
+    if !sessions_root.exists() {
+        return Vec::new();
+    }
+    let repo = canonicalize_or_normalize(repo_path);
+    let repo_text = repo.to_string_lossy().to_string();
+    let repo_dash = repo_text.replace('/', "-");
+    let repo_hash = sha256_hex(&repo_text);
+    let mut out = Vec::new();
+    for candidate in list_files_by_extension_recursive(&sessions_root, "jsonl") {
+        let path_text = candidate.to_string_lossy();
+        if path_text.contains(&repo_dash) || path_text.contains(&repo_hash) {
+            out.push(candidate);
+            continue;
+        }
+        if read_matches_repo_hint(&candidate, &repo) {
+            out.push(candidate);
+        }
+    }
+    sorted_unique(out)
+}
+
+fn opencode_data_root(home_dir: &Path) -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+        return PathBuf::from(xdg).join("opencode");
+    }
+    home_dir.join(".local").join("share").join("opencode")
+}
+
+fn run_git(repo_path: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn resolve_opencode_project_id(repo_path: &Path) -> String {
+    let Some(top_level) = run_git(repo_path, &["rev-parse", "--show-toplevel"]) else {
+        return "global".to_string();
+    };
+    let repo_root = PathBuf::from(top_level);
+    let common_dir = run_git(&repo_root, &["rev-parse", "--git-common-dir"])
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                repo_root.join(path)
+            }
+        })
+        .unwrap_or_else(|| repo_root.join(".git"));
+    let cache_file = common_dir.join("opencode");
+    if let Ok(content) = fs::read_to_string(&cache_file) {
+        let trimmed = content.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    let Some(root_commits) = run_git(&repo_root, &["rev-list", "--max-parents=0", "--all"]) else {
+        return "global".to_string();
+    };
+    let mut roots = root_commits
+        .lines()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "global".to_string())
+}
+
+fn discover_opencode_sessions(repo_path: &Path, home_dir: &Path) -> Vec<PathBuf> {
+    let data_root = opencode_data_root(home_dir);
+    if !data_root.exists() {
+        return Vec::new();
+    }
+    let project_id = resolve_opencode_project_id(repo_path);
+    let mut out = Vec::new();
+
+    let current_bucket = data_root
+        .join("project")
+        .join(&project_id)
+        .join("storage")
+        .join("session");
+    out.extend(list_files_by_extension_recursive(&current_bucket.join("info"), "json"));
+    out.extend(list_files_by_extension_recursive(
+        &current_bucket.join("message"),
+        "json",
+    ));
+    out.extend(list_files_by_extension_recursive(
+        &current_bucket.join("part"),
+        "json",
+    ));
+
+    let legacy_bucket = data_root.join("storage");
+    out.extend(list_files_by_extension_recursive(
+        &legacy_bucket.join("session").join(&project_id),
+        "json",
+    ));
+
+    sorted_unique(out)
+}
+
 #[derive(Debug)]
 pub enum AdapterError {
     Json(serde_json::Error),
@@ -383,6 +735,10 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         AdapterId::ClaudeCode
     }
 
+    fn discover_sessions_for_repo(&self, repo_path: &Path, home_dir: &Path) -> Vec<PathBuf> {
+        discover_claude_sessions(repo_path, home_dir)
+    }
+
     fn convert_to_tape_jsonl(&self, input: &str) -> Result<String, AdapterError> {
         Ok(claude_jsonl_to_tape_jsonl(input)?)
     }
@@ -396,6 +752,10 @@ impl HarnessAdapter for CodexCliAdapter {
         AdapterId::CodexCli
     }
 
+    fn discover_sessions_for_repo(&self, repo_path: &Path, home_dir: &Path) -> Vec<PathBuf> {
+        discover_codex_sessions(repo_path, home_dir)
+    }
+
     fn convert_to_tape_jsonl(&self, input: &str) -> Result<String, AdapterError> {
         Ok(codex_jsonl_to_tape_jsonl(input)?)
     }
@@ -407,6 +767,10 @@ pub struct OpenCodeAdapter;
 impl HarnessAdapter for OpenCodeAdapter {
     fn adapter_id(&self) -> AdapterId {
         AdapterId::OpenCode
+    }
+
+    fn discover_sessions_for_repo(&self, repo_path: &Path, home_dir: &Path) -> Vec<PathBuf> {
+        discover_opencode_sessions(repo_path, home_dir)
     }
 
     fn convert_to_tape_jsonl(&self, input: &str) -> Result<String, AdapterError> {
@@ -435,6 +799,10 @@ impl HarnessAdapter for GeminiCliAdapter {
         AdapterId::GeminiCli
     }
 
+    fn discover_sessions_for_repo(&self, repo_path: &Path, home_dir: &Path) -> Vec<PathBuf> {
+        discover_gemini_sessions(repo_path, home_dir)
+    }
+
     fn convert_to_tape_jsonl(&self, input: &str) -> Result<String, AdapterError> {
         Ok(gemini_json_to_tape_jsonl(input)?)
     }
@@ -446,6 +814,10 @@ pub struct OpenClawAdapter;
 impl HarnessAdapter for OpenClawAdapter {
     fn adapter_id(&self) -> AdapterId {
         AdapterId::OpenClaw
+    }
+
+    fn discover_sessions_for_repo(&self, repo_path: &Path, home_dir: &Path) -> Vec<PathBuf> {
+        discover_openclaw_sessions(repo_path, home_dir)
     }
 
     fn convert_to_tape_jsonl(&self, input: &str) -> Result<String, AdapterError> {
@@ -693,8 +1065,10 @@ fn validate_contract_row(line: usize, row: &Value, issues: &mut Vec<ConformanceI
 mod tests {
     use super::{
         AdapterId, AdapterStatus, CoverageGrade, adapter_registry, descriptor_for,
-        discovery_scaffold, run_conformance,
+        discover_sessions_with_adapter, discovery_scaffold, run_conformance,
     };
+    use std::fs;
+    use std::process::Command;
 
     #[test]
     fn codex_conformance_harness_passes() {
@@ -894,6 +1268,154 @@ mod tests {
             path.to_string_lossy()
                 .contains("/home/tester/.codex/sessions")
         }));
+    }
+
+    #[test]
+    fn claude_discovery_finds_repo_bucket_sessions_and_subagents() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo");
+        let canonical_repo = super::canonicalize_or_normalize(&repo);
+        let project_key = canonical_repo.to_string_lossy().replace('/', "-");
+        let claude_root = home.join(".claude/projects").join(project_key);
+        let session_root = claude_root.join("session-a");
+        let root_jsonl = claude_root.join("main.jsonl");
+        let subagent_jsonl = session_root.join("subagents/sub.jsonl");
+        fs::create_dir_all(subagent_jsonl.parent().expect("parent")).expect("subagents");
+        fs::create_dir_all(claude_root.join("memory")).expect("memory");
+        fs::create_dir_all(session_root.join("tool-results")).expect("tool-results");
+        fs::write(&root_jsonl, "{\"type\":\"assistant\"}\n").expect("root");
+        fs::write(&subagent_jsonl, "{\"type\":\"assistant\"}\n").expect("sub");
+        fs::write(claude_root.join("memory/ignore.jsonl"), "{\"type\":\"assistant\"}\n")
+            .expect("ignore");
+        fs::write(session_root.join("tool-results/out.txt"), "stdout").expect("txt");
+
+        let discovered = discover_sessions_with_adapter(AdapterId::ClaudeCode, &repo, &home);
+        assert_eq!(discovered, vec![root_jsonl, subagent_jsonl]);
+    }
+
+    #[test]
+    fn codex_discovery_filters_by_session_meta_cwd() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo");
+        let codex_root = home.join(".codex/sessions/2026/03/10");
+        fs::create_dir_all(&codex_root).expect("codex root");
+        let matching = codex_root.join("matching.jsonl");
+        let other = codex_root.join("other.jsonl");
+        fs::write(
+            &matching,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{}\"}}}}\n",
+                repo.to_string_lossy()
+            ),
+        )
+        .expect("matching");
+        fs::write(
+            &other,
+            "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/tmp/other\"}}\n",
+        )
+        .expect("other");
+
+        let discovered = discover_sessions_with_adapter(AdapterId::CodexCli, &repo, &home);
+        assert_eq!(discovered, vec![matching]);
+    }
+
+    #[test]
+    fn gemini_discovery_uses_repo_hash_bucket() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo");
+        let repo_hash = super::sha256_hex(&super::canonicalize_or_normalize(&repo).to_string_lossy());
+        let bucket = home.join(".gemini/tmp").join(repo_hash);
+        let chat = bucket.join("chats/session-2026.json");
+        let logs = bucket.join("logs.json");
+        fs::create_dir_all(chat.parent().expect("chat parent")).expect("chat dir");
+        fs::write(&chat, "{\"sessionId\":\"a\"}\n").expect("chat");
+        fs::write(&logs, "[]\n").expect("logs");
+        let other_bucket = home.join(".gemini/tmp").join("other").join("chats");
+        fs::create_dir_all(&other_bucket).expect("other");
+        fs::write(other_bucket.join("session-ignore.json"), "{\"sessionId\":\"b\"}\n")
+            .expect("other session");
+
+        let discovered = discover_sessions_with_adapter(AdapterId::GeminiCli, &repo, &home);
+        assert_eq!(discovered, vec![chat, logs]);
+    }
+
+    #[test]
+    fn openclaw_discovery_matches_repo_key_or_content_hint() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo");
+        let canonical_repo = super::canonicalize_or_normalize(&repo);
+        let repo_dash = canonical_repo.to_string_lossy().replace('/', "-");
+        let sessions = home.join(".openclaw/sessions");
+        let by_path = sessions.join(&repo_dash).join("a.jsonl");
+        let by_content = sessions.join("misc").join("b.jsonl");
+        let unrelated = sessions.join("misc").join("c.jsonl");
+        fs::create_dir_all(by_path.parent().expect("parent")).expect("by-path dir");
+        fs::create_dir_all(by_content.parent().expect("parent")).expect("by-content dir");
+        fs::write(&by_path, "{\"type\":\"message\"}\n").expect("by path");
+        fs::write(
+            &by_content,
+            format!(
+                "{{\"type\":\"meta\",\"cwd\":\"{}\"}}\n",
+                canonical_repo.to_string_lossy()
+            ),
+        )
+        .expect("by content");
+        fs::write(&unrelated, "{\"type\":\"meta\",\"cwd\":\"/tmp/other\"}\n").expect("other");
+
+        let discovered = discover_sessions_with_adapter(AdapterId::OpenClaw, &repo, &home);
+        assert_eq!(discovered, vec![by_path, by_content]);
+    }
+
+    #[test]
+    fn opencode_discovery_uses_project_id_bucket_and_legacy_session_bucket() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo");
+        let git_init_ok = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .arg("init")
+            .output()
+            .map(|output| output.status.success())
+            .expect("git init command should run");
+        assert!(git_init_ok, "git init should succeed");
+        let project_id = "proj123";
+        fs::write(repo.join(".git/opencode"), format!("{project_id}\n")).expect("opencode cache");
+
+        let data_root = home.join(".local/share/opencode");
+        let current_info = data_root
+            .join(format!("project/{project_id}/storage/session/info/info.json"));
+        let current_message = data_root
+            .join(format!("project/{project_id}/storage/session/message/sess-a/msg.json"));
+        let current_part = data_root
+            .join(format!("project/{project_id}/storage/session/part/sess-a/part.json"));
+        let legacy_session = data_root.join(format!("storage/session/{project_id}/legacy.json"));
+        let other_project = data_root.join("project/other/storage/session/info/ignore.json");
+        for path in [
+            &current_info,
+            &current_message,
+            &current_part,
+            &legacy_session,
+            &other_project,
+        ] {
+            fs::create_dir_all(path.parent().expect("parent")).expect("mkdirs");
+            fs::write(path, "{}\n").expect("write");
+        }
+
+        let discovered = discover_sessions_with_adapter(AdapterId::OpenCode, &repo, &home);
+        assert_eq!(
+            discovered,
+            vec![current_info, current_message, current_part, legacy_session]
+        );
     }
 
     use std::path::Path;

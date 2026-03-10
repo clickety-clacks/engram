@@ -119,6 +119,38 @@ fn ingest_is_local_scoped_incremental_and_idempotent() {
 }
 
 #[test]
+fn ingest_discovers_codex_sessions_for_repo_via_adapter_hook() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    let codex_root = home.join(".codex/sessions/2026/03/10");
+    fs::create_dir_all(&codex_root).expect("codex root");
+    fs::write(
+        codex_root.join("session.jsonl"),
+        format!(
+            concat!(
+                "{{\"timestamp\":\"2026-02-22T00:00:00Z\",\"type\":\"session_meta\",",
+                "\"payload\":{{\"cwd\":\"{}\",\"git\":{{\"commit_hash\":\"abc123\"}}}}}}\n",
+                "{{\"timestamp\":\"2026-02-22T00:00:01Z\",\"type\":\"response_item\",",
+                "\"payload\":{{\"type\":\"function_call\",\"name\":\"exec_command\",",
+                "\"call_id\":\"call_1\",\"arguments\":\"{{\\\"cmd\\\":\\\"echo hi\\\"}}\"}}}}\n",
+                "{{\"timestamp\":\"2026-02-22T00:00:02Z\",\"type\":\"response_item\",",
+                "\"payload\":{{\"type\":\"function_call_output\",\"call_id\":\"call_1\",",
+                "\"output\":\"Process exited with code 0\\nOutput:\\nhi\"}}}}\n"
+            ),
+            repo.to_string_lossy()
+        ),
+    )
+    .expect("codex session");
+
+    let ingest = run_json(&repo, &["ingest"], None, &home);
+    assert_eq!(ingest["status"], "ok");
+    assert_eq!(ingest["imported_tapes"], 1);
+    assert!(ingest["scanned_inputs"].as_u64().unwrap_or(0) >= 1);
+}
+
+#[test]
 fn ingest_writes_to_configured_tapes_dir() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
