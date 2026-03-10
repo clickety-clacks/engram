@@ -365,6 +365,11 @@ pub trait HarnessAdapter {
 
     fn convert_to_tape_jsonl(&self, input: &str) -> Result<String, AdapterError>;
 
+    fn discover_sessions_for_repo(&self, repo_path: &Path, home_dir: &Path) -> Vec<PathBuf> {
+        let _ = (repo_path, home_dir);
+        vec![]
+    }
+
     fn descriptor(&self) -> &'static AdapterDescriptor {
         descriptor_for(self.adapter_id())
     }
@@ -456,6 +461,23 @@ pub fn convert_with_adapter(id: AdapterId, input: &str) -> Result<String, Adapte
         AdapterId::Cursor => CursorAdapter.convert_to_tape_jsonl(input),
         AdapterId::GeminiCli => GeminiCliAdapter.convert_to_tape_jsonl(input),
         AdapterId::OpenClaw => OpenClawAdapter.convert_to_tape_jsonl(input),
+    }
+}
+
+pub fn discover_sessions_with_adapter(
+    id: AdapterId,
+    repo_path: &Path,
+    home_dir: &Path,
+) -> Vec<PathBuf> {
+    // TODO: Replace this adapter-id dispatch once discovery is wired through a
+    // native adapter registry with concrete discovery implementations.
+    match id {
+        AdapterId::ClaudeCode => ClaudeCodeAdapter.discover_sessions_for_repo(repo_path, home_dir),
+        AdapterId::CodexCli => CodexCliAdapter.discover_sessions_for_repo(repo_path, home_dir),
+        AdapterId::OpenCode => OpenCodeAdapter.discover_sessions_for_repo(repo_path, home_dir),
+        AdapterId::Cursor => CursorAdapter.discover_sessions_for_repo(repo_path, home_dir),
+        AdapterId::GeminiCli => GeminiCliAdapter.discover_sessions_for_repo(repo_path, home_dir),
+        AdapterId::OpenClaw => OpenClawAdapter.discover_sessions_for_repo(repo_path, home_dir),
     }
 }
 

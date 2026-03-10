@@ -18,7 +18,9 @@ use engram::query::explain::{
     ExplainTraversal, PrettyConfidenceTier, explain_by_anchor, pretty_tier,
 };
 use engram::store::atomic::atomic_write;
-use engram::tape::adapter::{AdapterId, convert_with_adapter};
+use engram::tape::adapter::{
+    AdapterId, adapter_registry, convert_with_adapter, discover_sessions_with_adapter,
+};
 use engram::tape::compress::{compress_jsonl, decompress_jsonl};
 use engram::tape::event::{TapeEventAt, TapeEventData, parse_jsonl_events};
 use serde::{Deserialize, Serialize};
@@ -296,7 +298,16 @@ fn cmd_ingest(cwd: &Path, paths: &RepoPaths, context: &RuntimeContext) -> Result
     ensure_local_store(paths)?;
     print_context_conspicuity(context);
     fs::create_dir_all(&context.tapes_dir).map_err(|err| CliError::io("mkdir_error", err))?;
-    let candidates = discover_local_transcript_candidates(cwd)?;
+    let mut candidates = discover_local_transcript_candidates(cwd)?;
+    let home = home_dir()?;
+    for descriptor in adapter_registry() {
+        // TODO: Merge/replace cwd scanning with adapter-driven session discovery
+        // once harness adapters implement discover_sessions_for_repo.
+        let discovered = discover_sessions_with_adapter(descriptor.id, cwd, &home);
+        candidates.extend(discovered);
+    }
+    candidates.sort();
+    candidates.dedup();
     let mut state = load_ingest_state(paths)?;
     ensure_db_parent(&context.db_path)?;
     let index = SqliteIndex::open(&path_string(&context.db_path))?;
