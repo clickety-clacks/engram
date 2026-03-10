@@ -691,6 +691,125 @@ fn discover_opencode_sessions(repo_path: &Path, home_dir: &Path) -> Vec<PathBuf>
     sorted_unique(out)
 }
 
+fn cursor_workspace_storage_roots(home_dir: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![
+        home_dir
+            .join("Library")
+            .join("Application Support")
+            .join("Cursor")
+            .join("User")
+            .join("workspaceStorage"),
+        home_dir
+            .join(".config")
+            .join("Cursor")
+            .join("User")
+            .join("workspaceStorage"),
+    ];
+    if let Some(app_data) = std::env::var_os("APPDATA") {
+        roots.push(
+            PathBuf::from(app_data)
+                .join("Cursor")
+                .join("User")
+                .join("workspaceStorage"),
+        );
+    }
+    sorted_unique(roots)
+}
+
+fn normalize_workspace_manifest_path(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let without_scheme = if let Some(rest) = trimmed.strip_prefix("file://") {
+        rest
+    } else {
+        trimmed
+    };
+    let candidate = PathBuf::from(without_scheme);
+    if !candidate.is_absolute() {
+        return None;
+    }
+    Some(canonicalize_or_normalize(&candidate))
+}
+
+fn collect_workspace_paths_from_manifest(value: &Value, out: &mut Vec<PathBuf>) {
+    match value {
+        Value::Object(map) => {
+            for (key, nested) in map {
+                let lower = key.to_ascii_lowercase();
+                if matches!(nested, Value::String(_))
+                    && (lower.contains("folder")
+                        || lower.contains("path")
+                        || lower.contains("workspace")
+                        || lower.contains("uri"))
+                {
+                    if let Some(text) = nested.as_str()
+                        && let Some(path) = normalize_workspace_manifest_path(text)
+                    {
+                        out.push(path);
+                    }
+                }
+                collect_workspace_paths_from_manifest(nested, out);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_workspace_paths_from_manifest(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn workspace_manifest_matches_repo(workspace_json: &Path, repo_path: &Path) -> bool {
+    let Ok(content) = fs::read_to_string(workspace_json) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<Value>(&content) else {
+        return false;
+    };
+    let repo = canonicalize_or_normalize(repo_path);
+    let mut candidates = Vec::new();
+    collect_workspace_paths_from_manifest(&json, &mut candidates);
+    candidates.into_iter().any(|candidate| candidate == repo)
+}
+
+fn discover_cursor_sessions(repo_path: &Path, home_dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for root in cursor_workspace_storage_roots(home_dir) {
+        if !root.exists() {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let workspace_dir = entry.path();
+            if !workspace_dir.is_dir() {
+                continue;
+            }
+            let workspace_json = workspace_dir.join("workspace.json");
+            if !workspace_json.is_file() {
+                continue;
+            }
+            if !workspace_manifest_matches_repo(&workspace_json, repo_path) {
+                continue;
+            }
+            let primary = workspace_dir.join("state.vscdb");
+            if primary.is_file() {
+                out.push(primary);
+                continue;
+            }
+            let backup = workspace_dir.join("state.vscdb.backup");
+            if backup.is_file() {
+                out.push(backup);
+            }
+        }
+    }
+    sorted_unique(out)
+}
+
 #[derive(Debug)]
 pub enum AdapterError {
     Json(serde_json::Error),
@@ -784,6 +903,10 @@ pub struct CursorAdapter;
 impl HarnessAdapter for CursorAdapter {
     fn adapter_id(&self) -> AdapterId {
         AdapterId::Cursor
+    }
+
+    fn discover_sessions_for_repo(&self, repo_path: &Path, home_dir: &Path) -> Vec<PathBuf> {
+        discover_cursor_sessions(repo_path, home_dir)
     }
 
     fn convert_to_tape_jsonl(&self, input: &str) -> Result<String, AdapterError> {
@@ -1206,6 +1329,81 @@ mod tests {
         assert_eq!(report.coverage.tool, CoverageGrade::Full);
         assert_eq!(report.coverage.read, CoverageGrade::Partial);
         assert_eq!(report.coverage.edit, CoverageGrade::Partial);
+    }
+
+    #[test]
+    fn cursor_discovery_returns_state_db_for_matching_workspace_manifest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo");
+        let canonical_repo = super::canonicalize_or_normalize(&repo);
+        let workspace_root = home
+            .join("Library/Application Support/Cursor/User/workspaceStorage");
+        let matching_dir = workspace_root.join("aaa");
+        let other_dir = workspace_root.join("bbb");
+        fs::create_dir_all(&matching_dir).expect("matching dir");
+        fs::create_dir_all(&other_dir).expect("other dir");
+        fs::write(
+            matching_dir.join("workspace.json"),
+            format!("{{\"folder\":\"{}\"}}\n", canonical_repo.to_string_lossy()),
+        )
+        .expect("matching workspace");
+        fs::write(other_dir.join("workspace.json"), "{\"folder\":\"/tmp/other\"}\n")
+            .expect("other workspace");
+        let state = matching_dir.join("state.vscdb");
+        fs::write(&state, "sqlite").expect("state db");
+        fs::write(other_dir.join("state.vscdb"), "sqlite").expect("other state");
+
+        let discovered = discover_sessions_with_adapter(AdapterId::Cursor, &repo, &home);
+        assert_eq!(discovered, vec![state]);
+    }
+
+    #[test]
+    fn cursor_discovery_supports_file_uri_manifest_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo");
+        let canonical_repo = super::canonicalize_or_normalize(&repo);
+        let workspace_dir = home
+            .join("Library/Application Support/Cursor/User/workspaceStorage/abc");
+        fs::create_dir_all(&workspace_dir).expect("workspace dir");
+        fs::write(
+            workspace_dir.join("workspace.json"),
+            format!(
+                "{{\"workspaceUri\":\"file://{}\"}}\n",
+                canonical_repo.to_string_lossy()
+            ),
+        )
+        .expect("workspace json");
+        let state = workspace_dir.join("state.vscdb");
+        fs::write(&state, "sqlite").expect("state db");
+
+        let discovered = discover_sessions_with_adapter(AdapterId::Cursor, &repo, &home);
+        assert_eq!(discovered, vec![state]);
+    }
+
+    #[test]
+    fn cursor_discovery_uses_backup_when_primary_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo");
+        let canonical_repo = super::canonicalize_or_normalize(&repo);
+        let workspace_dir = home
+            .join("Library/Application Support/Cursor/User/workspaceStorage/backup");
+        fs::create_dir_all(&workspace_dir).expect("workspace dir");
+        fs::write(
+            workspace_dir.join("workspace.json"),
+            format!("{{\"workspacePath\":\"{}\"}}\n", canonical_repo.to_string_lossy()),
+        )
+        .expect("workspace json");
+        let backup = workspace_dir.join("state.vscdb.backup");
+        fs::write(&backup, "sqlite").expect("backup db");
+
+        let discovered = discover_sessions_with_adapter(AdapterId::Cursor, &repo, &home);
+        assert_eq!(discovered, vec![backup]);
     }
 
     #[test]
