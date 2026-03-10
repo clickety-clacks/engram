@@ -497,9 +497,18 @@ Import raw harness transcripts from the current directory and its subdirectories
 into tapes and fingerprint them into the resolved DB.
 
 This command is **local-scoped** — it operates on the folder you're standing in,
-not on a global source list. It discovers transcript files in the current
-directory tree, parses them via the appropriate adapter, writes normalized tapes,
-and fingerprints those tapes into the DB resolved via config walk-up.
+not on a global source list. Discovery now has two layers:
+1. Adapter repo-scoped discovery: each harness adapter can map the ingest
+   repo path to that harness's native storage location (for example,
+   ~/.claude/projects/<encoded-repo>/...) and return matching transcript files
+   for that repo.
+2. Local tree fallback: Engram still scans the current directory tree for
+   json/jsonl files (excluding .engram) so local transcript drops continue to
+   work.
+
+Candidates from both layers are de-duplicated, then parsed via the appropriate
+adapter, normalized into tapes, and fingerprinted into the DB resolved via
+config walk-up.
 
 ```bash
 cd ~/src/clawline
