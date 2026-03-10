@@ -1336,7 +1336,9 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path().join("home");
         let repo = temp.path().join("repo");
+        let other_repo = temp.path().join("other-repo");
         fs::create_dir_all(&repo).expect("repo");
+        fs::create_dir_all(&other_repo).expect("other repo");
         let canonical_repo = super::canonicalize_or_normalize(&repo);
         let workspace_root = home
             .join("Library/Application Support/Cursor/User/workspaceStorage");
@@ -1357,6 +1359,8 @@ mod tests {
 
         let discovered = discover_sessions_with_adapter(AdapterId::Cursor, &repo, &home);
         assert_eq!(discovered, vec![state]);
+        let wrong_repo = discover_sessions_with_adapter(AdapterId::Cursor, &other_repo, &home);
+        assert!(wrong_repo.is_empty(), "wrong_repo={wrong_repo:?}");
     }
 
     #[test]
@@ -1364,7 +1368,9 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path().join("home");
         let repo = temp.path().join("repo");
+        let other_repo = temp.path().join("other-repo");
         fs::create_dir_all(&repo).expect("repo");
+        fs::create_dir_all(&other_repo).expect("other repo");
         let canonical_repo = super::canonicalize_or_normalize(&repo);
         let workspace_dir = home
             .join("Library/Application Support/Cursor/User/workspaceStorage/abc");
@@ -1382,6 +1388,8 @@ mod tests {
 
         let discovered = discover_sessions_with_adapter(AdapterId::Cursor, &repo, &home);
         assert_eq!(discovered, vec![state]);
+        let wrong_repo = discover_sessions_with_adapter(AdapterId::Cursor, &other_repo, &home);
+        assert!(wrong_repo.is_empty(), "wrong_repo={wrong_repo:?}");
     }
 
     #[test]
@@ -1389,7 +1397,9 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path().join("home");
         let repo = temp.path().join("repo");
+        let other_repo = temp.path().join("other-repo");
         fs::create_dir_all(&repo).expect("repo");
+        fs::create_dir_all(&other_repo).expect("other repo");
         let canonical_repo = super::canonicalize_or_normalize(&repo);
         let workspace_dir = home
             .join("Library/Application Support/Cursor/User/workspaceStorage/backup");
@@ -1404,6 +1414,8 @@ mod tests {
 
         let discovered = discover_sessions_with_adapter(AdapterId::Cursor, &repo, &home);
         assert_eq!(discovered, vec![backup]);
+        let wrong_repo = discover_sessions_with_adapter(AdapterId::Cursor, &other_repo, &home);
+        assert!(wrong_repo.is_empty(), "wrong_repo={wrong_repo:?}");
     }
 
     #[test]
@@ -1473,7 +1485,9 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path().join("home");
         let repo = temp.path().join("repo");
+        let other_repo = temp.path().join("other-repo");
         fs::create_dir_all(&repo).expect("repo");
+        fs::create_dir_all(&other_repo).expect("other repo");
         let canonical_repo = super::canonicalize_or_normalize(&repo);
         let project_key = canonical_repo.to_string_lossy().replace('/', "-");
         let claude_root = home.join(".claude/projects").join(project_key);
@@ -1491,6 +1505,8 @@ mod tests {
 
         let discovered = discover_sessions_with_adapter(AdapterId::ClaudeCode, &repo, &home);
         assert_eq!(discovered, vec![root_jsonl, subagent_jsonl]);
+        let wrong_repo = discover_sessions_with_adapter(AdapterId::ClaudeCode, &other_repo, &home);
+        assert!(wrong_repo.is_empty(), "wrong_repo={wrong_repo:?}");
     }
 
     #[test]
@@ -1498,7 +1514,9 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path().join("home");
         let repo = temp.path().join("repo");
+        let other_repo = temp.path().join("other-repo");
         fs::create_dir_all(&repo).expect("repo");
+        fs::create_dir_all(&other_repo).expect("other repo");
         let codex_root = home.join(".codex/sessions/2026/03/10");
         fs::create_dir_all(&codex_root).expect("codex root");
         let matching = codex_root.join("matching.jsonl");
@@ -1519,6 +1537,8 @@ mod tests {
 
         let discovered = discover_sessions_with_adapter(AdapterId::CodexCli, &repo, &home);
         assert_eq!(discovered, vec![matching]);
+        let wrong_repo = discover_sessions_with_adapter(AdapterId::CodexCli, &other_repo, &home);
+        assert!(wrong_repo.is_empty(), "wrong_repo={wrong_repo:?}");
     }
 
     #[test]
@@ -1526,7 +1546,9 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path().join("home");
         let repo = temp.path().join("repo");
+        let other_repo = temp.path().join("other-repo");
         fs::create_dir_all(&repo).expect("repo");
+        fs::create_dir_all(&other_repo).expect("other repo");
         let repo_hash = super::sha256_hex(&super::canonicalize_or_normalize(&repo).to_string_lossy());
         let bucket = home.join(".gemini/tmp").join(repo_hash);
         let chat = bucket.join("chats/session-2026.json");
@@ -1541,6 +1563,8 @@ mod tests {
 
         let discovered = discover_sessions_with_adapter(AdapterId::GeminiCli, &repo, &home);
         assert_eq!(discovered, vec![chat, logs]);
+        let wrong_repo = discover_sessions_with_adapter(AdapterId::GeminiCli, &other_repo, &home);
+        assert!(wrong_repo.is_empty(), "wrong_repo={wrong_repo:?}");
     }
 
     #[test]
@@ -1548,7 +1572,9 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path().join("home");
         let repo = temp.path().join("repo");
+        let other_repo = temp.path().join("other-repo");
         fs::create_dir_all(&repo).expect("repo");
+        fs::create_dir_all(&other_repo).expect("other repo");
         let canonical_repo = super::canonicalize_or_normalize(&repo);
         let repo_dash = canonical_repo.to_string_lossy().replace('/', "-");
         let sessions = home.join(".openclaw/sessions");
@@ -1570,6 +1596,8 @@ mod tests {
 
         let discovered = discover_sessions_with_adapter(AdapterId::OpenClaw, &repo, &home);
         assert_eq!(discovered, vec![by_path, by_content]);
+        let wrong_repo = discover_sessions_with_adapter(AdapterId::OpenClaw, &other_repo, &home);
+        assert!(wrong_repo.is_empty(), "wrong_repo={wrong_repo:?}");
     }
 
     #[test]
@@ -1577,7 +1605,9 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path().join("home");
         let repo = temp.path().join("repo");
+        let other_repo = temp.path().join("other-repo");
         fs::create_dir_all(&repo).expect("repo");
+        fs::create_dir_all(&other_repo).expect("other repo");
         let git_init_ok = Command::new("git")
             .arg("-C")
             .arg(&repo)
@@ -1614,6 +1644,8 @@ mod tests {
             discovered,
             vec![current_info, current_message, current_part, legacy_session]
         );
+        let wrong_repo = discover_sessions_with_adapter(AdapterId::OpenCode, &other_repo, &home);
+        assert!(wrong_repo.is_empty(), "wrong_repo={wrong_repo:?}");
     }
 
     use std::path::Path;
