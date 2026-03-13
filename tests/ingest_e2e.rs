@@ -247,6 +247,38 @@ fn ingest_handles_partial_trailing_record_without_advancing_cursor() {
 }
 
 #[test]
+fn ingest_imports_gemini_json_fixture_without_jsonl_prefix_skip() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+
+    let source_path = repo.join("session-gemini.json");
+    fs::write(
+        &source_path,
+        include_str!("fixtures/gemini/session_with_tools.json"),
+    )
+    .expect("gemini fixture");
+
+    let first = run_json(&repo, &["ingest"], None, &home);
+    assert_eq!(first["status"], "ok");
+    assert_eq!(first["imported_tapes"], 1);
+    assert_eq!(first["skipped_unchanged"], 0);
+    assert_eq!(first["failure_count"], 0);
+
+    let cursor_path = cursor_state_path(&repo, &source_path);
+    assert!(
+        cursor_path.exists(),
+        "expected cursor state for gemini json"
+    );
+
+    let second = run_json(&repo, &["ingest"], None, &home);
+    assert_eq!(second["status"], "ok");
+    assert_eq!(second["imported_tapes"], 0);
+    assert_eq!(second["skipped_unchanged"], 1);
+}
+
+#[test]
 fn ingest_guard_mismatch_triggers_full_fallback_reingest() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
