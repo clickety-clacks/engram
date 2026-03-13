@@ -427,7 +427,7 @@ fn cmd_ingest(
                 }));
                 continue;
             }
-            let complete = complete_jsonl_prefix_len(&ingest_bytes);
+            let complete = complete_ingest_prefix_len(&abs_path, &ingest_bytes);
             if complete == 0 {
                 skipped_unchanged += 1;
                 continue;
@@ -447,7 +447,7 @@ fn cmd_ingest(
                     continue;
                 }
             };
-            let complete = complete_jsonl_prefix_len(&all_bytes);
+            let complete = complete_ingest_prefix_len(&abs_path, &all_bytes);
             if complete == 0 {
                 skipped_unchanged += 1;
                 continue;
@@ -499,7 +499,7 @@ fn cmd_ingest(
                     continue;
                 }
             };
-            let complete = complete_jsonl_prefix_len(&all_bytes);
+            let complete = complete_ingest_prefix_len(&abs_path, &all_bytes);
             if complete == 0 {
                 skipped_unchanged += 1;
                 continue;
@@ -994,6 +994,17 @@ fn ingest_cursor_guard_matches(
             .map_err(|err| CliError::io("read_error", err))?;
     }
     Ok(sha256_hex_bytes(&bytes) == guard.hash)
+}
+
+fn complete_ingest_prefix_len(path: &Path, bytes: &[u8]) -> usize {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase());
+    if matches!(extension.as_deref(), Some("json")) {
+        return bytes.len();
+    }
+    complete_jsonl_prefix_len(bytes)
 }
 
 fn complete_jsonl_prefix_len(bytes: &[u8]) -> usize {
