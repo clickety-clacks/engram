@@ -1,14 +1,21 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use engram::anchor::fingerprint_text;
-use engram::config::{ensure_user_config, load_effective_config};
+use engram::config::{
+    EffectiveWatchConfig, EffectiveWatchSource, ensure_user_config,
+    load_effective_config_with_override,
+};
 use engram::index::lineage::{
     Cardinality, EvidenceFragmentRef, EvidenceKind, LINK_THRESHOLD_DEFAULT, LocationDelta,
     StoredEdgeClass,
@@ -23,6 +30,10 @@ use engram::tape::adapter::{
 };
 use engram::tape::compress::{compress_jsonl, decompress_jsonl};
 use engram::tape::event::{TapeEventAt, TapeEventData, parse_jsonl_events};
+use notify::event::{ModifyKind, RenameMode};
+use notify::{
+    Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -75,6 +86,7 @@ struct Cli {
 enum Command {
     Init,
     Ingest(IngestArgs),
+    Watch(WatchArgs),
     Fingerprint,
     Record(RecordArgs),
     Explain(ExplainArgs),
@@ -87,6 +99,12 @@ enum Command {
 struct IngestArgs {
     #[arg(value_name = "PATH")]
     paths: Vec<PathBuf>,
+}
+
+#[derive(Args, Debug, Default)]
+struct WatchArgs {
+    #[arg(long)]
+    config: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -139,6 +157,7 @@ struct RuntimeContext {
     db_path: PathBuf,
     tapes_dir: PathBuf,
     additional_stores: Vec<PathBuf>,
+    watch: Option<EffectiveWatchConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +207,7 @@ fn run() -> Result<(), CliError> {
             let context = resolve_runtime_context(&cwd)?;
             cmd_ingest(&cwd, &paths, &context, args)
         }
+        Command::Watch(args) => cmd_watch(&cwd, args),
         Command::Fingerprint => {
             let context = resolve_runtime_context(&cwd)?;
             cmd_fingerprint(&paths, &context)
@@ -224,6 +244,7 @@ fn cmd_init(paths: &RepoPaths) -> Result<(), CliError> {
         db_path: paths.root.join("index.sqlite"),
         tapes_dir: paths.root.join("tapes"),
         additional_stores: Vec::new(),
+        watch: None,
     };
     print_context_conspicuity(&context);
     if context.config_path.exists() {
@@ -618,6 +639,228 @@ fn cmd_ingest(
         "failure_count": failures.len(),
         "failures": failures,
     }))
+}
+
+#[derive(Debug, Clone)]
+struct WatchSourceRuntime {
+    source: EffectiveWatchSource,
+    pattern: glob::Pattern,
+    debounce: Duration,
+    ingest_timeout: Duration,
+}
+
+enum WatchIngestResult {
+    Completed(Result<(), CliError>),
+    TimedOut,
+}
+
+fn cmd_watch(cwd: &Path, args: WatchArgs) -> Result<(), CliError> {
+    let config_override = args.config.as_ref().map(|path| {
+        if path.is_absolute() {
+            path.clone()
+        } else {
+            cwd.join(path)
+        }
+    });
+    let context = resolve_runtime_context_with_override(cwd, config_override.as_deref())?;
+    print_context_conspicuity(&context);
+
+    let watch_config = context
+        .watch
+        .clone()
+        .ok_or_else(|| CliError::new("watch_config_error", "watch config missing in config.yml"))?;
+    if watch_config.sources.is_empty() {
+        return Err(CliError::new(
+            "watch_config_error",
+            "watch.sources must contain at least one source",
+        ));
+    }
+
+    if let Some(parent) = watch_config.log.parent() {
+        fs::create_dir_all(parent).map_err(|err| CliError::io("mkdir_error", err))?;
+    }
+    let mut log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&watch_config.log)
+        .map_err(|err| CliError::io("write_error", err))?;
+
+    watch_log_line(
+        &mut log,
+        &format!("watch started sources={}", watch_config.sources.len()),
+    )?;
+
+    let mut runtimes = Vec::new();
+    for source in watch_config.sources {
+        let pattern = glob::Pattern::new(&source.pattern)
+            .map_err(|err| CliError::new("watch_config_error", err.to_string()))?;
+        if !source.path.is_dir() {
+            watch_log_line(
+                &mut log,
+                &format!("watch source skipped missing_dir={}", source.path.display()),
+            )?;
+            continue;
+        }
+        watch_log_line(
+            &mut log,
+            &format!(
+                "watch source path={} pattern={} debounce={} timeout={}",
+                source.path.display(),
+                source.pattern,
+                watch_config.debounce_secs,
+                watch_config.ingest_timeout_secs
+            ),
+        )?;
+        runtimes.push(WatchSourceRuntime {
+            source,
+            pattern,
+            debounce: Duration::from_secs(watch_config.debounce_secs),
+            ingest_timeout: Duration::from_secs(watch_config.ingest_timeout_secs),
+        });
+    }
+    if runtimes.is_empty() {
+        return Err(CliError::new(
+            "watch_config_error",
+            "no watch sources available",
+        ));
+    }
+
+    let (tx, rx) = mpsc::channel::<Result<Event, notify::Error>>();
+    let mut watcher = RecommendedWatcher::new(
+        move |result| {
+            let _ = tx.send(result);
+        },
+        NotifyConfig::default(),
+    )
+    .map_err(|err| CliError::new("watch_error", err.to_string()))?;
+    for runtime in &runtimes {
+        watcher
+            .watch(&runtime.source.path, RecursiveMode::Recursive)
+            .map_err(|err| CliError::new("watch_error", err.to_string()))?;
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_signal = stop.clone();
+    ctrlc::set_handler(move || {
+        stop_signal.store(true, Ordering::SeqCst);
+    })
+    .map_err(|err| CliError::new("watch_error", err.to_string()))?;
+
+    let mut last_ingest = HashMap::<(usize, PathBuf), Instant>::new();
+    while !stop.load(Ordering::SeqCst) {
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(Ok(event)) => {
+                if !watch_event_kind_supported(&event.kind) {
+                    continue;
+                }
+                for path in event.paths {
+                    for (idx, runtime) in runtimes.iter().enumerate() {
+                        if !path.starts_with(&runtime.source.path) {
+                            continue;
+                        }
+                        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                            continue;
+                        };
+                        if !runtime.pattern.matches(name) {
+                            continue;
+                        }
+                        let key = (idx, path.clone());
+                        if let Some(last) = last_ingest.get(&key)
+                            && last.elapsed() < runtime.debounce
+                        {
+                            continue;
+                        }
+                        watch_log_line(&mut log, &format!("event path={}", path.display()))?;
+                        std::thread::sleep(runtime.debounce);
+                        match run_watch_ingest(runtime, &path, &context) {
+                            WatchIngestResult::TimedOut => {
+                                watch_log_line(
+                                    &mut log,
+                                    &format!("ingest timeout path={}", path.display()),
+                                )?;
+                            }
+                            WatchIngestResult::Completed(Ok(())) => {
+                                watch_log_line(
+                                    &mut log,
+                                    &format!("ingest ok path={}", path.display()),
+                                )?;
+                            }
+                            WatchIngestResult::Completed(Err(err)) => {
+                                watch_log_line(
+                                    &mut log,
+                                    &format!(
+                                        "ingest failed path={} code={} message={}",
+                                        path.display(),
+                                        err.code,
+                                        err.message
+                                    ),
+                                )?;
+                            }
+                        }
+                        last_ingest.insert(key, Instant::now());
+                    }
+                }
+            }
+            Ok(Err(err)) => {
+                watch_log_line(&mut log, &format!("watch error: {err}"))?;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    watch_log_line(&mut log, "watch stopped")?;
+    log.flush()
+        .map_err(|err| CliError::io("write_error", err))?;
+    Ok(())
+}
+
+fn watch_event_kind_supported(kind: &EventKind) -> bool {
+    match kind {
+        EventKind::Create(_) => true,
+        EventKind::Modify(ModifyKind::Name(mode)) => matches!(
+            mode,
+            RenameMode::Any | RenameMode::Both | RenameMode::To | RenameMode::From
+        ),
+        EventKind::Modify(_) => true,
+        _ => false,
+    }
+}
+
+fn run_watch_ingest(
+    runtime: &WatchSourceRuntime,
+    changed_path: &Path,
+    context: &RuntimeContext,
+) -> WatchIngestResult {
+    let source_cwd = runtime.source.path.clone();
+    let changed = changed_path.to_path_buf();
+    let context = context.clone();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = repo_paths(&source_cwd).and_then(|paths| {
+            cmd_ingest(
+                &source_cwd,
+                &paths,
+                &context,
+                IngestArgs {
+                    paths: vec![changed],
+                },
+            )
+        });
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(runtime.ingest_timeout) {
+        Ok(result) => WatchIngestResult::Completed(result),
+        Err(mpsc::RecvTimeoutError::Timeout) => WatchIngestResult::TimedOut,
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            WatchIngestResult::Completed(Err(CliError::new("watch_error", "ingest thread ended")))
+        }
+    }
+}
+
+fn watch_log_line(log: &mut File, message: &str) -> Result<(), CliError> {
+    writeln!(log, "[{}] {}", now_iso8601(), message).map_err(|err| CliError::io("write_error", err))
 }
 
 struct CapturedCommandTape {
@@ -2092,14 +2335,22 @@ fn repo_paths(cwd: &Path) -> Result<RepoPaths, CliError> {
 }
 
 fn resolve_runtime_context(cwd: &Path) -> Result<RuntimeContext, CliError> {
+    resolve_runtime_context_with_override(cwd, None)
+}
+
+fn resolve_runtime_context_with_override(
+    cwd: &Path,
+    config_override: Option<&Path>,
+) -> Result<RuntimeContext, CliError> {
     let home = home_dir()?;
-    let config = load_effective_config(cwd, &home)
+    let config = load_effective_config_with_override(cwd, &home, config_override)
         .map_err(|err| CliError::new("config_error", err.to_string()))?;
     Ok(RuntimeContext {
         config_path: config.path,
         db_path: config.db,
         tapes_dir: config.tapes_dir,
         additional_stores: config.additional_stores,
+        watch: config.watch,
     })
 }
 
