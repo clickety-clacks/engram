@@ -879,16 +879,21 @@ The fingerprint DB (`index.sqlite`) is never committed to the repo. It is
 derived and lives at the location specified by the resolved config's `db:`
 key — typically `~/.engram/index.sqlite`.
 
-### Git hook integration
+### Integration: file watchers (recommended)
 
-For repos that want automatic ingestion, Engram hooks into git operations:
+The recommended integration is a **file watcher** on the session directory of your AI harness — not git hooks.
 
-| Git operation | Engram hook | What it does |
-|--------------|-------------|-------------|
-| `git checkout` | post-checkout | Runs `engram ingest` — captures latest harness logs |
-| `git pull/merge` | post-merge | Runs `engram ingest` + `engram fingerprint` — processes new transcripts and indexes incoming tapes |
+When an agent edits a file, the event appears in the session transcript immediately, before any git operation. A file watcher (e.g. `fswatch`) fires on new/updated session files and calls `engram ingest <file>` in real time:
 
-Hooks are non-destructive — they never overwrite existing repo hooks. Install via `scripts/install-hooks-safe.sh`.
+```bash
+fswatch -0 ~/.claude/projects | xargs -0 -r engram ingest
+```
+
+This is correct and sufficient. Git events are late (post-commit) and redundant — by the time `git commit` runs, the session transcript already contains the evidence.
+
+### Git hook integration (not recommended)
+
+Git hooks are **not** the right trigger for engram ingestion. The session transcript is the source of truth, not the commit. Do not install engram git hooks. If any exist in your repos, remove them.
 
 ### Branch and merge behavior
 
