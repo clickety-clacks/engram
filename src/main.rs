@@ -655,6 +655,11 @@ enum WatchIngestResult {
 }
 
 fn cmd_watch(cwd: &Path, args: WatchArgs) -> Result<(), CliError> {
+    let home = home_dir()?;
+    cmd_watch_with_home(cwd, args, &home)
+}
+
+fn cmd_watch_with_home(cwd: &Path, args: WatchArgs, home: &Path) -> Result<(), CliError> {
     let config_override = args.config.as_ref().map(|path| {
         if path.is_absolute() {
             path.clone()
@@ -662,7 +667,15 @@ fn cmd_watch(cwd: &Path, args: WatchArgs) -> Result<(), CliError> {
             cwd.join(path)
         }
     });
-    let context = resolve_runtime_context_with_override(cwd, config_override.as_deref())?;
+    let config = load_effective_config_with_override(cwd, home, config_override.as_deref())
+        .map_err(|err| CliError::new("config_error", err.to_string()))?;
+    let context = RuntimeContext {
+        config_path: config.path,
+        db_path: config.db,
+        tapes_dir: config.tapes_dir,
+        additional_stores: config.additional_stores,
+        watch: config.watch,
+    };
     print_context_conspicuity(&context);
 
     let watch_config = context
@@ -2489,6 +2502,7 @@ fn pretty_tier_name(tier: PrettyConfidenceTier) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use notify::event::{CreateKind, RemoveKind};
 
     #[test]
     fn dispatch_extraction_handles_same_uuid_in_surface_and_nested_locations() {
@@ -2518,5 +2532,65 @@ mod tests {
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].uuid, uuid);
         assert_eq!(links[0].direction, DispatchDirection::Sent);
+    }
+
+    #[test]
+    fn cmd_watch_errors_when_watch_config_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        let cwd = home.join("workspace");
+        fs::create_dir_all(&cwd).expect("workspace");
+
+        let err = cmd_watch_with_home(&cwd, WatchArgs::default(), &home).expect_err("must fail");
+        assert_eq!(err.code, "watch_config_error");
+        assert!(
+            err.message.contains("watch config missing in config.yml"),
+            "unexpected message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn cmd_watch_errors_when_watch_sources_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        let cwd = home.join("workspace");
+        fs::create_dir_all(&cwd).expect("workspace");
+        let config_path = cwd.join(".engram/config.yml");
+        fs::create_dir_all(config_path.parent().expect("parent")).expect("config dir");
+        fs::write(&config_path, "db: ./index.sqlite\nwatch:\n  sources: []\n").expect("config");
+
+        let err = cmd_watch_with_home(
+            &cwd,
+            WatchArgs {
+                config: Some(config_path),
+            },
+            &home,
+        )
+        .expect_err("must fail");
+        assert_eq!(err.code, "watch_config_error");
+        assert!(
+            err.message
+                .contains("watch.sources must contain at least one source"),
+            "unexpected message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn watch_event_kind_supported_matrix() {
+        assert!(watch_event_kind_supported(&EventKind::Create(
+            CreateKind::Any
+        )));
+        assert!(watch_event_kind_supported(&EventKind::Modify(
+            ModifyKind::Any
+        )));
+        assert!(watch_event_kind_supported(&EventKind::Modify(
+            ModifyKind::Name(RenameMode::Any)
+        )));
+        assert!(!watch_event_kind_supported(&EventKind::Any));
+        assert!(!watch_event_kind_supported(&EventKind::Remove(
+            RemoveKind::Any
+        )));
     }
 }
