@@ -440,3 +440,20 @@ fn global_and_dispatch_flags_are_removed_from_cli() {
     let explain_err = String::from_utf8_lossy(&explain_dispatch.stderr);
     assert!(explain_err.contains("--dispatch"), "stderr={explain_err}");
 }
+
+#[test]
+fn watch_errors_clearly_when_watch_config_is_missing() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+
+    let watch = run_cli(repo, &["watch"], None);
+    assert!(
+        !watch.status.success(),
+        "watch should fail without watch config"
+    );
+    let stderr = String::from_utf8_lossy(&watch.stderr);
+    assert!(
+        stderr.contains("watch config missing in config.yml"),
+        "stderr={stderr}"
+    );
+}
