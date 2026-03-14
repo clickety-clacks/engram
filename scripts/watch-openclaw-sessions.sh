@@ -3,6 +3,7 @@ set -euo pipefail
 
 WATCH_DIR="$HOME/shared-workspace/shared/openclaw-sessions"
 GEMINI_WATCH_DIR="$HOME/.gemini/tmp"
+CLAUDE_WATCH_DIR="$HOME/.claude/projects"
 LOG_FILE="$HOME/.engram/openclaw-sessions-watch.log"
 DEBOUNCE_SECS="${DEBOUNCE_SECS:-5}"
 INGEST_TIMEOUT="${INGEST_TIMEOUT:-120}"
@@ -75,6 +76,23 @@ start_gemini_watch() {
     done
 }
 
+
+start_claude_watch() {
+  if [ ! -d "$CLAUDE_WATCH_DIR" ]; then
+    echo "$(date) claude watch skipped: $CLAUDE_WATCH_DIR missing" >> "$LOG_FILE"
+    return 0
+  fi
+
+  /opt/homebrew/bin/fswatch -0 -r --event Created --event Updated --event Renamed     "$CLAUDE_WATCH_DIR"   | while IFS= read -r -d "" changed_path; do
+      case "$changed_path" in
+        *.jsonl)
+          echo "$(date) claude change: $changed_path" >> "$LOG_FILE"
+          sleep "$DEBOUNCE_SECS"
+          run_ingest "$HOME" "$changed_path" "claude"
+          ;;
+      esac
+    done
+}
 WATCH_PIDS=()
 cleanup() {
   for pid in "${WATCH_PIDS[@]:-}"; do
@@ -95,6 +113,13 @@ if [ -d "$GEMINI_WATCH_DIR" ]; then
   WATCH_PIDS+=($!)
 else
   echo "[$(date)] gemini watch skipped: $GEMINI_WATCH_DIR missing" >> "$LOG_FILE"
+fi
+
+if [ -d "$CLAUDE_WATCH_DIR" ]; then
+  start_claude_watch &
+  WATCH_PIDS+=($!)
+else
+  echo "$(date) claude watch skipped: $CLAUDE_WATCH_DIR missing" >> "$LOG_FILE"
 fi
 
 wait "${WATCH_PIDS[@]}"
