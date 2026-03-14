@@ -5,6 +5,7 @@ WATCH_DIR="$HOME/shared-workspace/shared/openclaw-sessions"
 GEMINI_WATCH_DIR="$HOME/.gemini/tmp"
 CLAUDE_WATCH_DIR="$HOME/.claude/projects"
 CODEX_WATCH_DIR="$HOME/.codex"
+CODEX_WATCH_DIR="$HOME/.codex"
 LOG_FILE="$HOME/.engram/openclaw-sessions-watch.log"
 DEBOUNCE_SECS="${DEBOUNCE_SECS:-5}"
 INGEST_TIMEOUT="${INGEST_TIMEOUT:-120}"
@@ -111,6 +112,23 @@ start_codex_watch() {
       esac
     done
 }
+
+start_codex_watch() {
+  if [ ! -d "$CODEX_WATCH_DIR" ]; then
+    echo "[Fri Mar 13 20:01:19 PDT 2026] codex watch skipped: $CODEX_WATCH_DIR missing" >> "$LOG_FILE"
+    return 0
+  fi
+
+  /opt/homebrew/bin/fswatch -0 -r --event Created --event Updated --event Renamed     "$CODEX_WATCH_DIR"   | while IFS= read -r -d "" changed_path; do
+      case "$changed_path" in
+        *.jsonl)
+          echo "[Fri Mar 13 20:01:19 PDT 2026] codex change: $changed_path" >> "$LOG_FILE"
+          sleep "$DEBOUNCE_SECS"
+          run_ingest "$HOME" "$changed_path" "codex"
+          ;;
+      esac
+    done
+}
 WATCH_PIDS=()
 cleanup() {
   for pid in "${WATCH_PIDS[@]:-}"; do
@@ -145,6 +163,13 @@ if [ -d "$CODEX_WATCH_DIR" ]; then
   WATCH_PIDS+=($!)
 else
   echo "[$(date)] codex watch skipped: $CODEX_WATCH_DIR missing" >> "$LOG_FILE"
+fi
+
+if [ -d "$CODEX_WATCH_DIR" ]; then
+  start_codex_watch &
+  WATCH_PIDS+=($!)
+else
+  echo "[Fri Mar 13 20:01:19 PDT 2026] codex watch skipped: $CODEX_WATCH_DIR missing" >> "$LOG_FILE"
 fi
 
 wait "${WATCH_PIDS[@]}"
