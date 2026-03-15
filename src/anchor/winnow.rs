@@ -12,7 +12,7 @@ pub fn fingerprint_text(text: &str) -> SpanAnchor {
     let tokens = tokenize(text);
     let features = winnowed_features(&tokens, DEFAULT_K_GRAM, DEFAULT_WINDOW);
     let fingerprint = if features.is_empty() {
-        format!("fallback:{}", hash_str(text))
+        String::new()
     } else {
         let joined = features
             .iter()
@@ -146,15 +146,6 @@ fn parse_fingerprint(raw: &str) -> Option<HashSet<u64>> {
         return Some(values.into_iter().collect());
     }
 
-    if let Some(rest) = raw.strip_prefix("fallback:") {
-        return Some([rest.parse::<u64>().ok()?].into_iter().collect());
-    }
-
-    if raw.len() == 64 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
-        let legacy = u64::from_str_radix(&raw[..16], 16).ok()?;
-        return Some([legacy].into_iter().collect());
-    }
-
     None
 }
 
@@ -179,5 +170,23 @@ mod tests {
         let score = fingerprint_similarity(&left.fingerprint, &right.fingerprint)
             .expect("similarity should compute");
         assert!(score > 0.0);
+    }
+
+    #[test]
+    fn short_spans_emit_no_fingerprint() {
+        let short = fingerprint_text("omega");
+        assert!(short.fingerprint.is_empty());
+    }
+
+    #[test]
+    fn legacy_fallback_and_sha_fingerprints_are_not_parsed() {
+        assert!(fingerprint_similarity("fallback:1234", "fallback:1234").is_none());
+        assert!(
+            fingerprint_similarity(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .is_none()
+        );
     }
 }

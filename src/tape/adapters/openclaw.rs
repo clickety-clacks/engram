@@ -4,7 +4,7 @@ use chrono::{SecondsFormat, TimeZone, Utc};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::anchor::{fingerprint_anchor_hashes, fingerprint_text};
+use crate::anchor::fingerprint_anchor_hashes;
 
 const DEFAULT_TS: &str = "1970-01-01T00:00:00Z";
 
@@ -97,7 +97,11 @@ fn extract_from_row(
                         .and_then(Value::as_str)
                         .map(ToOwned::to_owned)
                 })
-                .or_else(|| obj.get("sessionId").and_then(Value::as_str).map(ToOwned::to_owned));
+                .or_else(|| {
+                    obj.get("sessionId")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                });
         }
         return;
     }
@@ -114,7 +118,11 @@ fn extract_from_row(
             .get("session_id")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
-            .or_else(|| obj.get("sessionId").and_then(Value::as_str).map(ToOwned::to_owned));
+            .or_else(|| {
+                obj.get("sessionId")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            });
     }
 
     let Some(message) = obj.get("message").and_then(Value::as_object) else {
@@ -283,7 +291,7 @@ fn emit_tool_result_message(
                 if !text.is_empty() {
                     event.insert(
                         "anchor_hashes".to_string(),
-                        json!([fingerprint_text(&text).fingerprint]),
+                        json!(fingerprint_anchor_hashes(&text)),
                     );
                 } else {
                     event.insert("anchor_hashes".to_string(), json!([]));
@@ -497,7 +505,11 @@ fn extract_timestamp(row: &Value) -> String {
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
         .or_else(|| row.get("t").and_then(Value::as_str).map(ToOwned::to_owned))
-        .or_else(|| row.get("time").and_then(Value::as_str).map(ToOwned::to_owned))
+        .or_else(|| {
+            row.get("time")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
         .or_else(|| {
             row.get("timestamp")
                 .and_then(Value::as_i64)
@@ -616,7 +628,9 @@ mod tests {
             .find(|row| row["k"] == "code.read")
             .expect("code.read");
         assert_eq!(code_read["file"], "src/auth.rs");
-        let anchors = code_read["anchor_hashes"].as_array().expect("anchor hashes");
+        let anchors = code_read["anchor_hashes"]
+            .as_array()
+            .expect("anchor hashes");
         assert!(!anchors.is_empty());
 
         let code_edit = rows

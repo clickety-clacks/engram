@@ -52,35 +52,28 @@ fn tape_id_for_contents(input: &str) -> String {
     out
 }
 
-fn sha256_hex(input: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(&mut out, "{byte:02x}");
-    }
-    out
-}
-
 #[test]
 fn init_record_tapes_show_and_explain_roundtrip() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();
     fs::create_dir_all(repo.join("src")).expect("src dir");
-    fs::write(repo.join("src/lib.rs"), "alpha\nomega\nzeta\n").expect("seed file");
+    let span_text = "fn omega() { return value + 1; }";
+    fs::write(
+        repo.join("src/lib.rs"),
+        format!("alpha\n{span_text}\nzeta\n"),
+    )
+    .expect("seed file");
 
     let init = run_json(repo, &["init"], None);
     assert_eq!(init["status"], "ok");
 
-    let span_anchor = fingerprint_text("omega").fingerprint;
+    let span_anchor = fingerprint_text(span_text).fingerprint;
     let transcript = format!(
         concat!(
             "{{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"meta\",\"model\":\"gpt-5\",\"repo_head\":\"abc123\",\"label\":\"lane-c\"}}\n",
             "{{\"t\":\"2026-02-22T00:00:01Z\",\"k\":\"code.read\",\"file\":\"src/lib.rs\",\"range\":[2,2],\"anchor_hashes\":[\"{0}\"]}}\n",
-            "{{\"t\":\"2026-02-22T00:00:02Z\",\"k\":\"code.edit\",\"file\":\"src/lib.rs\",\"before_range\":[2,2],\"after_range\":[2,2],\"before_hash\":\"seed\",\"after_hash\":\"{0}\"}}\n",
-            "{{\"t\":\"2026-02-22T00:00:03Z\",\"k\":\"code.edit\",\"file\":\"src/lib.rs\",\"before_range\":[4,5],\"after_range\":[4,5],\"before_hash\":\"gone\"}}\n"
+            "{{\"t\":\"2026-02-22T00:00:02Z\",\"k\":\"code.edit\",\"file\":\"src/lib.rs\",\"before_range\":[2,2],\"after_range\":[2,2],\"before_anchor_hashes\":[\"winnow:00000000000000aa\"],\"after_anchor_hashes\":[\"{0}\"]}}\n",
+            "{{\"t\":\"2026-02-22T00:00:03Z\",\"k\":\"code.edit\",\"file\":\"src/lib.rs\",\"before_range\":[4,5],\"after_range\":[4,5],\"before_anchor_hashes\":[\"winnow:00000000000000bb\"]}}\n"
         ),
         span_anchor
     );
@@ -116,22 +109,28 @@ fn init_record_tapes_show_and_explain_roundtrip() {
 }
 
 #[test]
-fn explain_matches_legacy_sha_edit_anchor_for_span_targets() {
+fn explain_matches_winnow_edit_anchor_for_span_targets() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();
     fs::create_dir_all(repo.join("src")).expect("src dir");
-    fs::write(repo.join("src/lib.rs"), "alpha\nomega\nzeta\n").expect("seed file");
+    let span_text = "fn omega() { return value + 1; }";
+    fs::write(
+        repo.join("src/lib.rs"),
+        format!("alpha\n{span_text}\nzeta\n"),
+    )
+    .expect("seed file");
 
     let _ = run_json(repo, &["init"], None);
 
-    let legacy_sha_anchor = sha256_hex("omega");
+    let span_anchor = fingerprint_text(span_text).fingerprint;
     let transcript = format!(
         concat!(
             "{{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"code.edit\",\"file\":\"src/lib.rs\",",
             "\"before_range\":[2,2],\"after_range\":[2,2],",
-            "\"before_hash\":\"deadbeef\",\"after_hash\":\"{0}\",\"similarity\":0.95}}\n"
+            "\"before_anchor_hashes\":[\"winnow:00000000000000cc\"],",
+            "\"after_anchor_hashes\":[\"{0}\"],\"similarity\":0.95}}\n"
         ),
-        legacy_sha_anchor
+        span_anchor
     );
     let _ = run_json(repo, &["record", "--stdin"], Some(&transcript));
 
@@ -140,23 +139,23 @@ fn explain_matches_legacy_sha_edit_anchor_for_span_targets() {
     assert!(
         query_anchors
             .iter()
-            .any(|anchor| anchor == &Value::String(legacy_sha_anchor.clone())),
-        "expected sha anchor fallback in query anchors"
+            .any(|anchor| anchor == &Value::String(span_anchor.clone())),
+        "expected winnow anchor in query anchors"
     );
     assert_eq!(
         explain["sessions"].as_array().expect("sessions").len(),
         1,
-        "expected explain to recover session via legacy sha edit anchor"
+        "expected explain to recover session via winnow edit anchor"
     );
     assert_eq!(
         explain["lineage"].as_array().expect("lineage").len(),
         1,
-        "expected inbound edit linkage for matched anchor"
+        "expected inbound edit linkage for matched winnow anchor"
     );
 }
 
 #[test]
-fn explain_matches_sha_edit_anchor_for_multiline_span_with_trailing_newline() {
+fn explain_matches_winnow_edit_anchor_for_multiline_span_with_trailing_newline() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();
     fs::create_dir_all(repo.join("src")).expect("src dir");
@@ -165,14 +164,15 @@ fn explain_matches_sha_edit_anchor_for_multiline_span_with_trailing_newline() {
     let _ = run_json(repo, &["init"], None);
 
     let exact_span = "fn a() {\n    alpha();\n}\n";
-    let exact_sha_anchor = sha256_hex(exact_span);
+    let exact_anchor = fingerprint_text(exact_span).fingerprint;
     let transcript = format!(
         concat!(
             "{{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"code.edit\",\"file\":\"src/lib.rs\",",
             "\"before_range\":[1,3],\"after_range\":[1,3],",
-            "\"before_hash\":\"deadbeef\",\"after_hash\":\"{0}\",\"similarity\":0.95}}\n"
+            "\"before_anchor_hashes\":[\"winnow:00000000000000dd\"],",
+            "\"after_anchor_hashes\":[\"{0}\"],\"similarity\":0.95}}\n"
         ),
-        exact_sha_anchor
+        exact_anchor
     );
     let _ = run_json(repo, &["record", "--stdin"], Some(&transcript));
 
@@ -181,18 +181,18 @@ fn explain_matches_sha_edit_anchor_for_multiline_span_with_trailing_newline() {
     assert!(
         query_anchors
             .iter()
-            .any(|anchor| anchor == &Value::String(exact_sha_anchor.clone())),
-        "expected exact multiline sha anchor in query anchors"
+            .any(|anchor| anchor == &Value::String(exact_anchor.clone())),
+        "expected exact multiline winnow anchor in query anchors"
     );
     assert_eq!(
         explain["sessions"].as_array().expect("sessions").len(),
         1,
-        "expected explain to recover session via exact multiline sha anchor"
+        "expected explain to recover session via exact multiline winnow anchor"
     );
     assert_eq!(
         explain["lineage"].as_array().expect("lineage").len(),
         1,
-        "expected inbound edit linkage for exact multiline sha anchor"
+        "expected inbound edit linkage for exact multiline winnow anchor"
     );
 }
 
@@ -202,13 +202,18 @@ fn explain_include_deleted_controls_tombstones() {
     let repo = temp.path();
     let _ = run_json(repo, &["init"], None);
 
-    let transcript = concat!(
-        r#"{"t":"2026-02-22T00:00:00Z","k":"code.edit","file":"src/lib.rs","before_range":[10,12],"after_range":[10,12],"before_hash":"deleted-anchor"}"#,
-        "\n"
+    let deleted_anchor = "winnow:00000000000000de";
+    let transcript = format!(
+        concat!(
+            "{{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"code.edit\",\"file\":\"src/lib.rs\",",
+            "\"before_range\":[10,12],\"after_range\":[10,12],",
+            "\"before_anchor_hashes\":[\"{0}\"]}}\n"
+        ),
+        deleted_anchor
     );
-    let _ = run_json(repo, &["record", "--stdin"], Some(transcript));
+    let _ = run_json(repo, &["record", "--stdin"], Some(&transcript));
 
-    let without_deleted = run_json(repo, &["explain", "deleted-anchor", "--anchor"], None);
+    let without_deleted = run_json(repo, &["explain", deleted_anchor, "--anchor"], None);
     assert_eq!(
         without_deleted["tombstones"]
             .as_array()
@@ -219,7 +224,7 @@ fn explain_include_deleted_controls_tombstones() {
 
     let with_deleted = run_json(
         repo,
-        &["explain", "deleted-anchor", "--anchor", "--include-deleted"],
+        &["explain", deleted_anchor, "--anchor", "--include-deleted"],
         None,
     );
     let tombstones = with_deleted["tombstones"].as_array().expect("tombstones");
@@ -234,15 +239,21 @@ fn explain_forensics_and_agent_links_behave_as_specified() {
     let repo = temp.path();
     let _ = run_json(repo, &["init"], None);
 
-    let transcript = concat!(
-        r#"{"t":"2026-02-22T00:00:00Z","k":"code.edit","file":"src/lib.rs","before_range":[1,1],"after_range":[1,1],"before_hash":"from-anchor","after_hash":"to-anchor"}"#,
-        "\n",
-        r#"{"t":"2026-02-22T00:00:01Z","k":"span.link","from_file":"src/a.rs","from_range":[1,2],"to_file":"src/b.rs","to_range":[10,20],"note":"extract"}"#,
-        "\n"
+    let from_anchor = "winnow:00000000000000ef";
+    let to_anchor = "winnow:00000000000000f0";
+    let transcript = format!(
+        concat!(
+            "{{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"code.edit\",\"file\":\"src/lib.rs\",",
+            "\"before_range\":[1,1],\"after_range\":[1,1],",
+            "\"before_anchor_hashes\":[\"{0}\"],\"after_anchor_hashes\":[\"{1}\"]}}\n",
+            "{{\"t\":\"2026-02-22T00:00:01Z\",\"k\":\"span.link\",\"from_file\":\"src/a.rs\",",
+            "\"from_range\":[1,2],\"to_file\":\"src/b.rs\",\"to_range\":[10,20],\"note\":\"extract\"}}\n"
+        ),
+        from_anchor, to_anchor
     );
-    let _ = run_json(repo, &["record", "--stdin"], Some(transcript));
+    let _ = run_json(repo, &["record", "--stdin"], Some(&transcript));
 
-    let default_explain = run_json(repo, &["explain", "to-anchor", "--anchor"], None);
+    let default_explain = run_json(repo, &["explain", to_anchor, "--anchor"], None);
     assert_eq!(
         default_explain["lineage"]
             .as_array()
@@ -253,7 +264,7 @@ fn explain_forensics_and_agent_links_behave_as_specified() {
 
     let forensics_explain = run_json(
         repo,
-        &["explain", "to-anchor", "--anchor", "--forensics"],
+        &["explain", to_anchor, "--anchor", "--forensics"],
         None,
     );
     assert_eq!(

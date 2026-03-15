@@ -1953,13 +1953,8 @@ fn derive_anchor_candidates(span_texts: &[String]) -> Vec<String> {
 
     for span_text in span_texts {
         let fingerprint = fingerprint_text(span_text).fingerprint;
-        if seen.insert(fingerprint.clone()) {
+        if !fingerprint.is_empty() && seen.insert(fingerprint.clone()) {
             out.push(fingerprint);
-        }
-
-        let sha = sha256_hex(span_text);
-        if seen.insert(sha.clone()) {
-            out.push(sha);
         }
     }
 
