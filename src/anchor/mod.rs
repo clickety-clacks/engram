@@ -6,6 +6,11 @@ pub fn fingerprint_anchor_hashes(text: &str) -> Vec<String> {
     if text.is_empty() {
         Vec::new()
     } else {
-        vec![fingerprint_text(text).fingerprint]
+        let fingerprint = fingerprint_text(text).fingerprint;
+        if fingerprint.is_empty() {
+            Vec::new()
+        } else {
+            vec![fingerprint]
+        }
     }
 }

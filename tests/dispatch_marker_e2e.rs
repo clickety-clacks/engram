@@ -3,8 +3,8 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
+use engram::anchor::fingerprint_text;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 fn run_cli(repo: &Path, args: &[&str], stdin: Option<&str>) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_engram"));
@@ -39,18 +39,6 @@ fn run_json(repo: &Path, args: &[&str], stdin: Option<&str>) -> Value {
     serde_json::from_slice(&output.stdout).expect("json stdout")
 }
 
-fn sha256_hex(input: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(&mut out, "{byte:02x}");
-    }
-    out
-}
-
 #[test]
 fn explain_dispatch_chain_includes_a_to_b_to_c_and_excludes_sibling() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -65,7 +53,7 @@ fn explain_dispatch_chain_includes_a_to_b_to_c_and_excludes_sibling() {
     let uuid_ab = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     let uuid_bc = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
     let span_text = "pub fn continuation_probe() -> &'static str { \"T126\" }";
-    let span_sha = sha256_hex(span_text);
+    let span_anchor = fingerprint_text(span_text).fingerprint;
 
     let tape_a = format!(
         concat!(
@@ -83,9 +71,9 @@ fn explain_dispatch_chain_includes_a_to_b_to_c_and_excludes_sibling() {
     let tape_c = format!(
         concat!(
             "{{\"t\":\"2026-02-27T12:10:01Z\",\"k\":\"msg.in\",\"role\":\"user\",\"content\":\"<engram-src id=\\\"{0}\\\"/> execute\"}}\n",
-            "{{\"t\":\"2026-02-27T12:10:02Z\",\"k\":\"code.edit\",\"file\":\"src/engine.rs\",\"before_range\":[2,2],\"after_range\":[2,2],\"before_hash\":\"old-c\",\"after_hash\":\"{1}\",\"similarity\":0.95}}\n"
+            "{{\"t\":\"2026-02-27T12:10:02Z\",\"k\":\"code.edit\",\"file\":\"src/engine.rs\",\"before_range\":[2,2],\"after_range\":[2,2],\"before_anchor_hashes\":[\"winnow:0000000000000101\"],\"after_anchor_hashes\":[\"{1}\"],\"similarity\":0.95}}\n"
         ),
-        uuid_bc, span_sha
+        uuid_bc, span_anchor
     );
     let tape_sibling = format!(
         "{{\"t\":\"2026-02-27T12:06:01Z\",\"k\":\"msg.in\",\"role\":\"user\",\"content\":\"<engram-src id=\\\"{uuid_ab}\\\"/> sibling\"}}\n"
@@ -133,7 +121,7 @@ fn compact_restart_reingest_adds_new_tape_without_duplication() {
 
     let uuid = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
     let span_text = "pub fn continuation_probe() -> &'static str { \"T126R\" }";
-    let span_sha = sha256_hex(span_text);
+    let span_anchor = fingerprint_text(span_text).fingerprint;
 
     let tape_base = format!(
         "{{\"t\":\"2026-02-27T13:00:01Z\",\"k\":\"msg.out\",\"role\":\"assistant\",\"content\":[{{\"type\":\"toolCall\",\"arguments\":{{\"payload\":\"<engram-src id=\\\"{uuid}\\\"/>\"}}}}]}}\n"
@@ -141,16 +129,16 @@ fn compact_restart_reingest_adds_new_tape_without_duplication() {
     let tape_worker = format!(
         concat!(
             "{{\"t\":\"2026-02-27T13:05:01Z\",\"k\":\"msg.in\",\"role\":\"user\",\"content\":\"<engram-src id=\\\"{0}\\\"/> run\"}}\n",
-            "{{\"t\":\"2026-02-27T13:05:02Z\",\"k\":\"code.edit\",\"file\":\"src/engine.rs\",\"before_range\":[2,2],\"after_range\":[2,2],\"before_hash\":\"old-w\",\"after_hash\":\"{1}\",\"similarity\":0.95}}\n"
+            "{{\"t\":\"2026-02-27T13:05:02Z\",\"k\":\"code.edit\",\"file\":\"src/engine.rs\",\"before_range\":[2,2],\"after_range\":[2,2],\"before_anchor_hashes\":[\"winnow:0000000000000102\"],\"after_anchor_hashes\":[\"{1}\"],\"similarity\":0.95}}\n"
         ),
-        uuid, span_sha
+        uuid, span_anchor
     );
     let tape_restart = format!(
         concat!(
             "{{\"t\":\"2026-02-27T13:20:01Z\",\"k\":\"msg.in\",\"role\":\"user\",\"content\":\"<engram-src id=\\\"{0}\\\"/> resumed after compact\"}}\n",
-            "{{\"t\":\"2026-02-27T13:20:02Z\",\"k\":\"code.edit\",\"file\":\"src/engine.rs\",\"before_range\":[2,2],\"after_range\":[2,2],\"before_hash\":\"old-r\",\"after_hash\":\"{1}\",\"similarity\":0.95}}\n"
+            "{{\"t\":\"2026-02-27T13:20:02Z\",\"k\":\"code.edit\",\"file\":\"src/engine.rs\",\"before_range\":[2,2],\"after_range\":[2,2],\"before_anchor_hashes\":[\"winnow:0000000000000103\"],\"after_anchor_hashes\":[\"{1}\"],\"similarity\":0.95}}\n"
         ),
-        uuid, span_sha
+        uuid, span_anchor
     );
 
     let _ = run_json(repo, &["record", "--stdin"], Some(&tape_base));

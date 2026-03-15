@@ -47,7 +47,11 @@ fn clawline_style_tape_yields_agent_useful_explain_windows() {
     let _ = run_json(repo, &["init"], None);
     let _ = run_json(repo, &["record", "--stdin"], Some(&fixture));
 
-    let explain = run_json(repo, &["explain", "claw-anchor-1", "--anchor"], None);
+    let explain = run_json(
+        repo,
+        &["explain", "winnow:0000000000000301", "--anchor"],
+        None,
+    );
     let sessions = explain["sessions"].as_array().expect("sessions");
     assert_eq!(sessions.len(), 1);
 

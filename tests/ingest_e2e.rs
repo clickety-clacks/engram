@@ -359,8 +359,9 @@ fn ingest_emits_edit_winnow_evidence_that_explain_can_query() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
     let repo = temp.path().join("repo");
+    let span_text = "fn beta() { return value + 2; }";
     fs::create_dir_all(repo.join("src")).expect("src dir");
-    fs::write(repo.join("src/lib.rs"), "b\n").expect("seed file");
+    fs::write(repo.join("src/lib.rs"), format!("{span_text}\n")).expect("seed file");
     let canonical_repo = fs::canonicalize(&repo).expect("canonical repo");
     let project_key = canonical_repo.to_string_lossy().replace('/', "-");
     let claude_root = home.join(".claude/projects").join(project_key);
@@ -377,7 +378,7 @@ fn ingest_emits_edit_winnow_evidence_that_explain_can_query() {
 
     let explain = run_json(&repo, &["explain", "src/lib.rs:1-1"], None, &home);
     let query_anchors = explain["query"]["anchors"].as_array().expect("anchors");
-    let expected_anchor = Value::String(fingerprint_text("b").fingerprint);
+    let expected_anchor = Value::String(fingerprint_text(span_text).fingerprint);
     assert!(
         query_anchors
             .iter()
@@ -669,17 +670,21 @@ fn explain_fans_out_to_additional_stores_and_dedupes() {
     )
     .expect("home config");
 
-    let anchor = "shared-anchor";
-    let transcript_a = concat!(
-        r#"{"t":"2026-02-22T00:00:00Z","k":"code.read","file":"src/a.rs","range":[1,1],"anchor_hashes":["shared-anchor"]}"#,
-        "\n"
+    let anchor = "winnow:0000000000000201";
+    let transcript_a = format!(
+        "{{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"code.read\",\"file\":\"src/a.rs\",\"range\":[1,1],\"anchor_hashes\":[\"{anchor}\"]}}\n"
     );
-    let transcript_b = concat!(
-        r#"{"t":"2026-02-22T00:00:01Z","k":"code.edit","file":"src/b.rs","before_range":[1,1],"after_range":[1,1],"before_hash":"old","after_hash":"shared-anchor","similarity":0.91}"#,
-        "\n"
+    let transcript_b = format!(
+        concat!(
+            "{{\"t\":\"2026-02-22T00:00:01Z\",\"k\":\"code.edit\",\"file\":\"src/b.rs\",",
+            "\"before_range\":[1,1],\"after_range\":[1,1],",
+            "\"before_anchor_hashes\":[\"winnow:0000000000000200\"],",
+            "\"after_anchor_hashes\":[\"{0}\"],\"similarity\":0.91}}\n"
+        ),
+        anchor
     );
-    let tape_a = sha256_hex(transcript_a);
-    let tape_b = sha256_hex(transcript_b);
+    let tape_a = sha256_hex(&transcript_a);
+    let tape_b = sha256_hex(&transcript_b);
 
     fs::write(
         project_a

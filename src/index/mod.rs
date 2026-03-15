@@ -1,5 +1,6 @@
 pub mod lineage;
 
+use std::collections::HashSet;
 use std::ops::Deref;
 
 use rusqlite::{Connection, params};
@@ -316,11 +317,7 @@ impl SqliteIndex {
         Ok(())
     }
 
-    pub fn insert_dispatch_link(
-        &self,
-        tape_id: &str,
-        link: &DispatchLink,
-    ) -> rusqlite::Result<()> {
+    pub fn insert_dispatch_link(&self, tape_id: &str, link: &DispatchLink) -> rusqlite::Result<()> {
         Self::insert_dispatch_link_on(&self.conn, tape_id, link)
     }
 
@@ -531,7 +528,12 @@ impl SqliteIndex {
                     }
                 }
                 TapeEventData::CodeEdit(edit) => {
-                    if let Some(before_hash) = &edit.before_hash {
+                    let before_anchors =
+                        edit_side_anchors(edit.before_hash.as_deref(), &edit.before_anchor_hashes);
+                    let after_anchors =
+                        edit_side_anchors(edit.after_hash.as_deref(), &edit.after_anchor_hashes);
+
+                    if !before_anchors.is_empty() {
                         let fragment = EvidenceFragmentRef {
                             tape_id: tape_id.to_string(),
                             event_offset: item.offset,
@@ -539,22 +541,12 @@ impl SqliteIndex {
                             file_path: edit.file.clone(),
                             timestamp: item.event.timestamp.clone(),
                         };
-                        Self::insert_evidence_on(tx.deref(), before_hash, &fragment)?;
-                    }
-                    if !edit.before_anchor_hashes.is_empty() {
-                        let fragment = EvidenceFragmentRef {
-                            tape_id: tape_id.to_string(),
-                            event_offset: item.offset,
-                            kind: EvidenceKind::Edit,
-                            file_path: edit.file.clone(),
-                            timestamp: item.event.timestamp.clone(),
-                        };
-                        for anchor in &edit.before_anchor_hashes {
+                        for anchor in &before_anchors {
                             Self::insert_evidence_on(tx.deref(), anchor, &fragment)?;
                         }
                     }
 
-                    if let Some(after_hash) = &edit.after_hash {
+                    if !after_anchors.is_empty() {
                         let fragment = EvidenceFragmentRef {
                             tape_id: tape_id.to_string(),
                             event_offset: item.offset,
@@ -562,48 +554,38 @@ impl SqliteIndex {
                             file_path: edit.file.clone(),
                             timestamp: item.event.timestamp.clone(),
                         };
-                        Self::insert_evidence_on(tx.deref(), after_hash, &fragment)?;
-                    }
-                    if !edit.after_anchor_hashes.is_empty() {
-                        let fragment = EvidenceFragmentRef {
-                            tape_id: tape_id.to_string(),
-                            event_offset: item.offset,
-                            kind: EvidenceKind::Edit,
-                            file_path: edit.file.clone(),
-                            timestamp: item.event.timestamp.clone(),
-                        };
-                        for anchor in &edit.after_anchor_hashes {
+                        for anchor in &after_anchors {
                             Self::insert_evidence_on(tx.deref(), anchor, &fragment)?;
                         }
                     }
 
-                    if let (Some(before_hash), Some(after_hash)) =
-                        (edit.before_hash.as_ref(), edit.after_hash.as_ref())
-                    {
-                        let confidence = if before_hash == after_hash {
+                    if !before_anchors.is_empty() && !after_anchors.is_empty() {
+                        let confidence = if before_anchors == after_anchors {
                             1.0
                         } else {
                             edit.similarity.unwrap_or(0.0)
                         };
                         Self::validate_confidence(confidence)?;
-                        Self::insert_edge_on(
-                            tx.deref(),
-                            &SpanEdge {
-                                from_anchor: before_hash.clone(),
-                                to_anchor: after_hash.clone(),
-                                confidence,
-                                location_delta: LocationDelta::Same,
-                                cardinality: Cardinality::OneToOne,
-                                agent_link: false,
-                                note: None,
-                            },
-                            link_threshold,
-                        )?;
+                        for before_anchor in &before_anchors {
+                            for after_anchor in &after_anchors {
+                                Self::insert_edge_on(
+                                    tx.deref(),
+                                    &SpanEdge {
+                                        from_anchor: before_anchor.clone(),
+                                        to_anchor: after_anchor.clone(),
+                                        confidence,
+                                        location_delta: LocationDelta::Same,
+                                        cardinality: Cardinality::OneToOne,
+                                        agent_link: false,
+                                        note: None,
+                                    },
+                                    link_threshold,
+                                )?;
+                            }
+                        }
                     }
 
-                    if edit.after_hash.is_none()
-                        && let Some(before_hash) = &edit.before_hash
-                    {
+                    if after_anchors.is_empty() && !before_anchors.is_empty() {
                         let range = edit
                             .before_range
                             .or(edit.after_range)
@@ -615,7 +597,7 @@ impl SqliteIndex {
                         Self::insert_tombstone_on(
                             tx.deref(),
                             &Tombstone {
-                                anchor_hashes: vec![before_hash.clone()],
+                                anchor_hashes: before_anchors,
                                 tape_id: tape_id.to_string(),
                                 event_offset: item.offset,
                                 file_path: edit.file.clone(),
@@ -747,6 +729,26 @@ impl SqliteIndex {
 
 fn encode_span_link_anchor(file: &str, range: crate::tape::event::FileRange) -> String {
     format!("span:{file}:{}-{}", range.start, range.end)
+}
+
+fn edit_side_anchors(hash: Option<&str>, anchors: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    for anchor in anchors {
+        if seen.insert(anchor.clone()) {
+            out.push(anchor.clone());
+        }
+    }
+
+    if out.is_empty()
+        && let Some(anchor) = hash.filter(|anchor| anchor.starts_with("winnow:"))
+        && seen.insert(anchor.to_string())
+    {
+        out.push(anchor.to_string());
+    }
+
+    out
 }
 
 impl SqliteIndex {
@@ -892,8 +894,12 @@ mod tests {
                     after_range: Some(FileRange { start: 10, end: 13 }),
                     before_hash: before_hash.map(ToOwned::to_owned),
                     after_hash: after_hash.map(ToOwned::to_owned),
-                    before_anchor_hashes: Vec::new(),
-                    after_anchor_hashes: Vec::new(),
+                    before_anchor_hashes: before_hash
+                        .map(|anchor| vec![anchor.to_string()])
+                        .unwrap_or_default(),
+                    after_anchor_hashes: after_hash
+                        .map(|anchor| vec![anchor.to_string()])
+                        .unwrap_or_default(),
                     similarity,
                 }),
             },
@@ -976,12 +982,26 @@ mod tests {
             .expect("before winnow evidence");
         assert_eq!(before_refs.len(), 1);
         assert_eq!(before_refs[0].kind, EvidenceKind::Edit);
+        assert_eq!(
+            index
+                .evidence_for_anchor("before")
+                .expect("legacy before evidence")
+                .len(),
+            0
+        );
 
         let after_refs = index
             .evidence_for_anchor("winnow:after")
             .expect("after winnow evidence");
         assert_eq!(after_refs.len(), 1);
         assert_eq!(after_refs[0].kind, EvidenceKind::Edit);
+        assert_eq!(
+            index
+                .evidence_for_anchor("after")
+                .expect("legacy after evidence")
+                .len(),
+            0
+        );
     }
 
     #[test]
@@ -1138,7 +1158,12 @@ mod tests {
         ];
 
         index
-            .ingest_tape_events_with_dispatch("tape-dispatch", &events, &links, LINK_THRESHOLD_DEFAULT)
+            .ingest_tape_events_with_dispatch(
+                "tape-dispatch",
+                &events,
+                &links,
+                LINK_THRESHOLD_DEFAULT,
+            )
             .expect("ingest dispatch links");
 
         let by_tape = index
@@ -1209,15 +1234,23 @@ mod tests {
         }];
 
         index
-            .ingest_tape_events_with_dispatch("tape-repeat", &events, &links, LINK_THRESHOLD_DEFAULT)
+            .ingest_tape_events_with_dispatch(
+                "tape-repeat",
+                &events,
+                &links,
+                LINK_THRESHOLD_DEFAULT,
+            )
             .expect("first ingest");
         index
-            .ingest_tape_events_with_dispatch("tape-repeat", &events, &links, LINK_THRESHOLD_DEFAULT)
+            .ingest_tape_events_with_dispatch(
+                "tape-repeat",
+                &events,
+                &links,
+                LINK_THRESHOLD_DEFAULT,
+            )
             .expect("second ingest");
 
-        let by_tape = index
-            .dispatch_links_for_tape("tape-repeat")
-            .expect("query");
+        let by_tape = index.dispatch_links_for_tape("tape-repeat").expect("query");
         assert_eq!(by_tape.len(), 1);
         assert_eq!(by_tape[0].uuid, "33333333-3333-4333-8333-333333333333");
     }
