@@ -3,6 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+use engram::anchor::fingerprint_text;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -351,6 +352,43 @@ fn ingest_discovers_codex_sessions_for_repo_via_adapter_hook() {
     assert_eq!(ingest["status"], "ok");
     assert_eq!(ingest["imported_tapes"], 1);
     assert!(ingest["scanned_inputs"].as_u64().unwrap_or(0) >= 1);
+}
+
+#[test]
+fn ingest_emits_edit_winnow_evidence_that_explain_can_query() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("src")).expect("src dir");
+    fs::write(repo.join("src/lib.rs"), "b\n").expect("seed file");
+    let canonical_repo = fs::canonicalize(&repo).expect("canonical repo");
+    let project_key = canonical_repo.to_string_lossy().replace('/', "-");
+    let claude_root = home.join(".claude/projects").join(project_key);
+    fs::create_dir_all(&claude_root).expect("claude root");
+    fs::write(
+        claude_root.join("main.jsonl"),
+        include_str!("fixtures/claude_adapter_input.jsonl"),
+    )
+    .expect("claude fixture");
+
+    let ingest = run_json(&repo, &["ingest"], None, &home);
+    assert_eq!(ingest["status"], "ok");
+    assert_eq!(ingest["imported_tapes"], 1);
+
+    let explain = run_json(&repo, &["explain", "src/lib.rs:1-1"], None, &home);
+    let query_anchors = explain["query"]["anchors"].as_array().expect("anchors");
+    let expected_anchor = Value::String(fingerprint_text("b").fingerprint);
+    assert!(
+        query_anchors
+            .iter()
+            .any(|anchor| anchor == &expected_anchor),
+        "expected explain query to include span winnow anchor"
+    );
+    assert_eq!(
+        explain["sessions"].as_array().expect("sessions").len(),
+        1,
+        "expected explain to recover ingested edit session via winnow evidence"
+    );
 }
 
 #[test]

@@ -2,6 +2,8 @@ use chrono::{SecondsFormat, TimeZone, Utc};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::anchor::fingerprint_anchor_hashes;
+
 pub fn opencode_json_to_tape_jsonl(input: &str) -> Result<String, serde_json::Error> {
     let root: Value = serde_json::from_str(input)?;
     let session_id = root
@@ -141,7 +143,9 @@ pub fn opencode_json_to_tape_jsonl(input: &str) -> Result<String, serde_json::Er
                                     "source": source_block("opencode", session_id.as_deref()),
                                     "file": file,
                                     "before_hash": tool_input.get("oldString").and_then(Value::as_str).map(hash_text),
-                                    "after_hash": tool_input.get("newString").and_then(Value::as_str).map(hash_text)
+                                    "after_hash": tool_input.get("newString").and_then(Value::as_str).map(hash_text),
+                                    "before_anchor_hashes": tool_input.get("oldString").and_then(Value::as_str).map(fingerprint_anchor_hashes).unwrap_or_default(),
+                                    "after_anchor_hashes": tool_input.get("newString").and_then(Value::as_str).map(fingerprint_anchor_hashes).unwrap_or_default()
                                 }));
                             }
                         }
@@ -157,7 +161,8 @@ pub fn opencode_json_to_tape_jsonl(input: &str) -> Result<String, serde_json::Er
                                     "k": "code.edit",
                                     "source": source_block("opencode", session_id.as_deref()),
                                     "file": file,
-                                    "after_hash": tool_input.get("content").and_then(Value::as_str).map(hash_text)
+                                    "after_hash": tool_input.get("content").and_then(Value::as_str).map(hash_text),
+                                    "after_anchor_hashes": tool_input.get("content").and_then(Value::as_str).map(fingerprint_anchor_hashes).unwrap_or_default()
                                 }));
                             }
                         }

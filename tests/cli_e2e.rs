@@ -156,6 +156,47 @@ fn explain_matches_legacy_sha_edit_anchor_for_span_targets() {
 }
 
 #[test]
+fn explain_matches_sha_edit_anchor_for_multiline_span_with_trailing_newline() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+    fs::create_dir_all(repo.join("src")).expect("src dir");
+    fs::write(repo.join("src/lib.rs"), "fn a() {\n    alpha();\n}\n").expect("seed file");
+
+    let _ = run_json(repo, &["init"], None);
+
+    let exact_span = "fn a() {\n    alpha();\n}\n";
+    let exact_sha_anchor = sha256_hex(exact_span);
+    let transcript = format!(
+        concat!(
+            "{{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"code.edit\",\"file\":\"src/lib.rs\",",
+            "\"before_range\":[1,3],\"after_range\":[1,3],",
+            "\"before_hash\":\"deadbeef\",\"after_hash\":\"{0}\",\"similarity\":0.95}}\n"
+        ),
+        exact_sha_anchor
+    );
+    let _ = run_json(repo, &["record", "--stdin"], Some(&transcript));
+
+    let explain = run_json(repo, &["explain", "src/lib.rs:1-3"], None);
+    let query_anchors = explain["query"]["anchors"].as_array().expect("anchors");
+    assert!(
+        query_anchors
+            .iter()
+            .any(|anchor| anchor == &Value::String(exact_sha_anchor.clone())),
+        "expected exact multiline sha anchor in query anchors"
+    );
+    assert_eq!(
+        explain["sessions"].as_array().expect("sessions").len(),
+        1,
+        "expected explain to recover session via exact multiline sha anchor"
+    );
+    assert_eq!(
+        explain["lineage"].as_array().expect("lineage").len(),
+        1,
+        "expected inbound edit linkage for exact multiline sha anchor"
+    );
+}
+
+#[test]
 fn explain_include_deleted_controls_tombstones() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();

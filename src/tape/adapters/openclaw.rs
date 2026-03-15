@@ -4,7 +4,7 @@ use chrono::{SecondsFormat, TimeZone, Utc};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::anchor::fingerprint_text;
+use crate::anchor::{fingerprint_anchor_hashes, fingerprint_text};
 
 const DEFAULT_TS: &str = "1970-01-01T00:00:00Z";
 
@@ -22,6 +22,8 @@ struct ToolCallContext {
     range: [u32; 2],
     before_hash: Option<String>,
     after_hash: Option<String>,
+    before_anchor_hashes: Vec<String>,
+    after_anchor_hashes: Vec<String>,
 }
 
 pub fn openclaw_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Error> {
@@ -293,6 +295,7 @@ fn emit_tool_result_message(
         ToolKind::Edit => {
             if let Some(file) = context.file {
                 let before_hash = context.before_hash;
+                let before_anchor_hashes = context.before_anchor_hashes;
                 let after_hash = context.after_hash.or_else(|| {
                     if text.is_empty() {
                         None
@@ -300,7 +303,17 @@ fn emit_tool_result_message(
                         Some(hash_text(&text))
                     }
                 });
-                if before_hash.is_some() || after_hash.is_some() {
+                let after_anchor_hashes =
+                    if context.after_anchor_hashes.is_empty() && !text.is_empty() {
+                        fingerprint_anchor_hashes(&text)
+                    } else {
+                        context.after_anchor_hashes
+                    };
+                if before_hash.is_some()
+                    || after_hash.is_some()
+                    || !before_anchor_hashes.is_empty()
+                    || !after_anchor_hashes.is_empty()
+                {
                     let mut event = serde_json::Map::new();
                     event.insert("t".to_string(), json!(timestamp));
                     event.insert("k".to_string(), json!("code.edit"));
@@ -311,6 +324,18 @@ fn emit_tool_result_message(
                     }
                     if let Some(after_hash) = after_hash {
                         event.insert("after_hash".to_string(), json!(after_hash));
+                    }
+                    if !before_anchor_hashes.is_empty() {
+                        event.insert(
+                            "before_anchor_hashes".to_string(),
+                            json!(before_anchor_hashes),
+                        );
+                    }
+                    if !after_anchor_hashes.is_empty() {
+                        event.insert(
+                            "after_anchor_hashes".to_string(),
+                            json!(after_anchor_hashes),
+                        );
                     }
                     out.push(Value::Object(event));
                 }
@@ -328,6 +353,8 @@ fn tool_context_for(tool_name: &str, args: &Value) -> ToolCallContext {
         range: extract_line_range(args),
         before_hash: extract_before_hash(args),
         after_hash: extract_after_hash(args),
+        before_anchor_hashes: extract_before_anchor_hashes(args),
+        after_anchor_hashes: extract_after_anchor_hashes(args),
     }
 }
 
@@ -406,13 +433,21 @@ fn extract_before_hash(args: &Value) -> Option<String> {
     obj.get("before_hash")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
-        .or_else(|| {
-            obj.get("old_string")
-                .and_then(Value::as_str)
-                .map(hash_text)
-        })
+        .or_else(|| obj.get("old_string").and_then(Value::as_str).map(hash_text))
         .or_else(|| obj.get("oldString").and_then(Value::as_str).map(hash_text))
         .or_else(|| obj.get("before").and_then(Value::as_str).map(hash_text))
+}
+
+fn extract_before_anchor_hashes(args: &Value) -> Vec<String> {
+    let Some(obj) = args.as_object() else {
+        return Vec::new();
+    };
+    obj.get("old_string")
+        .and_then(Value::as_str)
+        .or_else(|| obj.get("oldString").and_then(Value::as_str))
+        .or_else(|| obj.get("before").and_then(Value::as_str))
+        .map(fingerprint_anchor_hashes)
+        .unwrap_or_default()
 }
 
 fn extract_after_hash(args: &Value) -> Option<String> {
@@ -420,14 +455,23 @@ fn extract_after_hash(args: &Value) -> Option<String> {
     obj.get("after_hash")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
-        .or_else(|| {
-            obj.get("new_string")
-                .and_then(Value::as_str)
-                .map(hash_text)
-        })
+        .or_else(|| obj.get("new_string").and_then(Value::as_str).map(hash_text))
         .or_else(|| obj.get("newString").and_then(Value::as_str).map(hash_text))
         .or_else(|| obj.get("after").and_then(Value::as_str).map(hash_text))
         .or_else(|| obj.get("content").and_then(Value::as_str).map(hash_text))
+}
+
+fn extract_after_anchor_hashes(args: &Value) -> Vec<String> {
+    let Some(obj) = args.as_object() else {
+        return Vec::new();
+    };
+    obj.get("new_string")
+        .and_then(Value::as_str)
+        .or_else(|| obj.get("newString").and_then(Value::as_str))
+        .or_else(|| obj.get("after").and_then(Value::as_str))
+        .or_else(|| obj.get("content").and_then(Value::as_str))
+        .map(fingerprint_anchor_hashes)
+        .unwrap_or_default()
 }
 
 fn join_text_blocks(content_blocks: &[Value]) -> String {

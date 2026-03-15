@@ -58,6 +58,8 @@ pub struct CodeEditEvent {
     pub after_range: Option<FileRange>,
     pub before_hash: Option<String>,
     pub after_hash: Option<String>,
+    pub before_anchor_hashes: Vec<String>,
+    pub after_anchor_hashes: Vec<String>,
     pub similarity: Option<f32>,
 }
 
@@ -153,6 +155,10 @@ struct RawEvent {
     #[serde(default)]
     after_hash: Option<String>,
     #[serde(default)]
+    before_anchor_hashes: Option<Vec<String>>,
+    #[serde(default)]
+    after_anchor_hashes: Option<Vec<String>>,
+    #[serde(default)]
     similarity: Option<f32>,
     #[serde(default)]
     anchor_hashes: Option<Vec<String>>,
@@ -187,6 +193,8 @@ impl RawEvent {
                     after_range: self.after_range.map(file_range),
                     before_hash: self.before_hash,
                     after_hash: self.after_hash,
+                    before_anchor_hashes: self.before_anchor_hashes.unwrap_or_default(),
+                    after_anchor_hashes: self.after_anchor_hashes.unwrap_or_default(),
                     similarity: self.similarity,
                 }),
                 None => TapeEventData::Other { kind },
@@ -250,7 +258,7 @@ mod tests {
     fn parses_offsets_and_supported_events() {
         let jsonl = r#"{"t":"2026-02-22T00:00:00Z","k":"meta","model":"gpt","repo_head":"abc"}
 {"t":"2026-02-22T00:00:01Z","k":"code.read","file":"src/lib.rs","range":[1,3],"anchor_hashes":["h1","h2"]}
-{"t":"2026-02-22T00:00:02Z","k":"code.edit","file":"src/lib.rs","before_range":[1,3],"after_range":[1,4],"before_hash":"a","after_hash":"b"}
+{"t":"2026-02-22T00:00:02Z","k":"code.edit","file":"src/lib.rs","before_range":[1,3],"after_range":[1,4],"before_hash":"a","after_hash":"b","before_anchor_hashes":["winnow:a"],"after_anchor_hashes":["winnow:b"]}
 {"t":"2026-02-22T00:00:03Z","k":"span.link","from_file":"a.rs","from_range":[1,2],"to_file":"b.rs","to_range":[3,4],"note":"moved"}"#;
 
         let events = parse_jsonl_events(jsonl).expect("valid JSONL");
@@ -263,6 +271,14 @@ mod tests {
                 assert_eq!(read.anchor_hashes, vec!["h1", "h2"]);
             }
             _ => panic!("expected code.read"),
+        }
+
+        match &events[2].event.data {
+            TapeEventData::CodeEdit(edit) => {
+                assert_eq!(edit.before_anchor_hashes, vec!["winnow:a"]);
+                assert_eq!(edit.after_anchor_hashes, vec!["winnow:b"]);
+            }
+            _ => panic!("expected code.edit"),
         }
     }
 

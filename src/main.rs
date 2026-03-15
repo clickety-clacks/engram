@@ -1943,29 +1943,24 @@ fn resolve_explain_anchors(cwd: &Path, args: &ExplainArgs) -> Result<Vec<String>
         .ok_or_else(|| CliError::new("invalid_explain_target", "target is required"))?;
     let (file, start, end) = parse_file_range_target(target)?;
     let file_path = cwd.join(file);
-    let span_text = read_file_span(&file_path, start, end)?;
-    Ok(derive_anchor_candidates(&span_text))
+    let span_texts = read_file_span_variants(&file_path, start, end)?;
+    Ok(derive_anchor_candidates(&span_texts))
 }
 
-fn derive_anchor_candidates(span_text: &str) -> Vec<String> {
+fn derive_anchor_candidates(span_texts: &[String]) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
 
-    let fingerprint = fingerprint_text(span_text).fingerprint;
-    if seen.insert(fingerprint.clone()) {
-        out.push(fingerprint);
-    }
+    for span_text in span_texts {
+        let fingerprint = fingerprint_text(span_text).fingerprint;
+        if seen.insert(fingerprint.clone()) {
+            out.push(fingerprint);
+        }
 
-    let mut hasher = Sha256::new();
-    hasher.update(span_text.as_bytes());
-    let digest = hasher.finalize();
-    let mut sha = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(&mut sha, "{byte:02x}");
-    }
-    if seen.insert(sha.clone()) {
-        out.push(sha);
+        let sha = sha256_hex(span_text);
+        if seen.insert(sha.clone()) {
+            out.push(sha);
+        }
     }
 
     out
@@ -1995,11 +1990,11 @@ fn parse_file_range_target(target: &str) -> Result<(&str, u32, u32), CliError> {
     Ok((file, start, end))
 }
 
-fn read_file_span(path: &Path, start: u32, end: u32) -> Result<String, CliError> {
+fn read_file_span_variants(path: &Path, start: u32, end: u32) -> Result<Vec<String>, CliError> {
     let content = fs::read_to_string(path).map_err(|err| CliError::io("read_span_error", err))?;
-    let lines = content.lines().collect::<Vec<_>>();
     let start_idx = start as usize - 1;
     let end_idx = end as usize - 1;
+    let lines = content.lines().collect::<Vec<_>>();
 
     if end_idx >= lines.len() {
         return Err(CliError::new(
@@ -2013,7 +2008,20 @@ fn read_file_span(path: &Path, start: u32, end: u32) -> Result<String, CliError>
         ));
     }
 
-    Ok(lines[start_idx..=end_idx].join("\n"))
+    let normalized = lines[start_idx..=end_idx].join("\n");
+    let raw_lines = content.split_inclusive('\n').collect::<Vec<_>>();
+    let raw = raw_lines
+        .get(start_idx..=end_idx)
+        .map(|slice| slice.concat());
+
+    let mut variants = vec![normalized];
+    if let Some(raw) = raw
+        && variants.last().is_none_or(|existing| existing != &raw)
+    {
+        variants.push(raw);
+    }
+
+    Ok(variants)
 }
 
 fn parse_jsonl_rows(input: &str) -> Result<Vec<TapeRow>, CliError> {
