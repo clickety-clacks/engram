@@ -1,6 +1,8 @@
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::anchor::fingerprint_anchor_hashes;
+
 pub fn gemini_json_to_tape_jsonl(input: &str) -> Result<String, serde_json::Error> {
     let root: Value = serde_json::from_str(input)?;
 
@@ -176,7 +178,8 @@ pub fn gemini_json_to_tape_jsonl(input: &str) -> Result<String, serde_json::Erro
                                     "k": "code.edit",
                                     "source": source_block(session_id),
                                     "file": file,
-                                    "after_hash": args.get("content").and_then(Value::as_str).map(hash_text)
+                                    "after_hash": args.get("content").and_then(Value::as_str).map(hash_text),
+                                    "after_anchor_hashes": args.get("content").and_then(Value::as_str).map(fingerprint_anchor_hashes).unwrap_or_default()
                                 }));
                                 edit_emitted = edit_emitted.saturating_add(1);
                             }

@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::anchor::fingerprint_anchor_hashes;
+
 pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Error> {
     let mut out = Vec::new();
     let mut tool_by_id: HashMap<String, String> = HashMap::new();
@@ -173,7 +175,9 @@ pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
                                                 "source": source_block("claude-code", session_id.as_deref()),
                                                 "file": file,
                                                 "before_hash": tool_input.get("old_string").and_then(Value::as_str).map(hash_text),
-                                                "after_hash": tool_input.get("new_string").and_then(Value::as_str).map(hash_text)
+                                                "after_hash": tool_input.get("new_string").and_then(Value::as_str).map(hash_text),
+                                                "before_anchor_hashes": tool_input.get("old_string").and_then(Value::as_str).map(fingerprint_anchor_hashes).unwrap_or_default(),
+                                                "after_anchor_hashes": tool_input.get("new_string").and_then(Value::as_str).map(fingerprint_anchor_hashes).unwrap_or_default()
                                             }));
                                             edit_emitted = edit_emitted.saturating_add(1);
                                         }
@@ -190,7 +194,8 @@ pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
                                                 "k": "code.edit",
                                                 "source": source_block("claude-code", session_id.as_deref()),
                                                 "file": file,
-                                                "after_hash": tool_input.get("content").and_then(Value::as_str).map(hash_text)
+                                                "after_hash": tool_input.get("content").and_then(Value::as_str).map(hash_text),
+                                                "after_anchor_hashes": tool_input.get("content").and_then(Value::as_str).map(fingerprint_anchor_hashes).unwrap_or_default()
                                             }));
                                             edit_emitted = edit_emitted.saturating_add(1);
                                         }
@@ -216,7 +221,9 @@ pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
                                                         "source": source_block("claude-code", session_id.as_deref()),
                                                         "file": file,
                                                         "before_hash": edit.get("old_string").and_then(Value::as_str).map(hash_text),
-                                                        "after_hash": edit.get("new_string").and_then(Value::as_str).map(hash_text)
+                                                        "after_hash": edit.get("new_string").and_then(Value::as_str).map(hash_text),
+                                                        "before_anchor_hashes": edit.get("old_string").and_then(Value::as_str).map(fingerprint_anchor_hashes).unwrap_or_default(),
+                                                        "after_anchor_hashes": edit.get("new_string").and_then(Value::as_str).map(fingerprint_anchor_hashes).unwrap_or_default()
                                                     }));
                                                     edit_emitted = edit_emitted.saturating_add(1);
                                                 }

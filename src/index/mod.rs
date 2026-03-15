@@ -541,6 +541,18 @@ impl SqliteIndex {
                         };
                         Self::insert_evidence_on(tx.deref(), before_hash, &fragment)?;
                     }
+                    if !edit.before_anchor_hashes.is_empty() {
+                        let fragment = EvidenceFragmentRef {
+                            tape_id: tape_id.to_string(),
+                            event_offset: item.offset,
+                            kind: EvidenceKind::Edit,
+                            file_path: edit.file.clone(),
+                            timestamp: item.event.timestamp.clone(),
+                        };
+                        for anchor in &edit.before_anchor_hashes {
+                            Self::insert_evidence_on(tx.deref(), anchor, &fragment)?;
+                        }
+                    }
 
                     if let Some(after_hash) = &edit.after_hash {
                         let fragment = EvidenceFragmentRef {
@@ -551,6 +563,18 @@ impl SqliteIndex {
                             timestamp: item.event.timestamp.clone(),
                         };
                         Self::insert_evidence_on(tx.deref(), after_hash, &fragment)?;
+                    }
+                    if !edit.after_anchor_hashes.is_empty() {
+                        let fragment = EvidenceFragmentRef {
+                            tape_id: tape_id.to_string(),
+                            event_offset: item.offset,
+                            kind: EvidenceKind::Edit,
+                            file_path: edit.file.clone(),
+                            timestamp: item.event.timestamp.clone(),
+                        };
+                        for anchor in &edit.after_anchor_hashes {
+                            Self::insert_evidence_on(tx.deref(), anchor, &fragment)?;
+                        }
                     }
 
                     if let (Some(before_hash), Some(after_hash)) =
@@ -868,6 +892,8 @@ mod tests {
                     after_range: Some(FileRange { start: 10, end: 13 }),
                     before_hash: before_hash.map(ToOwned::to_owned),
                     after_hash: after_hash.map(ToOwned::to_owned),
+                    before_anchor_hashes: Vec::new(),
+                    after_anchor_hashes: Vec::new(),
                     similarity,
                 }),
             },
@@ -919,6 +945,43 @@ mod tests {
             .expect("tombstone query");
         assert_eq!(tombstones.len(), 1);
         assert_eq!(tombstones[0].file_path, "src/lib.rs");
+    }
+
+    #[test]
+    fn ingests_edit_winnow_anchors_as_direct_evidence() {
+        let index = SqliteIndex::open_in_memory().expect("in-memory sqlite");
+        let events = vec![TapeEventAt {
+            offset: 1,
+            event: TapeEvent {
+                timestamp: "2026-02-22T00:00:01Z".to_string(),
+                data: TapeEventData::CodeEdit(CodeEditEvent {
+                    file: "src/lib.rs".to_string(),
+                    before_range: Some(FileRange { start: 10, end: 12 }),
+                    after_range: Some(FileRange { start: 10, end: 13 }),
+                    before_hash: Some("before".to_string()),
+                    after_hash: Some("after".to_string()),
+                    before_anchor_hashes: vec!["winnow:before".to_string()],
+                    after_anchor_hashes: vec!["winnow:after".to_string()],
+                    similarity: Some(0.80),
+                }),
+            },
+        }];
+
+        index
+            .ingest_tape_events("tape-1", &events, LINK_THRESHOLD_DEFAULT)
+            .expect("ingest succeeds");
+
+        let before_refs = index
+            .evidence_for_anchor("winnow:before")
+            .expect("before winnow evidence");
+        assert_eq!(before_refs.len(), 1);
+        assert_eq!(before_refs[0].kind, EvidenceKind::Edit);
+
+        let after_refs = index
+            .evidence_for_anchor("winnow:after")
+            .expect("after winnow evidence");
+        assert_eq!(after_refs.len(), 1);
+        assert_eq!(after_refs[0].kind, EvidenceKind::Edit);
     }
 
     #[test]
