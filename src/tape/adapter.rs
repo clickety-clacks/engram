@@ -248,10 +248,7 @@ pub fn adapter_registry() -> &'static [AdapterDescriptor] {
         AdapterDescriptor {
             id: AdapterId::OpenClaw,
             status: AdapterStatus::Implemented,
-            artifact_path_templates: &[
-                "~/.openclaw/sessions/**/*.jsonl",
-                "~/.openclaw/logs/*.log",
-            ],
+            artifact_path_templates: &["~/.openclaw/sessions/**/*.jsonl", "~/.openclaw/logs/*.log"],
             schema_sample_set: &["openclaw-session-jsonl", "openclaw-node-log"],
             mapping_table: &[
                 MappingRule {
@@ -511,7 +508,10 @@ fn discover_gemini_sessions(repo_path: &Path, home_dir: &Path) -> Vec<PathBuf> {
     let chats = bucket.join("chats");
     if chats.exists() {
         for candidate in list_files_by_extension_shallow(&chats, "json") {
-            let name = candidate.file_name().and_then(|value| value.to_str()).unwrap_or("");
+            let name = candidate
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("");
             if name.starts_with("session-") {
                 out.push(candidate);
             }
@@ -672,7 +672,10 @@ fn discover_opencode_sessions(repo_path: &Path, home_dir: &Path) -> Vec<PathBuf>
         .join(&project_id)
         .join("storage")
         .join("session");
-    out.extend(list_files_by_extension_recursive(&current_bucket.join("info"), "json"));
+    out.extend(list_files_by_extension_recursive(
+        &current_bucket.join("info"),
+        "json",
+    ));
     out.extend(list_files_by_extension_recursive(
         &current_bucket.join("message"),
         "json",
@@ -1190,6 +1193,10 @@ mod tests {
         AdapterId, AdapterStatus, CoverageGrade, adapter_registry, descriptor_for,
         discover_sessions_with_adapter, discovery_scaffold, run_conformance,
     };
+    use crate::anchor::fingerprint_anchor_hashes;
+    use crate::index::SqliteIndex;
+    use crate::index::lineage::{EvidenceKind, LINK_THRESHOLD_DEFAULT};
+    use crate::tape::event::{TapeEventData, parse_jsonl_events};
     use std::fs;
     use std::process::Command;
 
@@ -1235,6 +1242,60 @@ mod tests {
         assert_eq!(report.coverage.tool, CoverageGrade::Full);
         assert_eq!(report.coverage.read, CoverageGrade::Full);
         assert_eq!(report.coverage.edit, CoverageGrade::Full);
+    }
+
+    #[test]
+    fn claude_conformance_ingest_stores_multiple_windowed_evidence_rows_for_single_edit() {
+        let content = (1..=24)
+            .map(|line| format!("fn line_{line}() {{ value_{line}(); }}\n"))
+            .collect::<String>();
+        let content_json = serde_json::to_string(&content).expect("escaped content");
+        let input = format!(
+            concat!(
+                "{{\"type\":\"assistant\",\"timestamp\":\"2026-02-22T00:00:00Z\",",
+                "\"message\":{{\"role\":\"assistant\",\"content\":[{{",
+                "\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Write\",",
+                "\"input\":{{\"file_path\":\"/repo/src/lib.rs\",\"content\":{0}}}",
+                "}}]}}}}"
+            ),
+            content_json
+        );
+
+        let normalized =
+            super::convert_with_adapter(AdapterId::ClaudeCode, &input).expect("adapter output");
+        let events = parse_jsonl_events(&normalized).expect("normalized events");
+        let edit = events
+            .iter()
+            .find_map(|item| match &item.event.data {
+                TapeEventData::CodeEdit(edit) => Some((item.offset, edit)),
+                _ => None,
+            })
+            .expect("code.edit event");
+
+        let anchors = fingerprint_anchor_hashes(
+            edit.1
+                .after_text
+                .as_deref()
+                .expect("adapter should emit after_text"),
+        );
+        assert!(
+            anchors.len() >= 3,
+            "expected overlapping window anchors, got {anchors:?}"
+        );
+
+        let index = SqliteIndex::open_in_memory().expect("sqlite");
+        index
+            .ingest_tape_events("tape", &events, LINK_THRESHOLD_DEFAULT)
+            .expect("ingest");
+
+        for anchor in &anchors {
+            let evidence = index
+                .evidence_for_anchor(anchor)
+                .expect("evidence query should succeed");
+            assert_eq!(evidence.len(), 1, "anchor={anchor} evidence={evidence:?}");
+            assert_eq!(evidence[0].event_offset, edit.0);
+            assert_eq!(evidence[0].kind, EvidenceKind::Edit);
+        }
     }
 
     #[test]
@@ -1340,8 +1401,7 @@ mod tests {
         fs::create_dir_all(&repo).expect("repo");
         fs::create_dir_all(&other_repo).expect("other repo");
         let canonical_repo = super::canonicalize_or_normalize(&repo);
-        let workspace_root = home
-            .join("Library/Application Support/Cursor/User/workspaceStorage");
+        let workspace_root = home.join("Library/Application Support/Cursor/User/workspaceStorage");
         let matching_dir = workspace_root.join("aaa");
         let other_dir = workspace_root.join("bbb");
         fs::create_dir_all(&matching_dir).expect("matching dir");
@@ -1351,8 +1411,11 @@ mod tests {
             format!("{{\"folder\":\"{}\"}}\n", canonical_repo.to_string_lossy()),
         )
         .expect("matching workspace");
-        fs::write(other_dir.join("workspace.json"), "{\"folder\":\"/tmp/other\"}\n")
-            .expect("other workspace");
+        fs::write(
+            other_dir.join("workspace.json"),
+            "{\"folder\":\"/tmp/other\"}\n",
+        )
+        .expect("other workspace");
         let state = matching_dir.join("state.vscdb");
         fs::write(&state, "sqlite").expect("state db");
         fs::write(other_dir.join("state.vscdb"), "sqlite").expect("other state");
@@ -1372,8 +1435,8 @@ mod tests {
         fs::create_dir_all(&repo).expect("repo");
         fs::create_dir_all(&other_repo).expect("other repo");
         let canonical_repo = super::canonicalize_or_normalize(&repo);
-        let workspace_dir = home
-            .join("Library/Application Support/Cursor/User/workspaceStorage/abc");
+        let workspace_dir =
+            home.join("Library/Application Support/Cursor/User/workspaceStorage/abc");
         fs::create_dir_all(&workspace_dir).expect("workspace dir");
         fs::write(
             workspace_dir.join("workspace.json"),
@@ -1401,12 +1464,15 @@ mod tests {
         fs::create_dir_all(&repo).expect("repo");
         fs::create_dir_all(&other_repo).expect("other repo");
         let canonical_repo = super::canonicalize_or_normalize(&repo);
-        let workspace_dir = home
-            .join("Library/Application Support/Cursor/User/workspaceStorage/backup");
+        let workspace_dir =
+            home.join("Library/Application Support/Cursor/User/workspaceStorage/backup");
         fs::create_dir_all(&workspace_dir).expect("workspace dir");
         fs::write(
             workspace_dir.join("workspace.json"),
-            format!("{{\"workspacePath\":\"{}\"}}\n", canonical_repo.to_string_lossy()),
+            format!(
+                "{{\"workspacePath\":\"{}\"}}\n",
+                canonical_repo.to_string_lossy()
+            ),
         )
         .expect("workspace json");
         let backup = workspace_dir.join("state.vscdb.backup");
@@ -1499,8 +1565,11 @@ mod tests {
         fs::create_dir_all(session_root.join("tool-results")).expect("tool-results");
         fs::write(&root_jsonl, "{\"type\":\"assistant\"}\n").expect("root");
         fs::write(&subagent_jsonl, "{\"type\":\"assistant\"}\n").expect("sub");
-        fs::write(claude_root.join("memory/ignore.jsonl"), "{\"type\":\"assistant\"}\n")
-            .expect("ignore");
+        fs::write(
+            claude_root.join("memory/ignore.jsonl"),
+            "{\"type\":\"assistant\"}\n",
+        )
+        .expect("ignore");
         fs::write(session_root.join("tool-results/out.txt"), "stdout").expect("txt");
 
         let discovered = discover_sessions_with_adapter(AdapterId::ClaudeCode, &repo, &home);
@@ -1549,7 +1618,8 @@ mod tests {
         let other_repo = temp.path().join("other-repo");
         fs::create_dir_all(&repo).expect("repo");
         fs::create_dir_all(&other_repo).expect("other repo");
-        let repo_hash = super::sha256_hex(&super::canonicalize_or_normalize(&repo).to_string_lossy());
+        let repo_hash =
+            super::sha256_hex(&super::canonicalize_or_normalize(&repo).to_string_lossy());
         let bucket = home.join(".gemini/tmp").join(repo_hash);
         let chat = bucket.join("chats/session-2026.json");
         let logs = bucket.join("logs.json");
@@ -1558,8 +1628,11 @@ mod tests {
         fs::write(&logs, "[]\n").expect("logs");
         let other_bucket = home.join(".gemini/tmp").join("other").join("chats");
         fs::create_dir_all(&other_bucket).expect("other");
-        fs::write(other_bucket.join("session-ignore.json"), "{\"sessionId\":\"b\"}\n")
-            .expect("other session");
+        fs::write(
+            other_bucket.join("session-ignore.json"),
+            "{\"sessionId\":\"b\"}\n",
+        )
+        .expect("other session");
 
         let discovered = discover_sessions_with_adapter(AdapterId::GeminiCli, &repo, &home);
         assert_eq!(discovered, vec![chat, logs]);
@@ -1620,12 +1693,15 @@ mod tests {
         fs::write(repo.join(".git/opencode"), format!("{project_id}\n")).expect("opencode cache");
 
         let data_root = home.join(".local/share/opencode");
-        let current_info = data_root
-            .join(format!("project/{project_id}/storage/session/info/info.json"));
-        let current_message = data_root
-            .join(format!("project/{project_id}/storage/session/message/sess-a/msg.json"));
-        let current_part = data_root
-            .join(format!("project/{project_id}/storage/session/part/sess-a/part.json"));
+        let current_info = data_root.join(format!(
+            "project/{project_id}/storage/session/info/info.json"
+        ));
+        let current_message = data_root.join(format!(
+            "project/{project_id}/storage/session/message/sess-a/msg.json"
+        ));
+        let current_part = data_root.join(format!(
+            "project/{project_id}/storage/session/part/sess-a/part.json"
+        ));
         let legacy_session = data_root.join(format!("storage/session/{project_id}/legacy.json"));
         let other_project = data_root.join("project/other/storage/session/info/ignore.json");
         for path in [

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
-use engram::anchor::fingerprint_text;
+use engram::anchor::{fingerprint_anchor_hashes, fingerprint_window_hashes};
 use engram::config::{
     EffectiveWatchConfig, EffectiveWatchSource, ensure_user_config,
     load_effective_config_with_override,
@@ -1952,9 +1952,15 @@ fn derive_anchor_candidates(span_texts: &[String]) -> Vec<String> {
     let mut out = Vec::new();
 
     for span_text in span_texts {
-        let fingerprint = fingerprint_text(span_text).fingerprint;
-        if !fingerprint.is_empty() && seen.insert(fingerprint.clone()) {
-            out.push(fingerprint);
+        for fingerprint in fingerprint_anchor_hashes(span_text) {
+            if seen.insert(fingerprint.clone()) {
+                out.push(fingerprint);
+            }
+        }
+        for fingerprint in fingerprint_window_hashes(span_text) {
+            if seen.insert(fingerprint.clone()) {
+                out.push(fingerprint);
+            }
         }
     }
 

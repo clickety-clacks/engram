@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-use engram::anchor::fingerprint_text;
+use engram::anchor::{fingerprint_anchor_hashes, fingerprint_text};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -193,6 +193,51 @@ fn explain_matches_winnow_edit_anchor_for_multiline_span_with_trailing_newline()
         explain["lineage"].as_array().expect("lineage").len(),
         1,
         "expected inbound edit linkage for exact multiline winnow anchor"
+    );
+}
+
+#[test]
+fn explain_matches_windowed_edit_anchor_for_arbitrary_subspan() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+    fs::create_dir_all(repo.join("src")).expect("src dir");
+
+    let file_text = (1..=24)
+        .map(|line| format!("fn line_{line}() {{ value_{line}(); }}\n"))
+        .collect::<String>();
+    fs::write(repo.join("src/lib.rs"), &file_text).expect("seed file");
+
+    let _ = run_json(repo, &["init"], None);
+
+    let after_anchor_hashes = fingerprint_anchor_hashes(&file_text);
+    assert!(
+        after_anchor_hashes.len() >= 3,
+        "anchors={after_anchor_hashes:?}"
+    );
+
+    let transcript = format!(
+        concat!(
+            "{{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"code.edit\",\"file\":\"src/lib.rs\",",
+            "\"before_range\":[1,24],\"after_range\":[1,24],",
+            "\"before_text\":\"fn old() {{ legacy(); }}\\n\",",
+            "\"after_text\":{0},\"similarity\":0.95}}\n"
+        ),
+        serde_json::to_string(&file_text).expect("text")
+    );
+    let _ = run_json(repo, &["record", "--stdin"], Some(&transcript));
+
+    let explain = run_json(repo, &["explain", "src/lib.rs:9-14"], None);
+    let query_anchors = explain["query"]["anchors"].as_array().expect("anchors");
+    assert!(
+        after_anchor_hashes
+            .iter()
+            .any(|anchor| query_anchors.contains(&Value::String(anchor.clone()))),
+        "expected query anchors to overlap stored windowed anchors: query={query_anchors:?} stored={after_anchor_hashes:?}"
+    );
+    assert_eq!(
+        explain["sessions"].as_array().expect("sessions").len(),
+        1,
+        "expected explain to recover session via overlapping windowed anchor"
     );
 }
 

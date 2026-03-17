@@ -3,8 +3,10 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use engram::anchor::fingerprint_anchor_hashes;
 use engram::index::SqliteIndex;
 use engram::index::lineage::LINK_THRESHOLD_DEFAULT;
+use engram::query::{ExplainTraversal, explain_by_anchor};
 use engram::tape::adapters::{
     claude_jsonl_to_tape_jsonl, codex_jsonl_to_tape_jsonl, gemini_json_to_tape_jsonl,
     openclaw_jsonl_to_tape_jsonl,
@@ -22,31 +24,37 @@ fn collect_winnow_anchors(events: &[engram::tape::TapeEventAt]) -> BTreeSet<Stri
     for item in events {
         match &item.event.data {
             TapeEventData::CodeRead(read) => {
-                anchors.extend(
-                    read.anchor_hashes
-                        .iter()
-                        .filter(|anchor| anchor.starts_with("winnow:"))
-                        .cloned(),
-                );
+                if let Some(text) = read.text.as_deref() {
+                    anchors.extend(fingerprint_anchor_hashes(text));
+                } else {
+                    anchors.extend(
+                        read.anchor_hashes
+                            .iter()
+                            .filter(|anchor| anchor.starts_with("winnow:"))
+                            .cloned(),
+                    );
+                }
             }
             TapeEventData::CodeEdit(edit) => {
-                anchors.extend(
-                    edit.before_anchor_hashes
-                        .iter()
-                        .chain(edit.after_anchor_hashes.iter())
-                        .filter(|anchor| anchor.starts_with("winnow:"))
-                        .cloned(),
-                );
-
-                if let Some(anchor) = edit.before_hash.as_deref()
-                    && anchor.starts_with("winnow:")
-                {
-                    anchors.insert(anchor.to_string());
+                if let Some(text) = edit.before_text.as_deref() {
+                    anchors.extend(fingerprint_anchor_hashes(text));
+                } else {
+                    anchors.extend(
+                        edit.before_anchor_hashes
+                            .iter()
+                            .filter(|anchor| anchor.starts_with("winnow:"))
+                            .cloned(),
+                    );
                 }
-                if let Some(anchor) = edit.after_hash.as_deref()
-                    && anchor.starts_with("winnow:")
-                {
-                    anchors.insert(anchor.to_string());
+                if let Some(text) = edit.after_text.as_deref() {
+                    anchors.extend(fingerprint_anchor_hashes(text));
+                } else {
+                    anchors.extend(
+                        edit.after_anchor_hashes
+                            .iter()
+                            .filter(|anchor| anchor.starts_with("winnow:"))
+                            .cloned(),
+                    );
                 }
             }
             TapeEventData::SpanLink(_) | TapeEventData::Meta(_) | TapeEventData::Other { .. } => {}
@@ -100,6 +108,22 @@ where
     assert!(
         evidence_rows > 0,
         "expected {label} live sample to store evidence rows for winnow anchors"
+    );
+
+    let explain = explain_by_anchor(
+        &index,
+        &[winnow_anchors
+            .iter()
+            .next()
+            .expect("sample anchor")
+            .to_string()],
+        ExplainTraversal::default(),
+        true,
+    )
+    .expect("explain should succeed");
+    assert!(
+        !explain.direct.is_empty(),
+        "expected {label} live sample explain query to return at least one direct hit"
     );
 }
 

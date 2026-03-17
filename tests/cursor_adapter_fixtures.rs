@@ -51,11 +51,14 @@ fn cursor_supported_paths_emit_deterministic_events_and_partial_coverage_meta() 
         .find(|event| event["k"] == "code.edit")
         .expect("expected code.edit from writeToolCall result");
     assert_eq!(edit["file"], "/Users/user/project/summary.txt");
+    assert_eq!(edit["after_text"].as_str(), Some("x"));
 
-    assert!(
-        events.iter().all(|event| event["k"] != "code.read"),
-        "events={events:?}"
-    );
+    let read = events
+        .iter()
+        .find(|event| event["k"] == "code.read")
+        .expect("expected code.read from readToolCall result");
+    assert_eq!(read["file"], "/Users/user/project/README.md");
+    assert_eq!(read["text"].as_str(), Some("hello"));
 }
 
 #[test]

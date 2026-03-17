@@ -5,6 +5,7 @@ use std::ops::Deref;
 
 use rusqlite::{Connection, params};
 
+use crate::anchor::fingerprint_anchor_hashes;
 use crate::index::lineage::{
     Cardinality, EvidenceFragmentRef, EvidenceKind, LINK_THRESHOLD_DEFAULT, LocationDelta,
     SpanEdge, StoredEdgeClass, Tombstone,
@@ -523,15 +524,21 @@ impl SqliteIndex {
                         file_path: read.file.clone(),
                         timestamp: item.event.timestamp.clone(),
                     };
-                    for anchor in &read.anchor_hashes {
-                        Self::insert_evidence_on(tx.deref(), anchor, &fragment)?;
+                    for anchor in read_evidence_anchors(read) {
+                        Self::insert_evidence_on(tx.deref(), &anchor, &fragment)?;
                     }
                 }
                 TapeEventData::CodeEdit(edit) => {
-                    let before_anchors =
-                        edit_side_anchors(edit.before_hash.as_deref(), &edit.before_anchor_hashes);
-                    let after_anchors =
-                        edit_side_anchors(edit.after_hash.as_deref(), &edit.after_anchor_hashes);
+                    let before_anchors = edit_side_anchors(
+                        edit.before_text.as_deref(),
+                        edit.before_hash.as_deref(),
+                        &edit.before_anchor_hashes,
+                    );
+                    let after_anchors = edit_side_anchors(
+                        edit.after_text.as_deref(),
+                        edit.after_hash.as_deref(),
+                        &edit.after_anchor_hashes,
+                    );
 
                     if !before_anchors.is_empty() {
                         let fragment = EvidenceFragmentRef {
@@ -731,7 +738,21 @@ fn encode_span_link_anchor(file: &str, range: crate::tape::event::FileRange) -> 
     format!("span:{file}:{}-{}", range.start, range.end)
 }
 
-fn edit_side_anchors(hash: Option<&str>, anchors: &[String]) -> Vec<String> {
+fn read_evidence_anchors(read: &crate::tape::event::CodeReadEvent) -> Vec<String> {
+    if let Some(text) = read.text.as_deref() {
+        return fingerprint_anchor_hashes(text);
+    }
+    dedupe_legacy_anchors(None, &read.anchor_hashes)
+}
+
+fn edit_side_anchors(text: Option<&str>, hash: Option<&str>, anchors: &[String]) -> Vec<String> {
+    if let Some(text) = text {
+        return fingerprint_anchor_hashes(text);
+    }
+    dedupe_legacy_anchors(hash, anchors)
+}
+
+fn dedupe_legacy_anchors(hash: Option<&str>, anchors: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
 
@@ -851,6 +872,7 @@ fn derive_stored_class(agent_link: bool, confidence: f32) -> StoredEdgeClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::anchor::fingerprint_anchor_hashes;
     use crate::index::lineage::LINK_THRESHOLD_DEFAULT;
     use crate::tape::event::{CodeEditEvent, CodeReadEvent, FileRange, TapeEvent, TapeEventData};
 
@@ -862,6 +884,7 @@ mod tests {
                 data: TapeEventData::CodeRead(CodeReadEvent {
                     file: file.to_string(),
                     range: FileRange { start: 1, end: 1 },
+                    text: None,
                     anchor_hashes: vec![anchor.to_string()],
                 }),
             },
@@ -892,6 +915,8 @@ mod tests {
                     file: file.to_string(),
                     before_range: Some(FileRange { start: 10, end: 12 }),
                     after_range: Some(FileRange { start: 10, end: 13 }),
+                    before_text: None,
+                    after_text: None,
                     before_hash: before_hash.map(ToOwned::to_owned),
                     after_hash: after_hash.map(ToOwned::to_owned),
                     before_anchor_hashes: before_hash
@@ -954,8 +979,16 @@ mod tests {
     }
 
     #[test]
-    fn ingests_edit_winnow_anchors_as_direct_evidence() {
+    fn ingests_windowed_edit_text_as_direct_evidence() {
         let index = SqliteIndex::open_in_memory().expect("in-memory sqlite");
+        let before_text = (1..=24)
+            .map(|line| format!("fn before_{line}() {{ value_{line}(); }}\n"))
+            .collect::<String>();
+        let after_text = (1..=24)
+            .map(|line| format!("fn after_{line}() {{ value_{line}(); }}\n"))
+            .collect::<String>();
+        let before_anchors = fingerprint_anchor_hashes(&before_text);
+        let after_anchors = fingerprint_anchor_hashes(&after_text);
         let events = vec![TapeEventAt {
             offset: 1,
             event: TapeEvent {
@@ -964,10 +997,12 @@ mod tests {
                     file: "src/lib.rs".to_string(),
                     before_range: Some(FileRange { start: 10, end: 12 }),
                     after_range: Some(FileRange { start: 10, end: 13 }),
-                    before_hash: Some("before".to_string()),
-                    after_hash: Some("after".to_string()),
-                    before_anchor_hashes: vec!["winnow:before".to_string()],
-                    after_anchor_hashes: vec!["winnow:after".to_string()],
+                    before_text: Some(before_text),
+                    after_text: Some(after_text),
+                    before_hash: None,
+                    after_hash: None,
+                    before_anchor_hashes: Vec::new(),
+                    after_anchor_hashes: Vec::new(),
                     similarity: Some(0.80),
                 }),
             },
@@ -977,31 +1012,20 @@ mod tests {
             .ingest_tape_events("tape-1", &events, LINK_THRESHOLD_DEFAULT)
             .expect("ingest succeeds");
 
+        assert!(before_anchors.len() >= 3, "anchors={before_anchors:?}");
+        assert!(after_anchors.len() >= 3, "anchors={after_anchors:?}");
+
         let before_refs = index
-            .evidence_for_anchor("winnow:before")
+            .evidence_for_anchor(&before_anchors[0])
             .expect("before winnow evidence");
         assert_eq!(before_refs.len(), 1);
         assert_eq!(before_refs[0].kind, EvidenceKind::Edit);
-        assert_eq!(
-            index
-                .evidence_for_anchor("before")
-                .expect("legacy before evidence")
-                .len(),
-            0
-        );
 
         let after_refs = index
-            .evidence_for_anchor("winnow:after")
+            .evidence_for_anchor(&after_anchors[0])
             .expect("after winnow evidence");
         assert_eq!(after_refs.len(), 1);
         assert_eq!(after_refs[0].kind, EvidenceKind::Edit);
-        assert_eq!(
-            index
-                .evidence_for_anchor("after")
-                .expect("legacy after evidence")
-                .len(),
-            0
-        );
     }
 
     #[test]

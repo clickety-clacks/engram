@@ -25,6 +25,14 @@ pub fn fingerprint_text(text: &str) -> SpanAnchor {
     SpanAnchor { fingerprint }
 }
 
+pub fn fingerprint_feature_hashes(text: &str) -> Vec<String> {
+    let tokens = tokenize(text);
+    winnowed_features(&tokens, DEFAULT_K_GRAM, DEFAULT_WINDOW)
+        .into_iter()
+        .map(|hash| format!("winnow:{hash:016x}"))
+        .collect()
+}
+
 pub fn fingerprint_similarity(left: &str, right: &str) -> Option<f32> {
     let left_features = parse_fingerprint(left)?;
     let right_features = parse_fingerprint(right)?;

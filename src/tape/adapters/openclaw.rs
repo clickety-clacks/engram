@@ -2,9 +2,6 @@ use std::collections::HashMap;
 
 use chrono::{SecondsFormat, TimeZone, Utc};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-
-use crate::anchor::fingerprint_anchor_hashes;
 
 const DEFAULT_TS: &str = "1970-01-01T00:00:00Z";
 
@@ -20,10 +17,8 @@ struct ToolCallContext {
     kind: ToolKind,
     file: Option<String>,
     range: [u32; 2],
-    before_hash: Option<String>,
-    after_hash: Option<String>,
-    before_anchor_hashes: Vec<String>,
-    after_anchor_hashes: Vec<String>,
+    before_text: Option<String>,
+    after_text: Option<String>,
 }
 
 pub fn openclaw_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Error> {
@@ -289,12 +284,7 @@ fn emit_tool_result_message(
                 event.insert("file".to_string(), json!(file));
                 event.insert("range".to_string(), json!(context.range));
                 if !text.is_empty() {
-                    event.insert(
-                        "anchor_hashes".to_string(),
-                        json!(fingerprint_anchor_hashes(&text)),
-                    );
-                } else {
-                    event.insert("anchor_hashes".to_string(), json!([]));
+                    event.insert("text".to_string(), json!(text));
                 }
                 event.insert("range_basis".to_string(), json!("line"));
                 out.push(Value::Object(event));
@@ -302,48 +292,25 @@ fn emit_tool_result_message(
         }
         ToolKind::Edit => {
             if let Some(file) = context.file {
-                let before_hash = context.before_hash;
-                let before_anchor_hashes = context.before_anchor_hashes;
-                let after_hash = context.after_hash.or_else(|| {
+                let before_text = context.before_text;
+                let after_text = context.after_text.or_else(|| {
                     if text.is_empty() {
                         None
                     } else {
-                        Some(hash_text(&text))
+                        Some(text.clone())
                     }
                 });
-                let after_anchor_hashes =
-                    if context.after_anchor_hashes.is_empty() && !text.is_empty() {
-                        fingerprint_anchor_hashes(&text)
-                    } else {
-                        context.after_anchor_hashes
-                    };
-                if before_hash.is_some()
-                    || after_hash.is_some()
-                    || !before_anchor_hashes.is_empty()
-                    || !after_anchor_hashes.is_empty()
-                {
+                if before_text.is_some() || after_text.is_some() {
                     let mut event = serde_json::Map::new();
                     event.insert("t".to_string(), json!(timestamp));
                     event.insert("k".to_string(), json!("code.edit"));
                     event.insert("source".to_string(), source_block(session_id));
                     event.insert("file".to_string(), json!(file));
-                    if let Some(before_hash) = before_hash {
-                        event.insert("before_hash".to_string(), json!(before_hash));
+                    if let Some(before_text) = before_text {
+                        event.insert("before_text".to_string(), json!(before_text));
                     }
-                    if let Some(after_hash) = after_hash {
-                        event.insert("after_hash".to_string(), json!(after_hash));
-                    }
-                    if !before_anchor_hashes.is_empty() {
-                        event.insert(
-                            "before_anchor_hashes".to_string(),
-                            json!(before_anchor_hashes),
-                        );
-                    }
-                    if !after_anchor_hashes.is_empty() {
-                        event.insert(
-                            "after_anchor_hashes".to_string(),
-                            json!(after_anchor_hashes),
-                        );
+                    if let Some(after_text) = after_text {
+                        event.insert("after_text".to_string(), json!(after_text));
                     }
                     out.push(Value::Object(event));
                 }
@@ -359,10 +326,8 @@ fn tool_context_for(tool_name: &str, args: &Value) -> ToolCallContext {
         kind,
         file: extract_file_path(args),
         range: extract_line_range(args),
-        before_hash: extract_before_hash(args),
-        after_hash: extract_after_hash(args),
-        before_anchor_hashes: extract_before_anchor_hashes(args),
-        after_anchor_hashes: extract_after_anchor_hashes(args),
+        before_text: extract_before_text(args),
+        after_text: extract_after_text(args),
     }
 }
 
@@ -436,50 +401,27 @@ fn extract_line_range(args: &Value) -> [u32; 2] {
     [start.max(1), end.max(start.max(1))]
 }
 
-fn extract_before_hash(args: &Value) -> Option<String> {
-    let obj = args.as_object()?;
-    obj.get("before_hash")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .or_else(|| obj.get("old_string").and_then(Value::as_str).map(hash_text))
-        .or_else(|| obj.get("oldString").and_then(Value::as_str).map(hash_text))
-        .or_else(|| obj.get("before").and_then(Value::as_str).map(hash_text))
-}
-
-fn extract_before_anchor_hashes(args: &Value) -> Vec<String> {
+fn extract_before_text(args: &Value) -> Option<String> {
     let Some(obj) = args.as_object() else {
-        return Vec::new();
+        return None;
     };
     obj.get("old_string")
         .and_then(Value::as_str)
         .or_else(|| obj.get("oldString").and_then(Value::as_str))
         .or_else(|| obj.get("before").and_then(Value::as_str))
-        .map(fingerprint_anchor_hashes)
-        .unwrap_or_default()
-}
-
-fn extract_after_hash(args: &Value) -> Option<String> {
-    let obj = args.as_object()?;
-    obj.get("after_hash")
-        .and_then(Value::as_str)
         .map(ToOwned::to_owned)
-        .or_else(|| obj.get("new_string").and_then(Value::as_str).map(hash_text))
-        .or_else(|| obj.get("newString").and_then(Value::as_str).map(hash_text))
-        .or_else(|| obj.get("after").and_then(Value::as_str).map(hash_text))
-        .or_else(|| obj.get("content").and_then(Value::as_str).map(hash_text))
 }
 
-fn extract_after_anchor_hashes(args: &Value) -> Vec<String> {
+fn extract_after_text(args: &Value) -> Option<String> {
     let Some(obj) = args.as_object() else {
-        return Vec::new();
+        return None;
     };
     obj.get("new_string")
         .and_then(Value::as_str)
         .or_else(|| obj.get("newString").and_then(Value::as_str))
         .or_else(|| obj.get("after").and_then(Value::as_str))
         .or_else(|| obj.get("content").and_then(Value::as_str))
-        .map(fingerprint_anchor_hashes)
-        .unwrap_or_default()
+        .map(ToOwned::to_owned)
 }
 
 fn join_text_blocks(content_blocks: &[Value]) -> String {
@@ -534,18 +476,6 @@ fn timestamp_from_epoch_millis(epoch_millis: i64) -> Option<String> {
     Utc.timestamp_millis_opt(epoch_millis)
         .single()
         .map(|ts| ts.to_rfc3339_opts(SecondsFormat::Secs, true))
-}
-
-fn hash_text(text: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(text.as_bytes());
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(&mut out, "{byte:02x}");
-    }
-    out
 }
 
 fn to_jsonl(events: &[Value]) -> Result<String, serde_json::Error> {
@@ -628,17 +558,18 @@ mod tests {
             .find(|row| row["k"] == "code.read")
             .expect("code.read");
         assert_eq!(code_read["file"], "src/auth.rs");
-        let anchors = code_read["anchor_hashes"]
-            .as_array()
-            .expect("anchor hashes");
-        assert!(!anchors.is_empty());
+        assert!(
+            code_read["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("verify_token"))
+        );
 
         let code_edit = rows
             .iter()
             .find(|row| row["k"] == "code.edit")
             .expect("code.edit");
         assert_eq!(code_edit["file"], "src/auth.rs");
-        assert!(code_edit.get("before_hash").is_some());
-        assert!(code_edit.get("after_hash").is_some());
+        assert!(code_edit.get("before_text").is_some());
+        assert!(code_edit.get("after_text").is_some());
     }
 }

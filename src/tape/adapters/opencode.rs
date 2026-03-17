@@ -1,8 +1,5 @@
 use chrono::{SecondsFormat, TimeZone, Utc};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-
-use crate::anchor::fingerprint_anchor_hashes;
 
 pub fn opencode_json_to_tape_jsonl(input: &str) -> Result<String, serde_json::Error> {
     let root: Value = serde_json::from_str(input)?;
@@ -126,6 +123,7 @@ pub fn opencode_json_to_tape_jsonl(input: &str) -> Result<String, serde_json::Er
                                     "source": source_block("opencode", session_id.as_deref()),
                                     "file": file,
                                     "range": [start, end],
+                                    "text": state.and_then(|obj| obj.get("output")).and_then(Value::as_str),
                                     "range_basis": "line"
                                 }));
                             }
@@ -142,10 +140,8 @@ pub fn opencode_json_to_tape_jsonl(input: &str) -> Result<String, serde_json::Er
                                     "k": "code.edit",
                                     "source": source_block("opencode", session_id.as_deref()),
                                     "file": file,
-                                    "before_hash": tool_input.get("oldString").and_then(Value::as_str).map(hash_text),
-                                    "after_hash": tool_input.get("newString").and_then(Value::as_str).map(hash_text),
-                                    "before_anchor_hashes": tool_input.get("oldString").and_then(Value::as_str).map(fingerprint_anchor_hashes).unwrap_or_default(),
-                                    "after_anchor_hashes": tool_input.get("newString").and_then(Value::as_str).map(fingerprint_anchor_hashes).unwrap_or_default()
+                                    "before_text": tool_input.get("oldString").and_then(Value::as_str),
+                                    "after_text": tool_input.get("newString").and_then(Value::as_str)
                                 }));
                             }
                         }
@@ -161,8 +157,7 @@ pub fn opencode_json_to_tape_jsonl(input: &str) -> Result<String, serde_json::Er
                                     "k": "code.edit",
                                     "source": source_block("opencode", session_id.as_deref()),
                                     "file": file,
-                                    "after_hash": tool_input.get("content").and_then(Value::as_str).map(hash_text),
-                                    "after_anchor_hashes": tool_input.get("content").and_then(Value::as_str).map(fingerprint_anchor_hashes).unwrap_or_default()
+                                    "after_text": tool_input.get("content").and_then(Value::as_str)
                                 }));
                             }
                         }
@@ -263,18 +258,6 @@ fn source_block(harness: &str, session_id: Option<&str>) -> Value {
             "harness": harness
         }),
     }
-}
-
-fn hash_text(text: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(text.as_bytes());
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(&mut out, "{byte:02x}");
-    }
-    out
 }
 
 fn extract_patch_files(patch_text: &str) -> Vec<String> {

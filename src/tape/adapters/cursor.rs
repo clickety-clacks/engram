@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde_json::{Value, json};
 
 const CURSOR_COVERAGE_TOOL: &str = "full";
@@ -9,6 +11,7 @@ pub fn cursor_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
     let mut session_id: Option<String> = None;
     let mut first_timestamp: Option<String> = None;
     let mut emitted_meta = false;
+    let mut tool_contexts = HashMap::<String, CursorToolContext>::new();
 
     for line in input.lines() {
         if line.trim().is_empty() {
@@ -95,32 +98,48 @@ pub fn cursor_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
                         call.insert("args".to_string(), json!(args));
                         if let Some(call_id) = &call_id {
                             call.insert("call_id".to_string(), json!(call_id));
+                            tool_contexts.insert(call_id.clone(), cursor_tool_context(&row));
                         }
                         out.push(Value::Object(call));
                     }
                     "completed" => {
+                        let stdout = cursor_tool_stdout(&row).unwrap_or_default();
+                        let context = call_id
+                            .as_ref()
+                            .and_then(|id| tool_contexts.remove(id))
+                            .unwrap_or_default();
                         let mut result = serde_json::Map::new();
                         result.insert("t".to_string(), json!(timestamp));
                         result.insert("k".to_string(), json!("tool.result"));
                         result.insert("source".to_string(), cursor_source(session_id.as_deref()));
                         result.insert("tool".to_string(), json!(tool));
                         result.insert("exit".to_string(), json!(cursor_tool_exit_code(&row)));
-                        result.insert(
-                            "stdout".to_string(),
-                            json!(cursor_tool_stdout(&row).unwrap_or_default()),
-                        );
+                        result.insert("stdout".to_string(), json!(stdout.clone()));
                         result.insert("stderr".to_string(), json!(cursor_tool_stderr(&row)));
                         if let Some(call_id) = &call_id {
                             result.insert("call_id".to_string(), json!(call_id));
                         }
                         out.push(Value::Object(result));
 
-                        if let Some(file) = cursor_write_edit_path(&row) {
+                        if let Some(file) = context.read_path {
+                            out.push(json!({
+                                "t": timestamp,
+                                "k": "code.read",
+                                "source": cursor_source(session_id.as_deref()),
+                                "file": file,
+                                "range": [1, 1],
+                                "text": if stdout.is_empty() { Value::Null } else { json!(stdout) },
+                                "range_basis": "line"
+                            }));
+                        }
+
+                        if let Some(file) = context.write_path {
                             out.push(json!({
                                 "t": timestamp,
                                 "k": "code.edit",
                                 "source": cursor_source(session_id.as_deref()),
-                                "file": file
+                                "file": file,
+                                "after_text": context.write_text
                             }));
                         }
                     }
@@ -146,6 +165,13 @@ pub fn cursor_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
     }
 
     to_jsonl(&out)
+}
+
+#[derive(Debug, Default)]
+struct CursorToolContext {
+    read_path: Option<String>,
+    write_path: Option<String>,
+    write_text: Option<String>,
 }
 
 fn content_text(value: &Value) -> String {
@@ -317,6 +343,14 @@ fn cursor_tool_exit_code(row: &Value) -> i64 {
     if has_error { 1 } else { 0 }
 }
 
+fn cursor_tool_context(row: &Value) -> CursorToolContext {
+    CursorToolContext {
+        read_path: cursor_read_path(row),
+        write_path: cursor_write_edit_path(row),
+        write_text: cursor_write_text(row),
+    }
+}
+
 fn cursor_write_edit_path(row: &Value) -> Option<String> {
     let tool_call = row.get("tool_call").and_then(Value::as_object)?;
     let write = tool_call.get("writeToolCall")?;
@@ -334,6 +368,26 @@ fn cursor_write_edit_path(row: &Value) -> Option<String> {
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
         })
+}
+
+fn cursor_read_path(row: &Value) -> Option<String> {
+    let tool_call = row.get("tool_call").and_then(Value::as_object)?;
+    tool_call
+        .get("readToolCall")
+        .and_then(|read| read.get("args"))
+        .and_then(|args| args.get("path"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn cursor_write_text(row: &Value) -> Option<String> {
+    let tool_call = row.get("tool_call").and_then(Value::as_object)?;
+    tool_call
+        .get("writeToolCall")
+        .and_then(|write| write.get("args"))
+        .and_then(|args| args.get("content"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 #[cfg(test)]
@@ -373,6 +427,13 @@ mod tests {
             .expect("read tool.call");
         assert_eq!(read_call["call_id"], "toolu_vrtx_01NnjaR886UcE8whekg2MGJd");
 
+        let read = events
+            .iter()
+            .find(|event| event.get("k").and_then(Value::as_str) == Some("code.read"))
+            .expect("code.read event");
+        assert_eq!(read["file"], "/Users/user/project/README.md");
+        assert_eq!(read["text"].as_str(), Some("hello"));
+
         let write_result = events
             .iter()
             .find(|event| {
@@ -387,5 +448,6 @@ mod tests {
             .find(|event| event.get("k").and_then(Value::as_str) == Some("code.edit"))
             .expect("code.edit event");
         assert_eq!(edit["file"], "/Users/user/project/summary.txt");
+        assert_eq!(edit["after_text"].as_str(), Some("x"));
     }
 }
