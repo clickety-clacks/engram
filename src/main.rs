@@ -39,6 +39,9 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
+const MAX_QUERY_WINDOW_ANCHORS: usize = 16;
+const MAX_LOOKUP_WINDOW_ANCHORS: usize = 128;
+
 const TAPE_SUFFIX: &str = ".jsonl.zst";
 const TRANSCRIPT_WINDOW_RADIUS: usize = 2;
 const CURSOR_GUARD_WINDOW: usize = 512;
@@ -1969,6 +1972,37 @@ fn resolve_explain_lookup_anchors(
     }
 
     let (file, _, _) = parse_file_range_target(target)?;
+    let mut scored: HashMap<String, (f32, u64)> = HashMap::new();
+
+    for index in indexes {
+        for (stored_anchor, hits) in index.window_anchor_stats_for_file(file)? {
+            let best_score = query_anchors
+                .iter()
+                .filter_map(|query_anchor| fingerprint_similarity(query_anchor, &stored_anchor))
+                .fold(0.0_f32, f32::max);
+            if best_score <= 0.0 {
+                continue;
+            }
+
+            scored
+                .entry(stored_anchor)
+                .and_modify(|entry| {
+                    entry.0 = entry.0.max(best_score);
+                    entry.1 = entry.1.max(hits);
+                })
+                .or_insert((best_score, hits));
+        }
+    }
+
+    let mut ranked = scored.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|(left_anchor, left_stats), (right_anchor, right_stats)| {
+        right_stats
+            .0
+            .total_cmp(&left_stats.0)
+            .then_with(|| right_stats.1.cmp(&left_stats.1))
+            .then_with(|| left_anchor.cmp(right_anchor))
+    });
+
     let mut seen = HashSet::new();
     let mut out = Vec::new();
 
@@ -1978,16 +2012,9 @@ fn resolve_explain_lookup_anchors(
         }
     }
 
-    for index in indexes {
-        for stored_anchor in index.anchors_for_file(file)? {
-            if query_anchors.iter().any(|query_anchor| {
-                query_anchor == &stored_anchor
-                    || fingerprint_similarity(query_anchor, &stored_anchor)
-                        .is_some_and(|score| score > 0.0)
-            }) && seen.insert(stored_anchor.clone())
-            {
-                out.push(stored_anchor);
-            }
+    for (anchor, _) in ranked.into_iter().take(MAX_LOOKUP_WINDOW_ANCHORS) {
+        if seen.insert(anchor.clone()) {
+            out.push(anchor);
         }
     }
 
@@ -2003,6 +2030,26 @@ fn derive_anchor_candidates(span_texts: &[String]) -> Vec<String> {
             if seen.insert(fingerprint.clone()) {
                 out.push(fingerprint);
             }
+        }
+    }
+
+    sample_anchor_candidates(out, MAX_QUERY_WINDOW_ANCHORS)
+}
+
+fn sample_anchor_candidates(anchors: Vec<String>, max_anchors: usize) -> Vec<String> {
+    if anchors.len() <= max_anchors || max_anchors == 0 {
+        return anchors;
+    }
+
+    let last = anchors.len() - 1;
+    let mut out = Vec::with_capacity(max_anchors);
+    let mut seen = HashSet::new();
+
+    for slot in 0..max_anchors {
+        let idx = slot * last / (max_anchors - 1);
+        let anchor = anchors[idx].clone();
+        if seen.insert(anchor.clone()) {
+            out.push(anchor);
         }
     }
 
@@ -2643,5 +2690,15 @@ mod tests {
         assert!(!watch_event_kind_supported(&EventKind::Remove(
             RemoveKind::Any
         )));
+    }
+
+    #[test]
+    fn derive_anchor_candidates_caps_large_queries() {
+        let text = (1..=1914)
+            .map(|line| format!("fn line_{line}() {{ value_{line}(); }}\n"))
+            .collect::<String>();
+
+        let anchors = derive_anchor_candidates(&[text]);
+        assert!(anchors.len() <= MAX_QUERY_WINDOW_ANCHORS);
     }
 }

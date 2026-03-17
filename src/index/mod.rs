@@ -362,18 +362,23 @@ impl SqliteIndex {
         Ok(out)
     }
 
-    pub fn anchors_for_file(&self, file_path: &str) -> rusqlite::Result<Vec<String>> {
+    pub fn window_anchor_stats_for_file(
+        &self,
+        file_path: &str,
+    ) -> rusqlite::Result<Vec<(String, u64)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT anchor
+            "SELECT anchor, COUNT(*) AS hits
              FROM evidence
              WHERE file_path = ?1
-             ORDER BY anchor ASC",
+               AND instr(anchor, ',') > 0
+             GROUP BY anchor
+             ORDER BY hits DESC, anchor ASC",
         )?;
 
         let mut rows = stmt.query(params![file_path])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
-            out.push(row.get(0)?);
+            out.push((row.get(0)?, row.get(1)?));
         }
         Ok(out)
     }
