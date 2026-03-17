@@ -135,6 +135,42 @@ fn ingest_is_local_scoped_incremental_and_idempotent() {
 }
 
 #[test]
+fn ingest_reimports_when_cursor_exists_but_db_and_tapes_are_wiped() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+
+    let source_path = repo.join("input.codex.jsonl");
+    fs::write(
+        &source_path,
+        include_str!("fixtures/codex/supported_paths.jsonl"),
+    )
+    .expect("seed source");
+
+    let first = run_json(&repo, &["ingest"], None, &home);
+    assert_eq!(first["status"], "ok");
+    assert_eq!(first["imported_tapes"], 1);
+
+    let cursor_path = cursor_state_path(&repo, &source_path);
+    assert!(cursor_path.exists(), "expected cursor state after first ingest");
+
+    let home_store = home.join(".engram");
+    fs::remove_file(home_store.join("index.sqlite")).expect("remove db");
+    for entry in fs::read_dir(home_store.join("tapes")).expect("tapes dir") {
+        let entry = entry.expect("tape entry");
+        if entry.path().is_file() {
+            fs::remove_file(entry.path()).expect("remove tape");
+        }
+    }
+
+    let second = run_json(&repo, &["ingest"], None, &home);
+    assert_eq!(second["status"], "ok");
+    assert_eq!(second["imported_tapes"], 1);
+    assert_eq!(second["skipped_unchanged"], 0);
+}
+
+#[test]
 fn ingest_path_args_respect_local_scope_and_limit_candidates() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");

@@ -391,7 +391,17 @@ fn cmd_ingest(
         let mut should_run_full = prior_state.is_none();
         let mut full_reason = None::<&str>;
         if let Some(prev) = prior_state.as_ref() {
-            if metadata.len() < prev.byte_cursor {
+            let prior_tape_path = tape_path_for_tapes_dir(&context.tapes_dir, &prev.tape_id);
+            let prior_tape_missing = !prior_tape_path.exists();
+            let prior_tape_unindexed = !index.has_tape(&prev.tape_id)?;
+            if prior_tape_missing || prior_tape_unindexed {
+                should_run_full = true;
+                full_reason = Some(if prior_tape_missing {
+                    "cursor_tape_missing"
+                } else {
+                    "cursor_tape_unindexed"
+                });
+            } else if metadata.len() < prev.byte_cursor {
                 should_run_full = true;
                 full_reason = Some("cursor_past_eof");
             } else {
