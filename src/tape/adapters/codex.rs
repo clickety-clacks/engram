@@ -2,8 +2,6 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 
-use crate::anchor::fingerprint_anchor_hashes;
-
 const CODEX_COVERAGE_TOOL: &str = "full";
 const CODEX_COVERAGE_READ: &str = "partial";
 const CODEX_COVERAGE_EDIT: &str = "partial";
@@ -299,17 +297,11 @@ fn emit_tool_call(
             event.insert("k".to_string(), json!("code.edit"));
             event.insert("source".to_string(), codex_source(session_id));
             event.insert("file".to_string(), json!(edit.file));
-            if !edit.before_anchor_hashes.is_empty() {
-                event.insert(
-                    "before_anchor_hashes".to_string(),
-                    json!(edit.before_anchor_hashes),
-                );
+            if let Some(before_text) = edit.before_text {
+                event.insert("before_text".to_string(), json!(before_text));
             }
-            if !edit.after_anchor_hashes.is_empty() {
-                event.insert(
-                    "after_anchor_hashes".to_string(),
-                    json!(edit.after_anchor_hashes),
-                );
+            if let Some(after_text) = edit.after_text {
+                event.insert("after_text".to_string(), json!(after_text));
             }
             out.push(Value::Object(event));
         }
@@ -325,8 +317,8 @@ fn value_to_argument_string(value: &Value) -> String {
 
 struct ApplyPatchEdit {
     file: String,
-    before_anchor_hashes: Vec<String>,
-    after_anchor_hashes: Vec<String>,
+    before_text: Option<String>,
+    after_text: Option<String>,
 }
 
 fn extract_apply_patch_edits(arguments: &str) -> Vec<ApplyPatchEdit> {
@@ -353,8 +345,8 @@ fn extract_apply_patch_edits(arguments: &str) -> Vec<ApplyPatchEdit> {
         if let Some(file) = current_file.take() {
             edits.push(ApplyPatchEdit {
                 file,
-                before_anchor_hashes: fingerprint_anchor_hashes(before),
-                after_anchor_hashes: fingerprint_anchor_hashes(after),
+                before_text: (!before.is_empty()).then(|| before.clone()),
+                after_text: (!after.is_empty()).then(|| after.clone()),
             });
             before.clear();
             after.clear();
@@ -456,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_adapter_emits_anchored_code_edit_for_custom_tool_call_apply_patch() {
+    fn codex_adapter_emits_textual_code_edit_for_custom_tool_call_apply_patch() {
         let input = r#"{"timestamp":"2025-11-03T20:59:25.465Z","type":"session_meta","payload":{"id":"019a4b84-7c94-7783-a08b-fb4674e68b65","model_provider":"openai"}}
 {"timestamp":"2025-11-03T20:59:25.465Z","type":"response_item","payload":{"type":"custom_tool_call","status":"completed","call_id":"call_patch","name":"apply_patch","input":"*** Begin Patch\n*** Update File: Helm/Features/Chat/Components/ChatScrollContent.swift\n@@\n-import SwiftUI\n-import Foundation\n+import SwiftUI\n+import Foundation\n+import OSLog\n@@\n-struct ChatScrollContent: View {\n+struct ChatScrollContent: View {\n     let messageIDs: [UUID]\n     let screenGeometry: GeometryProxy\n     let screenHeight: CGFloat\n*** End Patch"}} "#;
 
@@ -470,11 +462,14 @@ mod tests {
             .iter()
             .find(|event| event["k"] == "code.edit")
             .expect("code.edit event");
-        assert_eq!(edit["file"], "Helm/Features/Chat/Components/ChatScrollContent.swift");
+        assert_eq!(
+            edit["file"],
+            "Helm/Features/Chat/Components/ChatScrollContent.swift"
+        );
         assert!(
-            edit["after_anchor_hashes"]
-                .as_array()
-                .is_some_and(|anchors| !anchors.is_empty()),
+            edit["after_text"]
+                .as_str()
+                .is_some_and(|text| text.contains("import OSLog")),
             "events={events:?}"
         );
     }

@@ -1,7 +1,4 @@
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-
-use crate::anchor::fingerprint_anchor_hashes;
 
 pub fn gemini_json_to_tape_jsonl(input: &str) -> Result<String, serde_json::Error> {
     let root: Value = serde_json::from_str(input)?;
@@ -158,12 +155,14 @@ pub fn gemini_json_to_tape_jsonl(input: &str) -> Result<String, serde_json::Erro
                         if tool.eq_ignore_ascii_case("read_file") {
                             read_total = read_total.saturating_add(1);
                             if let Some(file) = args.get("file_path").and_then(Value::as_str) {
+                                let (stdout, _, _) = extract_gemini_tool_result(tool_call);
                                 out.push(json!({
                                     "t": tool_timestamp,
                                     "k": "code.read",
                                     "source": source_block(session_id),
                                     "file": file,
                                     "range": [1, 1],
+                                    "text": if stdout.is_empty() { Value::Null } else { json!(stdout) },
                                     "range_basis": "line"
                                 }));
                                 read_emitted = read_emitted.saturating_add(1);
@@ -178,8 +177,7 @@ pub fn gemini_json_to_tape_jsonl(input: &str) -> Result<String, serde_json::Erro
                                     "k": "code.edit",
                                     "source": source_block(session_id),
                                     "file": file,
-                                    "after_hash": args.get("content").and_then(Value::as_str).map(hash_text),
-                                    "after_anchor_hashes": args.get("content").and_then(Value::as_str).map(fingerprint_anchor_hashes).unwrap_or_default()
+                                    "after_text": args.get("content").and_then(Value::as_str)
                                 }));
                                 edit_emitted = edit_emitted.saturating_add(1);
                             }
@@ -287,18 +285,6 @@ fn to_jsonl(events: &[Value]) -> Result<String, serde_json::Error> {
     Ok(out)
 }
 
-fn hash_text(text: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(text.as_bytes());
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(&mut out, "{byte:02x}");
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
@@ -331,6 +317,7 @@ mod tests {
             .expect("code.read event");
         assert_eq!(read["file"], "/repo/README.md");
         assert_eq!(read["range"], json!([1, 1]));
+        assert!(read["text"].is_string());
 
         let edit = events
             .iter()
@@ -339,7 +326,7 @@ mod tests {
                     && event.get("file").and_then(Value::as_str) == Some("/repo/notes.txt")
             })
             .expect("code.edit event");
-        assert!(edit.get("after_hash").is_some());
+        assert!(edit.get("after_text").is_some());
 
         let tool_result = events
             .iter()

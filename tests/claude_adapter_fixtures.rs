@@ -38,7 +38,7 @@ fn claude_multiedit_fixture_emits_expanded_edits_and_full_coverage() {
     assert!(
         edit_events
             .iter()
-            .all(|event| event.get("before_hash").is_some() && event.get("after_hash").is_some()),
+            .all(|event| event.get("before_text").is_some() && event.get("after_text").is_some()),
         "events={events:?}"
     );
 

@@ -1,13 +1,17 @@
 use std::collections::HashMap;
 
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
-use crate::anchor::fingerprint_anchor_hashes;
+#[derive(Debug, Clone)]
+struct ClaudeToolContext {
+    tool: String,
+    read_file: Option<String>,
+    read_range: Option<[u32; 2]>,
+}
 
 pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Error> {
     let mut out = Vec::new();
-    let mut tool_by_id: HashMap<String, String> = HashMap::new();
+    let mut tool_by_id: HashMap<String, ClaudeToolContext> = HashMap::new();
     let mut session_id: Option<String> = None;
     let mut first_timestamp: Option<String> = None;
 
@@ -62,18 +66,35 @@ pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
                             .to_string();
                         let tool = tool_by_id
                             .get(&tool_use_id)
-                            .cloned()
+                            .map(|context| context.tool.clone())
                             .unwrap_or_else(|| "unknown".to_string());
                         out.push(json!({
                             "t": timestamp,
                             "k": "tool.result",
                             "source": source_block("claude-code", session_id.as_deref()),
                             "tool": tool,
-                            "call_id": if tool_use_id.is_empty() { Value::Null } else { Value::String(tool_use_id) },
+                            "call_id": if tool_use_id.is_empty() { Value::Null } else { Value::String(tool_use_id.clone()) },
                             "exit": if block.get("is_error").and_then(Value::as_bool) == Some(true) { 1 } else { 0 },
                             "stdout": content_text(block.get("content").unwrap_or(&Value::Null)),
                             "stderr": ""
                         }));
+
+                        if let Some(context) = tool_by_id.remove(&tool_use_id)
+                            && context.tool == "Read"
+                            && let (Some(file), Some(range)) =
+                                (context.read_file, context.read_range)
+                        {
+                            out.push(json!({
+                                "t": timestamp,
+                                "k": "code.read",
+                                "source": source_block("claude-code", session_id.as_deref()),
+                                "file": file,
+                                "range": range,
+                                "text": content_text(block.get("content").unwrap_or(&Value::Null)),
+                                "range_basis": "line"
+                            }));
+                            read_emitted = read_emitted.saturating_add(1);
+                        }
                     }
                 }
             }
@@ -117,7 +138,34 @@ pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
                                     .and_then(Value::as_str)
                                     .unwrap_or("")
                                     .to_string();
-                                tool_by_id.insert(tool_use_id.clone(), tool.to_string());
+                                let read_file = tool_input
+                                    .get("file_path")
+                                    .and_then(Value::as_str)
+                                    .map(ToOwned::to_owned);
+                                let read_range = if tool == "Read" {
+                                    let start = tool_input
+                                        .get("offset")
+                                        .and_then(Value::as_u64)
+                                        .map(|n| n as u32)
+                                        .unwrap_or(1)
+                                        .max(1);
+                                    let end = tool_input
+                                        .get("limit")
+                                        .and_then(Value::as_u64)
+                                        .map(|n| start.saturating_add((n as u32).saturating_sub(1)))
+                                        .unwrap_or(start);
+                                    Some([start, end])
+                                } else {
+                                    None
+                                };
+                                tool_by_id.insert(
+                                    tool_use_id.clone(),
+                                    ClaudeToolContext {
+                                        tool: tool.to_string(),
+                                        read_file,
+                                        read_range,
+                                    },
+                                );
 
                                 out.push(json!({
                                     "t": timestamp,
@@ -131,36 +179,6 @@ pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
                                 match tool {
                                     "Read" => {
                                         read_total = read_total.saturating_add(1);
-                                        if let Some(file) = tool_input
-                                            .get("file_path")
-                                            .and_then(Value::as_str)
-                                            .map(ToOwned::to_owned)
-                                        {
-                                            let start = tool_input
-                                                .get("offset")
-                                                .and_then(Value::as_u64)
-                                                .map(|n| n as u32)
-                                                .unwrap_or(1)
-                                                .max(1);
-                                            let end = tool_input
-                                                .get("limit")
-                                                .and_then(Value::as_u64)
-                                                .map(|n| {
-                                                    start.saturating_add(
-                                                        (n as u32).saturating_sub(1),
-                                                    )
-                                                })
-                                                .unwrap_or(start);
-                                            out.push(json!({
-                                                "t": timestamp,
-                                                "k": "code.read",
-                                                "source": source_block("claude-code", session_id.as_deref()),
-                                                "file": file,
-                                                "range": [start, end],
-                                                "range_basis": "line"
-                                            }));
-                                            read_emitted = read_emitted.saturating_add(1);
-                                        }
                                     }
                                     "Edit" => {
                                         edit_total = edit_total.saturating_add(1);
@@ -174,10 +192,8 @@ pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
                                                 "k": "code.edit",
                                                 "source": source_block("claude-code", session_id.as_deref()),
                                                 "file": file,
-                                                "before_hash": tool_input.get("old_string").and_then(Value::as_str).map(hash_text),
-                                                "after_hash": tool_input.get("new_string").and_then(Value::as_str).map(hash_text),
-                                                "before_anchor_hashes": tool_input.get("old_string").and_then(Value::as_str).map(fingerprint_anchor_hashes).unwrap_or_default(),
-                                                "after_anchor_hashes": tool_input.get("new_string").and_then(Value::as_str).map(fingerprint_anchor_hashes).unwrap_or_default()
+                                                "before_text": tool_input.get("old_string").and_then(Value::as_str),
+                                                "after_text": tool_input.get("new_string").and_then(Value::as_str)
                                             }));
                                             edit_emitted = edit_emitted.saturating_add(1);
                                         }
@@ -194,8 +210,7 @@ pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
                                                 "k": "code.edit",
                                                 "source": source_block("claude-code", session_id.as_deref()),
                                                 "file": file,
-                                                "after_hash": tool_input.get("content").and_then(Value::as_str).map(hash_text),
-                                                "after_anchor_hashes": tool_input.get("content").and_then(Value::as_str).map(fingerprint_anchor_hashes).unwrap_or_default()
+                                                "after_text": tool_input.get("content").and_then(Value::as_str)
                                             }));
                                             edit_emitted = edit_emitted.saturating_add(1);
                                         }
@@ -220,10 +235,8 @@ pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
                                                         "k": "code.edit",
                                                         "source": source_block("claude-code", session_id.as_deref()),
                                                         "file": file,
-                                                        "before_hash": edit.get("old_string").and_then(Value::as_str).map(hash_text),
-                                                        "after_hash": edit.get("new_string").and_then(Value::as_str).map(hash_text),
-                                                        "before_anchor_hashes": edit.get("old_string").and_then(Value::as_str).map(fingerprint_anchor_hashes).unwrap_or_default(),
-                                                        "after_anchor_hashes": edit.get("new_string").and_then(Value::as_str).map(fingerprint_anchor_hashes).unwrap_or_default()
+                                                        "before_text": edit.get("old_string").and_then(Value::as_str),
+                                                        "after_text": edit.get("new_string").and_then(Value::as_str)
                                                     }));
                                                     edit_emitted = edit_emitted.saturating_add(1);
                                                 }
@@ -307,18 +320,6 @@ fn to_jsonl(events: &[Value]) -> Result<String, serde_json::Error> {
     Ok(out)
 }
 
-fn hash_text(text: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(text.as_bytes());
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(&mut out, "{byte:02x}");
-    }
-    out
-}
-
 fn content_text(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
@@ -384,6 +385,11 @@ mod tests {
         assert_eq!(read["range"], json!([10, 14]));
         assert_eq!(read["range_basis"], "line");
         assert_eq!(read["source"]["harness"], "claude-code");
+        assert!(
+            read["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("10->line"))
+        );
 
         let edit = events
             .iter()
@@ -393,6 +399,14 @@ mod tests {
             })
             .expect("code.edit event");
         assert_eq!(edit["source"]["harness"], "claude-code");
+        assert_eq!(
+            edit["before_text"].as_str(),
+            Some("fn alpha() { return value + 1; }")
+        );
+        assert_eq!(
+            edit["after_text"].as_str(),
+            Some("fn beta() { return value + 2; }")
+        );
 
         let result = events
             .iter()

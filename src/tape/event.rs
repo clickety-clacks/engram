@@ -48,6 +48,7 @@ pub struct MetaEvent {
 pub struct CodeReadEvent {
     pub file: String,
     pub range: FileRange,
+    pub text: Option<String>,
     pub anchor_hashes: Vec<String>,
 }
 
@@ -56,6 +57,8 @@ pub struct CodeEditEvent {
     pub file: String,
     pub before_range: Option<FileRange>,
     pub after_range: Option<FileRange>,
+    pub before_text: Option<String>,
+    pub after_text: Option<String>,
     pub before_hash: Option<String>,
     pub after_hash: Option<String>,
     pub before_anchor_hashes: Vec<String>,
@@ -155,6 +158,12 @@ struct RawEvent {
     #[serde(default)]
     after_hash: Option<String>,
     #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    before_text: Option<String>,
+    #[serde(default)]
+    after_text: Option<String>,
+    #[serde(default)]
     before_anchor_hashes: Option<Vec<String>>,
     #[serde(default)]
     after_anchor_hashes: Option<Vec<String>>,
@@ -182,6 +191,7 @@ impl RawEvent {
                 (Some(file), Some(range)) => TapeEventData::CodeRead(CodeReadEvent {
                     file,
                     range: file_range(range),
+                    text: self.text,
                     anchor_hashes: self.anchor_hashes.unwrap_or_default(),
                 }),
                 _ => TapeEventData::Other { kind },
@@ -191,6 +201,8 @@ impl RawEvent {
                     file,
                     before_range: self.before_range.map(file_range),
                     after_range: self.after_range.map(file_range),
+                    before_text: self.before_text,
+                    after_text: self.after_text,
                     before_hash: self.before_hash,
                     after_hash: self.after_hash,
                     before_anchor_hashes: self.before_anchor_hashes.unwrap_or_default(),
@@ -257,8 +269,8 @@ mod tests {
     #[test]
     fn parses_offsets_and_supported_events() {
         let jsonl = r#"{"t":"2026-02-22T00:00:00Z","k":"meta","model":"gpt","repo_head":"abc"}
-{"t":"2026-02-22T00:00:01Z","k":"code.read","file":"src/lib.rs","range":[1,3],"anchor_hashes":["h1","h2"]}
-{"t":"2026-02-22T00:00:02Z","k":"code.edit","file":"src/lib.rs","before_range":[1,3],"after_range":[1,4],"before_hash":"a","after_hash":"b","before_anchor_hashes":["winnow:a"],"after_anchor_hashes":["winnow:b"]}
+{"t":"2026-02-22T00:00:01Z","k":"code.read","file":"src/lib.rs","range":[1,3],"text":"fn alpha() {}\n"}
+{"t":"2026-02-22T00:00:02Z","k":"code.edit","file":"src/lib.rs","before_range":[1,3],"after_range":[1,4],"before_text":"fn alpha() {}\n","after_text":"fn beta() {}\n","before_hash":"a","after_hash":"b","before_anchor_hashes":["winnow:a"],"after_anchor_hashes":["winnow:b"]}
 {"t":"2026-02-22T00:00:03Z","k":"span.link","from_file":"a.rs","from_range":[1,2],"to_file":"b.rs","to_range":[3,4],"note":"moved"}"#;
 
         let events = parse_jsonl_events(jsonl).expect("valid JSONL");
@@ -268,13 +280,15 @@ mod tests {
         match &events[1].event.data {
             TapeEventData::CodeRead(read) => {
                 assert_eq!(read.file, "src/lib.rs");
-                assert_eq!(read.anchor_hashes, vec!["h1", "h2"]);
+                assert_eq!(read.text.as_deref(), Some("fn alpha() {}\n"));
             }
             _ => panic!("expected code.read"),
         }
 
         match &events[2].event.data {
             TapeEventData::CodeEdit(edit) => {
+                assert_eq!(edit.before_text.as_deref(), Some("fn alpha() {}\n"));
+                assert_eq!(edit.after_text.as_deref(), Some("fn beta() {}\n"));
                 assert_eq!(edit.before_anchor_hashes, vec!["winnow:a"]);
                 assert_eq!(edit.after_anchor_hashes, vec!["winnow:b"]);
             }

@@ -3,7 +3,8 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-use engram::anchor::fingerprint_text;
+use engram::anchor::{fingerprint_anchor_hashes, fingerprint_similarity, fingerprint_text};
+use rusqlite::Connection;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -193,6 +194,106 @@ fn explain_matches_winnow_edit_anchor_for_multiline_span_with_trailing_newline()
         explain["lineage"].as_array().expect("lineage").len(),
         1,
         "expected inbound edit linkage for exact multiline winnow anchor"
+    );
+}
+
+#[test]
+fn explain_matches_windowed_edit_anchor_for_arbitrary_subspan() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+    fs::create_dir_all(repo.join("src")).expect("src dir");
+
+    let file_text = (1..=72)
+        .map(|line| format!("fn line_{line}() {{ value_{line}(); }}\n"))
+        .collect::<String>();
+    fs::write(repo.join("src/lib.rs"), &file_text).expect("seed file");
+
+    let _ = run_json(repo, &["init"], None);
+
+    let after_anchor_hashes = fingerprint_anchor_hashes(&file_text);
+    assert!(
+        after_anchor_hashes.len() >= 3,
+        "anchors={after_anchor_hashes:?}"
+    );
+
+    let transcript = format!(
+        concat!(
+            "{{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"code.edit\",\"file\":\"src/lib.rs\",",
+            "\"before_range\":[1,24],\"after_range\":[1,24],",
+            "\"before_text\":\"fn old() {{ legacy(); }}\\n\",",
+            "\"after_text\":{0},\"similarity\":0.95}}\n"
+        ),
+        serde_json::to_string(&file_text).expect("text")
+    );
+    let _ = run_json(repo, &["record", "--stdin"], Some(&transcript));
+
+    let explain = run_json(repo, &["explain", "src/lib.rs:25-32"], None);
+    let query_anchors = explain["query"]["anchors"]
+        .as_array()
+        .expect("anchors")
+        .iter()
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    assert!(
+        after_anchor_hashes
+            .iter()
+            .any(|stored_anchor| query_anchors
+                .iter()
+                .any(
+                    |query_anchor| fingerprint_similarity(query_anchor, stored_anchor)
+                        .is_some_and(|score| score > 0.0)
+                )),
+        "expected query anchors to overlap stored windowed anchors by similarity: query={query_anchors:?} stored={after_anchor_hashes:?}"
+    );
+    assert_eq!(
+        explain["sessions"].as_array().expect("sessions").len(),
+        1,
+        "expected explain to recover session via overlapping windowed anchor"
+    );
+}
+
+#[test]
+fn large_windowed_file_stays_under_row_budget_and_explains() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+    fs::create_dir_all(repo.join("src")).expect("src dir");
+
+    let file_text = (1..=1914)
+        .map(|line| format!("fn line_{line}() {{ value_{line}(); }}\n"))
+        .collect::<String>();
+    fs::write(repo.join("src/lib.rs"), &file_text).expect("seed file");
+
+    let _ = run_json(repo, &["init"], None);
+    let transcript = format!(
+        concat!(
+            "{{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"code.edit\",\"file\":\"src/lib.rs\",",
+            "\"before_range\":[1,1],\"after_range\":[1,1914],",
+            "\"before_text\":\"fn old() {{ legacy(); }}\\n\",",
+            "\"after_text\":{0},\"similarity\":0.95}}\n"
+        ),
+        serde_json::to_string(&file_text).expect("text")
+    );
+    let _ = run_json(repo, &["record", "--stdin"], Some(&transcript));
+
+    let conn = Connection::open(repo.join(".home/.engram/index.sqlite")).expect("sqlite");
+    let evidence_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM evidence WHERE file_path = 'src/lib.rs'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("evidence count");
+    assert!(evidence_rows > 0);
+    assert!(
+        evidence_rows < 500,
+        "expected window-scale evidence rows, got {evidence_rows}"
+    );
+
+    let explain = run_json(repo, &["explain", "src/lib.rs:900-930"], None);
+    assert!(
+        !explain["sessions"].as_array().expect("sessions").is_empty(),
+        "expected explain to recover at least one session"
     );
 }
 
