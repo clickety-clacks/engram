@@ -2,18 +2,12 @@ use std::collections::HashSet;
 
 pub mod winnow;
 
-pub use winnow::{
-    SpanAnchor, fingerprint_feature_hashes, fingerprint_similarity, fingerprint_text,
-};
+pub use winnow::{SpanAnchor, fingerprint_similarity, fingerprint_text};
 
-const WINDOW_LINES: usize = 12;
-const WINDOW_OVERLAP_LINES: usize = 6;
+const WINDOW_LINES: usize = 24;
+const WINDOW_OVERLAP_LINES: usize = 12;
 
 pub fn fingerprint_anchor_hashes(text: &str) -> Vec<String> {
-    collect_window_anchors(text, fingerprint_feature_hashes)
-}
-
-pub fn fingerprint_window_hashes(text: &str) -> Vec<String> {
     collect_window_anchors(text, |window| {
         let fingerprint = fingerprint_text(window).fingerprint;
         if fingerprint.is_empty() {
@@ -22,6 +16,10 @@ pub fn fingerprint_window_hashes(text: &str) -> Vec<String> {
             vec![fingerprint]
         }
     })
+}
+
+pub fn fingerprint_window_hashes(text: &str) -> Vec<String> {
+    fingerprint_anchor_hashes(text)
 }
 
 fn collect_window_anchors<F>(text: &str, anchors_for_window: F) -> Vec<String>
@@ -94,7 +92,7 @@ mod tests {
     use super::{fingerprint_anchor_hashes, fingerprint_window_hashes};
 
     #[test]
-    fn short_text_emits_feature_anchors() {
+    fn short_text_emits_window_anchor() {
         let anchors = fingerprint_anchor_hashes("fn main() {\n    println!(\"hi\");\n}\n");
         assert!(!anchors.is_empty());
         assert!(anchors.iter().all(|anchor| anchor.starts_with("winnow:")));
@@ -102,7 +100,7 @@ mod tests {
 
     #[test]
     fn long_text_emits_overlapping_window_anchors() {
-        let text = (1..=24)
+        let text = (1..=72)
             .map(|line| format!("fn line_{line}() {{ value_{line}(); }}\n"))
             .collect::<String>();
 
@@ -112,12 +110,26 @@ mod tests {
 
     #[test]
     fn window_hashes_preserve_legacy_full_fingerprints() {
-        let text = (1..=24)
+        let text = (1..=72)
             .map(|line| format!("fn line_{line}() {{ value_{line}(); }}\n"))
             .collect::<String>();
 
         let window_hashes = fingerprint_window_hashes(&text);
         assert!(window_hashes.len() >= 3, "hashes={window_hashes:?}");
         assert!(window_hashes.iter().all(|anchor| anchor.contains(',')));
+    }
+
+    #[test]
+    fn large_file_produces_window_scale_anchor_count() {
+        let text = (1..=1914)
+            .map(|line| format!("fn line_{line}() {{ value_{line}(); }}\n"))
+            .collect::<String>();
+
+        let anchors = fingerprint_anchor_hashes(&text);
+        assert!(
+            (100..=200).contains(&anchors.len()),
+            "expected window-scale anchor count, got {}",
+            anchors.len()
+        );
     }
 }

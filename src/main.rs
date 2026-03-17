@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
-use engram::anchor::{fingerprint_anchor_hashes, fingerprint_window_hashes};
+use engram::anchor::{fingerprint_anchor_hashes, fingerprint_similarity};
 use engram::config::{
     EffectiveWatchConfig, EffectiveWatchSource, ensure_user_config,
     load_effective_config_with_override,
@@ -1532,18 +1532,19 @@ fn cmd_explain(
             indexes.push(SqliteIndex::open(&path_string(store))?);
         }
     }
-    let anchors = resolve_explain_anchors(cwd, &args)?;
     let target = args
         .target
         .clone()
         .ok_or_else(|| CliError::new("invalid_explain_target", "target is required"))?;
+    let query_anchors = resolve_explain_anchors(cwd, &args)?;
+    let lookup_anchors = resolve_explain_lookup_anchors(&indexes, &target, &args, &query_anchors)?;
     let traversal = ExplainTraversal {
         min_confidence: args.min_confidence,
         max_fanout: args.max_fanout,
         max_edges: args.max_edges,
         max_depth: args.depth,
     };
-    let result = explain_across_indexes(&indexes, &anchors, traversal, args.forensics)?;
+    let result = explain_across_indexes(&indexes, &lookup_anchors, traversal, args.forensics)?;
 
     let touches = collect_touch_evidence(&indexes, &result.direct, &result.touched_anchors)?;
     let mut sessions = build_session_windows(&paths, touches)?;
@@ -1583,7 +1584,7 @@ fn cmd_explain(
         "query": {
             "target": target,
             "anchor_mode": args.anchor,
-            "anchors": anchors,
+            "anchors": query_anchors,
             "min_confidence": args.min_confidence,
             "max_fanout": args.max_fanout,
             "max_edges": args.max_edges,
@@ -1957,17 +1958,48 @@ fn resolve_explain_anchors(cwd: &Path, args: &ExplainArgs) -> Result<Vec<String>
     Ok(derive_anchor_candidates(&span_texts))
 }
 
+fn resolve_explain_lookup_anchors(
+    indexes: &[SqliteIndex],
+    target: &str,
+    args: &ExplainArgs,
+    query_anchors: &[String],
+) -> Result<Vec<String>, CliError> {
+    if args.anchor {
+        return Ok(query_anchors.to_vec());
+    }
+
+    let (file, _, _) = parse_file_range_target(target)?;
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+
+    for anchor in query_anchors {
+        if seen.insert(anchor.clone()) {
+            out.push(anchor.clone());
+        }
+    }
+
+    for index in indexes {
+        for stored_anchor in index.anchors_for_file(file)? {
+            if query_anchors.iter().any(|query_anchor| {
+                query_anchor == &stored_anchor
+                    || fingerprint_similarity(query_anchor, &stored_anchor)
+                        .is_some_and(|score| score > 0.0)
+            }) && seen.insert(stored_anchor.clone())
+            {
+                out.push(stored_anchor);
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 fn derive_anchor_candidates(span_texts: &[String]) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
 
     for span_text in span_texts {
         for fingerprint in fingerprint_anchor_hashes(span_text) {
-            if seen.insert(fingerprint.clone()) {
-                out.push(fingerprint);
-            }
-        }
-        for fingerprint in fingerprint_window_hashes(span_text) {
             if seen.insert(fingerprint.clone()) {
                 out.push(fingerprint);
             }

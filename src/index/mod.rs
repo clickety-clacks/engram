@@ -362,6 +362,22 @@ impl SqliteIndex {
         Ok(out)
     }
 
+    pub fn anchors_for_file(&self, file_path: &str) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT anchor
+             FROM evidence
+             WHERE file_path = ?1
+             ORDER BY anchor ASC",
+        )?;
+
+        let mut rows = stmt.query(params![file_path])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(row.get(0)?);
+        }
+        Ok(out)
+    }
+
     pub fn outbound_edges(
         &self,
         from_anchor: &str,
@@ -981,10 +997,10 @@ mod tests {
     #[test]
     fn ingests_windowed_edit_text_as_direct_evidence() {
         let index = SqliteIndex::open_in_memory().expect("in-memory sqlite");
-        let before_text = (1..=24)
+        let before_text = (1..=72)
             .map(|line| format!("fn before_{line}() {{ value_{line}(); }}\n"))
             .collect::<String>();
-        let after_text = (1..=24)
+        let after_text = (1..=72)
             .map(|line| format!("fn after_{line}() {{ value_{line}(); }}\n"))
             .collect::<String>();
         let before_anchors = fingerprint_anchor_hashes(&before_text);

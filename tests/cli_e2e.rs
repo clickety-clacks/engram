@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-use engram::anchor::{fingerprint_anchor_hashes, fingerprint_text};
+use engram::anchor::{fingerprint_anchor_hashes, fingerprint_similarity, fingerprint_text};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -202,7 +202,7 @@ fn explain_matches_windowed_edit_anchor_for_arbitrary_subspan() {
     let repo = temp.path();
     fs::create_dir_all(repo.join("src")).expect("src dir");
 
-    let file_text = (1..=24)
+    let file_text = (1..=72)
         .map(|line| format!("fn line_{line}() {{ value_{line}(); }}\n"))
         .collect::<String>();
     fs::write(repo.join("src/lib.rs"), &file_text).expect("seed file");
@@ -226,13 +226,24 @@ fn explain_matches_windowed_edit_anchor_for_arbitrary_subspan() {
     );
     let _ = run_json(repo, &["record", "--stdin"], Some(&transcript));
 
-    let explain = run_json(repo, &["explain", "src/lib.rs:9-14"], None);
-    let query_anchors = explain["query"]["anchors"].as_array().expect("anchors");
+    let explain = run_json(repo, &["explain", "src/lib.rs:25-32"], None);
+    let query_anchors = explain["query"]["anchors"]
+        .as_array()
+        .expect("anchors")
+        .iter()
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
     assert!(
         after_anchor_hashes
             .iter()
-            .any(|anchor| query_anchors.contains(&Value::String(anchor.clone()))),
-        "expected query anchors to overlap stored windowed anchors: query={query_anchors:?} stored={after_anchor_hashes:?}"
+            .any(|stored_anchor| query_anchors
+                .iter()
+                .any(
+                    |query_anchor| fingerprint_similarity(query_anchor, stored_anchor)
+                        .is_some_and(|score| score > 0.0)
+                )),
+        "expected query anchors to overlap stored windowed anchors by similarity: query={query_anchors:?} stored={after_anchor_hashes:?}"
     );
     assert_eq!(
         explain["sessions"].as_array().expect("sessions").len(),

@@ -1246,7 +1246,7 @@ mod tests {
 
     #[test]
     fn claude_conformance_ingest_stores_multiple_windowed_evidence_rows_for_single_edit() {
-        let content = (1..=24)
+        let content = (1..=72)
             .map(|line| format!("fn line_{line}() {{ value_{line}(); }}\n"))
             .collect::<String>();
         let content_json = serde_json::to_string(&content).expect("escaped content");
