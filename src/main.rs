@@ -159,6 +159,7 @@ struct RuntimeContext {
     config_path: PathBuf,
     db_path: PathBuf,
     tapes_dir: PathBuf,
+    tape_lookup_dirs: Vec<PathBuf>,
     additional_stores: Vec<PathBuf>,
     watch: Option<EffectiveWatchConfig>,
 }
@@ -242,10 +243,12 @@ fn cmd_init(paths: &RepoPaths) -> Result<(), CliError> {
     let home = home_dir()?;
     ensure_user_config(&home).map_err(|err| CliError::new("config_error", err.to_string()))?;
     ensure_local_store(paths)?;
+    let local_tapes_dir = paths.root.join("tapes");
     let context = RuntimeContext {
         config_path: paths.root.join("config.yml"),
         db_path: paths.root.join("index.sqlite"),
-        tapes_dir: paths.root.join("tapes"),
+        tapes_dir: local_tapes_dir.clone(),
+        tape_lookup_dirs: vec![local_tapes_dir, home.join(".engram").join("tapes")],
         additional_stores: Vec::new(),
         watch: None,
     };
@@ -682,10 +685,12 @@ fn cmd_watch_with_home(cwd: &Path, args: WatchArgs, home: &Path) -> Result<(), C
     });
     let config = load_effective_config_with_override(cwd, home, config_override.as_deref())
         .map_err(|err| CliError::new("config_error", err.to_string()))?;
+    let tape_lookup_dirs = tape_lookup_dirs(cwd, home, &config);
     let context = RuntimeContext {
         config_path: config.path,
         db_path: config.db,
         tapes_dir: config.tapes_dir,
+        tape_lookup_dirs,
         additional_stores: config.additional_stores,
         watch: config.watch,
     };
@@ -1450,13 +1455,12 @@ fn cmd_tapes(paths: &RepoPaths, context: &RuntimeContext) -> Result<(), CliError
 fn cmd_show(paths: &RepoPaths, context: &RuntimeContext, args: ShowArgs) -> Result<(), CliError> {
     ensure_local_store(paths)?;
     print_context_conspicuity(context);
-    let tape_path = tape_path_for_id(&paths, &args.tape_id);
-    if !tape_path.exists() {
+    let Some(tape_path) = resolve_tape_path(context, &args.tape_id) else {
         return Err(CliError::new(
             "tape_not_found",
             format!("tape `{}` not found", args.tape_id),
         ));
-    }
+    };
 
     let content = read_tape_content(&tape_path)?;
     if args.raw {
@@ -1550,9 +1554,9 @@ fn cmd_explain(
     let result = explain_across_indexes(&indexes, &lookup_anchors, traversal, args.forensics)?;
 
     let touches = collect_touch_evidence(&indexes, &result.direct, &result.touched_anchors)?;
-    let mut sessions = build_session_windows(&paths, touches)?;
+    let mut sessions = build_session_windows(context, touches)?;
     let (dispatch_lineage, dispatch_sessions) =
-        collect_dispatch_upstream_sessions(paths, &indexes[0], &sessions)?;
+        collect_dispatch_upstream_sessions(context, &indexes[0], &sessions)?;
     sessions.extend(dispatch_sessions);
 
     let mut tombstones = Vec::new();
@@ -1604,7 +1608,7 @@ fn cmd_explain(
 }
 
 fn collect_dispatch_upstream_sessions(
-    paths: &RepoPaths,
+    context: &RuntimeContext,
     index: &SqliteIndex,
     sessions: &[Value],
 ) -> Result<(Vec<Value>, Vec<Value>), CliError> {
@@ -1635,7 +1639,7 @@ fn collect_dispatch_upstream_sessions(
                 continue;
             };
             let edit_turn =
-                message_turn_before_offset(paths, &mut rows_cache, tape_id, edit_offset)?;
+                message_turn_before_offset(context, &mut rows_cache, tape_id, edit_offset)?;
 
             let mut current_tape = tape_id.to_string();
             let mut current_turn = edit_turn;
@@ -1664,7 +1668,7 @@ fn collect_dispatch_upstream_sessions(
                 }));
 
                 if seen_tapes.insert(parent.tape_id.clone())
-                    && let Some(extra) = build_dispatch_session(paths, &mut rows_cache, &parent)?
+                    && let Some(extra) = build_dispatch_session(context, &mut rows_cache, &parent)?
                 {
                     extras.push(extra);
                 }
@@ -1679,11 +1683,11 @@ fn collect_dispatch_upstream_sessions(
 }
 
 fn build_dispatch_session(
-    paths: &RepoPaths,
+    context: &RuntimeContext,
     rows_cache: &mut HashMap<String, Vec<TapeRow>>,
     link: &DispatchLinkRow,
 ) -> Result<Option<Value>, CliError> {
-    let rows = load_tape_rows_cached(paths, rows_cache, &link.tape_id)?;
+    let rows = load_tape_rows_cached(context, rows_cache, &link.tape_id)?;
     let anchor_offset = message_turn_to_event_offset(rows, link.first_turn_index)
         .or_else(|| rows.last().map(|row| row.offset))
         .unwrap_or(0);
@@ -1802,7 +1806,7 @@ fn touch_key(fragment: &EvidenceFragmentRef) -> String {
 }
 
 fn build_session_windows(
-    paths: &RepoPaths,
+    context: &RuntimeContext,
     touches: Vec<EvidenceFragmentRef>,
 ) -> Result<Vec<Value>, CliError> {
     let mut by_tape: HashMap<String, Vec<EvidenceFragmentRef>> = HashMap::new();
@@ -1816,8 +1820,8 @@ fn build_session_windows(
     let mut sessions = Vec::new();
     for (tape_id, mut tape_touches) in by_tape {
         tape_touches.sort_by_key(|t| t.event_offset);
-        let tape_path = tape_path_for_id(paths, &tape_id);
-        let windows = if tape_path.exists() {
+        let tape_path = resolve_tape_path(context, &tape_id);
+        let windows = if let Some(tape_path) = tape_path.as_ref() {
             let content = read_tape_content(&tape_path)?;
             let rows = parse_jsonl_rows(&content)?;
             tape_touches
@@ -1851,7 +1855,7 @@ fn build_session_windows(
 
         sessions.push(json!({
             "tape_id": tape_id,
-            "tape_present_locally": tape_path.exists(),
+            "tape_present_locally": tape_path.is_some(),
             "touch_count": tape_touches.len(),
             "latest_touch_timestamp": latest_touch_timestamp,
             "touches": touches_json,
@@ -2130,29 +2134,28 @@ fn parse_jsonl_rows(input: &str) -> Result<Vec<TapeRow>, CliError> {
 }
 
 fn load_tape_rows_cached<'a>(
-    paths: &RepoPaths,
+    context: &RuntimeContext,
     cache: &'a mut HashMap<String, Vec<TapeRow>>,
     tape_id: &str,
 ) -> Result<&'a Vec<TapeRow>, CliError> {
     if !cache.contains_key(tape_id) {
-        let tape_path = tape_path_for_id(paths, tape_id);
-        if !tape_path.exists() {
+        let Some(tape_path) = resolve_tape_path(context, tape_id) else {
             cache.insert(tape_id.to_string(), Vec::new());
-        } else {
-            let content = read_tape_content(&tape_path)?;
-            cache.insert(tape_id.to_string(), parse_jsonl_rows(&content)?);
-        }
+            return Ok(cache.get(tape_id).expect("cache entry inserted"));
+        };
+        let content = read_tape_content(&tape_path)?;
+        cache.insert(tape_id.to_string(), parse_jsonl_rows(&content)?);
     }
     Ok(cache.get(tape_id).expect("cache entry inserted"))
 }
 
 fn message_turn_before_offset(
-    paths: &RepoPaths,
+    context: &RuntimeContext,
     cache: &mut HashMap<String, Vec<TapeRow>>,
     tape_id: &str,
     event_offset: u64,
 ) -> Result<i64, CliError> {
-    let rows = load_tape_rows_cached(paths, cache, tape_id)?;
+    let rows = load_tape_rows_cached(context, cache, tape_id)?;
     let turn = rows
         .iter()
         .filter(|row| row.offset < event_offset && is_message_row(&row.value))
@@ -2456,10 +2459,12 @@ fn resolve_runtime_context_with_override(
     let home = home_dir()?;
     let config = load_effective_config_with_override(cwd, &home, config_override)
         .map_err(|err| CliError::new("config_error", err.to_string()))?;
+    let tape_lookup_dirs = tape_lookup_dirs(cwd, &home, &config);
     Ok(RuntimeContext {
         config_path: config.path,
         db_path: config.db,
         tapes_dir: config.tapes_dir,
+        tape_lookup_dirs,
         additional_stores: config.additional_stores,
         watch: config.watch,
     })
@@ -2497,6 +2502,39 @@ fn tape_path_for_id(paths: &RepoPaths, tape_id: &str) -> PathBuf {
 
 fn tape_path_for_tapes_dir(tapes_dir: &Path, tape_id: &str) -> PathBuf {
     tapes_dir.join(format!("{tape_id}{TAPE_SUFFIX}"))
+}
+
+fn tape_lookup_dirs(
+    cwd: &Path,
+    home: &Path,
+    config: &engram::config::EffectiveConfig,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    push_tape_lookup_dir(&mut dirs, config.tapes_dir.clone());
+    push_tape_lookup_dir(&mut dirs, cwd.join(".engram").join("tapes"));
+    push_tape_lookup_dir(&mut dirs, home.join(".engram").join("tapes"));
+    for store in &config.additional_stores {
+        let store_tapes = store
+            .parent()
+            .map(|parent| parent.join("tapes"))
+            .unwrap_or_else(|| PathBuf::from("tapes"));
+        push_tape_lookup_dir(&mut dirs, store_tapes);
+    }
+    dirs
+}
+
+fn push_tape_lookup_dir(dirs: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if dirs.iter().all(|existing| existing != &candidate) {
+        dirs.push(candidate);
+    }
+}
+
+fn resolve_tape_path(context: &RuntimeContext, tape_id: &str) -> Option<PathBuf> {
+    context
+        .tape_lookup_dirs
+        .iter()
+        .map(|dir| tape_path_for_tapes_dir(dir, tape_id))
+        .find(|path| path.exists())
 }
 
 fn tape_id_from_path(path: &Path) -> Option<String> {
