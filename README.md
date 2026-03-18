@@ -157,6 +157,14 @@ OpenClaw note (example only):
 - An OpenClaw submitter can propagate the UUID in a header and mirror it in message content as `<engram-src .../>`.
 - That submitter/header pattern is an integration example, not Engram core behavior.
 
+## 6. Regression Testing
+
+Run the dedicated regression suite that guards explain anchor granularity, scaled performance, config walk-up behavior, and additional-store window resolution:
+
+```bash
+cargo test --test regression_suite
+```
+
 ## Specs
 
 - Core event contract: `specs/core/event-contract.md`
