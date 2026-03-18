@@ -16,7 +16,7 @@ Core model:
 
 ## 2. How you use it
 
-Normal loop:
+### One-shot ingest
 
 ```bash
 # optional: create an explicit local workspace store
@@ -29,8 +29,18 @@ engram ingest
 engram explain src/auth.rs:40-78
 ```
 
-How commands work:
-- `engram ingest`: local-scoped. Walks the current directory tree for transcript files, converts recognized harness logs into tapes, and fingerprints those tapes into the resolved DB.
+### Continuous ingest (recommended)
+
+```bash
+engram watch
+```
+
+`engram watch` monitors directories listed under the `watch:` key in config.yml, runs ingest on each new or changed file that matches the configured pattern, and logs activity to `watch.log`. This is the recommended integration pattern — file watchers, not git hooks.
+
+### How commands work
+
+- `engram ingest [PATH...]`: local-scoped. Walks the current directory tree (or given paths) for transcript files, converts recognized harness logs into tapes, and fingerprints those tapes into the resolved DB.
+- `engram watch`: long-running file watcher. Reads `watch.sources` from the resolved config.yml, watches those directories for new/changed files, debounces, and runs ingest on each matching file. Requires a `watch:` section in config.
 - `engram fingerprint`: local-scoped. Indexes existing `./.engram/tapes/*.jsonl.zst` into the resolved DB (no transcript parsing, no tape creation).
 - `engram explain <file>:<start>-<end>`: computes anchors for the selected span, queries the resolved DB, follows lineage and dispatch-marker links, and returns evidence sessions/windows.
 
@@ -44,16 +54,19 @@ There is no separate `--dispatch` explain mode.
 
 ## 3. How you configure it
 
-Config resolution is walk-up, first-found-wins:
-1. `./.engram/config.yml`
-2. parent directories’ `.engram/config.yml`
-3. fallback `~/.engram/config.yml`
+### Config resolution
 
-No merge between levels.
+Engram walks up the directory tree from the current working directory looking for `.engram/config.yml`. The first one found wins. No merge between levels. If none is found, falls back to `~/.engram/config.yml`.
 
 On first invocation, Engram auto-creates `~/.engram/config.yml` if missing.
 
-Primary schema:
+Every command prints the resolved config path and DB path before command output.
+
+### Repo-level vs global config
+
+Use two levels of config:
+
+**Global** (`~/.engram/config.yml`) — sets `db` and `additional_stores`:
 
 ```yaml
 db: ~/.engram/index.sqlite
@@ -61,11 +74,39 @@ additional_stores:
   - /nfs/team/engram/index.sqlite
 ```
 
-Field meanings:
+**Repo-level** (`.engram/config.yml` in your repo root) — sets `tapes_dir` so tapes travel with the repo:
+
+```yaml
+tapes_dir: .engram/tapes
+```
+
+Do not set `db:` or `additional_stores:` in repo-level configs. Let those walk up to the global config.
+
+### Field reference
+
 - `db`: primary SQLite store this directory writes to and reads from.
+- `tapes_dir`: where tapes are stored. Relative paths resolve from the config file's parent directory.
 - `additional_stores`: extra read-only stores queried by `engram explain` (fan-out + dedupe).
 
-Every command prints resolved config path and DB path before command output.
+### Watch config
+
+Add a `watch:` section to the config where `engram watch` will be run (typically the global config):
+
+```yaml
+watch:
+  debounce_secs: 5          # seconds to wait after a file event before ingesting (default: 5)
+  ingest_timeout_secs: 120  # max seconds per ingest run (default: 120)
+  log: ~/.engram/watch.log  # log file path (default: ~/.engram/watch.log)
+  sources:
+    - path: ~/shared/openclaw
+      pattern: "*.jsonl"
+    - path: ~/sessions
+      pattern: "session-*.json"
+```
+
+Each source entry:
+- `path`: directory to watch (recursive).
+- `pattern`: glob pattern for files to ingest within that directory.
 
 ## 4. How you install it
 
