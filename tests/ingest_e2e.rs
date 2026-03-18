@@ -59,6 +59,17 @@ fn sha256_hex(input: &str) -> String {
     out
 }
 
+fn write_tape(tapes_dir: &Path, transcript: &str) -> String {
+    fs::create_dir_all(tapes_dir).expect("tapes dir");
+    let tape_id = sha256_hex(transcript);
+    fs::write(
+        tapes_dir.join(format!("{tape_id}.jsonl.zst")),
+        zstd::stream::encode_all(transcript.as_bytes(), 0).expect("compress tape"),
+    )
+    .expect("write tape");
+    tape_id
+}
+
 fn cursor_state_path(repo: &Path, transcript: &Path) -> PathBuf {
     let absolute = fs::canonicalize(transcript).expect("canonical transcript path");
     let key = sha256_hex(absolute.to_string_lossy().as_ref());
@@ -153,7 +164,10 @@ fn ingest_reimports_when_cursor_exists_but_db_and_tapes_are_wiped() {
     assert_eq!(first["imported_tapes"], 1);
 
     let cursor_path = cursor_state_path(&repo, &source_path);
-    assert!(cursor_path.exists(), "expected cursor state after first ingest");
+    assert!(
+        cursor_path.exists(),
+        "expected cursor state after first ingest"
+    );
 
     let home_store = home.join(".engram");
     fs::remove_file(home_store.join("index.sqlite")).expect("remove db");
@@ -767,6 +781,116 @@ fn explain_fans_out_to_additional_stores_and_dedupes() {
     );
     assert!(
         sessions.iter().any(|session| session["tape_id"] == tape_b),
+        "sessions={sessions:?}"
+    );
+}
+
+#[test]
+fn show_and_explain_fall_back_to_home_tapes_when_repo_tapes_dir_is_empty() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join(".engram")).expect("repo .engram");
+    fs::create_dir_all(home.join(".engram")).expect("home .engram");
+
+    fs::write(
+        home.join(".engram/config.yml"),
+        "db: ~/.engram/index.sqlite\ntapes_dir: .engram/tapes\n",
+    )
+    .expect("home config");
+    fs::write(
+        repo.join(".engram/config.yml"),
+        "db: ~/.engram/index.sqlite\ntapes_dir: .engram/tapes\n",
+    )
+    .expect("repo config");
+
+    let anchor = "winnow:0000000000000202";
+    let transcript = format!(
+        concat!(
+            "{{\"t\":\"2026-03-17T00:00:00Z\",\"k\":\"meta\",\"label\":\"home-store\"}}\n",
+            "{{\"t\":\"2026-03-17T00:00:01Z\",\"k\":\"code.read\",\"file\":\"src/lib.rs\",\"range\":[1,1],\"anchor_hashes\":[\"{anchor}\"]}}\n"
+        ),
+        anchor = anchor
+    );
+    let tape_id = write_tape(&home.join(".engram/tapes"), &transcript);
+
+    let fingerprint = run_json(&home, &["fingerprint"], None, &home);
+    assert_eq!(fingerprint["status"], "ok");
+    assert_eq!(fingerprint["fingerprinted_tapes"], 1);
+
+    let show = run_json(&repo, &["show", &tape_id], None, &home);
+    assert_eq!(show["tape_id"], tape_id);
+    assert_eq!(show["event_count"], 2);
+
+    let explain = run_json(&repo, &["explain", anchor, "--anchor"], None, &home);
+    let sessions = explain["sessions"].as_array().expect("sessions");
+    assert_eq!(sessions.len(), 1, "sessions={sessions:?}");
+    assert_eq!(sessions[0]["tape_id"], tape_id);
+    assert_eq!(sessions[0]["tape_present_locally"], true);
+    assert!(
+        !sessions[0]["windows"]
+            .as_array()
+            .expect("windows")
+            .is_empty(),
+        "sessions={sessions:?}"
+    );
+}
+
+#[test]
+fn show_and_explain_resolve_tapes_from_additional_store_directories() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let project_a = home.join("project-a");
+    let project_b = home.join("project-b");
+    fs::create_dir_all(project_a.join(".engram")).expect("project a .engram");
+    fs::create_dir_all(project_b.join(".engram")).expect("project b .engram");
+    fs::create_dir_all(home.join(".engram")).expect("home .engram");
+
+    fs::write(
+        project_b.join(".engram/config.yml"),
+        "db: .engram/index.sqlite\ntapes_dir: .engram/tapes\n",
+    )
+    .expect("project b config");
+    fs::write(
+        project_a.join(".engram/config.yml"),
+        format!(
+            "db: .engram/index.sqlite\ntapes_dir: .engram/tapes\nadditional_stores:\n  - {}\n",
+            project_b.join(".engram/index.sqlite").to_string_lossy()
+        ),
+    )
+    .expect("project a config");
+
+    let anchor = "winnow:0000000000000203";
+    let transcript = format!(
+        concat!(
+            "{{\"t\":\"2026-03-17T00:05:00Z\",\"k\":\"meta\",\"label\":\"project-b\"}}\n",
+            "{{\"t\":\"2026-03-17T00:05:01Z\",\"k\":\"code.edit\",\"file\":\"src/lib.rs\",",
+            "\"before_range\":[1,1],\"after_range\":[1,1],",
+            "\"before_anchor_hashes\":[\"winnow:0000000000000100\"],",
+            "\"after_anchor_hashes\":[\"{anchor}\"],\"similarity\":0.91}}\n"
+        ),
+        anchor = anchor
+    );
+    let tape_id = write_tape(&project_b.join(".engram/tapes"), &transcript);
+
+    let fingerprint = run_json(&project_b, &["fingerprint"], None, &home);
+    assert_eq!(fingerprint["status"], "ok");
+    assert_eq!(fingerprint["fingerprinted_tapes"], 1);
+
+    let show = run_json(&project_a, &["show", &tape_id], None, &home);
+    assert_eq!(show["tape_id"], tape_id);
+    assert_eq!(show["event_count"], 2);
+
+    let explain = run_json(&project_a, &["explain", anchor, "--anchor"], None, &home);
+    let sessions = explain["sessions"].as_array().expect("sessions");
+    assert_eq!(sessions.len(), 1, "sessions={sessions:?}");
+    assert_eq!(sessions[0]["tape_id"], tape_id);
+    assert_eq!(sessions[0]["tape_present_locally"], true);
+    assert!(
+        !sessions[0]["windows"]
+            .as_array()
+            .expect("windows")
+            .is_empty(),
         "sessions={sessions:?}"
     );
 }
