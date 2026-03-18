@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 pub mod winnow;
 
-pub use winnow::{SpanAnchor, fingerprint_similarity, fingerprint_text};
+pub use winnow::{SpanAnchor, expand_winnow_anchor, fingerprint_similarity, fingerprint_text};
 
 const WINDOW_LINES: usize = 24;
 const WINDOW_OVERLAP_LINES: usize = 12;
@@ -20,6 +20,23 @@ pub fn fingerprint_anchor_hashes(text: &str) -> Vec<String> {
 
 pub fn fingerprint_window_hashes(text: &str) -> Vec<String> {
     fingerprint_anchor_hashes(text)
+}
+
+/// Return individual winnow hash tokens for `text`, using the same overlapping
+/// window strategy as [`fingerprint_anchor_hashes`] but expanding each window
+/// fingerprint into one entry per hash token.
+///
+/// Suitable for storing as individual `evidence` rows so that each token can
+/// be looked up via an exact-equality index scan.
+pub fn fingerprint_token_hashes(text: &str) -> Vec<String> {
+    collect_window_anchors(text, |window| {
+        let fingerprint = fingerprint_text(window).fingerprint;
+        if fingerprint.is_empty() {
+            Vec::new()
+        } else {
+            expand_winnow_anchor(&fingerprint)
+        }
+    })
 }
 
 fn collect_window_anchors<F>(text: &str, anchors_for_window: F) -> Vec<String>

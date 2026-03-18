@@ -33,6 +33,20 @@ pub fn fingerprint_feature_hashes(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Split a composite winnow fingerprint into individual token strings.
+///
+/// `"winnow:aaa,bbb,ccc"` → `["winnow:aaa", "winnow:bbb", "winnow:ccc"]`
+/// Non-winnow strings and empty strings return an empty vec.
+pub fn expand_winnow_anchor(anchor: &str) -> Vec<String> {
+    let Some(rest) = anchor.strip_prefix("winnow:") else {
+        return Vec::new();
+    };
+    rest.split(',')
+        .filter(|token| !token.is_empty())
+        .map(|token| format!("winnow:{token}"))
+        .collect()
+}
+
 pub fn fingerprint_similarity(left: &str, right: &str) -> Option<f32> {
     let left_features = parse_fingerprint(left)?;
     let right_features = parse_fingerprint(right)?;

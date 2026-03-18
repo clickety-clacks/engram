@@ -5,7 +5,7 @@ use std::ops::Deref;
 
 use rusqlite::{Connection, params};
 
-use crate::anchor::fingerprint_anchor_hashes;
+use crate::anchor::{expand_winnow_anchor, fingerprint_anchor_hashes, fingerprint_token_hashes};
 use crate::index::lineage::{
     Cardinality, EvidenceFragmentRef, EvidenceKind, LINK_THRESHOLD_DEFAULT, LocationDelta,
     SpanEdge, StoredEdgeClass, Tombstone,
@@ -550,18 +550,30 @@ impl SqliteIndex {
                     }
                 }
                 TapeEventData::CodeEdit(edit) => {
-                    let before_anchors = edit_side_anchors(
+                    // Individual tokens for evidence rows (one DB row per hash).
+                    let before_tokens = edit_side_tokens(
                         edit.before_text.as_deref(),
                         edit.before_hash.as_deref(),
                         &edit.before_anchor_hashes,
                     );
-                    let after_anchors = edit_side_anchors(
+                    let after_tokens = edit_side_tokens(
+                        edit.after_text.as_deref(),
+                        edit.after_hash.as_deref(),
+                        &edit.after_anchor_hashes,
+                    );
+                    // Window-level anchors for edges (avoids N×M explosion).
+                    let before_edge = edit_side_edge_anchors(
+                        edit.before_text.as_deref(),
+                        edit.before_hash.as_deref(),
+                        &edit.before_anchor_hashes,
+                    );
+                    let after_edge = edit_side_edge_anchors(
                         edit.after_text.as_deref(),
                         edit.after_hash.as_deref(),
                         &edit.after_anchor_hashes,
                     );
 
-                    if !before_anchors.is_empty() {
+                    if !before_tokens.is_empty() {
                         let fragment = EvidenceFragmentRef {
                             tape_id: tape_id.to_string(),
                             event_offset: item.offset,
@@ -569,12 +581,12 @@ impl SqliteIndex {
                             file_path: edit.file.clone(),
                             timestamp: item.event.timestamp.clone(),
                         };
-                        for anchor in &before_anchors {
+                        for anchor in &before_tokens {
                             Self::insert_evidence_on(tx.deref(), anchor, &fragment)?;
                         }
                     }
 
-                    if !after_anchors.is_empty() {
+                    if !after_tokens.is_empty() {
                         let fragment = EvidenceFragmentRef {
                             tape_id: tape_id.to_string(),
                             event_offset: item.offset,
@@ -582,20 +594,20 @@ impl SqliteIndex {
                             file_path: edit.file.clone(),
                             timestamp: item.event.timestamp.clone(),
                         };
-                        for anchor in &after_anchors {
+                        for anchor in &after_tokens {
                             Self::insert_evidence_on(tx.deref(), anchor, &fragment)?;
                         }
                     }
 
-                    if !before_anchors.is_empty() && !after_anchors.is_empty() {
-                        let confidence = if before_anchors == after_anchors {
+                    if !before_edge.is_empty() && !after_edge.is_empty() {
+                        let confidence = if before_edge == after_edge {
                             1.0
                         } else {
                             edit.similarity.unwrap_or(0.0)
                         };
                         Self::validate_confidence(confidence)?;
-                        for before_anchor in &before_anchors {
-                            for after_anchor in &after_anchors {
+                        for before_anchor in &before_edge {
+                            for after_anchor in &after_edge {
                                 Self::insert_edge_on(
                                     tx.deref(),
                                     &SpanEdge {
@@ -613,7 +625,7 @@ impl SqliteIndex {
                         }
                     }
 
-                    if after_anchors.is_empty() && !before_anchors.is_empty() {
+                    if after_tokens.is_empty() && !before_tokens.is_empty() {
                         let range = edit
                             .before_range
                             .or(edit.after_range)
@@ -625,7 +637,7 @@ impl SqliteIndex {
                         Self::insert_tombstone_on(
                             tx.deref(),
                             &Tombstone {
-                                anchor_hashes: before_anchors,
+                                anchor_hashes: before_tokens,
                                 tape_id: tape_id.to_string(),
                                 event_offset: item.offset,
                                 file_path: edit.file.clone(),
@@ -759,39 +771,73 @@ fn encode_span_link_anchor(file: &str, range: crate::tape::event::FileRange) -> 
     format!("span:{file}:{}-{}", range.start, range.end)
 }
 
+/// Anchors used to insert evidence rows for a code-read event.
+/// Returns individual winnow hash tokens so each can be indexed by equality.
 fn read_evidence_anchors(read: &crate::tape::event::CodeReadEvent) -> Vec<String> {
     if let Some(text) = read.text.as_deref() {
-        return fingerprint_anchor_hashes(text);
+        return fingerprint_token_hashes(text);
     }
-    dedupe_legacy_anchors(None, &read.anchor_hashes)
+    expand_legacy_anchors(None, &read.anchor_hashes)
 }
 
-fn edit_side_anchors(text: Option<&str>, hash: Option<&str>, anchors: &[String]) -> Vec<String> {
+/// Anchors used to insert evidence rows for one side of a code-edit event.
+/// Returns individual winnow hash tokens.
+fn edit_side_tokens(text: Option<&str>, hash: Option<&str>, anchors: &[String]) -> Vec<String> {
+    if let Some(text) = text {
+        return fingerprint_token_hashes(text);
+    }
+    expand_legacy_anchors(hash, anchors)
+}
+
+/// Anchors used to insert edge rows for one side of a code-edit event.
+///
+/// * When `text` is available, returns window-level (comma-separated)
+///   fingerprints — one per 24-line window — to prevent N×M edge explosion.
+/// * For legacy tape events with pre-computed `anchor_hashes`, expands any
+///   comma-separated winnow entries into individual tokens so that edge
+///   targets remain queryable by exact equality.
+fn edit_side_edge_anchors(
+    text: Option<&str>,
+    hash: Option<&str>,
+    anchors: &[String],
+) -> Vec<String> {
     if let Some(text) = text {
         return fingerprint_anchor_hashes(text);
     }
-    dedupe_legacy_anchors(hash, anchors)
+    expand_legacy_anchors(hash, anchors)
 }
 
-fn dedupe_legacy_anchors(hash: Option<&str>, anchors: &[String]) -> Vec<String> {
+/// Expand legacy anchor_hashes into individual winnow tokens.
+/// A comma-separated entry like "winnow:aaa,bbb" becomes ["winnow:aaa","winnow:bbb"].
+fn expand_legacy_anchors(hash: Option<&str>, anchors: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
 
     for anchor in anchors {
-        if seen.insert(anchor.clone()) {
+        for token in expand_winnow_anchor(anchor) {
+            if seen.insert(token.clone()) {
+                out.push(token);
+            }
+        }
+        // Non-winnow anchors (e.g. span: links) are kept as-is.
+        if !anchor.starts_with("winnow:") && seen.insert(anchor.clone()) {
             out.push(anchor.clone());
         }
     }
 
     if out.is_empty()
-        && let Some(anchor) = hash.filter(|anchor| anchor.starts_with("winnow:"))
-        && seen.insert(anchor.to_string())
+        && let Some(anchor) = hash.filter(|h| h.starts_with("winnow:"))
     {
-        out.push(anchor.to_string());
+        for token in expand_winnow_anchor(anchor) {
+            if seen.insert(token.clone()) {
+                out.push(token);
+            }
+        }
     }
 
     out
 }
+
 
 impl SqliteIndex {
     fn validate_anchor(anchor: &str) -> rusqlite::Result<()> {
@@ -893,7 +939,7 @@ fn derive_stored_class(agent_link: bool, confidence: f32) -> StoredEdgeClass {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::anchor::fingerprint_anchor_hashes;
+    use crate::anchor::fingerprint_token_hashes;
     use crate::index::lineage::LINK_THRESHOLD_DEFAULT;
     use crate::tape::event::{CodeEditEvent, CodeReadEvent, FileRange, TapeEvent, TapeEventData};
 
@@ -1008,8 +1054,10 @@ mod tests {
         let after_text = (1..=72)
             .map(|line| format!("fn after_{line}() {{ value_{line}(); }}\n"))
             .collect::<String>();
-        let before_anchors = fingerprint_anchor_hashes(&before_text);
-        let after_anchors = fingerprint_anchor_hashes(&after_text);
+        // Individual tokens are stored in evidence; window-level anchors are
+        // only used for edges.
+        let before_tokens = fingerprint_token_hashes(&before_text);
+        let after_tokens = fingerprint_token_hashes(&after_text);
         let events = vec![TapeEventAt {
             offset: 1,
             event: TapeEvent {
@@ -1033,18 +1081,18 @@ mod tests {
             .ingest_tape_events("tape-1", &events, LINK_THRESHOLD_DEFAULT)
             .expect("ingest succeeds");
 
-        assert!(before_anchors.len() >= 3, "anchors={before_anchors:?}");
-        assert!(after_anchors.len() >= 3, "anchors={after_anchors:?}");
+        assert!(before_tokens.len() >= 3, "tokens={before_tokens:?}");
+        assert!(after_tokens.len() >= 3, "tokens={after_tokens:?}");
 
         let before_refs = index
-            .evidence_for_anchor(&before_anchors[0])
-            .expect("before winnow evidence");
+            .evidence_for_anchor(&before_tokens[0])
+            .expect("before winnow token evidence");
         assert_eq!(before_refs.len(), 1);
         assert_eq!(before_refs[0].kind, EvidenceKind::Edit);
 
         let after_refs = index
-            .evidence_for_anchor(&after_anchors[0])
-            .expect("after winnow evidence");
+            .evidence_for_anchor(&after_tokens[0])
+            .expect("after winnow token evidence");
         assert_eq!(after_refs.len(), 1);
         assert_eq!(after_refs[0].kind, EvidenceKind::Edit);
     }

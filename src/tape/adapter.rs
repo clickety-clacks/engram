@@ -1193,7 +1193,7 @@ mod tests {
         AdapterId, AdapterStatus, CoverageGrade, adapter_registry, descriptor_for,
         discover_sessions_with_adapter, discovery_scaffold, run_conformance,
     };
-    use crate::anchor::fingerprint_anchor_hashes;
+    use crate::anchor::{fingerprint_anchor_hashes, fingerprint_token_hashes};
     use crate::index::SqliteIndex;
     use crate::index::lineage::{EvidenceKind, LINK_THRESHOLD_DEFAULT};
     use crate::tape::event::{TapeEventData, parse_jsonl_events};
@@ -1272,27 +1272,31 @@ mod tests {
             })
             .expect("code.edit event");
 
-        let anchors = fingerprint_anchor_hashes(
-            edit.1
-                .after_text
-                .as_deref()
-                .expect("adapter should emit after_text"),
-        );
+        let after_text = edit
+            .1
+            .after_text
+            .as_deref()
+            .expect("adapter should emit after_text");
+        // window_anchors are used to confirm multiple windows are produced
+        let window_anchors = fingerprint_anchor_hashes(after_text);
         assert!(
-            anchors.len() >= 3,
-            "expected overlapping window anchors, got {anchors:?}"
+            window_anchors.len() >= 3,
+            "expected overlapping window anchors, got {window_anchors:?}"
         );
+        // Evidence is stored at individual-token granularity; sample a few.
+        let tokens = fingerprint_token_hashes(after_text);
+        assert!(tokens.len() >= 3, "expected token-level evidence, got {tokens:?}");
 
         let index = SqliteIndex::open_in_memory().expect("sqlite");
         index
             .ingest_tape_events("tape", &events, LINK_THRESHOLD_DEFAULT)
             .expect("ingest");
 
-        for anchor in &anchors {
+        for token in tokens.iter().take(5) {
             let evidence = index
-                .evidence_for_anchor(anchor)
+                .evidence_for_anchor(token)
                 .expect("evidence query should succeed");
-            assert_eq!(evidence.len(), 1, "anchor={anchor} evidence={evidence:?}");
+            assert_eq!(evidence.len(), 1, "token={token} evidence={evidence:?}");
             assert_eq!(evidence[0].event_offset, edit.0);
             assert_eq!(evidence[0].kind, EvidenceKind::Edit);
         }

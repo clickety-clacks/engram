@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use engram::anchor::fingerprint_text;
+use engram::anchor::{expand_winnow_anchor, fingerprint_text};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -428,12 +428,16 @@ fn ingest_emits_edit_winnow_evidence_that_explain_can_query() {
 
     let explain = run_json(&repo, &["explain", "src/lib.rs:1-1"], None, &home);
     let query_anchors = explain["query"]["anchors"].as_array().expect("anchors");
-    let expected_anchor = Value::String(fingerprint_text(span_text).fingerprint);
+    // query_anchors are individual tokens; verify at least one token from the
+    // span's fingerprint is present.
+    let span_anchor = fingerprint_text(span_text).fingerprint;
+    let span_tokens = expand_winnow_anchor(&span_anchor);
     assert!(
-        query_anchors
+        span_tokens
             .iter()
-            .any(|anchor| anchor == &expected_anchor),
-        "expected explain query to include span winnow anchor"
+            .any(|token| query_anchors.iter().any(|a| a == token)),
+        "expected explain query to include span winnow anchor: \
+         span={span_anchor} query={query_anchors:?}"
     );
     assert_eq!(
         explain["sessions"].as_array().expect("sessions").len(),
