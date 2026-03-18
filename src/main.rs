@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
-use engram::anchor::{fingerprint_anchor_hashes, fingerprint_similarity};
+use engram::anchor::fingerprint_token_hashes;
 use engram::config::{
     EffectiveWatchConfig, EffectiveWatchSource, ensure_user_config,
     load_effective_config_with_override,
@@ -40,7 +40,6 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 const MAX_QUERY_WINDOW_ANCHORS: usize = 16;
-const MAX_LOOKUP_WINDOW_ANCHORS: usize = 128;
 
 const TAPE_SUFFIX: &str = ".jsonl.zst";
 const TRANSCRIPT_WINDOW_RADIUS: usize = 2;
@@ -1966,63 +1965,15 @@ fn resolve_explain_anchors(cwd: &Path, args: &ExplainArgs) -> Result<Vec<String>
 }
 
 fn resolve_explain_lookup_anchors(
-    indexes: &[SqliteIndex],
-    target: &str,
-    args: &ExplainArgs,
+    _indexes: &[SqliteIndex],
+    _target: &str,
+    _args: &ExplainArgs,
     query_anchors: &[String],
 ) -> Result<Vec<String>, CliError> {
-    if args.anchor {
-        return Ok(query_anchors.to_vec());
-    }
-
-    let (file, _, _) = parse_file_range_target(target)?;
-    let mut scored: HashMap<String, (f32, u64)> = HashMap::new();
-
-    for index in indexes {
-        for (stored_anchor, hits) in index.window_anchor_stats_for_file(file)? {
-            let best_score = query_anchors
-                .iter()
-                .filter_map(|query_anchor| fingerprint_similarity(query_anchor, &stored_anchor))
-                .fold(0.0_f32, f32::max);
-            if best_score <= 0.0 {
-                continue;
-            }
-
-            scored
-                .entry(stored_anchor)
-                .and_modify(|entry| {
-                    entry.0 = entry.0.max(best_score);
-                    entry.1 = entry.1.max(hits);
-                })
-                .or_insert((best_score, hits));
-        }
-    }
-
-    let mut ranked = scored.into_iter().collect::<Vec<_>>();
-    ranked.sort_by(|(left_anchor, left_stats), (right_anchor, right_stats)| {
-        right_stats
-            .0
-            .total_cmp(&left_stats.0)
-            .then_with(|| right_stats.1.cmp(&left_stats.1))
-            .then_with(|| left_anchor.cmp(right_anchor))
-    });
-
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-
-    for anchor in query_anchors {
-        if seen.insert(anchor.clone()) {
-            out.push(anchor.clone());
-        }
-    }
-
-    for (anchor, _) in ranked.into_iter().take(MAX_LOOKUP_WINDOW_ANCHORS) {
-        if seen.insert(anchor.clone()) {
-            out.push(anchor);
-        }
-    }
-
-    Ok(out)
+    // query_anchors are individual winnow hash tokens — each maps to an
+    // evidence row via an exact-equality index scan.  No similarity scoring
+    // or full-table scan needed.
+    Ok(query_anchors.to_vec())
 }
 
 fn derive_anchor_candidates(span_texts: &[String]) -> Vec<String> {
@@ -2030,9 +1981,9 @@ fn derive_anchor_candidates(span_texts: &[String]) -> Vec<String> {
     let mut out = Vec::new();
 
     for span_text in span_texts {
-        for fingerprint in fingerprint_anchor_hashes(span_text) {
-            if seen.insert(fingerprint.clone()) {
-                out.push(fingerprint);
+        for token in fingerprint_token_hashes(span_text) {
+            if seen.insert(token.clone()) {
+                out.push(token);
             }
         }
     }
