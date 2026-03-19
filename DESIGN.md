@@ -639,6 +639,159 @@ Garbage-collect unreferenced content-addressed blobs. Keeps index entries and li
 
 Concept search over tape contents. Requires optional vector index bolt-on.
 
+## Agent Tool Surface
+
+### Design principle
+
+Provenance has a topology. Engram's job is to provide tools that let agents navigate that topology. The agent is the intelligence — Engram is navigational infrastructure.
+
+Engram does not interpret, summarize, or understand provenance. It makes the provenance corpus efficiently traversable. The agent does all the thinking — discovering causality, extracting semantics, judging relevance.
+
+This is the same relationship as a filesystem: `cat` doesn't understand code, `grep` doesn't know what's important. But together they let an intelligent agent find what it needs without reading everything.
+
+### Invariants
+
+1. **Token efficiency**: every tool must allow the agent to navigate provenance while consuming as few tokens as possible. Results include content by default (small default window), but the agent controls sizing to avoid reading more than it needs.
+
+2. **Token exhaustion protection**: engram must never return a result set large enough to exhaust the agent's context. If a query would produce a result exceeding a safe threshold, engram truncates the result and tells the agent to constrain its query further.
+
+3. **Useful metadata on large corpora**: when a result is truncated (or any time the corpus is large enough that the agent needs to navigate rather than read everything), engram returns actionable metadata about what it didn't return. The exact metadata will evolve, but examples include: total session count, time range, result size vs what was returned. The principle is: the agent should never be left guessing about the shape of what it hasn't seen.
+
+### The provenance topology
+
+A filesystem organizes bytes into files → directories → trees. Agents navigate this with `ls`, `cat`, `grep`, `find`.
+
+Provenance has a different topology:
+
+    code spans → evidence (anchors) → sessions → windows → content
+
+This is not a file tree. It is a directed graph from code backward through time to the conversations that produced it.
+
+#### Two dimensions of navigation
+
+**Dimension 1: Reference depth** — traversal along the reference chain from concrete to abstract. Each hop up a reference link moves toward higher-level reasoning. The chain is a gradient, not fixed layers — some chains have two levels, some have ten. Landmarks like “implementation,” “architecture,” and “intent” are tendencies along the gradient, not discrete buckets.
+
+```
+code span
+  ↑ evidence (fingerprint match)
+session window   ← concrete (code edits, tool calls)
+  ↑ reference
+session window
+  ↑ reference
+session window   ← abstract (design rationale, product intent)
+```
+
+**Dimension 2: Window positioning** — at each level of the reference chain, the agent is looking at a window into a session. The agent controls that window using absolute line positioning within the session.
+
+Defaults:
+- Window position: 75% of the span before the link point, 25% after
+- Window size: configurable default (TBD based on cardinality data)
+
+The first explain returns content with default window plus line boundaries (e.g., “lines 380–420 of 1200”). To see more, the agent requests exactly the lines it hasn't seen using `--start` and `--lines`. No overlap, no repeated content. The agent manages its own cursor.
+
+Coordinate system: lines. Same as grep.
+
+#### Edge visibility
+
+Each result must advertise its edges — upstream references (dispatching sessions), downstream references (dispatched agents), and sibling links. The agent cannot navigate a topology it cannot see. Every node must tell the agent what paths exist from it.
+
+#### Filtering the result set
+
+Grep is not a separate navigation dimension — it is a filter on dimension 1 (reference depth). It winnows which windows are returned before the agent reads content.
+
+`engram explain <span> --grep <pattern>` returns only windows that both match the span's fingerprint evidence AND contain content matching the pattern. This is the primary token-saving tool for large result sets.
+
+### API surface
+
+Two commands. Everything else is the agent composing these.
+
+#### `engram explain`
+
+Three input forms:
+
+```
+engram explain <file>:<start>-<end>   # fingerprint from disk
+engram explain "<string>"             # fingerprint from string  
+engram explain <session_id>           # navigate a known session
+```
+
+Flags (all optional, composable):
+
+| Flag | Description |
+|------|-------------|
+| `--grep <pattern>` | Only return windows whose content matches |
+| `--start N` | Absolute line position within a session |
+| `--lines N` | Number of lines to return from start |
+| `--limit N` | Cap number of sessions returned |
+
+**Default behavior**: returns content with a default window for each matching session.
+
+**Per-session metadata returned**:
+
+| Field | Description |
+|-------|-------------|
+| `session_id` | Stable identifier for this session |
+| `timestamp` | When this session occurred |
+| `window_start` | First line number of returned content |
+| `window_end` | Last line number of returned content |
+| `total_lines` | Total lines in session (so agent knows how much exists) |
+| `score` | Fingerprint match relevance |
+| `refs_up` | Count of upstream reference edges (dispatching sessions) |
+| `refs_down` | Count of downstream reference edges (dispatched agents) |
+| `files_touched` | List of files this session modified |
+
+**Truncation response** (when result exceeds safe threshold):
+
+| Field | Description |
+|-------|-------------|
+| `returned` | Number of sessions returned |
+| `total` | Total sessions matching |
+| `time_range` | Earliest and latest session timestamps |
+| `truncated` | `true` |
+
+**Example interaction**:
+
+```bash
+# Step 1: initial explain
+$ engram explain src/server.ts:3398-3412
+session: af156abd  score: 0.92  lines: 380-420 / 1200  refs_up: 2  refs_down: 0
+  > 380: The alert retry logic was failing because...
+  > ...
+  > 420: Fixed by preserving the original body on retry.
+
+session: cc469340  score: 0.78  lines: 100-140 / 850  refs_up: 1  refs_down: 3
+  > 100: Flynn flagged that main session was eating alerts...
+  > ...
+  > 140: Added applyMainSessionAlertRequirement as belt-and-suspenders.
+
+# Step 2: agent wants more context on first session
+$ engram explain af156abd --start 421 --lines 50
+
+# Step 3: agent follows upstream reference
+$ engram explain cc469340 --start 1 --lines 40
+
+# Step 4: agent greps for a term across all provenance for this span
+$ engram explain src/server.ts:3398-3412 --grep "NO_REPLY"
+```
+
+#### `engram grep <pattern>`
+
+Literal text search across all tapes.
+
+```
+engram grep <pattern>
+```
+
+Same output format as explain. Same flags: `--start`, `--lines`, `--limit`.
+
+Returns windows from any session containing the pattern, ranked by recency. The agent navigates from there using the same session IDs and line positioning.
+
+### Open questions
+
+1. **Default window size**: what should the default be? Need cardinality data from real corpus.
+2. **Output format**: JSON for machine consumption? Plain text for agent readability? Both via flag?
+
+
 ## Continuation Detection: Open Question
 
 ### What we investigated
