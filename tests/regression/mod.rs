@@ -243,3 +243,93 @@ fn explain_additional_store_resolves_windows_from_store_tapes_path() {
         "expected windows for additional-store session"
     );
 }
+
+#[test]
+fn explain_supports_string_and_session_id_navigation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = home.join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+
+    let code_text = "fn explain_nav() { return 42; }\n";
+    write_repo_file(&repo, "src/lib.rs", code_text);
+
+    let _ = run_json(&repo, &["init"], None, &home);
+    let record_line = json!({
+        "t": "2026-03-18T02:00:00Z",
+        "k": "code.edit",
+        "file": "src/lib.rs",
+        "before_range": [1, 1],
+        "after_range": [1, 1],
+        "before_text": "fn explain_nav() { return 0; }\n",
+        "after_text": code_text,
+        "similarity": 0.95,
+    })
+    .to_string()
+        + "\n";
+    let _ = run_json(&repo, &["record", "--stdin"], Some(&record_line), &home);
+
+    let explain = run_json(&repo, &["explain", code_text], None, &home);
+    let sessions = explain["sessions"].as_array().expect("sessions");
+    assert!(
+        !sessions.is_empty(),
+        "expected string explain to return sessions"
+    );
+    let session_id = sessions[0]["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string();
+
+    assert!(sessions[0].get("window_start").is_some());
+    assert!(sessions[0].get("window_end").is_some());
+    assert!(sessions[0].get("total_lines").is_some());
+    assert!(sessions[0].get("score").is_some());
+    assert!(sessions[0].get("refs_up").is_some());
+    assert!(sessions[0].get("refs_down").is_some());
+    assert!(sessions[0].get("files_touched").is_some());
+
+    let by_session = run_json(
+        &repo,
+        &["explain", &session_id, "--start", "1", "--lines", "5"],
+        None,
+        &home,
+    );
+    let nav_sessions = by_session["sessions"].as_array().expect("sessions");
+    assert_eq!(nav_sessions.len(), 1);
+    assert_eq!(nav_sessions[0]["session_id"], Value::String(session_id));
+    assert_eq!(nav_sessions[0]["window_start"], Value::from(1));
+}
+
+#[test]
+fn grep_uses_explain_output_shape_and_truncation_header() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = home.join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+
+    write_repo_file(&repo, "src/lib.rs", "fn grep_case() {}\n");
+    let _ = run_json(&repo, &["init"], None, &home);
+
+    for i in 0..2 {
+        let ts = format!("2026-03-18T02:0{i}:00Z");
+        let record_line = json!({
+            "t": ts,
+            "k": "msg.out",
+            "role": "assistant",
+            "content": format!("needle marker {i}"),
+        })
+        .to_string()
+            + "\n";
+        let _ = run_json(&repo, &["record", "--stdin"], Some(&record_line), &home);
+    }
+
+    let grep = run_json(&repo, &["grep", "needle", "--limit", "1"], None, &home);
+    let sessions = grep["sessions"].as_array().expect("sessions");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(grep["returned"], Value::from(1));
+    assert_eq!(grep["total"], Value::from(2));
+    assert_eq!(grep["truncated"], Value::Bool(true));
+    assert!(grep["time_range"].get("start").is_some());
+    assert!(sessions[0].get("content").is_some());
+    assert!(sessions[0].get("session_id").is_some());
+}

@@ -40,6 +40,10 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 const MAX_QUERY_WINDOW_ANCHORS: usize = 16;
+const DEFAULT_WINDOW_LINES: usize = 40;
+const DEFAULT_WINDOW_BEFORE_RATIO_NUM: usize = 3;
+const DEFAULT_WINDOW_BEFORE_RATIO_DEN: usize = 4;
+const SAFE_RESULT_SESSION_THRESHOLD: usize = 25;
 
 const TAPE_SUFFIX: &str = ".jsonl.zst";
 const TRANSCRIPT_WINDOW_RADIUS: usize = 2;
@@ -92,6 +96,7 @@ enum Command {
     Fingerprint,
     Record(RecordArgs),
     Explain(ExplainArgs),
+    Grep(GrepArgs),
     Tapes,
     Show(ShowArgs),
     Gc,
@@ -129,6 +134,14 @@ struct ExplainArgs {
     target: Option<String>,
     #[arg(long)]
     anchor: bool,
+    #[arg(long)]
+    grep: Option<String>,
+    #[arg(long)]
+    start: Option<usize>,
+    #[arg(long)]
+    lines: Option<usize>,
+    #[arg(long)]
+    limit: Option<usize>,
     #[arg(long, default_value_t = 0.50)]
     min_confidence: f32,
     #[arg(long, default_value_t = 50)]
@@ -143,6 +156,17 @@ struct ExplainArgs {
     forensics: bool,
     #[arg(long)]
     pretty: bool,
+}
+
+#[derive(Args, Debug)]
+struct GrepArgs {
+    pattern: String,
+    #[arg(long)]
+    start: Option<usize>,
+    #[arg(long)]
+    lines: Option<usize>,
+    #[arg(long)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +246,10 @@ fn run() -> Result<(), CliError> {
         Command::Explain(args) => {
             let context = resolve_runtime_context(&cwd)?;
             cmd_explain(&cwd, &paths, &context, args)
+        }
+        Command::Grep(args) => {
+            let context = resolve_runtime_context(&cwd)?;
+            cmd_grep(&paths, &context, args)
         }
         Command::Tapes => {
             let context = resolve_runtime_context(&cwd)?;
@@ -1531,66 +1559,149 @@ fn cmd_explain(
     ensure_local_store(paths)?;
     print_context_conspicuity(context);
     ensure_db_parent(&context.db_path)?;
-    let mut indexes = Vec::new();
-    indexes.push(SqliteIndex::open(&path_string(&context.db_path))?);
-    for store in &context.additional_stores {
-        if store.exists() {
-            indexes.push(SqliteIndex::open(&path_string(store))?);
-        }
-    }
+
+    let indexes = open_query_indexes(context)?;
     let target = args
         .target
         .clone()
         .ok_or_else(|| CliError::new("invalid_explain_target", "target is required"))?;
-    let query_anchors = resolve_explain_anchors(cwd, &args)?;
-    let lookup_anchors = resolve_explain_lookup_anchors(&indexes, &target, &args, &query_anchors)?;
-    let traversal = ExplainTraversal {
-        min_confidence: args.min_confidence,
-        max_fanout: args.max_fanout,
-        max_edges: args.max_edges,
-        max_depth: args.depth,
-    };
-    let result = explain_across_indexes(&indexes, &lookup_anchors, traversal, args.forensics)?;
+    let target_kind = classify_explain_target(cwd, context, &indexes, &target, args.anchor)?;
 
-    let touches = collect_touch_evidence(&indexes, &result.direct, &result.touched_anchors)?;
-    let mut sessions = build_session_windows(context, touches)?;
-    let (dispatch_lineage, dispatch_sessions) =
-        collect_dispatch_upstream_sessions(context, &indexes[0], &sessions)?;
-    sessions.extend(dispatch_sessions);
-
+    let mut query_anchors = Vec::new();
+    let mut raw_sessions: Vec<Value>;
+    let mut dispatch_lineage = Vec::new();
+    let mut lineage = Vec::new();
     let mut tombstones = Vec::new();
-    if args.include_deleted {
-        for anchor in &result.touched_anchors {
-            for index in &indexes {
-                for tombstone in index.tombstones_for_anchor(anchor)? {
-                    tombstones.push(json!({
-                        "anchor": anchor,
-                        "tape_id": tombstone.tape_id,
-                        "event_offset": tombstone.event_offset,
-                        "file_path": tombstone.file_path,
-                        "range": {
-                            "start": tombstone.range_at_deletion.start,
-                            "end": tombstone.range_at_deletion.end
-                        },
-                        "timestamp": tombstone.timestamp,
-                    }));
+    let mut score_by_session = HashMap::new();
+
+    match target_kind {
+        ExplainTarget::SessionId(session_id) => {
+            raw_sessions = build_session_windows_for_ids(context, &[session_id])?;
+        }
+        ExplainTarget::FileRange { file, start, end } => {
+            let span_texts = read_file_span_variants(&cwd.join(file), start, end)?;
+            query_anchors = derive_anchor_candidates(&span_texts);
+            let traversal = ExplainTraversal {
+                min_confidence: args.min_confidence,
+                max_fanout: args.max_fanout,
+                max_edges: args.max_edges,
+                max_depth: args.depth,
+            };
+            let result =
+                explain_across_indexes(&indexes, &query_anchors, traversal, args.forensics)?;
+            let touches =
+                collect_touch_evidence(&indexes, &result.direct, &result.touched_anchors)?;
+            raw_sessions = build_session_windows(context, touches)?;
+            let (chain, dispatch_sessions) =
+                collect_dispatch_upstream_sessions(context, &indexes[0], &raw_sessions)?;
+            dispatch_lineage = chain;
+            raw_sessions.extend(dispatch_sessions);
+            lineage = result.lineage.iter().map(edge_to_json).collect::<Vec<_>>();
+            score_by_session = collect_anchor_scores(&indexes, &query_anchors)?;
+
+            if args.include_deleted {
+                for anchor in &result.touched_anchors {
+                    for index in &indexes {
+                        for tombstone in index.tombstones_for_anchor(anchor)? {
+                            tombstones.push(json!({
+                                "anchor": anchor,
+                                "tape_id": tombstone.tape_id,
+                                "event_offset": tombstone.event_offset,
+                                "file_path": tombstone.file_path,
+                                "range": {
+                                    "start": tombstone.range_at_deletion.start,
+                                    "end": tombstone.range_at_deletion.end
+                                },
+                                "timestamp": tombstone.timestamp,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+        ExplainTarget::Literal(text) => {
+            query_anchors = if args.anchor {
+                vec![text]
+            } else {
+                derive_anchor_candidates(&[text])
+            };
+            let traversal = ExplainTraversal {
+                min_confidence: args.min_confidence,
+                max_fanout: args.max_fanout,
+                max_edges: args.max_edges,
+                max_depth: args.depth,
+            };
+            let result =
+                explain_across_indexes(&indexes, &query_anchors, traversal, args.forensics)?;
+            let touches =
+                collect_touch_evidence(&indexes, &result.direct, &result.touched_anchors)?;
+            raw_sessions = build_session_windows(context, touches)?;
+            let (chain, dispatch_sessions) =
+                collect_dispatch_upstream_sessions(context, &indexes[0], &raw_sessions)?;
+            dispatch_lineage = chain;
+            raw_sessions.extend(dispatch_sessions);
+            lineage = result.lineage.iter().map(edge_to_json).collect::<Vec<_>>();
+            score_by_session = collect_anchor_scores(&indexes, &query_anchors)?;
+
+            if args.include_deleted {
+                for anchor in &result.touched_anchors {
+                    for index in &indexes {
+                        for tombstone in index.tombstones_for_anchor(anchor)? {
+                            tombstones.push(json!({
+                                "anchor": anchor,
+                                "tape_id": tombstone.tape_id,
+                                "event_offset": tombstone.event_offset,
+                                "file_path": tombstone.file_path,
+                                "range": {
+                                    "start": tombstone.range_at_deletion.start,
+                                    "end": tombstone.range_at_deletion.end
+                                },
+                                "timestamp": tombstone.timestamp,
+                            }));
+                        }
+                    }
                 }
             }
         }
     }
 
     if args.pretty {
-        print_pretty_explain(&target, &result.lineage, &sessions, &tombstones);
+        print_pretty_explain(&target, &[], &raw_sessions, &tombstones);
         return Ok(());
     }
 
-    let lineage = result.lineage.iter().map(edge_to_json).collect::<Vec<_>>();
+    let mut sessions = format_sessions_for_agent(
+        context,
+        &indexes[0],
+        raw_sessions,
+        &score_by_session,
+        args.start,
+        args.lines,
+        args.grep.as_deref(),
+    )?;
+    sessions.sort_by(|a, b| {
+        let a_score = a.get("score").and_then(Value::as_f64).unwrap_or(0.0);
+        let b_score = b.get("score").and_then(Value::as_f64).unwrap_or(0.0);
+        let a_ts = a.get("timestamp").and_then(Value::as_str).unwrap_or("");
+        let b_ts = b.get("timestamp").and_then(Value::as_str).unwrap_or("");
+        b_score
+            .partial_cmp(&a_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b_ts.cmp(a_ts))
+    });
+
+    let (sessions, returned, total, time_range, truncated) =
+        apply_session_truncation(sessions, args.limit);
 
     print_json(&json!({
         "query": {
+            "command": "explain",
             "target": target,
-            "anchor_mode": args.anchor,
             "anchors": query_anchors,
+            "grep": args.grep,
+            "start": args.start,
+            "lines": args.lines,
+            "limit": args.limit,
             "min_confidence": args.min_confidence,
             "max_fanout": args.max_fanout,
             "max_edges": args.max_edges,
@@ -1603,7 +1714,445 @@ fn cmd_explain(
         "dispatch_lineage": dispatch_lineage,
         "tombstones": tombstones,
         "stores_queried": indexes.len(),
+        "returned": returned,
+        "total": total,
+        "time_range": time_range,
+        "truncated": truncated,
     }))
+}
+
+fn cmd_grep(paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Result<(), CliError> {
+    ensure_local_store(paths)?;
+    print_context_conspicuity(context);
+    ensure_db_parent(&context.db_path)?;
+
+    let indexes = open_query_indexes(context)?;
+    let (raw_sessions, score_by_session) = collect_grep_matches(context, &indexes, &args.pattern)?;
+    let mut sessions = format_sessions_for_agent(
+        context,
+        &indexes[0],
+        raw_sessions,
+        &score_by_session,
+        args.start,
+        args.lines,
+        None,
+    )?;
+    sessions.sort_by(|a, b| {
+        let a_ts = a.get("timestamp").and_then(Value::as_str).unwrap_or("");
+        let b_ts = b.get("timestamp").and_then(Value::as_str).unwrap_or("");
+        b_ts.cmp(a_ts)
+    });
+
+    let (sessions, returned, total, time_range, truncated) =
+        apply_session_truncation(sessions, args.limit);
+
+    print_json(&json!({
+        "query": {
+            "command": "grep",
+            "pattern": args.pattern,
+            "start": args.start,
+            "lines": args.lines,
+            "limit": args.limit,
+        },
+        "sessions": sessions,
+        "lineage": [],
+        "dispatch_lineage": [],
+        "tombstones": [],
+        "stores_queried": indexes.len(),
+        "returned": returned,
+        "total": total,
+        "time_range": time_range,
+        "truncated": truncated,
+    }))
+}
+
+#[derive(Debug, Clone)]
+enum ExplainTarget {
+    FileRange { file: String, start: u32, end: u32 },
+    Literal(String),
+    SessionId(String),
+}
+
+fn open_query_indexes(context: &RuntimeContext) -> Result<Vec<SqliteIndex>, CliError> {
+    let mut indexes = Vec::new();
+    indexes.push(SqliteIndex::open(&path_string(&context.db_path))?);
+    for store in &context.additional_stores {
+        if store.exists() {
+            indexes.push(SqliteIndex::open(&path_string(store))?);
+        }
+    }
+    Ok(indexes)
+}
+
+fn classify_explain_target(
+    cwd: &Path,
+    context: &RuntimeContext,
+    indexes: &[SqliteIndex],
+    target: &str,
+    anchor_mode: bool,
+) -> Result<ExplainTarget, CliError> {
+    if anchor_mode {
+        return Ok(ExplainTarget::Literal(target.to_string()));
+    }
+
+    if let Ok((file, start, end)) = parse_file_range_target(target)
+        && cwd.join(file).exists()
+    {
+        return Ok(ExplainTarget::FileRange {
+            file: file.to_string(),
+            start,
+            end,
+        });
+    }
+
+    if is_known_session_id(context, indexes, target)? {
+        return Ok(ExplainTarget::SessionId(target.to_string()));
+    }
+
+    Ok(ExplainTarget::Literal(target.to_string()))
+}
+
+fn is_known_session_id(
+    context: &RuntimeContext,
+    indexes: &[SqliteIndex],
+    candidate: &str,
+) -> Result<bool, CliError> {
+    if resolve_tape_path(context, candidate).is_some() {
+        return Ok(true);
+    }
+    for index in indexes {
+        if index
+            .referenced_tape_ids()?
+            .iter()
+            .any(|id| id == candidate)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn build_session_windows_for_ids(
+    context: &RuntimeContext,
+    session_ids: &[String],
+) -> Result<Vec<Value>, CliError> {
+    let mut out = Vec::new();
+    for session_id in session_ids {
+        let tape_path = resolve_tape_path(context, session_id);
+        let rows = if let Some(path) = tape_path.as_ref() {
+            parse_jsonl_rows(&read_tape_content(path)?)?
+        } else {
+            Vec::new()
+        };
+        let first_offset = rows.first().map(|row| row.offset).unwrap_or(0);
+        let windows = event_window(&rows, first_offset, TRANSCRIPT_WINDOW_RADIUS)
+            .into_iter()
+            .collect::<Vec<_>>();
+        out.push(json!({
+            "tape_id": session_id,
+            "tape_present_locally": tape_path.is_some(),
+            "touch_count": 0,
+            "latest_touch_timestamp": extract_latest_timestamp_from_rows(&rows),
+            "touches": [],
+            "windows": windows,
+        }));
+    }
+    Ok(out)
+}
+
+fn collect_anchor_scores(
+    indexes: &[SqliteIndex],
+    anchors: &[String],
+) -> Result<HashMap<String, f32>, CliError> {
+    if anchors.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut by_tape: HashMap<String, HashSet<String>> = HashMap::new();
+    for anchor in anchors {
+        for index in indexes {
+            for fragment in index.evidence_for_anchor(anchor)? {
+                by_tape
+                    .entry(fragment.tape_id)
+                    .or_default()
+                    .insert(anchor.clone());
+            }
+        }
+    }
+
+    let denom = anchors.len() as f32;
+    let mut out = HashMap::new();
+    for (tape_id, hits) in by_tape {
+        out.insert(tape_id, hits.len() as f32 / denom);
+    }
+    Ok(out)
+}
+
+fn collect_grep_matches(
+    context: &RuntimeContext,
+    indexes: &[SqliteIndex],
+    pattern: &str,
+) -> Result<(Vec<Value>, HashMap<String, f32>), CliError> {
+    let mut tape_ids = HashSet::new();
+    for index in indexes {
+        for tape_id in index.referenced_tape_ids()? {
+            tape_ids.insert(tape_id);
+        }
+    }
+    for dir in &context.tape_lookup_dirs {
+        if !dir.exists() {
+            continue;
+        }
+        let entries = fs::read_dir(dir).map_err(|err| CliError::io("read_dir_error", err))?;
+        for entry in entries {
+            let entry = entry.map_err(|err| CliError::io("read_dir_error", err))?;
+            if let Some(tape_id) = tape_id_from_path(&entry.path()) {
+                tape_ids.insert(tape_id);
+            }
+        }
+    }
+
+    let mut raw_sessions = Vec::new();
+    let mut score_by_session = HashMap::new();
+
+    for tape_id in tape_ids {
+        let Some(path) = resolve_tape_path(context, &tape_id) else {
+            continue;
+        };
+        let content = read_tape_content(&path)?;
+        let lines = content.lines().collect::<Vec<_>>();
+        let mut first_match = None;
+        let mut match_count = 0usize;
+        for (idx, line) in lines.iter().enumerate() {
+            if line.contains(pattern) {
+                match_count += 1;
+                if first_match.is_none() {
+                    first_match = Some(idx as u64);
+                }
+            }
+        }
+        let Some(first_match) = first_match else {
+            continue;
+        };
+
+        let rows = parse_jsonl_rows(&content)?;
+        let windows = event_window(&rows, first_match, TRANSCRIPT_WINDOW_RADIUS)
+            .into_iter()
+            .collect::<Vec<_>>();
+        raw_sessions.push(json!({
+            "tape_id": tape_id,
+            "tape_present_locally": true,
+            "touch_count": match_count,
+            "latest_touch_timestamp": extract_latest_timestamp_from_rows(&rows),
+            "touches": [],
+            "windows": windows,
+        }));
+        score_by_session.insert(
+            raw_sessions
+                .last()
+                .and_then(|v| v.get("tape_id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            match_count as f32,
+        );
+    }
+
+    Ok((raw_sessions, score_by_session))
+}
+
+fn format_sessions_for_agent(
+    context: &RuntimeContext,
+    primary_index: &SqliteIndex,
+    raw_sessions: Vec<Value>,
+    score_by_session: &HashMap<String, f32>,
+    start: Option<usize>,
+    lines: Option<usize>,
+    grep: Option<&str>,
+) -> Result<Vec<Value>, CliError> {
+    let mut out = Vec::new();
+    let line_count = lines.unwrap_or(DEFAULT_WINDOW_LINES).max(1);
+
+    for raw in raw_sessions {
+        let Some(session_id) = raw.get("tape_id").and_then(Value::as_str) else {
+            continue;
+        };
+
+        let tape_path = resolve_tape_path(context, session_id);
+        let (rows, raw_text, total_lines) = if let Some(path) = tape_path.as_ref() {
+            let content = read_tape_content(path)?;
+            let rows = parse_jsonl_rows(&content)?;
+            let total = content.lines().count();
+            (rows, content, total)
+        } else {
+            (Vec::new(), String::new(), 0usize)
+        };
+
+        let content_lines = raw_text.lines().collect::<Vec<_>>();
+        let anchor_line = raw
+            .get("windows")
+            .and_then(Value::as_array)
+            .and_then(|windows| windows.first())
+            .and_then(|window| window.get("touch_offset"))
+            .and_then(Value::as_u64)
+            .map(|offset| offset as usize + 1)
+            .unwrap_or(1);
+
+        let default_before =
+            line_count * DEFAULT_WINDOW_BEFORE_RATIO_NUM / DEFAULT_WINDOW_BEFORE_RATIO_DEN;
+        let window_start =
+            start.unwrap_or_else(|| anchor_line.saturating_sub(default_before).max(1));
+        let window_end = if total_lines == 0 {
+            0
+        } else {
+            usize::min(
+                total_lines,
+                window_start.saturating_add(line_count).saturating_sub(1),
+            )
+        };
+
+        let content = if total_lines == 0 || window_end == 0 {
+            Vec::new()
+        } else {
+            ((window_start - 1)..window_end)
+                .map(|idx| {
+                    json!({
+                        "line": idx + 1,
+                        "text": content_lines.get(idx).copied().unwrap_or_default(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+
+        if let Some(pattern) = grep
+            && !content.iter().any(|line| {
+                line.get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains(pattern))
+            })
+        {
+            continue;
+        }
+
+        let mut files_touched = raw
+            .get("touches")
+            .and_then(Value::as_array)
+            .map(|touches| {
+                touches
+                    .iter()
+                    .filter_map(|touch| touch.get("file_path").and_then(Value::as_str))
+                    .map(ToOwned::to_owned)
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        if files_touched.is_empty() {
+            for file in collect_files_touched_from_rows(&rows) {
+                files_touched.insert(file);
+            }
+        }
+        let mut files_touched = files_touched.into_iter().collect::<Vec<_>>();
+        files_touched.sort();
+
+        let (refs_up, refs_down) = dispatch_ref_counts(primary_index, session_id)?;
+        let timestamp = raw
+            .get("latest_touch_timestamp")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| extract_latest_timestamp_from_rows(&rows));
+
+        out.push(json!({
+            "session_id": session_id,
+            "timestamp": timestamp,
+            "window_start": window_start,
+            "window_end": window_end,
+            "total_lines": total_lines,
+            "score": score_by_session.get(session_id).copied().unwrap_or(0.0),
+            "refs_up": refs_up,
+            "refs_down": refs_down,
+            "files_touched": files_touched,
+            "content": content,
+            "tape_present_locally": tape_path.is_some(),
+            "touch_count": raw.get("touch_count").cloned().unwrap_or(Value::from(0)),
+            "touches": raw.get("touches").cloned().unwrap_or_else(|| json!([])),
+            "windows": raw.get("windows").cloned().unwrap_or_else(|| json!([])),
+            "tape_id": session_id,
+        }));
+    }
+
+    Ok(out)
+}
+
+fn dispatch_ref_counts(index: &SqliteIndex, tape_id: &str) -> Result<(usize, usize), CliError> {
+    let mut up = 0usize;
+    let mut down = 0usize;
+    for link in index.dispatch_links_for_tape(tape_id)? {
+        match link.direction {
+            DispatchDirection::Received => up += 1,
+            DispatchDirection::Sent => down += 1,
+        }
+    }
+    Ok((up, down))
+}
+
+fn extract_latest_timestamp_from_rows(rows: &[TapeRow]) -> String {
+    rows.iter()
+        .filter_map(|row| row.value.get("t").and_then(Value::as_str))
+        .max()
+        .unwrap_or("")
+        .to_string()
+}
+
+fn collect_files_touched_from_rows(rows: &[TapeRow]) -> Vec<String> {
+    let mut files = HashSet::new();
+    for row in rows {
+        if let Some(file) = row.value.get("file").and_then(Value::as_str) {
+            files.insert(file.to_string());
+        }
+        if let Some(file) = row.value.get("from_file").and_then(Value::as_str) {
+            files.insert(file.to_string());
+        }
+        if let Some(file) = row.value.get("to_file").and_then(Value::as_str) {
+            files.insert(file.to_string());
+        }
+    }
+    let mut out = files.into_iter().collect::<Vec<_>>();
+    out.sort();
+    out
+}
+
+fn apply_session_truncation(
+    sessions: Vec<Value>,
+    limit: Option<usize>,
+) -> (Vec<Value>, usize, usize, Value, bool) {
+    let total = sessions.len();
+    let max_return = usize::min(limit.unwrap_or(usize::MAX), SAFE_RESULT_SESSION_THRESHOLD);
+    let returned_count = usize::min(total, max_return);
+
+    let mut timestamps = sessions
+        .iter()
+        .filter_map(|session| session.get("timestamp").and_then(Value::as_str))
+        .filter(|timestamp| !timestamp.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    timestamps.sort();
+
+    let time_range = if timestamps.is_empty() {
+        json!({"start": Value::Null, "end": Value::Null})
+    } else {
+        json!({
+            "start": timestamps.first().cloned().unwrap_or_default(),
+            "end": timestamps.last().cloned().unwrap_or_default(),
+        })
+    };
+
+    let truncated = returned_count < total;
+    let sessions = sessions
+        .into_iter()
+        .take(returned_count)
+        .collect::<Vec<_>>();
+
+    (sessions, returned_count, total, time_range, truncated)
 }
 
 fn collect_dispatch_upstream_sessions(
@@ -1941,39 +2490,6 @@ fn print_pretty_explain(
             println!("- {tombstone}");
         }
     }
-}
-
-fn resolve_explain_anchors(cwd: &Path, args: &ExplainArgs) -> Result<Vec<String>, CliError> {
-    if args.anchor {
-        let target = args.target.clone().ok_or_else(|| {
-            CliError::new(
-                "invalid_explain_target",
-                "target is required for --anchor mode",
-            )
-        })?;
-        return Ok(vec![target]);
-    }
-
-    let target = args
-        .target
-        .as_deref()
-        .ok_or_else(|| CliError::new("invalid_explain_target", "target is required"))?;
-    let (file, start, end) = parse_file_range_target(target)?;
-    let file_path = cwd.join(file);
-    let span_texts = read_file_span_variants(&file_path, start, end)?;
-    Ok(derive_anchor_candidates(&span_texts))
-}
-
-fn resolve_explain_lookup_anchors(
-    _indexes: &[SqliteIndex],
-    _target: &str,
-    _args: &ExplainArgs,
-    query_anchors: &[String],
-) -> Result<Vec<String>, CliError> {
-    // query_anchors are individual winnow hash tokens — each maps to an
-    // evidence row via an exact-equality index scan.  No similarity scoring
-    // or full-table scan needed.
-    Ok(query_anchors.to_vec())
 }
 
 fn derive_anchor_candidates(span_texts: &[String]) -> Vec<String> {
