@@ -724,7 +724,7 @@ Flags (all optional, composable):
 | `--lines N` | Number of lines to return from start |
 | `--limit N` | Cap number of sessions returned |
 
-**Default behavior**: returns content with a default window for each matching session.
+**Default behavior**: returns content with a default window for each matching session, returning at most the top 10 sessions unless `--limit` is provided.
 
 **Per-session metadata returned**:
 
@@ -735,7 +735,7 @@ Flags (all optional, composable):
 | `window_start` | First line number of returned content |
 | `window_end` | Last line number of returned content |
 | `total_lines` | Total lines in session (so agent knows how much exists) |
-| `score` | Fingerprint match relevance |
+| `confidence` | Fingerprint match relevance |
 | `refs_up` | Count of upstream reference edges (dispatching sessions) |
 | `refs_down` | Count of downstream reference edges (dispatched agents) |
 | `files_touched` | List of files this session modified |
@@ -754,12 +754,12 @@ Flags (all optional, composable):
 ```bash
 # Step 1: initial explain
 $ engram explain src/server.ts:3398-3412
-session: af156abd  score: 0.92  lines: 380-420 / 1200  refs_up: 2  refs_down: 0
+session: af156abd  confidence: 0.92  lines: 380-420 / 1200  refs_up: 2  refs_down: 0
   > 380: The alert retry logic was failing because...
   > ...
   > 420: Fixed by preserving the original body on retry.
 
-session: cc469340  score: 0.78  lines: 100-140 / 850  refs_up: 1  refs_down: 3
+session: cc469340  confidence: 0.78  lines: 100-140 / 850  refs_up: 1  refs_down: 3
   > 100: Flynn flagged that main session was eating alerts...
   > ...
   > 140: Added applyMainSessionAlertRequirement as belt-and-suspenders.

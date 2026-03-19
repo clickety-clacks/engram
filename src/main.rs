@@ -43,6 +43,7 @@ const MAX_QUERY_WINDOW_ANCHORS: usize = 16;
 const DEFAULT_WINDOW_LINES: usize = 40;
 const DEFAULT_WINDOW_BEFORE_RATIO_NUM: usize = 3;
 const DEFAULT_WINDOW_BEFORE_RATIO_DEN: usize = 4;
+const DEFAULT_SESSION_LIMIT: usize = 10;
 const SAFE_RESULT_SESSION_THRESHOLD: usize = 25;
 
 const TAPE_SUFFIX: &str = ".jsonl.zst";
@@ -142,8 +143,6 @@ struct ExplainArgs {
     lines: Option<usize>,
     #[arg(long)]
     limit: Option<usize>,
-    #[arg(long, default_value_t = 0.50)]
-    min_confidence: f32,
     #[arg(long, default_value_t = 50)]
     max_fanout: usize,
     #[arg(long, default_value_t = 500)]
@@ -1582,10 +1581,10 @@ fn cmd_explain(
             let span_texts = read_file_span_variants(&cwd.join(file), start, end)?;
             query_anchors = derive_anchor_candidates(&span_texts);
             let traversal = ExplainTraversal {
-                min_confidence: args.min_confidence,
                 max_fanout: args.max_fanout,
                 max_edges: args.max_edges,
                 max_depth: args.depth,
+                ..ExplainTraversal::default()
             };
             let result =
                 explain_across_indexes(&indexes, &query_anchors, traversal, args.forensics)?;
@@ -1626,10 +1625,10 @@ fn cmd_explain(
                 derive_anchor_candidates(&[text])
             };
             let traversal = ExplainTraversal {
-                min_confidence: args.min_confidence,
                 max_fanout: args.max_fanout,
                 max_edges: args.max_edges,
                 max_depth: args.depth,
+                ..ExplainTraversal::default()
             };
             let result =
                 explain_across_indexes(&indexes, &query_anchors, traversal, args.forensics)?;
@@ -1680,8 +1679,8 @@ fn cmd_explain(
         args.grep.as_deref(),
     )?;
     sessions.sort_by(|a, b| {
-        let a_score = a.get("score").and_then(Value::as_f64).unwrap_or(0.0);
-        let b_score = b.get("score").and_then(Value::as_f64).unwrap_or(0.0);
+        let a_score = a.get("confidence").and_then(Value::as_f64).unwrap_or(0.0);
+        let b_score = b.get("confidence").and_then(Value::as_f64).unwrap_or(0.0);
         let a_ts = a.get("timestamp").and_then(Value::as_str).unwrap_or("");
         let b_ts = b.get("timestamp").and_then(Value::as_str).unwrap_or("");
         b_score
@@ -1702,7 +1701,6 @@ fn cmd_explain(
             "start": args.start,
             "lines": args.lines,
             "limit": args.limit,
-            "min_confidence": args.min_confidence,
             "max_fanout": args.max_fanout,
             "max_edges": args.max_edges,
             "depth": args.depth,
@@ -2067,7 +2065,7 @@ fn format_sessions_for_agent(
             "window_start": window_start,
             "window_end": window_end,
             "total_lines": total_lines,
-            "score": score_by_session.get(session_id).copied().unwrap_or(0.0),
+            "confidence": score_by_session.get(session_id).copied().unwrap_or(0.0),
             "refs_up": refs_up,
             "refs_down": refs_down,
             "files_touched": files_touched,
@@ -2126,7 +2124,10 @@ fn apply_session_truncation(
     limit: Option<usize>,
 ) -> (Vec<Value>, usize, usize, Value, bool) {
     let total = sessions.len();
-    let max_return = usize::min(limit.unwrap_or(usize::MAX), SAFE_RESULT_SESSION_THRESHOLD);
+    let max_return = usize::min(
+        limit.unwrap_or(DEFAULT_SESSION_LIMIT),
+        SAFE_RESULT_SESSION_THRESHOLD,
+    );
     let returned_count = usize::min(total, max_return);
 
     let mut timestamps = sessions

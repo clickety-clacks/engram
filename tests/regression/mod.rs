@@ -77,7 +77,7 @@ fn explain_scaled_fixture_meets_perf_budget() {
 
     let _ = run_json(&repo, &["init"], None, &home);
 
-    for rev in 0..8 {
+    for rev in 0..12 {
         let revised_text = format!("// revision {rev}\n{file_text}");
         let record_line = json!({
             "t": "2026-03-18T00:00:00Z",
@@ -112,10 +112,22 @@ fn explain_scaled_fixture_meets_perf_budget() {
     );
 
     let sessions = explain["sessions"].as_array().expect("sessions");
-    assert!(
-        !sessions.is_empty(),
-        "expected explain to return sessions on scaled fixture"
+    assert_eq!(
+        explain["returned"].as_u64(),
+        Some(10),
+        "default explain limit should return top 10 sessions"
     );
+    assert_eq!(
+        explain["total"].as_u64(),
+        Some(12),
+        "fixture should produce 12 matching sessions"
+    );
+    assert_eq!(
+        explain["truncated"].as_bool(),
+        Some(true),
+        "default explain limit should truncate when more than 10 match"
+    );
+    assert_eq!(sessions.len(), 10);
 }
 
 #[test]
@@ -283,7 +295,7 @@ fn explain_supports_string_and_session_id_navigation() {
     assert!(sessions[0].get("window_start").is_some());
     assert!(sessions[0].get("window_end").is_some());
     assert!(sessions[0].get("total_lines").is_some());
-    assert!(sessions[0].get("score").is_some());
+    assert!(sessions[0].get("confidence").is_some());
     assert!(sessions[0].get("refs_up").is_some());
     assert!(sessions[0].get("refs_down").is_some());
     assert!(sessions[0].get("files_touched").is_some());
@@ -332,4 +344,35 @@ fn grep_uses_explain_output_shape_and_truncation_header() {
     assert!(grep["time_range"].get("start").is_some());
     assert!(sessions[0].get("content").is_some());
     assert!(sessions[0].get("session_id").is_some());
+}
+
+#[test]
+fn grep_defaults_to_ten_sessions() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = home.join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+
+    write_repo_file(&repo, "src/lib.rs", "fn grep_default_limit() {}\n");
+    let _ = run_json(&repo, &["init"], None, &home);
+
+    for i in 0..12 {
+        let ts = format!("2026-03-18T03:{i:02}:00Z");
+        let record_line = json!({
+            "t": ts,
+            "k": "msg.out",
+            "role": "assistant",
+            "content": format!("default-limit needle {i}"),
+        })
+        .to_string()
+            + "\n";
+        let _ = run_json(&repo, &["record", "--stdin"], Some(&record_line), &home);
+    }
+
+    let grep = run_json(&repo, &["grep", "default-limit needle"], None, &home);
+    let sessions = grep["sessions"].as_array().expect("sessions");
+    assert_eq!(grep["returned"], Value::from(10));
+    assert_eq!(grep["total"], Value::from(12));
+    assert_eq!(grep["truncated"], Value::Bool(true));
+    assert_eq!(sessions.len(), 10);
 }
