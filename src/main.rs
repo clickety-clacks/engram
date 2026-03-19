@@ -43,7 +43,6 @@ const MAX_QUERY_WINDOW_ANCHORS: usize = 16;
 const DEFAULT_WINDOW_LINES: usize = 40;
 const DEFAULT_WINDOW_BEFORE_RATIO_NUM: usize = 3;
 const DEFAULT_WINDOW_BEFORE_RATIO_DEN: usize = 4;
-const DEFAULT_SESSION_LIMIT: usize = 10;
 const SAFE_RESULT_SESSION_THRESHOLD: usize = 25;
 
 const TAPE_SUFFIX: &str = ".jsonl.zst";
@@ -98,6 +97,7 @@ enum Command {
     Record(RecordArgs),
     Explain(ExplainArgs),
     Grep(GrepArgs),
+    Peek(PeekArgs),
     Tapes,
     Show(ShowArgs),
     Gc,
@@ -133,27 +133,33 @@ struct ShowArgs {
 #[derive(Args, Debug)]
 struct ExplainArgs {
     target: Option<String>,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     anchor: bool,
     #[arg(long)]
-    grep: Option<String>,
-    #[arg(long)]
-    start: Option<usize>,
-    #[arg(long)]
-    lines: Option<usize>,
+    grep_filter: Option<String>,
     #[arg(long)]
     limit: Option<usize>,
-    #[arg(long, default_value_t = 50)]
+    #[arg(long, default_value_t = 0.5)]
+    min_confidence: f32,
+    #[arg(long, default_value_t = 0)]
+    offset: usize,
+    #[arg(long)]
+    since: Option<String>,
+    #[arg(long)]
+    until: Option<String>,
+    #[arg(long)]
+    count: bool,
+    #[arg(long, default_value_t = 50, hide = true)]
     max_fanout: usize,
-    #[arg(long, default_value_t = 500)]
+    #[arg(long, default_value_t = 500, hide = true)]
     max_edges: usize,
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 10, hide = true)]
     depth: usize,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     include_deleted: bool,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     forensics: bool,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pretty: bool,
 }
 
@@ -161,11 +167,30 @@ struct ExplainArgs {
 struct GrepArgs {
     pattern: String,
     #[arg(long)]
+    limit: Option<usize>,
+    #[arg(long, default_value_t = 0)]
+    offset: usize,
+    #[arg(long)]
+    since: Option<String>,
+    #[arg(long)]
+    until: Option<String>,
+    #[arg(long)]
+    count: bool,
+}
+
+#[derive(Args, Debug)]
+struct PeekArgs {
+    session_id: String,
+    #[arg(long)]
     start: Option<usize>,
     #[arg(long)]
     lines: Option<usize>,
     #[arg(long)]
-    limit: Option<usize>,
+    before: Option<usize>,
+    #[arg(long)]
+    after: Option<usize>,
+    #[arg(long)]
+    grep_filter: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +208,11 @@ struct RuntimeContext {
     tapes_dir: PathBuf,
     tape_lookup_dirs: Vec<PathBuf>,
     additional_stores: Vec<PathBuf>,
+    explain_default_limit: usize,
+    peek_default_lines: usize,
+    peek_default_before: usize,
+    peek_default_after: usize,
+    peek_grep_context: usize,
     watch: Option<EffectiveWatchConfig>,
 }
 
@@ -211,12 +241,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            let payload = json!({
-                "error": {
-                    "code": err.code,
-                    "message": err.message,
-                }
-            });
+            let payload = error_payload(&err);
             eprintln!("{payload}");
             ExitCode::FAILURE
         }
@@ -224,6 +249,9 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), CliError> {
+    if maybe_print_spec_help()? {
+        return Ok(());
+    }
     let cli = Cli::parse();
     let cwd = std::env::current_dir().map_err(|err| CliError::io("cwd_error", err))?;
     let paths = repo_paths(&cwd)?;
@@ -250,6 +278,10 @@ fn run() -> Result<(), CliError> {
             let context = resolve_runtime_context(&cwd)?;
             cmd_grep(&paths, &context, args)
         }
+        Command::Peek(args) => {
+            let context = resolve_runtime_context(&cwd)?;
+            cmd_peek(&paths, &context, args)
+        }
         Command::Tapes => {
             let context = resolve_runtime_context(&cwd)?;
             cmd_tapes(&paths, &context)
@@ -265,6 +297,145 @@ fn run() -> Result<(), CliError> {
     }
 }
 
+fn error_payload(err: &CliError) -> Value {
+    match err.code {
+        "session_not_found" => json!({
+            "error": "session_not_found",
+            "session_id": err.message,
+        }),
+        "no_results" => json!({
+            "error": "no_results",
+            "query": err.message,
+        }),
+        "invalid_span" => json!({
+            "error": "invalid_span",
+            "detail": err.message,
+        }),
+        _ => json!({
+            "error": {
+                "code": err.code,
+                "message": err.message,
+            }
+        }),
+    }
+}
+
+const HELP_ENGRAM: &str = r#"Engram indexes agent conversations that produced your code.
+
+Results are organized as provenance chains: the root is WHY
+(product decisions, design rationale), descendants are HOW
+(specs, implementation). Use explain to find chains, peek to
+read them.
+
+COMMANDS:
+  explain    Find provenance for code (by fingerprint)
+  grep       Find provenance for a term (by text search)
+  peek       Read content from a provenance session
+  ingest     Import transcripts into the index
+  watch      Continuously watch for new transcripts
+
+Run engram <command> --help for details.
+"#;
+
+const HELP_EXPLAIN: &str = r#"Find the conversations that produced this code.
+
+Returns the root of each provenance chain — the highest-level
+context explaining WHY this code exists. Results include chain
+metadata (children, depth) so you can walk down to HOW with peek.
+
+USAGE:
+  engram explain <file>:<start>-<end>   Provenance for a code span
+  engram explain <file>                 Provenance for an entire file  
+  engram explain "<string>"             Provenance for arbitrary text
+
+OPTIONS:
+  --grep-filter <pattern>   Only results whose content matches (grep syntax)
+  --limit N                 Max results [default: 10]
+  --offset N                Skip first N results (pagination)
+  --min-confidence N        Only results above this match quality (0.0-1.0)
+  --since <date>            Only sessions after this date
+  --until <date>            Only sessions before this date
+  --count                   Show counts only, no content (token budgeting)
+
+EXAMPLES:
+  engram explain src/server.ts:40-78
+  engram explain src/server.ts:40-78 --grep-filter "retry"
+  engram explain src/server.ts --since 2026-03-01 --limit 5
+"#;
+
+const HELP_GREP: &str = r#"Search all provenance sessions for a term.
+
+Unlike explain (which matches by code fingerprint), grep searches
+for literal text across all indexed conversations.
+
+USAGE:
+  engram grep <pattern>
+
+OPTIONS:
+  --limit N       Max results [default: 10]
+  --offset N      Skip first N results
+  --since <date>  Only sessions after this date
+  --until <date>  Only sessions before this date
+  --count         Show counts only, no content
+
+EXAMPLES:
+  engram grep "maxMessageBytes"
+  engram grep "retry logic" --since 2026-03-01
+"#;
+
+const HELP_PEEK: &str = r#"Read content from a provenance session.
+
+Use explain or grep to find sessions, then peek to read them.
+By default returns a window around the anchor point (where the
+session connects to its parent chain). Use --start/--lines for
+absolute positioning.
+
+USAGE:
+  engram peek <session_id>
+
+OPTIONS:
+  --start N                 Read from this line number
+  --lines N                 Number of lines to return [default: 40]
+  --before N                Lines before the anchor point [default: 30]
+  --after N                 Lines after the anchor point [default: 10]
+  --grep-filter <pattern>   Find lines matching this term within the session
+
+EXAMPLES:
+  engram peek af156abd
+  engram peek af156abd --start 421 --lines 30
+  engram peek af156abd --grep-filter "NO_REPLY"
+"#;
+
+fn maybe_print_spec_help() -> Result<bool, CliError> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let help_flag = |value: &str| value == "--help" || value == "-h";
+
+    if args.len() == 1 && help_flag(&args[0]) {
+        print!("{HELP_ENGRAM}");
+        return Ok(true);
+    }
+
+    if args.len() == 2 && help_flag(&args[1]) {
+        match args[0].as_str() {
+            "explain" => {
+                print!("{HELP_EXPLAIN}");
+                return Ok(true);
+            }
+            "grep" => {
+                print!("{HELP_GREP}");
+                return Ok(true);
+            }
+            "peek" => {
+                print!("{HELP_PEEK}");
+                return Ok(true);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(false)
+}
+
 fn cmd_init(paths: &RepoPaths) -> Result<(), CliError> {
     let home = home_dir()?;
     ensure_user_config(&home).map_err(|err| CliError::new("config_error", err.to_string()))?;
@@ -276,6 +447,11 @@ fn cmd_init(paths: &RepoPaths) -> Result<(), CliError> {
         tapes_dir: local_tapes_dir.clone(),
         tape_lookup_dirs: vec![local_tapes_dir, home.join(".engram").join("tapes")],
         additional_stores: Vec::new(),
+        explain_default_limit: 10,
+        peek_default_lines: 40,
+        peek_default_before: 30,
+        peek_default_after: 10,
+        peek_grep_context: 5,
         watch: None,
     };
     print_context_conspicuity(&context);
@@ -718,6 +894,11 @@ fn cmd_watch_with_home(cwd: &Path, args: WatchArgs, home: &Path) -> Result<(), C
         tapes_dir: config.tapes_dir,
         tape_lookup_dirs,
         additional_stores: config.additional_stores,
+        explain_default_limit: config.explain_default_limit,
+        peek_default_lines: config.peek.default_lines,
+        peek_default_before: config.peek.default_before,
+        peek_default_after: config.peek.default_after,
+        peek_grep_context: config.peek.grep_context,
         watch: config.watch,
     };
     print_context_conspicuity(&context);
@@ -1572,19 +1753,17 @@ fn cmd_explain(
     let mut lineage = Vec::new();
     let mut tombstones = Vec::new();
     let mut score_by_session = HashMap::new();
+    let date_filter = DateFilter::parse(args.since.as_deref(), args.until.as_deref())?;
 
     match target_kind {
-        ExplainTarget::SessionId(session_id) => {
-            raw_sessions = build_session_windows_for_ids(context, &[session_id])?;
-        }
         ExplainTarget::FileRange { file, start, end } => {
             let span_texts = read_file_span_variants(&cwd.join(file), start, end)?;
             query_anchors = derive_anchor_candidates(&span_texts);
             let traversal = ExplainTraversal {
+                min_confidence: args.min_confidence,
                 max_fanout: args.max_fanout,
                 max_edges: args.max_edges,
                 max_depth: args.depth,
-                ..ExplainTraversal::default()
             };
             let result =
                 explain_across_indexes(&indexes, &query_anchors, traversal, args.forensics)?;
@@ -1618,6 +1797,28 @@ fn cmd_explain(
                 }
             }
         }
+        ExplainTarget::FileWhole { file } => {
+            let full_text = fs::read_to_string(cwd.join(file))
+                .map_err(|err| CliError::io("read_span_error", err))?;
+            query_anchors = derive_anchor_candidates(&[full_text]);
+            let traversal = ExplainTraversal {
+                min_confidence: args.min_confidence,
+                max_fanout: args.max_fanout,
+                max_edges: args.max_edges,
+                max_depth: args.depth,
+            };
+            let result =
+                explain_across_indexes(&indexes, &query_anchors, traversal, args.forensics)?;
+            let touches =
+                collect_touch_evidence(&indexes, &result.direct, &result.touched_anchors)?;
+            raw_sessions = build_session_windows(context, touches)?;
+            let (chain, dispatch_sessions) =
+                collect_dispatch_upstream_sessions(context, &indexes[0], &raw_sessions)?;
+            dispatch_lineage = chain;
+            raw_sessions.extend(dispatch_sessions);
+            lineage = result.lineage.iter().map(edge_to_json).collect::<Vec<_>>();
+            score_by_session = collect_anchor_scores(&indexes, &query_anchors)?;
+        }
         ExplainTarget::Literal(text) => {
             query_anchors = if args.anchor {
                 vec![text]
@@ -1625,10 +1826,10 @@ fn cmd_explain(
                 derive_anchor_candidates(&[text])
             };
             let traversal = ExplainTraversal {
+                min_confidence: args.min_confidence,
                 max_fanout: args.max_fanout,
                 max_edges: args.max_edges,
                 max_depth: args.depth,
-                ..ExplainTraversal::default()
             };
             let result =
                 explain_across_indexes(&indexes, &query_anchors, traversal, args.forensics)?;
@@ -1674,33 +1875,50 @@ fn cmd_explain(
         &indexes[0],
         raw_sessions,
         &score_by_session,
-        args.start,
-        args.lines,
-        args.grep.as_deref(),
+        args.grep_filter.as_deref(),
+        !args.count,
     )?;
+    sessions.retain(|session| session_matches_date_filter(session, &date_filter));
+    annotate_chain_fields(&mut sessions, &dispatch_lineage);
     sessions.sort_by(|a, b| {
+        let a_depth = a.get("depth").and_then(Value::as_u64).unwrap_or(0);
+        let b_depth = b.get("depth").and_then(Value::as_u64).unwrap_or(0);
         let a_score = a.get("confidence").and_then(Value::as_f64).unwrap_or(0.0);
         let b_score = b.get("confidence").and_then(Value::as_f64).unwrap_or(0.0);
         let a_ts = a.get("timestamp").and_then(Value::as_str).unwrap_or("");
         let b_ts = b.get("timestamp").and_then(Value::as_str).unwrap_or("");
-        b_score
+        a_depth
+            .cmp(&b_depth)
+            .then_with(|| {
+                b_score
             .partial_cmp(&a_score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .then_with(|| b_ts.cmp(a_ts))
     });
+    if sessions.is_empty() {
+        return Err(CliError::new("no_results", target));
+    }
 
     let (sessions, returned, total, time_range, truncated) =
-        apply_session_truncation(sessions, args.limit);
+        apply_session_truncation(sessions, args.limit, args.offset, context.explain_default_limit);
+    if sessions.is_empty() {
+        return Err(CliError::new("no_results", target));
+    }
+    let chain_metadata = build_chain_metadata(&sessions);
 
     print_json(&json!({
         "query": {
             "command": "explain",
             "target": target,
             "anchors": query_anchors,
-            "grep": args.grep,
-            "start": args.start,
-            "lines": args.lines,
+            "grep_filter": args.grep_filter,
             "limit": args.limit,
+            "offset": args.offset,
+            "min_confidence": args.min_confidence,
+            "since": args.since,
+            "until": args.until,
+            "count": args.count,
             "max_fanout": args.max_fanout,
             "max_edges": args.max_edges,
             "depth": args.depth,
@@ -1708,6 +1926,7 @@ fn cmd_explain(
             "include_deleted": args.include_deleted,
         },
         "sessions": sessions,
+        "chains": chain_metadata,
         "lineage": lineage,
         "dispatch_lineage": dispatch_lineage,
         "tombstones": tombstones,
@@ -1726,31 +1945,40 @@ fn cmd_grep(paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Resu
 
     let indexes = open_query_indexes(context)?;
     let (raw_sessions, score_by_session) = collect_grep_matches(context, &indexes, &args.pattern)?;
+    let date_filter = DateFilter::parse(args.since.as_deref(), args.until.as_deref())?;
     let mut sessions = format_sessions_for_agent(
         context,
         &indexes[0],
         raw_sessions,
         &score_by_session,
-        args.start,
-        args.lines,
         None,
+        !args.count,
     )?;
+    sessions.retain(|session| session_matches_date_filter(session, &date_filter));
     sessions.sort_by(|a, b| {
         let a_ts = a.get("timestamp").and_then(Value::as_str).unwrap_or("");
         let b_ts = b.get("timestamp").and_then(Value::as_str).unwrap_or("");
         b_ts.cmp(a_ts)
     });
+    if sessions.is_empty() {
+        return Err(CliError::new("no_results", args.pattern));
+    }
 
     let (sessions, returned, total, time_range, truncated) =
-        apply_session_truncation(sessions, args.limit);
+        apply_session_truncation(sessions, args.limit, args.offset, context.explain_default_limit);
+    if sessions.is_empty() {
+        return Err(CliError::new("no_results", args.pattern));
+    }
 
     print_json(&json!({
         "query": {
             "command": "grep",
             "pattern": args.pattern,
-            "start": args.start,
-            "lines": args.lines,
             "limit": args.limit,
+            "offset": args.offset,
+            "since": args.since,
+            "until": args.until,
+            "count": args.count,
         },
         "sessions": sessions,
         "lineage": [],
@@ -1764,11 +1992,139 @@ fn cmd_grep(paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Resu
     }))
 }
 
+fn cmd_peek(paths: &RepoPaths, context: &RuntimeContext, args: PeekArgs) -> Result<(), CliError> {
+    ensure_local_store(paths)?;
+    print_context_conspicuity(context);
+    ensure_db_parent(&context.db_path)?;
+
+    let indexes = open_query_indexes(context)?;
+    let session_id = args.session_id;
+    let Some(tape_path) = resolve_tape_path(context, &session_id) else {
+        return Err(CliError::new("session_not_found", session_id));
+    };
+    let raw_text = read_tape_content(&tape_path)?;
+    let rows = parse_jsonl_rows(&raw_text)?;
+    let total_lines = raw_text.lines().count();
+    let content_lines = raw_text.lines().collect::<Vec<_>>();
+    let timestamp = extract_latest_timestamp_from_rows(&rows);
+    let grep_context = context.peek_grep_context.max(1);
+
+    let (window_start, window_end, content) = if let Some(pattern) = args.grep_filter.as_deref() {
+        let mut hits = Vec::new();
+        for (idx, line) in content_lines.iter().enumerate() {
+            if line.contains(pattern) {
+                hits.push(idx);
+            }
+        }
+        if hits.is_empty() {
+            return Err(CliError::new("no_results", pattern.to_string()));
+        }
+        let mut ranges = Vec::new();
+        for idx in hits {
+            let start = idx.saturating_sub(grep_context);
+            let end = usize::min(total_lines.saturating_sub(1), idx + grep_context);
+            ranges.push((start, end));
+        }
+        ranges.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for (start, end) in ranges {
+            if let Some(last) = merged.last_mut()
+                && start <= last.1.saturating_add(1)
+            {
+                last.1 = usize::max(last.1, end);
+                continue;
+            }
+            merged.push((start, end));
+        }
+        let mut out = Vec::new();
+        let mut first = usize::MAX;
+        let mut last = 0usize;
+        for (start, end) in merged {
+            first = usize::min(first, start);
+            last = usize::max(last, end);
+            for idx in start..=end {
+                out.push(json!({
+                    "line": idx + 1,
+                    "text": content_lines.get(idx).copied().unwrap_or_default(),
+                }));
+            }
+        }
+        (first + 1, last + 1, out)
+    } else {
+        let anchor_line = default_peek_anchor_line(&indexes[0], &session_id, &rows);
+        if let Some(start) = args.start {
+            let line_count = args
+                .lines
+                .unwrap_or(context.peek_default_lines)
+                .max(1);
+            let end = usize::min(
+                total_lines,
+                start.saturating_add(line_count).saturating_sub(1),
+            );
+            let content = if total_lines == 0 || end == 0 {
+                Vec::new()
+            } else {
+                ((start.saturating_sub(1))..end)
+                    .map(|idx| {
+                        json!({
+                            "line": idx + 1,
+                            "text": content_lines.get(idx).copied().unwrap_or_default(),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            (start, end, content)
+        } else {
+            let before = args.before.unwrap_or(context.peek_default_before);
+            let after = args.after.unwrap_or(context.peek_default_after);
+            let start = anchor_line.saturating_sub(before).max(1);
+            let end = usize::min(total_lines, anchor_line.saturating_add(after));
+            let content = if total_lines == 0 || end == 0 {
+                Vec::new()
+            } else {
+                ((start - 1)..end)
+                    .map(|idx| {
+                        json!({
+                            "line": idx + 1,
+                            "text": content_lines.get(idx).copied().unwrap_or_default(),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            (start, end, content)
+        }
+    };
+
+    if content.is_empty() {
+        return Err(CliError::new("no_results", session_id.clone()));
+    }
+
+    print_json(&json!({
+        "query": {
+            "command": "peek",
+            "session_id": session_id,
+            "start": args.start,
+            "lines": args.lines,
+            "before": args.before,
+            "after": args.after,
+            "grep_filter": args.grep_filter,
+        },
+        "session": {
+            "session_id": session_id,
+            "timestamp": timestamp,
+            "window_start": window_start,
+            "window_end": window_end,
+            "total_lines": total_lines,
+            "content": content,
+        }
+    }))
+}
+
 #[derive(Debug, Clone)]
 enum ExplainTarget {
     FileRange { file: String, start: u32, end: u32 },
+    FileWhole { file: String },
     Literal(String),
-    SessionId(String),
 }
 
 fn open_query_indexes(context: &RuntimeContext) -> Result<Vec<SqliteIndex>, CliError> {
@@ -1784,8 +2140,8 @@ fn open_query_indexes(context: &RuntimeContext) -> Result<Vec<SqliteIndex>, CliE
 
 fn classify_explain_target(
     cwd: &Path,
-    context: &RuntimeContext,
-    indexes: &[SqliteIndex],
+    _context: &RuntimeContext,
+    _indexes: &[SqliteIndex],
     target: &str,
     anchor_mode: bool,
 ) -> Result<ExplainTarget, CliError> {
@@ -1793,41 +2149,30 @@ fn classify_explain_target(
         return Ok(ExplainTarget::Literal(target.to_string()));
     }
 
-    if let Ok((file, start, end)) = parse_file_range_target(target)
-        && cwd.join(file).exists()
-    {
-        return Ok(ExplainTarget::FileRange {
-            file: file.to_string(),
-            start,
-            end,
-        });
+    if has_span_shape(target) {
+        let (file, start, end) = parse_file_range_target(target)?;
+        if cwd.join(file).exists() {
+            return Ok(ExplainTarget::FileRange {
+                file: file.to_string(),
+                start,
+                end,
+            });
+        }
     }
 
-    if is_known_session_id(context, indexes, target)? {
-        return Ok(ExplainTarget::SessionId(target.to_string()));
+    if cwd.join(target).is_file() {
+        return Ok(ExplainTarget::FileWhole {
+            file: target.to_string(),
+        });
     }
 
     Ok(ExplainTarget::Literal(target.to_string()))
 }
 
-fn is_known_session_id(
-    context: &RuntimeContext,
-    indexes: &[SqliteIndex],
-    candidate: &str,
-) -> Result<bool, CliError> {
-    if resolve_tape_path(context, candidate).is_some() {
-        return Ok(true);
-    }
-    for index in indexes {
-        if index
-            .referenced_tape_ids()?
-            .iter()
-            .any(|id| id == candidate)
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+fn has_span_shape(target: &str) -> bool {
+    target
+        .rsplit_once(':')
+        .is_some_and(|(_, rhs)| rhs.contains('-'))
 }
 
 fn build_session_windows_for_ids(
@@ -1964,12 +2309,11 @@ fn format_sessions_for_agent(
     primary_index: &SqliteIndex,
     raw_sessions: Vec<Value>,
     score_by_session: &HashMap<String, f32>,
-    start: Option<usize>,
-    lines: Option<usize>,
     grep: Option<&str>,
+    include_content: bool,
 ) -> Result<Vec<Value>, CliError> {
     let mut out = Vec::new();
-    let line_count = lines.unwrap_or(DEFAULT_WINDOW_LINES).max(1);
+    let line_count = DEFAULT_WINDOW_LINES.max(1);
 
     for raw in raw_sessions {
         let Some(session_id) = raw.get("tape_id").and_then(Value::as_str) else {
@@ -1998,8 +2342,7 @@ fn format_sessions_for_agent(
 
         let default_before =
             line_count * DEFAULT_WINDOW_BEFORE_RATIO_NUM / DEFAULT_WINDOW_BEFORE_RATIO_DEN;
-        let window_start =
-            start.unwrap_or_else(|| anchor_line.saturating_sub(default_before).max(1));
+        let window_start = anchor_line.saturating_sub(default_before).max(1);
         let window_end = if total_lines == 0 {
             0
         } else {
@@ -2009,25 +2352,31 @@ fn format_sessions_for_agent(
             )
         };
 
-        let content = if total_lines == 0 || window_end == 0 {
+        let window_texts = if total_lines == 0 || window_end == 0 {
             Vec::new()
         } else {
             ((window_start - 1)..window_end)
-                .map(|idx| {
+                .map(|idx| content_lines.get(idx).copied().unwrap_or_default())
+                .collect::<Vec<_>>()
+        };
+
+        let content = if !include_content {
+            Vec::new()
+        } else {
+            window_texts
+                .iter()
+                .enumerate()
+                .map(|(idx, text)| {
                     json!({
-                        "line": idx + 1,
-                        "text": content_lines.get(idx).copied().unwrap_or_default(),
+                        "line": window_start + idx,
+                        "text": text,
                     })
                 })
                 .collect::<Vec<_>>()
         };
 
         if let Some(pattern) = grep
-            && !content.iter().any(|line| {
-                line.get("text")
-                    .and_then(Value::as_str)
-                    .is_some_and(|text| text.contains(pattern))
-            })
+            && !window_texts.iter().any(|text| text.contains(pattern))
         {
             continue;
         }
@@ -2122,13 +2471,17 @@ fn collect_files_touched_from_rows(rows: &[TapeRow]) -> Vec<String> {
 fn apply_session_truncation(
     sessions: Vec<Value>,
     limit: Option<usize>,
+    offset: usize,
+    default_limit: usize,
 ) -> (Vec<Value>, usize, usize, Value, bool) {
     let total = sessions.len();
+    let start = usize::min(offset, total);
+    let remaining = total.saturating_sub(start);
     let max_return = usize::min(
-        limit.unwrap_or(DEFAULT_SESSION_LIMIT),
+        limit.unwrap_or(default_limit),
         SAFE_RESULT_SESSION_THRESHOLD,
     );
-    let returned_count = usize::min(total, max_return);
+    let returned_count = usize::min(remaining, max_return);
 
     let mut timestamps = sessions
         .iter()
@@ -2147,13 +2500,224 @@ fn apply_session_truncation(
         })
     };
 
-    let truncated = returned_count < total;
+    let truncated = start > 0 || start.saturating_add(returned_count) < total;
     let sessions = sessions
         .into_iter()
+        .skip(start)
         .take(returned_count)
         .collect::<Vec<_>>();
 
     (sessions, returned_count, total, time_range, truncated)
+}
+
+#[derive(Debug, Clone)]
+struct DateFilter {
+    since: Option<chrono::DateTime<Utc>>,
+    until: Option<chrono::DateTime<Utc>>,
+}
+
+impl DateFilter {
+    fn parse(since: Option<&str>, until: Option<&str>) -> Result<Self, CliError> {
+        Ok(Self {
+            since: parse_date_bound(since, DateBound::Since)?,
+            until: parse_date_bound(until, DateBound::Until)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DateBound {
+    Since,
+    Until,
+}
+
+fn parse_date_bound(raw: Option<&str>, bound: DateBound) -> Result<Option<chrono::DateTime<Utc>>, CliError> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+
+    if let Ok(value) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Ok(Some(value.with_timezone(&Utc)));
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+        let dt = match bound {
+            DateBound::Since => date.and_hms_opt(0, 0, 0),
+            DateBound::Until => date.and_hms_opt(23, 59, 59),
+        }
+        .ok_or_else(|| CliError::new("invalid_date", raw.to_string()))?;
+        return Ok(Some(chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc)));
+    }
+    Err(CliError::new(
+        "invalid_date",
+        format!("invalid date format `{raw}`"),
+    ))
+}
+
+fn session_matches_date_filter(session: &Value, filter: &DateFilter) -> bool {
+    let Some(raw_ts) = session.get("timestamp").and_then(Value::as_str) else {
+        return true;
+    };
+    if raw_ts.is_empty() {
+        return true;
+    }
+    let Ok(ts) = chrono::DateTime::parse_from_rfc3339(raw_ts) else {
+        return true;
+    };
+    let ts = ts.with_timezone(&Utc);
+    if let Some(since) = filter.since
+        && ts < since
+    {
+        return false;
+    }
+    if let Some(until) = filter.until
+        && ts > until
+    {
+        return false;
+    }
+    true
+}
+
+fn annotate_chain_fields(sessions: &mut [Value], dispatch_lineage: &[Value]) {
+    let ids = sessions
+        .iter()
+        .filter_map(|session| session.get("session_id").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect::<HashSet<_>>();
+
+    let mut parent_of = HashMap::<String, String>::new();
+    let mut children_of = HashMap::<String, Vec<String>>::new();
+    for link in dispatch_lineage {
+        let Some(child) = link.get("session").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(parent) = link.get("parent_session").and_then(Value::as_str) else {
+            continue;
+        };
+        if !ids.contains(child) || !ids.contains(parent) {
+            continue;
+        }
+        parent_of.insert(child.to_string(), parent.to_string());
+        children_of
+            .entry(parent.to_string())
+            .or_default()
+            .push(child.to_string());
+    }
+    for children in children_of.values_mut() {
+        children.sort();
+    }
+
+    let mut root_for = HashMap::<String, String>::new();
+    for id in &ids {
+        let mut current = id.clone();
+        while let Some(parent) = parent_of.get(&current) {
+            current = parent.clone();
+        }
+        root_for.insert(id.clone(), current);
+    }
+    let mut chain_len = HashMap::<String, usize>::new();
+    for root in root_for.values() {
+        *chain_len.entry(root.clone()).or_insert(0) += 1;
+    }
+
+    for session in sessions {
+        let Some(id) = session
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+        else {
+            continue;
+        };
+        let mut depth = 0usize;
+        let mut current = id.clone();
+        while let Some(parent) = parent_of.get(&current) {
+            depth += 1;
+            current = parent.clone();
+        }
+        let parent = parent_of.get(&id).cloned();
+        let children = children_of.get(&id).cloned().unwrap_or_default();
+        let root = root_for.get(&id).cloned().unwrap_or_else(|| id.clone());
+        let length = chain_len.get(&root).copied().unwrap_or(1);
+
+        if let Some(obj) = session.as_object_mut() {
+            obj.insert("depth".to_string(), json!(depth));
+            obj.insert("parent".to_string(), parent.map(Value::from).unwrap_or(Value::Null));
+            obj.insert("children".to_string(), json!(children));
+            obj.insert("chain_length".to_string(), json!(length));
+        }
+    }
+}
+
+fn build_chain_metadata(sessions: &[Value]) -> Vec<Value> {
+    let mut parent_of = HashMap::<String, String>::new();
+    for session in sessions {
+        if let (Some(id), Some(parent)) = (
+            session.get("session_id").and_then(Value::as_str),
+            session.get("parent").and_then(Value::as_str),
+        ) {
+            parent_of.insert(id.to_string(), parent.to_string());
+        }
+    }
+    let mut by_root = HashMap::<String, Vec<Value>>::new();
+    let mut root_order = Vec::<String>::new();
+    for session in sessions {
+        let Some(id) = session.get("session_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let mut root = id.to_string();
+        while let Some(parent) = parent_of.get(&root) {
+            root = parent.clone();
+        }
+        if !root_order.iter().any(|value| value == &root) {
+            root_order.push(root.clone());
+        }
+        by_root
+            .entry(root)
+            .or_default()
+            .push(json!({
+                "session_id": id,
+                "depth": session.get("depth").cloned().unwrap_or_else(|| json!(0)),
+                "parent": session.get("parent").cloned().unwrap_or(Value::Null),
+                "children": session.get("children").cloned().unwrap_or_else(|| json!([])),
+            }));
+    }
+    let mut out = Vec::new();
+    for root in root_order {
+        let mut descendants = by_root.remove(&root).unwrap_or_default();
+        descendants.sort_by(|a, b| {
+            let ad = a.get("depth").and_then(Value::as_u64).unwrap_or(0);
+            let bd = b.get("depth").and_then(Value::as_u64).unwrap_or(0);
+            ad.cmp(&bd)
+        });
+        out.push(json!({
+            "root_session_id": root,
+            "descendants": descendants,
+        }));
+    }
+    out
+}
+
+fn default_peek_anchor_line(
+    index: &SqliteIndex,
+    session_id: &str,
+    rows: &[TapeRow],
+) -> usize {
+    if let Ok(links) = index.dispatch_links_for_tape(session_id)
+        && let Some(received) = links
+            .into_iter()
+            .filter(|link| matches!(link.direction, DispatchDirection::Received))
+            .min_by_key(|link| link.first_turn_index)
+    {
+        if let Some(offset) = message_turn_to_event_offset(rows, received.first_turn_index)
+            && let Some(pos) = rows.iter().position(|row| row.offset == offset)
+        {
+            return pos + 1;
+        }
+    }
+    if rows.is_empty() {
+        1
+    } else {
+        1
+    }
 }
 
 fn collect_dispatch_upstream_sessions(
@@ -2531,20 +3095,20 @@ fn sample_anchor_candidates(anchors: Vec<String>, max_anchors: usize) -> Vec<Str
 fn parse_file_range_target(target: &str) -> Result<(&str, u32, u32), CliError> {
     let (file, range) = target
         .rsplit_once(':')
-        .ok_or_else(|| CliError::new("invalid_explain_target", "expected <file>:<start>-<end>"))?;
+        .ok_or_else(|| CliError::new("invalid_span", "expected <file>:<start>-<end>"))?;
     let (start_raw, end_raw) = range
         .split_once('-')
-        .ok_or_else(|| CliError::new("invalid_explain_target", "expected <file>:<start>-<end>"))?;
+        .ok_or_else(|| CliError::new("invalid_span", "expected <file>:<start>-<end>"))?;
 
     let start: u32 = start_raw
         .parse()
-        .map_err(|_| CliError::new("invalid_explain_target", "start line must be an integer"))?;
+        .map_err(|_| CliError::new("invalid_span", "start line must be an integer"))?;
     let end: u32 = end_raw
         .parse()
-        .map_err(|_| CliError::new("invalid_explain_target", "end line must be an integer"))?;
+        .map_err(|_| CliError::new("invalid_span", "end line must be an integer"))?;
     if start == 0 || end == 0 || end < start {
         return Err(CliError::new(
-            "invalid_explain_target",
+            "invalid_span",
             "line range must be 1-based and end must be >= start",
         ));
     }
@@ -2560,7 +3124,7 @@ fn read_file_span_variants(path: &Path, start: u32, end: u32) -> Result<Vec<Stri
 
     if end_idx >= lines.len() {
         return Err(CliError::new(
-            "span_out_of_bounds",
+            "invalid_span",
             format!(
                 "requested range {}-{} exceeds file length {}",
                 start,
@@ -2934,6 +3498,11 @@ fn resolve_runtime_context_with_override(
         tapes_dir: config.tapes_dir,
         tape_lookup_dirs,
         additional_stores: config.additional_stores,
+        explain_default_limit: config.explain_default_limit,
+        peek_default_lines: config.peek.default_lines,
+        peek_default_before: config.peek.default_before,
+        peek_default_after: config.peek.default_after,
+        peek_grep_context: config.peek.grep_context,
         watch: config.watch,
     })
 }

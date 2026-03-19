@@ -10,7 +10,17 @@ pub struct EffectiveConfig {
     pub db: PathBuf,
     pub tapes_dir: PathBuf,
     pub additional_stores: Vec<PathBuf>,
+    pub explain_default_limit: usize,
+    pub peek: EffectivePeekConfig,
     pub watch: Option<EffectiveWatchConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectivePeekConfig {
+    pub default_lines: usize,
+    pub default_before: usize,
+    pub default_after: usize,
+    pub grep_context: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,7 +42,22 @@ pub struct ParsedConfig {
     pub db: Option<String>,
     pub tapes_dir: Option<String>,
     pub additional_stores: Vec<String>,
+    pub explain: Option<ParsedExplainConfig>,
+    pub peek: Option<ParsedPeekConfig>,
     pub watch: Option<ParsedWatchConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedExplainConfig {
+    pub default_limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedPeekConfig {
+    pub default_lines: Option<usize>,
+    pub default_before: Option<usize>,
+    pub default_after: Option<usize>,
+    pub grep_context: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,7 +84,31 @@ struct RawConfig {
     #[serde(default)]
     additional_stores: Option<Vec<String>>,
     #[serde(default)]
+    explain: Option<RawExplainConfig>,
+    #[serde(default)]
+    peek: Option<RawPeekConfig>,
+    #[serde(default)]
     watch: Option<RawWatchConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawExplainConfig {
+    #[serde(default)]
+    default_limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPeekConfig {
+    #[serde(default)]
+    default_lines: Option<usize>,
+    #[serde(default)]
+    default_before: Option<usize>,
+    #[serde(default)]
+    default_after: Option<usize>,
+    #[serde(default)]
+    grep_context: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,9 +184,18 @@ pub fn load_effective_config_with_override(
     let default_db = home.join(".engram").join("index.sqlite");
     let default_tapes_dir = cwd.join(".engram").join("tapes");
     let default_watch_log = home.join(".engram").join("watch.log");
+    let default_explain_limit = 10usize;
+    let default_peek = EffectivePeekConfig {
+        default_lines: 40,
+        default_before: 30,
+        default_after: 10,
+        grep_context: 5,
+    };
     let mut db = None;
     let mut tapes_dir = None;
     let mut additional_stores = None;
+    let mut explain_default_limit = None;
+    let mut peek = None;
     let mut watch = None;
 
     for layer_path in &config_chain {
@@ -161,6 +219,21 @@ pub fn load_effective_config_with_override(
             && let Some(raw_tapes_dir) = raw.tapes_dir.as_deref()
         {
             tapes_dir = Some(resolve_path(raw_tapes_dir, &base_dir, home)?);
+        }
+        if explain_default_limit.is_none()
+            && let Some(raw_explain) = raw.explain.as_ref()
+        {
+            explain_default_limit = Some(raw_explain.default_limit.unwrap_or(default_explain_limit));
+        }
+        if peek.is_none()
+            && let Some(raw_peek) = raw.peek.as_ref()
+        {
+            peek = Some(EffectivePeekConfig {
+                default_lines: raw_peek.default_lines.unwrap_or(default_peek.default_lines),
+                default_before: raw_peek.default_before.unwrap_or(default_peek.default_before),
+                default_after: raw_peek.default_after.unwrap_or(default_peek.default_after),
+                grep_context: raw_peek.grep_context.unwrap_or(default_peek.grep_context),
+            });
         }
         if watch.is_none()
             && let Some(raw_watch) = raw.watch.as_ref()
@@ -195,6 +268,8 @@ pub fn load_effective_config_with_override(
         db: db.unwrap_or(default_db),
         tapes_dir: tapes_dir.unwrap_or(default_tapes_dir),
         additional_stores: additional_stores.unwrap_or_default(),
+        explain_default_limit: explain_default_limit.unwrap_or(default_explain_limit),
+        peek: peek.unwrap_or(default_peek),
         watch,
     })
 }
@@ -275,6 +350,15 @@ fn parse_config(content: &str) -> Result<ParsedConfig, ConfigError> {
         db: raw.db,
         tapes_dir: raw.tapes_dir,
         additional_stores: raw.additional_stores.unwrap_or_default(),
+        explain: raw.explain.map(|explain| ParsedExplainConfig {
+            default_limit: explain.default_limit,
+        }),
+        peek: raw.peek.map(|peek| ParsedPeekConfig {
+            default_lines: peek.default_lines,
+            default_before: peek.default_before,
+            default_after: peek.default_after,
+            grep_context: peek.grep_context,
+        }),
         watch,
     })
 }

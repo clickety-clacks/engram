@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use rusqlite::Connection;
 use serde_json::{Value, json};
-use support::{run_json, run_json_timed};
+use support::{run_cli, run_json, run_json_timed};
 
 fn write_repo_file(repo: &Path, rel: &str, content: &str) {
     let path = repo.join(rel);
@@ -257,7 +257,7 @@ fn explain_additional_store_resolves_windows_from_store_tapes_path() {
 }
 
 #[test]
-fn explain_supports_string_and_session_id_navigation() {
+fn explain_supports_string_file_and_peek_navigation() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
     let repo = home.join("repo");
@@ -302,14 +302,22 @@ fn explain_supports_string_and_session_id_navigation() {
 
     let by_session = run_json(
         &repo,
-        &["explain", &session_id, "--start", "1", "--lines", "5"],
+        &["peek", &session_id, "--start", "1", "--lines", "5"],
         None,
         &home,
     );
-    let nav_sessions = by_session["sessions"].as_array().expect("sessions");
-    assert_eq!(nav_sessions.len(), 1);
-    assert_eq!(nav_sessions[0]["session_id"], Value::String(session_id));
-    assert_eq!(nav_sessions[0]["window_start"], Value::from(1));
+    let peek_session = &by_session["session"];
+    assert_eq!(peek_session["session_id"], Value::String(session_id));
+    assert_eq!(peek_session["window_start"], Value::from(1));
+
+    let whole_file = run_json(&repo, &["explain", "src/lib.rs"], None, &home);
+    assert!(
+        !whole_file["sessions"]
+            .as_array()
+            .expect("sessions")
+            .is_empty(),
+        "whole-file explain should return sessions"
+    );
 }
 
 #[test]
@@ -344,6 +352,106 @@ fn grep_uses_explain_output_shape_and_truncation_header() {
     assert!(grep["time_range"].get("start").is_some());
     assert!(sessions[0].get("content").is_some());
     assert!(sessions[0].get("session_id").is_some());
+}
+
+#[test]
+fn explain_supports_grep_filter_offset_count_and_date_bounds() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = home.join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    write_repo_file(&repo, "src/lib.rs", "fn filters_case() {}\n");
+    let _ = run_json(&repo, &["init"], None, &home);
+
+    for i in 0..4 {
+        let ts = format!("2026-03-18T04:0{i}:00Z");
+        let record_line = json!({
+            "t": ts,
+            "k": "code.edit",
+            "file": "src/lib.rs",
+            "before_range": [1, 1],
+            "after_range": [1, 1],
+            "before_text": "fn filters_case() {}\n",
+            "after_text": format!("fn filters_case_{i}() {{}}\n"),
+            "similarity": 0.9,
+        })
+        .to_string()
+            + "\n";
+        let _ = run_json(&repo, &["record", "--stdin"], Some(&record_line), &home);
+    }
+
+    let filtered = run_json(
+        &repo,
+        &[
+            "explain",
+            "src/lib.rs:1-1",
+            "--grep-filter",
+            "filters_case",
+            "--since",
+            "2026-03-18",
+            "--until",
+            "2026-03-18",
+            "--offset",
+            "1",
+            "--limit",
+            "2",
+            "--count",
+        ],
+        None,
+        &home,
+    );
+    assert_eq!(filtered["returned"], Value::from(2));
+    assert_eq!(filtered["query"]["count"], Value::Bool(true));
+    assert_eq!(filtered["query"]["offset"], Value::from(1));
+}
+
+#[test]
+fn api_surface_errors_are_json_objects() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = home.join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    write_repo_file(&repo, "src/lib.rs", "fn invalid_span() {}\n");
+    let _ = run_json(&repo, &["init"], None, &home);
+
+    let invalid_span = run_cli(&repo, &["explain", "src/lib.rs:2-a"], None, &home);
+    assert!(!invalid_span.status.success());
+    let invalid_stderr = String::from_utf8_lossy(&invalid_span.stderr);
+    let invalid_json = invalid_stderr
+        .lines()
+        .last()
+        .expect("invalid span stderr line")
+        .as_bytes()
+        .to_vec();
+    let invalid_payload: Value = serde_json::from_slice(&invalid_json).expect("invalid span json error");
+    assert_eq!(invalid_payload["error"], Value::String("invalid_span".to_string()));
+
+    let no_results = run_cli(&repo, &["grep", "definitely-missing-pattern"], None, &home);
+    assert!(!no_results.status.success());
+    let no_results_stderr = String::from_utf8_lossy(&no_results.stderr);
+    let no_results_json = no_results_stderr
+        .lines()
+        .last()
+        .expect("no_results stderr line")
+        .as_bytes()
+        .to_vec();
+    let no_results_payload: Value = serde_json::from_slice(&no_results_json).expect("no_results json error");
+    assert_eq!(no_results_payload["error"], Value::String("no_results".to_string()));
+
+    let missing_session = run_cli(&repo, &["peek", "missing-session-id"], None, &home);
+    assert!(!missing_session.status.success());
+    let session_stderr = String::from_utf8_lossy(&missing_session.stderr);
+    let session_json = session_stderr
+        .lines()
+        .last()
+        .expect("session_not_found stderr line")
+        .as_bytes()
+        .to_vec();
+    let session_payload: Value = serde_json::from_slice(&session_json).expect("session_not_found json error");
+    assert_eq!(
+        session_payload["error"],
+        Value::String("session_not_found".to_string())
+    );
 }
 
 #[test]
