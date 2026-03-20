@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -213,6 +213,8 @@ struct RuntimeContext {
     peek_default_before: usize,
     peek_default_after: usize,
     peek_grep_context: usize,
+    metrics_enabled: bool,
+    metrics_log: PathBuf,
     watch: Option<EffectiveWatchConfig>,
 }
 
@@ -395,7 +397,7 @@ USAGE:
 
 OPTIONS:
   --start N                 Read from this line number
-  --lines N                 Number of lines to return [default: 40]
+  --lines N                 Number of lines to return [default: 30]
   --before N                Lines before the anchor point [default: 30]
   --after N                 Lines after the anchor point [default: 10]
   --grep-filter <pattern>   Find lines matching this term within the session
@@ -452,6 +454,8 @@ fn cmd_init(paths: &RepoPaths) -> Result<(), CliError> {
         peek_default_before: 30,
         peek_default_after: 10,
         peek_grep_context: 5,
+        metrics_enabled: true,
+        metrics_log: home.join(".engram").join("metrics.jsonl"),
         watch: None,
     };
     print_context_conspicuity(&context);
@@ -899,6 +903,8 @@ fn cmd_watch_with_home(cwd: &Path, args: WatchArgs, home: &Path) -> Result<(), C
         peek_default_before: config.peek.default_before,
         peek_default_after: config.peek.default_after,
         peek_grep_context: config.peek.grep_context,
+        metrics_enabled: config.metrics.enabled,
+        metrics_log: config.metrics.log,
         watch: config.watch,
     };
     print_context_conspicuity(&context);
@@ -1906,6 +1912,15 @@ fn cmd_explain(
         return Err(CliError::new("no_results", target));
     }
     let chain_metadata = build_chain_metadata(&sessions);
+    append_metrics(
+        context,
+        "explain",
+        &target,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+    );
 
     print_json(&json!({
         "query": {
@@ -1970,6 +1985,21 @@ fn cmd_grep(paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Resu
         return Err(CliError::new("no_results", args.pattern));
     }
 
+    let metrics_sessions = if args.count {
+        Vec::new()
+    } else {
+        sessions
+    };
+    append_metrics(
+        context,
+        "grep",
+        &args.pattern,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+    );
+
     print_json(&json!({
         "query": {
             "command": "grep",
@@ -1980,7 +2010,7 @@ fn cmd_grep(paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Resu
             "until": args.until,
             "count": args.count,
         },
-        "sessions": sessions,
+        "sessions": metrics_sessions,
         "lineage": [],
         "dispatch_lineage": [],
         "tombstones": [],
@@ -2098,6 +2128,16 @@ fn cmd_peek(paths: &RepoPaths, context: &RuntimeContext, args: PeekArgs) -> Resu
     if content.is_empty() {
         return Err(CliError::new("no_results", session_id.clone()));
     }
+    let window_lines = content.len();
+    append_metrics(
+        context,
+        "peek",
+        &session_id,
+        Value::String(session_id.clone()),
+        json!(window_start),
+        json!(window_lines),
+        json!(total_lines),
+    );
 
     print_json(&json!({
         "query": {
@@ -2313,7 +2353,7 @@ fn format_sessions_for_agent(
     include_content: bool,
 ) -> Result<Vec<Value>, CliError> {
     let mut out = Vec::new();
-    let line_count = DEFAULT_WINDOW_LINES.max(1);
+    let line_count = context.peek_default_lines.max(1);
 
     for raw in raw_sessions {
         let Some(session_id) = raw.get("tape_id").and_then(Value::as_str) else {
@@ -3503,6 +3543,8 @@ fn resolve_runtime_context_with_override(
         peek_default_before: config.peek.default_before,
         peek_default_after: config.peek.default_after,
         peek_grep_context: config.peek.grep_context,
+        metrics_enabled: config.metrics.enabled,
+        metrics_log: config.metrics.log,
         watch: config.watch,
     })
 }
@@ -3525,6 +3567,44 @@ fn ensure_db_parent(db_path: &Path) -> Result<(), CliError> {
 fn print_context_conspicuity(context: &RuntimeContext) {
     eprintln!("config: {}", context.config_path.display());
     eprintln!("db: {}", context.db_path.display());
+}
+
+fn append_metrics(
+    context: &RuntimeContext,
+    command: &str,
+    target: &str,
+    session_id: Value,
+    window_start: Value,
+    window_lines: Value,
+    total_lines: Value,
+) {
+    if !context.metrics_enabled {
+        return;
+    }
+
+    if let Some(parent) = context.metrics_log.parent()
+        && fs::create_dir_all(parent).is_err()
+    {
+        return;
+    }
+
+    let payload = json!({
+        "ts": Utc::now().to_rfc3339(),
+        "command": command,
+        "target": target,
+        "session_id": session_id,
+        "window_start": window_start,
+        "window_lines": window_lines,
+        "total_lines": total_lines,
+    });
+    let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&context.metrics_log)
+    else {
+        return;
+    };
+    let _ = writeln!(file, "{payload}");
 }
 
 fn home_dir() -> Result<PathBuf, CliError> {

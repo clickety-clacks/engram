@@ -12,6 +12,7 @@ pub struct EffectiveConfig {
     pub additional_stores: Vec<PathBuf>,
     pub explain_default_limit: usize,
     pub peek: EffectivePeekConfig,
+    pub metrics: EffectiveMetricsConfig,
     pub watch: Option<EffectiveWatchConfig>,
 }
 
@@ -21,6 +22,12 @@ pub struct EffectivePeekConfig {
     pub default_before: usize,
     pub default_after: usize,
     pub grep_context: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveMetricsConfig {
+    pub enabled: bool,
+    pub log: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +51,7 @@ pub struct ParsedConfig {
     pub additional_stores: Vec<String>,
     pub explain: Option<ParsedExplainConfig>,
     pub peek: Option<ParsedPeekConfig>,
+    pub metrics: Option<ParsedMetricsConfig>,
     pub watch: Option<ParsedWatchConfig>,
 }
 
@@ -58,6 +66,12 @@ pub struct ParsedPeekConfig {
     pub default_before: Option<usize>,
     pub default_after: Option<usize>,
     pub grep_context: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedMetricsConfig {
+    pub enabled: Option<bool>,
+    pub log: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +102,8 @@ struct RawConfig {
     #[serde(default)]
     peek: Option<RawPeekConfig>,
     #[serde(default)]
+    metrics: Option<RawMetricsConfig>,
+    #[serde(default)]
     watch: Option<RawWatchConfig>,
 }
 
@@ -109,6 +125,15 @@ struct RawPeekConfig {
     default_after: Option<usize>,
     #[serde(default)]
     grep_context: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMetricsConfig {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    log: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,9 +209,10 @@ pub fn load_effective_config_with_override(
     let default_db = home.join(".engram").join("index.sqlite");
     let default_tapes_dir = cwd.join(".engram").join("tapes");
     let default_watch_log = home.join(".engram").join("watch.log");
+    let default_metrics_log = home.join(".engram").join("metrics.jsonl");
     let default_explain_limit = 10usize;
     let default_peek = EffectivePeekConfig {
-        default_lines: 40,
+        default_lines: 30,
         default_before: 30,
         default_after: 10,
         grep_context: 5,
@@ -196,6 +222,7 @@ pub fn load_effective_config_with_override(
     let mut additional_stores = None;
     let mut explain_default_limit = None;
     let mut peek = None;
+    let mut metrics = None;
     let mut watch = None;
 
     for layer_path in &config_chain {
@@ -235,6 +262,19 @@ pub fn load_effective_config_with_override(
                 grep_context: raw_peek.grep_context.unwrap_or(default_peek.grep_context),
             });
         }
+        if metrics.is_none()
+            && let Some(raw_metrics) = raw.metrics.as_ref()
+        {
+            let log = if let Some(raw_log) = raw_metrics.log.as_deref() {
+                resolve_path(raw_log, &base_dir, home)?
+            } else {
+                default_metrics_log.clone()
+            };
+            metrics = Some(EffectiveMetricsConfig {
+                enabled: raw_metrics.enabled.unwrap_or(true),
+                log,
+            });
+        }
         if watch.is_none()
             && let Some(raw_watch) = raw.watch.as_ref()
         {
@@ -270,6 +310,10 @@ pub fn load_effective_config_with_override(
         additional_stores: additional_stores.unwrap_or_default(),
         explain_default_limit: explain_default_limit.unwrap_or(default_explain_limit),
         peek: peek.unwrap_or(default_peek),
+        metrics: metrics.unwrap_or(EffectiveMetricsConfig {
+            enabled: true,
+            log: default_metrics_log,
+        }),
         watch,
     })
 }
@@ -358,6 +402,10 @@ fn parse_config(content: &str) -> Result<ParsedConfig, ConfigError> {
             default_before: peek.default_before,
             default_after: peek.default_after,
             grep_context: peek.grep_context,
+        }),
+        metrics: raw.metrics.map(|metrics| ParsedMetricsConfig {
+            enabled: metrics.enabled,
+            log: metrics.log,
         }),
         watch,
     })

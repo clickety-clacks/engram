@@ -484,3 +484,71 @@ fn grep_defaults_to_ten_sessions() {
     assert_eq!(grep["truncated"], Value::Bool(true));
     assert_eq!(sessions.len(), 10);
 }
+
+#[test]
+fn grep_count_returns_metadata_only() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = home.join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    write_repo_file(&repo, "src/lib.rs", "fn grep_count_case() {}\n");
+    let _ = run_json(&repo, &["init"], None, &home);
+
+    for i in 0..3 {
+        let ts = format!("2026-03-18T05:0{i}:00Z");
+        let record_line = json!({
+            "t": ts,
+            "k": "msg.out",
+            "role": "assistant",
+            "content": format!("count-only needle {i}"),
+        })
+        .to_string()
+            + "\n";
+        let _ = run_json(&repo, &["record", "--stdin"], Some(&record_line), &home);
+    }
+
+    let grep = run_json(&repo, &["grep", "count-only needle", "--count"], None, &home);
+    assert_eq!(grep["returned"], Value::from(3));
+    assert_eq!(grep["total"], Value::from(3));
+    assert_eq!(grep["sessions"], json!([]));
+}
+
+#[test]
+fn metrics_logging_writes_expected_jsonl_row() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = home.join("repo");
+    fs::create_dir_all(repo.join(".engram")).expect("repo");
+    write_repo_file(
+        &repo,
+        ".engram/config.yml",
+        "db: .engram/index.sqlite\ntapes_dir: .engram/tapes\nmetrics:\n  log: .engram/metrics.jsonl\n",
+    );
+    write_repo_file(&repo, "src/lib.rs", "fn metrics_case() {}\n");
+
+    let _ = run_json(&repo, &["init"], None, &home);
+    let record_line = json!({
+        "t": "2026-03-18T05:20:00Z",
+        "k": "code.edit",
+        "file": "src/lib.rs",
+        "before_range": [1, 1],
+        "after_range": [1, 1],
+        "before_text": "fn metrics_case_old() {}\n",
+        "after_text": "fn metrics_case() {}\n",
+        "similarity": 0.9,
+    })
+    .to_string()
+        + "\n";
+    let _ = run_json(&repo, &["record", "--stdin"], Some(&record_line), &home);
+
+    let _ = run_json(&repo, &["explain", "src/lib.rs:1-1"], None, &home);
+    let metrics_path = repo.join(".engram/metrics.jsonl");
+    assert!(metrics_path.exists(), "metrics log should be created");
+    let content = fs::read_to_string(metrics_path).expect("metrics content");
+    let last = content.lines().last().expect("metrics row");
+    let row: Value = serde_json::from_str(last).expect("metrics row json");
+    assert_eq!(row["command"], Value::String("explain".to_string()));
+    assert_eq!(row["target"], Value::String("src/lib.rs:1-1".to_string()));
+    assert!(row.get("ts").is_some());
+    assert!(row.get("window_lines").is_some());
+}
