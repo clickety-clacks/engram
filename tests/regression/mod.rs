@@ -55,14 +55,9 @@ fn explain_arbitrary_span_returns_sessions_for_windowed_edits() {
     );
 
     let first = &sessions[0];
-    assert!(
-        !first["touches"].as_array().expect("touches").is_empty(),
-        "expected explain touches for arbitrary span"
-    );
-    assert!(
-        !first["windows"].as_array().expect("windows").is_empty(),
-        "expected explain transcript windows for arbitrary span"
-    );
+    assert!(first.get("window_start").is_some());
+    assert!(first.get("window_end").is_some());
+    assert!(first.get("total_lines").is_some());
 }
 
 #[test]
@@ -174,13 +169,8 @@ fn config_walkup_uses_global_db_and_repo_tapes_dir() {
     );
     let sessions = explain["sessions"].as_array().expect("sessions");
     assert_eq!(sessions.len(), 1, "expected session from global db lookup");
-    assert!(
-        !sessions[0]["windows"]
-            .as_array()
-            .expect("windows")
-            .is_empty(),
-        "expected windows resolved from repo-level tapes_dir"
-    );
+    assert!(sessions[0].get("window_start").is_some());
+    assert!(sessions[0].get("window_end").is_some());
 }
 
 #[test]
@@ -242,18 +232,8 @@ fn explain_additional_store_resolves_windows_from_store_tapes_path() {
     assert_eq!(explain["stores_queried"].as_u64(), Some(2));
     let sessions = explain["sessions"].as_array().expect("sessions");
     assert_eq!(sessions.len(), 1, "expected match from additional store");
-    assert_eq!(
-        sessions[0]["tape_present_locally"],
-        Value::Bool(true),
-        "expected tape lookup to resolve via additional store path"
-    );
-    assert!(
-        !sessions[0]["windows"]
-            .as_array()
-            .expect("windows")
-            .is_empty(),
-        "expected windows for additional-store session"
-    );
+    assert!(sessions[0].get("window_start").is_some());
+    assert!(sessions[0].get("window_end").is_some());
 }
 
 #[test]
@@ -299,6 +279,9 @@ fn explain_supports_string_file_and_peek_navigation() {
     assert!(sessions[0].get("refs_up").is_some());
     assert!(sessions[0].get("refs_down").is_some());
     assert!(sessions[0].get("files_touched").is_some());
+    assert!(sessions[0].get("content").is_none());
+    assert!(sessions[0].get("windows").is_none());
+    assert!(sessions[0].get("touches").is_none());
 
     let by_session = run_json(
         &repo,
@@ -350,8 +333,9 @@ fn grep_uses_explain_output_shape_and_truncation_header() {
     assert_eq!(grep["total"], Value::from(2));
     assert_eq!(grep["truncated"], Value::Bool(true));
     assert!(grep["time_range"].get("start").is_some());
-    assert!(sessions[0].get("content").is_some());
     assert!(sessions[0].get("session_id").is_some());
+    assert!(sessions[0].get("window_start").is_some());
+    assert!(sessions[0].get("window_end").is_some());
 }
 
 #[test]

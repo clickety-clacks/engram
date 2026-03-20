@@ -40,7 +40,6 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 const MAX_QUERY_WINDOW_ANCHORS: usize = 16;
-const DEFAULT_WINDOW_LINES: usize = 40;
 const DEFAULT_WINDOW_BEFORE_RATIO_NUM: usize = 3;
 const DEFAULT_WINDOW_BEFORE_RATIO_DEN: usize = 4;
 const SAFE_RESULT_SESSION_THRESHOLD: usize = 25;
@@ -344,6 +343,7 @@ const HELP_EXPLAIN: &str = r#"Find the conversations that produced this code.
 Returns the root of each provenance chain — the highest-level
 context explaining WHY this code exists. Results include chain
 metadata (children, depth) so you can walk down to HOW with peek.
+Returns metadata only. Use peek <session_id> to read content.
 
 USAGE:
   engram explain <file>:<start>-<end>   Provenance for a code span
@@ -1882,7 +1882,6 @@ fn cmd_explain(
         raw_sessions,
         &score_by_session,
         args.grep_filter.as_deref(),
-        !args.count,
     )?;
     sessions.retain(|session| session_matches_date_filter(session, &date_filter));
     annotate_chain_fields(&mut sessions, &dispatch_lineage);
@@ -1967,7 +1966,6 @@ fn cmd_grep(paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Resu
         raw_sessions,
         &score_by_session,
         None,
-        !args.count,
     )?;
     sessions.retain(|session| session_matches_date_filter(session, &date_filter));
     sessions.sort_by(|a, b| {
@@ -2215,34 +2213,6 @@ fn has_span_shape(target: &str) -> bool {
         .is_some_and(|(_, rhs)| rhs.contains('-'))
 }
 
-fn build_session_windows_for_ids(
-    context: &RuntimeContext,
-    session_ids: &[String],
-) -> Result<Vec<Value>, CliError> {
-    let mut out = Vec::new();
-    for session_id in session_ids {
-        let tape_path = resolve_tape_path(context, session_id);
-        let rows = if let Some(path) = tape_path.as_ref() {
-            parse_jsonl_rows(&read_tape_content(path)?)?
-        } else {
-            Vec::new()
-        };
-        let first_offset = rows.first().map(|row| row.offset).unwrap_or(0);
-        let windows = event_window(&rows, first_offset, TRANSCRIPT_WINDOW_RADIUS)
-            .into_iter()
-            .collect::<Vec<_>>();
-        out.push(json!({
-            "tape_id": session_id,
-            "tape_present_locally": tape_path.is_some(),
-            "touch_count": 0,
-            "latest_touch_timestamp": extract_latest_timestamp_from_rows(&rows),
-            "touches": [],
-            "windows": windows,
-        }));
-    }
-    Ok(out)
-}
-
 fn collect_anchor_scores(
     indexes: &[SqliteIndex],
     anchors: &[String],
@@ -2350,7 +2320,6 @@ fn format_sessions_for_agent(
     raw_sessions: Vec<Value>,
     score_by_session: &HashMap<String, f32>,
     grep: Option<&str>,
-    include_content: bool,
 ) -> Result<Vec<Value>, CliError> {
     let mut out = Vec::new();
     let line_count = context.peek_default_lines.max(1);
@@ -2400,21 +2369,6 @@ fn format_sessions_for_agent(
                 .collect::<Vec<_>>()
         };
 
-        let content = if !include_content {
-            Vec::new()
-        } else {
-            window_texts
-                .iter()
-                .enumerate()
-                .map(|(idx, text)| {
-                    json!({
-                        "line": window_start + idx,
-                        "text": text,
-                    })
-                })
-                .collect::<Vec<_>>()
-        };
-
         if let Some(pattern) = grep
             && !window_texts.iter().any(|text| text.contains(pattern))
         {
@@ -2458,12 +2412,6 @@ fn format_sessions_for_agent(
             "refs_up": refs_up,
             "refs_down": refs_down,
             "files_touched": files_touched,
-            "content": content,
-            "tape_present_locally": tape_path.is_some(),
-            "touch_count": raw.get("touch_count").cloned().unwrap_or(Value::from(0)),
-            "touches": raw.get("touches").cloned().unwrap_or_else(|| json!([])),
-            "windows": raw.get("windows").cloned().unwrap_or_else(|| json!([])),
-            "tape_id": session_id,
         }));
     }
 
