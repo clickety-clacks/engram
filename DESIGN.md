@@ -1246,6 +1246,75 @@ engram/
       cursor.rs          # Cursor adapter
 ```
 
+## Usage Metrics
+
+### Why we collect metrics
+
+Engram's default window sizes (how many lines of content to return with explain results and peek calls) are configurable but we don't yet know the right defaults. Too small and the agent has to immediately re-request more. Too big and tokens are wasted on content the agent ignores.
+
+Rather than guess, engram logs minimal per-call metrics so defaults can be tuned from real usage data.
+
+### What is collected
+
+Each CLI call appends one JSON line to `~/.engram/metrics.jsonl`:
+
+```json
+{"ts":"2026-03-19T14:30:00Z","command":"explain","target":"server.ts:3398-3412","session_id":null,"window_start":null,"window_lines":null,"total_lines":null}
+{"ts":"2026-03-19T14:30:05Z","command":"peek","target":"af156abd","session_id":"af156abd...","window_start":2754,"window_lines":30,"total_lines":7418}
+{"ts":"2026-03-19T14:30:08Z","command":"peek","target":"af156abd","session_id":"af156abd...","window_start":2784,"window_lines":30,"total_lines":7418}
+```
+
+Seven fields per call:
+
+| Field | Description |
+|-------|-------------|
+| `ts` | Timestamp for temporal grouping |
+| `command` | explain, grep, or peek |
+| `target` | What was queried (span, pattern, or session_id) |
+| `session_id` | Session being read (null for explain/grep) |
+| `window_start` | First line of returned content |
+| `window_lines` | Lines returned |
+| `total_lines` | Total lines available in the session |
+
+### How to use the metrics
+
+The key insight: `session_id` is the natural correlation key. You don't need a synthetic correlation ID because the session_id links explain results to follow-up peek calls.
+
+**"Is the default window too small?"** Look for multiple peek calls to the same session_id within a short time window. If the agent does `peek X lines 1-30` then immediately `peek X lines 31-60`, the default was too small — the agent needed more than it got.
+
+**"Is the default window too big?"** If explain returns 10 sessions with 30-line windows and the agent only peeks 2 of them, most of that content was wasted. A smaller default would save tokens.
+
+**"How deep do agents navigate?"** Count distinct session_ids peeked per explain target. 1 = stopped at root. 3+ = walked the chain.
+
+An agent (or user) can analyze `~/.engram/metrics.jsonl` periodically and adjust defaults in config:
+
+```yaml
+explain:
+  default_limit: 10
+peek:
+  default_lines: 40    # tune this based on metrics
+  default_before: 30
+  default_after: 10
+```
+
+Over time, the metrics reveal the right balance between token efficiency and orientation quality for your specific usage patterns.
+
+### Config
+
+Metrics logging is on by default. To disable:
+
+```yaml
+metrics:
+  enabled: false
+```
+
+To change the log path:
+
+```yaml
+metrics:
+  log: /custom/path/metrics.jsonl
+```
+
 ## Open Questions
 
 - **Anchor algorithm calibration**: k-gram size, window size, hash function. Needs benchmarking against real codebases. The thresholds (0.30, 0.50, 0.90) may need tuning, but the architecture is correct regardless of specific numbers.
