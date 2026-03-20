@@ -2,17 +2,17 @@
 
 **How did we get here?**
 
-*An automatically built index into why your code is the way it is.*
+*An automatically built index into why things are the way they are.*
 
 Your code started as a conversation. Every agent reasoning through a problem, every decision handed off, every rationale spoken aloud — that is the exhaust of agentic engineering, and it carries more signal than the code itself. Engram fingerprints and indexes that exhaust across conversations, creating a foundation for institutional knowledge — the kind you forget is there until you realize nothing works without it.
 
-Engram answers one question: **why does this code span exist?**
+Engram answers one question: **why does this exist?**
 
 ## 1. What it is
 
-Engram is a deterministic provenance index for agent-driven software work.
+Engram is a deterministic provenance index for agent-driven work.
 
-It stores immutable tapes and indexes their fingerprints in SQLite so a code-span query can return the sessions that causally produced that span.
+It stores immutable tapes and indexes their fingerprints in SQLite so a query on any text can return the sessions that causally produced it.
 
 Core model:
 - Tapes are immutable files.
