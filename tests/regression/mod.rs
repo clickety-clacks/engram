@@ -55,9 +55,13 @@ fn explain_arbitrary_span_returns_sessions_for_windowed_edits() {
     );
 
     let first = &sessions[0];
-    assert!(first.get("window_start").is_some());
-    assert!(first.get("window_end").is_some());
-    assert!(first.get("total_lines").is_some());
+    let window_start = first["window_start"].as_u64().expect("window_start");
+    let window_end = first["window_end"].as_u64().expect("window_end");
+    let total_lines = first["total_lines"].as_u64().expect("total_lines");
+    assert!(window_start >= 1);
+    assert!(window_end >= window_start);
+    assert!(window_end <= total_lines.max(1));
+    assert!(total_lines >= 1);
 }
 
 #[test]
@@ -169,8 +173,9 @@ fn config_walkup_uses_global_db_and_repo_tapes_dir() {
     );
     let sessions = explain["sessions"].as_array().expect("sessions");
     assert_eq!(sessions.len(), 1, "expected session from global db lookup");
-    assert!(sessions[0].get("window_start").is_some());
-    assert!(sessions[0].get("window_end").is_some());
+    assert_eq!(sessions[0]["window_start"], Value::from(1));
+    assert_eq!(sessions[0]["window_end"], Value::from(1));
+    assert_eq!(sessions[0]["total_lines"], Value::from(1));
 }
 
 #[test]
@@ -232,8 +237,9 @@ fn explain_additional_store_resolves_windows_from_store_tapes_path() {
     assert_eq!(explain["stores_queried"].as_u64(), Some(2));
     let sessions = explain["sessions"].as_array().expect("sessions");
     assert_eq!(sessions.len(), 1, "expected match from additional store");
-    assert!(sessions[0].get("window_start").is_some());
-    assert!(sessions[0].get("window_end").is_some());
+    assert_eq!(sessions[0]["window_start"], Value::from(1));
+    assert_eq!(sessions[0]["window_end"], Value::from(1));
+    assert_eq!(sessions[0]["total_lines"], Value::from(1));
 }
 
 #[test]
@@ -272,13 +278,17 @@ fn explain_supports_string_file_and_peek_navigation() {
         .expect("session_id")
         .to_string();
 
-    assert!(sessions[0].get("window_start").is_some());
-    assert!(sessions[0].get("window_end").is_some());
-    assert!(sessions[0].get("total_lines").is_some());
-    assert!(sessions[0].get("confidence").is_some());
-    assert!(sessions[0].get("refs_up").is_some());
-    assert!(sessions[0].get("refs_down").is_some());
-    assert!(sessions[0].get("files_touched").is_some());
+    assert_eq!(sessions[0]["window_start"], Value::from(1));
+    assert_eq!(sessions[0]["window_end"], Value::from(1));
+    assert_eq!(sessions[0]["total_lines"], Value::from(1));
+    assert!(sessions[0]["confidence"].as_f64().unwrap_or(0.0) > 0.0);
+    assert_eq!(sessions[0]["refs_up"], Value::from(0));
+    assert_eq!(sessions[0]["refs_down"], Value::from(0));
+    assert_eq!(
+        sessions[0]["files_touched"],
+        json!(["src/lib.rs"]),
+        "single-file fixture should report one touched file"
+    );
     assert!(sessions[0].get("content").is_none());
     assert!(sessions[0].get("windows").is_none());
     assert!(sessions[0].get("touches").is_none());
@@ -332,10 +342,13 @@ fn grep_uses_explain_output_shape_and_truncation_header() {
     assert_eq!(grep["returned"], Value::from(1));
     assert_eq!(grep["total"], Value::from(2));
     assert_eq!(grep["truncated"], Value::Bool(true));
-    assert!(grep["time_range"].get("start").is_some());
-    assert!(sessions[0].get("session_id").is_some());
-    assert!(sessions[0].get("window_start").is_some());
-    assert!(sessions[0].get("window_end").is_some());
+    assert_eq!(
+        grep["time_range"],
+        json!({"start":"2026-03-18T02:00:00Z","end":"2026-03-18T02:01:00Z"})
+    );
+    assert!(sessions[0]["session_id"].as_str().is_some());
+    assert_eq!(sessions[0]["window_start"], Value::from(1));
+    assert_eq!(sessions[0]["window_end"], Value::from(1));
 }
 
 #[test]
@@ -533,8 +546,8 @@ fn metrics_logging_writes_expected_jsonl_row() {
     let row: Value = serde_json::from_str(last).expect("metrics row json");
     assert_eq!(row["command"], Value::String("explain".to_string()));
     assert_eq!(row["target"], Value::String("src/lib.rs:1-1".to_string()));
-    assert!(row.get("ts").is_some());
-    assert!(row.get("window_lines").is_some());
+    assert!(!row["ts"].as_str().unwrap_or("").is_empty());
+    assert_eq!(row["window_lines"], Value::Null);
 }
 
 #[test]
