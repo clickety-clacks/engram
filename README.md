@@ -157,20 +157,6 @@ OpenClaw note (example only):
 - An OpenClaw submitter can propagate the UUID in a header and mirror it in message content as `<engram-src .../>`.
 - That submitter/header pattern is an integration example, not Engram core behavior.
 
-### Agent sandbox compatibility
-
-Some agent harnesses (e.g., Claude Code) block execution of ad-hoc signed binaries. If `engram` exits with code 137 (SIGKILL) before producing any output, install the shell wrapper:
-
-```bash
-cat > ~/.local/bin/engram-cli << \"WRAPPER\"
-#!/bin/bash
-exec ~/.cargo/bin/engram "\$@"
-WRAPPER
-chmod +x ~/.local/bin/engram-cli
-```
-
-Then use `engram-cli` instead of `engram` in agent prompts. The wrapper delegates to the same binary through the shell, which the sandbox trusts.
-
 ## 6. Regression Testing
 
 Run the dedicated regression suite that guards explain anchor granularity, scaled performance, config walk-up behavior, and additional-store window resolution:
