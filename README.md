@@ -165,6 +165,68 @@ Run the dedicated regression suite that guards explain anchor granularity, scale
 cargo test --test regression_suite
 ```
 
+## 7. Usage Metrics & Tuning Defaults
+
+Engram logs minimal per-call metrics to `~/.engram/metrics.jsonl` so you can tune default window sizes from real usage data.
+
+### For agents: auto-tuning defaults
+
+An agent can periodically analyze the metrics log and update `config.yml` defaults. Here's the pattern:
+
+```bash
+# Check if default window is too small (agents immediately re-requesting more)
+cat ~/.engram/metrics.jsonl | python3 -c "
+import sys, json
+from collections import defaultdict
+
+calls = [json.loads(l) for l in sys.stdin if l.strip()]
+peeks = [c for c in calls if c['command'] == 'peek' and c['session_id']]
+
+# Group peeks by session_id, sorted by timestamp
+by_session = defaultdict(list)
+for p in peeks:
+    by_session[p['session_id']].append(p)
+
+# Count sessions where agent made 2+ sequential peeks (expanding window)
+sequential = 0
+for sid, ps in by_session.items():
+    ps.sort(key=lambda x: x['ts'])
+    for i in range(1, len(ps)):
+        if ps[i]['window_start'] == ps[i-1]['window_start'] + ps[i-1]['window_lines']:
+            sequential += 1
+            break
+
+total = len(by_session)
+if total > 0:
+    pct = sequential / total * 100
+    print(f'{sequential}/{total} sessions ({pct:.0f}%) had sequential window expansion')
+    if pct > 50:
+        print('Recommendation: increase peek.default_lines in config.yml')
+    else:
+        print('Current default window size looks adequate')
+"
+```
+
+### Config defaults to tune
+
+```yaml
+peek:
+  default_lines: 40    # increase if agents frequently expand
+  default_before: 30   # lines before anchor point
+  default_after: 10    # lines after anchor point
+  grep_context: 5      # lines around grep matches in peek
+
+explain:
+  default_limit: 10    # sessions per query
+```
+
+### Disabling metrics
+
+```yaml
+metrics:
+  enabled: false
+```
+
 ## Specs
 
 - Core event contract: `specs/core/event-contract.md`
