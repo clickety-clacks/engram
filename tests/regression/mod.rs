@@ -536,3 +536,357 @@ fn metrics_logging_writes_expected_jsonl_row() {
     assert!(row.get("ts").is_some());
     assert!(row.get("window_lines").is_some());
 }
+
+#[test]
+fn peek_start_and_lines_returns_exact_absolute_range() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = home.join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+
+    let _ = run_json(&repo, &["init"], None, &home);
+    let transcript = (1..=8)
+        .map(|i| {
+            json!({
+                "t": format!("2026-03-19T00:{i:02}:00Z"),
+                "k": "msg.out",
+                "role": "assistant",
+                "content": format!("absolute-line-{i}")
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let recorded = run_json(&repo, &["record", "--stdin"], Some(&transcript), &home);
+    let session_id = recorded["tape_id"].as_str().expect("tape_id");
+
+    let peek = run_json(
+        &repo,
+        &["peek", session_id, "--start", "3", "--lines", "2"],
+        None,
+        &home,
+    );
+    let session = &peek["session"];
+    assert_eq!(session["window_start"], Value::from(3));
+    assert_eq!(session["window_end"], Value::from(4));
+    let content = session["content"].as_array().expect("content");
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[0]["line"], Value::from(3));
+    assert_eq!(content[1]["line"], Value::from(4));
+    assert!(
+        content[0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("absolute-line-3")
+    );
+    assert!(
+        content[1]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("absolute-line-4")
+    );
+}
+
+#[test]
+fn peek_before_after_returns_anchor_relative_range() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = home.join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+
+    let _ = run_json(&repo, &["init"], None, &home);
+    let transcript = (1..=6)
+        .map(|i| {
+            json!({
+                "t": format!("2026-03-19T01:{i:02}:00Z"),
+                "k": "msg.out",
+                "role": "assistant",
+                "content": format!("anchor-line-{i}")
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let recorded = run_json(&repo, &["record", "--stdin"], Some(&transcript), &home);
+    let session_id = recorded["tape_id"].as_str().expect("tape_id");
+
+    let peek = run_json(
+        &repo,
+        &["peek", session_id, "--before", "0", "--after", "2"],
+        None,
+        &home,
+    );
+    let session = &peek["session"];
+    assert_eq!(session["window_start"], Value::from(1));
+    assert_eq!(session["window_end"], Value::from(3));
+    let content = session["content"].as_array().expect("content");
+    assert_eq!(content.len(), 3);
+    assert_eq!(content[0]["line"], Value::from(1));
+    assert_eq!(content[2]["line"], Value::from(3));
+}
+
+#[test]
+fn peek_grep_filter_returns_match_context_window() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = home.join("repo");
+    fs::create_dir_all(repo.join(".engram")).expect("repo");
+    write_repo_file(
+        &repo,
+        ".engram/config.yml",
+        "db: .engram/index.sqlite\ntapes_dir: .engram/tapes\npeek:\n  grep_context: 1\n",
+    );
+
+    let _ = run_json(&repo, &["init"], None, &home);
+    let transcript = (1..=15)
+        .map(|i| {
+            let content = if i == 9 {
+                "needle-in-session".to_string()
+            } else {
+                format!("plain-line-{i}")
+            };
+            json!({
+                "t": format!("2026-03-19T02:{i:02}:00Z"),
+                "k": "msg.out",
+                "role": "assistant",
+                "content": content
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let recorded = run_json(&repo, &["record", "--stdin"], Some(&transcript), &home);
+    let session_id = recorded["tape_id"].as_str().expect("tape_id");
+
+    let peek = run_json(
+        &repo,
+        &["peek", session_id, "--grep-filter", "needle-in-session"],
+        None,
+        &home,
+    );
+    let session = &peek["session"];
+    assert_eq!(session["window_start"], Value::from(8));
+    assert_eq!(session["window_end"], Value::from(10));
+    let content = session["content"].as_array().expect("content");
+    assert_eq!(content.len(), 3);
+    assert!(
+        content
+            .iter()
+            .any(|line| line["text"].as_str().unwrap_or("").contains("needle-in-session")),
+        "grep-filter output should include the matching line"
+    );
+}
+
+#[test]
+fn explain_chain_metadata_populates_parent_children_and_depth() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = home.join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    write_repo_file(&repo, "src/lib.rs", "fn chain_target() { child(); }\n");
+
+    let _ = run_json(&repo, &["init"], None, &home);
+    let dispatch_uuid = "11111111-1111-4111-8111-111111111111";
+
+    let parent_transcript = json!({
+        "t": "2026-03-19T03:00:00Z",
+        "k": "msg.out",
+        "role": "assistant",
+        "content": "parent dispatch created",
+        "metadata": { "dispatch_id": format!("<engram-src id=\"{dispatch_uuid}\"/>") }
+    })
+    .to_string()
+        + "\n";
+    let parent = run_json(&repo, &["record", "--stdin"], Some(&parent_transcript), &home);
+    let parent_id = parent["tape_id"].as_str().expect("parent tape id").to_string();
+
+    let child_transcript = format!(
+        "{}\n{}\n",
+        json!({
+            "t": "2026-03-19T03:05:00Z",
+            "k": "msg.in",
+            "role": "user",
+            "content": format!("context <engram-src id=\"{dispatch_uuid}\"/>")
+        }),
+        json!({
+            "t": "2026-03-19T03:06:00Z",
+            "k": "code.edit",
+            "file": "src/lib.rs",
+            "before_range": [1, 1],
+            "after_range": [1, 1],
+            "before_text": "fn chain_target() { old(); }\n",
+            "after_text": "fn chain_target() { child(); }\n",
+            "similarity": 0.96
+        })
+    );
+    let child = run_json(&repo, &["record", "--stdin"], Some(&child_transcript), &home);
+    let child_id = child["tape_id"].as_str().expect("child tape id").to_string();
+
+    let explain = run_json(&repo, &["explain", "src/lib.rs:1-1", "--limit", "10"], None, &home);
+    let sessions = explain["sessions"].as_array().expect("sessions");
+
+    let parent_session = sessions
+        .iter()
+        .find(|session| session["session_id"] == Value::String(parent_id.clone()))
+        .expect("parent session in explain output");
+    let child_session = sessions
+        .iter()
+        .find(|session| session["session_id"] == Value::String(child_id.clone()))
+        .expect("child session in explain output");
+
+    assert_eq!(parent_session["depth"], Value::from(0));
+    assert_eq!(parent_session["parent"], Value::Null);
+    assert_eq!(parent_session["chain_length"], Value::from(2));
+    assert!(
+        parent_session["children"]
+            .as_array()
+            .expect("parent children")
+            .iter()
+            .any(|value| value.as_str() == Some(child_id.as_str()))
+    );
+
+    assert_eq!(child_session["depth"], Value::from(1));
+    assert_eq!(child_session["parent"], Value::String(parent_id.clone()));
+    assert_eq!(child_session["chain_length"], Value::from(2));
+
+    let chains = explain["chains"].as_array().expect("chains");
+    let parent_chain = chains
+        .iter()
+        .find(|chain| chain["root_session_id"] == Value::String(parent_id.clone()))
+        .expect("root chain");
+    let descendants = parent_chain["descendants"].as_array().expect("descendants");
+    assert_eq!(descendants.len(), 2);
+    assert!(
+        descendants
+            .iter()
+            .any(|value| value["session_id"] == Value::String(child_id.clone()))
+    );
+}
+
+#[test]
+fn grep_truncates_at_safe_threshold_boundary() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = home.join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    write_repo_file(&repo, "src/lib.rs", "fn threshold_case() {}\n");
+    let _ = run_json(&repo, &["init"], None, &home);
+
+    for i in 0..26 {
+        let record_line = json!({
+            "t": format!("2026-03-19T04:{i:02}:00Z"),
+            "k": "msg.out",
+            "role": "assistant",
+            "content": format!("threshold needle {i}"),
+        })
+        .to_string()
+            + "\n";
+        let _ = run_json(&repo, &["record", "--stdin"], Some(&record_line), &home);
+    }
+
+    let grep = run_json(
+        &repo,
+        &["grep", "threshold needle", "--limit", "100"],
+        None,
+        &home,
+    );
+    assert_eq!(grep["total"], Value::from(26));
+    assert_eq!(grep["returned"], Value::from(25));
+    assert_eq!(grep["truncated"], Value::Bool(true));
+    assert!(grep["time_range"].get("start").is_some());
+    assert!(grep["time_range"].get("end").is_some());
+    assert_eq!(grep["sessions"].as_array().expect("sessions").len(), 25);
+}
+
+#[test]
+fn explain_since_until_filters_sessions_by_timestamp() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = home.join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    write_repo_file(&repo, "src/lib.rs", "fn date_filter_target() { live(); }\n");
+    let _ = run_json(&repo, &["init"], None, &home);
+
+    for (idx, ts) in [
+        "2026-03-10T10:00:00Z",
+        "2026-03-15T10:00:00Z",
+        "2026-03-20T10:00:00Z",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let record_line = json!({
+            "t": ts,
+            "k": "code.edit",
+            "file": "src/lib.rs",
+            "before_range": [1, 1],
+            "after_range": [1, 1],
+            "before_text": format!("fn date_filter_target() {{ old_{idx}(); }}\n"),
+            "after_text": "fn date_filter_target() { live(); }\n",
+            "similarity": 0.9,
+        })
+        .to_string()
+            + "\n";
+        let _ = run_json(&repo, &["record", "--stdin"], Some(&record_line), &home);
+    }
+
+    let explain = run_json(
+        &repo,
+        &[
+            "explain",
+            "src/lib.rs:1-1",
+            "--since",
+            "2026-03-12",
+            "--until",
+            "2026-03-18",
+            "--limit",
+            "10",
+        ],
+        None,
+        &home,
+    );
+    assert_eq!(explain["total"], Value::from(1));
+    assert_eq!(explain["returned"], Value::from(1));
+    let sessions = explain["sessions"].as_array().expect("sessions");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(
+        sessions[0]["timestamp"],
+        Value::String("2026-03-15T10:00:00Z".to_string())
+    );
+}
+
+#[test]
+fn explain_direct_string_query_returns_fingerprint_matches() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = home.join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+
+    let query = "fn direct_string_match() { value_42(); }\n";
+    write_repo_file(&repo, "src/lib.rs", query);
+    let _ = run_json(&repo, &["init"], None, &home);
+    let record_line = json!({
+        "t": "2026-03-19T05:00:00Z",
+        "k": "code.edit",
+        "file": "src/lib.rs",
+        "before_range": [1, 1],
+        "after_range": [1, 1],
+        "before_text": "fn direct_string_match() { value_0(); }\n",
+        "after_text": query,
+        "similarity": 0.97,
+    })
+    .to_string()
+        + "\n";
+    let _ = run_json(&repo, &["record", "--stdin"], Some(&record_line), &home);
+
+    let explain = run_json(&repo, &["explain", query], None, &home);
+    let sessions = explain["sessions"].as_array().expect("sessions");
+    assert!(!sessions.is_empty(), "expected literal explain to return matches");
+    assert!(
+        sessions[0]["confidence"].as_f64().unwrap_or(0.0) > 0.0,
+        "direct string explain should return a positive confidence match"
+    );
+}

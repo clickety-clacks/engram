@@ -780,11 +780,15 @@ fn explain_fans_out_to_additional_stores_and_dedupes() {
     assert_eq!(explain["stores_queried"], 2);
     let sessions = explain["sessions"].as_array().expect("sessions");
     assert!(
-        sessions.iter().any(|session| session["tape_id"] == tape_a),
+        sessions
+            .iter()
+            .any(|session| session["session_id"] == Value::String(tape_a.clone())),
         "sessions={sessions:?}"
     );
     assert!(
-        sessions.iter().any(|session| session["tape_id"] == tape_b),
+        sessions
+            .iter()
+            .any(|session| session["session_id"] == Value::String(tape_b.clone())),
         "sessions={sessions:?}"
     );
 }
@@ -829,15 +833,9 @@ fn show_and_explain_fall_back_to_home_tapes_when_repo_tapes_dir_is_empty() {
     let explain = run_json(&repo, &["explain", anchor, "--anchor"], None, &home);
     let sessions = explain["sessions"].as_array().expect("sessions");
     assert_eq!(sessions.len(), 1, "sessions={sessions:?}");
-    assert_eq!(sessions[0]["tape_id"], tape_id);
-    assert_eq!(sessions[0]["tape_present_locally"], true);
-    assert!(
-        !sessions[0]["windows"]
-            .as_array()
-            .expect("windows")
-            .is_empty(),
-        "sessions={sessions:?}"
-    );
+    assert_eq!(sessions[0]["session_id"], Value::String(tape_id.clone()));
+    assert!(sessions[0]["window_end"].as_u64().unwrap_or(0) >= 1);
+    assert!(sessions[0]["total_lines"].as_u64().unwrap_or(0) >= 1);
 }
 
 #[test]
@@ -888,15 +886,9 @@ fn show_and_explain_resolve_tapes_from_additional_store_directories() {
     let explain = run_json(&project_a, &["explain", anchor, "--anchor"], None, &home);
     let sessions = explain["sessions"].as_array().expect("sessions");
     assert_eq!(sessions.len(), 1, "sessions={sessions:?}");
-    assert_eq!(sessions[0]["tape_id"], tape_id);
-    assert_eq!(sessions[0]["tape_present_locally"], true);
-    assert!(
-        !sessions[0]["windows"]
-            .as_array()
-            .expect("windows")
-            .is_empty(),
-        "sessions={sessions:?}"
-    );
+    assert_eq!(sessions[0]["session_id"], Value::String(tape_id));
+    assert!(sessions[0]["window_end"].as_u64().unwrap_or(0) >= 1);
+    assert!(sessions[0]["total_lines"].as_u64().unwrap_or(0) >= 1);
 }
 
 #[test]
