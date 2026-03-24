@@ -1340,7 +1340,7 @@ fn discover_ingest_candidates(
         if !canonical.starts_with(&scope_root) {
             failures.push(json!({
                 "path": path_string(&canonical),
-                "error": "path is outside local ingest scope",
+                "error": "path is outside current working directory scope (run `engram ingest` from a parent directory, e.g. $HOME)",
             }));
             continue;
         }
