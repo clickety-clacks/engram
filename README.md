@@ -62,7 +62,7 @@ There is no separate `--dispatch` explain mode.
 
 ### Config resolution
 
-Engram walks up the directory tree from the current working directory looking for `.engram/config.yml`. The first one found wins. No merge between levels. If none is found, falls back to `~/.engram/config.yml`.
+Engram walks up the directory tree from the current working directory, collecting `.engram/config.yml` files from the nearest directory up through `~/.engram/config.yml`. Config values inherit per key across that chain: the nearest config that sets a given key wins, and missing keys fall through to parent configs. If the current working directory is outside `HOME`, Engram skips the walk-up chain and uses `~/.engram/config.yml` directly.
 
 On first invocation, Engram auto-creates `~/.engram/config.yml` if missing.
 
