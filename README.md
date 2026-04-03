@@ -8,6 +8,8 @@ Your code started as a conversation. Every agent reasoning through a problem, ev
 
 Engram answers one question: **why does this exist?**
 
+Licensed under the Apache License, Version 2.0.
+
 ## 1. What it is
 
 Engram is a deterministic provenance index for agent-driven work.
@@ -232,3 +234,8 @@ metrics:
 - Core event contract: `specs/core/event-contract.md`
 - Dispatch marker: `specs/core/dispatch-marker.md`
 - Adapter contracts: `specs/adapters/*.md`
+
+
+## License
+
+Apache License 2.0. See `LICENSE` for the full text.
