@@ -10,7 +10,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use engram::anchor::fingerprint_token_hashes;
 use engram::config::{
     EffectiveWatchConfig, EffectiveWatchSource, ensure_user_config,
@@ -97,6 +97,7 @@ enum Command {
     Explain(ExplainArgs),
     Grep(GrepArgs),
     Peek(PeekArgs),
+    Rate(RateArgs),
     Tapes,
     Show(ShowArgs),
     Gc,
@@ -192,6 +193,37 @@ struct PeekArgs {
     grep_filter: Option<String>,
 }
 
+#[derive(Args, Debug)]
+struct RateArgs {
+    result_id: String,
+    #[arg(long)]
+    outcome: RateOutcome,
+    #[arg(long)]
+    note: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "snake_case")]
+enum RateOutcome {
+    FoundAnswer,
+    PartiallyHelped,
+    Noise,
+    Misleading,
+    NotUsed,
+}
+
+impl RateOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FoundAnswer => "found_answer",
+            Self::PartiallyHelped => "partially_helped",
+            Self::Noise => "noise",
+            Self::Misleading => "misleading",
+            Self::NotUsed => "not_used",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RepoPaths {
     root: PathBuf,
@@ -283,6 +315,10 @@ fn run() -> Result<(), CliError> {
             let context = resolve_runtime_context(&cwd)?;
             cmd_peek(&paths, &context, args)
         }
+        Command::Rate(args) => {
+            let context = resolve_runtime_context(&cwd)?;
+            cmd_rate(&paths, &context, args)
+        }
         Command::Tapes => {
             let context = resolve_runtime_context(&cwd)?;
             cmd_tapes(&paths, &context)
@@ -332,6 +368,7 @@ COMMANDS:
   explain    Find provenance for code (by fingerprint)
   grep       Find provenance for a term (by text search)
   peek       Read content from a provenance session
+  rate       Record whether a returned result was useful
   ingest     Import transcripts into the index
   watch      Continuously watch for new transcripts
 
@@ -408,6 +445,23 @@ EXAMPLES:
   engram peek af156abd --grep-filter "NO_REPLY"
 "#;
 
+const HELP_RATE: &str = r#"Record usefulness feedback for a prior query result.
+
+USAGE:
+  engram rate <result_id> --outcome <class> [--note "..."]
+
+OUTCOMES:
+  found_answer
+  partially_helped
+  noise
+  misleading
+  not_used
+
+EXAMPLES:
+  engram rate result_abc123 --outcome found_answer
+  engram rate result_abc123 --outcome misleading --note "sent me to the wrong session"
+"#;
+
 fn maybe_print_spec_help() -> Result<bool, CliError> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let help_flag = |value: &str| value == "--help" || value == "-h";
@@ -429,6 +483,10 @@ fn maybe_print_spec_help() -> Result<bool, CliError> {
             }
             "peek" => {
                 print!("{HELP_PEEK}");
+                return Ok(true);
+            }
+            "rate" => {
+                print!("{HELP_RATE}");
                 return Ok(true);
             }
             _ => {}
@@ -476,6 +534,34 @@ fn cmd_init(paths: &RepoPaths) -> Result<(), CliError> {
         "status": "ok",
         "created": true,
         "message": "created local workspace config at .engram/config.yml",
+    }))
+}
+
+fn cmd_rate(paths: &RepoPaths, context: &RuntimeContext, args: RateArgs) -> Result<(), CliError> {
+    ensure_local_store(paths)?;
+    print_context_conspicuity(context);
+    ensure_db_parent(&context.db_path)?;
+
+    let index = SqliteIndex::open(&path_string(&context.db_path))?;
+    if !index.query_result_exists(&args.result_id)? {
+        return Err(CliError::new("unknown_result_id", args.result_id));
+    }
+
+    let rated_at = Utc::now().to_rfc3339();
+    index.upsert_result_feedback(
+        &args.result_id,
+        args.outcome.as_str(),
+        args.note.as_deref(),
+        &rated_at,
+    )?;
+
+    print_json(&json!({
+        "status": "ok",
+        "result_id": args.result_id,
+        "outcome": args.outcome.as_str(),
+        "note": args.note,
+        "rated_at": rated_at,
+        "storage": "local_index",
     }))
 }
 
@@ -1896,8 +1982,8 @@ fn cmd_explain(
             .cmp(&b_depth)
             .then_with(|| {
                 b_score
-            .partial_cmp(&a_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+                    .partial_cmp(&a_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
             .then_with(|| b_ts.cmp(a_ts))
     });
@@ -1905,8 +1991,12 @@ fn cmd_explain(
         return Err(CliError::new("no_results", target));
     }
 
-    let (sessions, returned, total, time_range, truncated) =
-        apply_session_truncation(sessions, args.limit, args.offset, context.explain_default_limit);
+    let (sessions, returned, total, time_range, truncated) = apply_session_truncation(
+        sessions,
+        args.limit,
+        args.offset,
+        context.explain_default_limit,
+    );
     if sessions.is_empty() {
         return Err(CliError::new("no_results", target));
     }
@@ -1921,7 +2011,10 @@ fn cmd_explain(
         Value::Null,
     );
 
-    print_json(&json!({
+    emit_query_result(
+        &indexes[0],
+        "explain",
+        json!({
         "query": {
             "command": "explain",
             "target": target,
@@ -1949,7 +2042,8 @@ fn cmd_explain(
         "total": total,
         "time_range": time_range,
         "truncated": truncated,
-    }))
+        }),
+    )
 }
 
 fn cmd_grep(paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Result<(), CliError> {
@@ -1960,13 +2054,8 @@ fn cmd_grep(paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Resu
     let indexes = open_query_indexes(context)?;
     let (raw_sessions, score_by_session) = collect_grep_matches(context, &indexes, &args.pattern)?;
     let date_filter = DateFilter::parse(args.since.as_deref(), args.until.as_deref())?;
-    let mut sessions = format_sessions_for_agent(
-        context,
-        &indexes[0],
-        raw_sessions,
-        &score_by_session,
-        None,
-    )?;
+    let mut sessions =
+        format_sessions_for_agent(context, &indexes[0], raw_sessions, &score_by_session, None)?;
     sessions.retain(|session| session_matches_date_filter(session, &date_filter));
     sessions.sort_by(|a, b| {
         let a_ts = a.get("timestamp").and_then(Value::as_str).unwrap_or("");
@@ -1977,17 +2066,17 @@ fn cmd_grep(paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Resu
         return Err(CliError::new("no_results", args.pattern));
     }
 
-    let (sessions, returned, total, time_range, truncated) =
-        apply_session_truncation(sessions, args.limit, args.offset, context.explain_default_limit);
+    let (sessions, returned, total, time_range, truncated) = apply_session_truncation(
+        sessions,
+        args.limit,
+        args.offset,
+        context.explain_default_limit,
+    );
     if sessions.is_empty() {
         return Err(CliError::new("no_results", args.pattern));
     }
 
-    let metrics_sessions = if args.count {
-        Vec::new()
-    } else {
-        sessions
-    };
+    let metrics_sessions = if args.count { Vec::new() } else { sessions };
     append_metrics(
         context,
         "grep",
@@ -1998,7 +2087,10 @@ fn cmd_grep(paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Resu
         Value::Null,
     );
 
-    print_json(&json!({
+    emit_query_result(
+        &indexes[0],
+        "grep",
+        json!({
         "query": {
             "command": "grep",
             "pattern": args.pattern,
@@ -2017,7 +2109,8 @@ fn cmd_grep(paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Resu
         "total": total,
         "time_range": time_range,
         "truncated": truncated,
-    }))
+        }),
+    )
 }
 
 fn cmd_peek(paths: &RepoPaths, context: &RuntimeContext, args: PeekArgs) -> Result<(), CliError> {
@@ -2081,10 +2174,7 @@ fn cmd_peek(paths: &RepoPaths, context: &RuntimeContext, args: PeekArgs) -> Resu
     } else {
         let anchor_line = default_peek_anchor_line(&indexes[0], &session_id, &rows);
         if let Some(start) = args.start {
-            let line_count = args
-                .lines
-                .unwrap_or(context.peek_default_lines)
-                .max(1);
+            let line_count = args.lines.unwrap_or(context.peek_default_lines).max(1);
             let end = usize::min(
                 total_lines,
                 start.saturating_add(line_count).saturating_sub(1),
@@ -2137,7 +2227,10 @@ fn cmd_peek(paths: &RepoPaths, context: &RuntimeContext, args: PeekArgs) -> Resu
         json!(total_lines),
     );
 
-    print_json(&json!({
+    emit_query_result(
+        &indexes[0],
+        "peek",
+        json!({
         "query": {
             "command": "peek",
             "session_id": session_id,
@@ -2155,7 +2248,8 @@ fn cmd_peek(paths: &RepoPaths, context: &RuntimeContext, args: PeekArgs) -> Resu
             "total_lines": total_lines,
             "content": content,
         }
-    }))
+        }),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -2519,7 +2613,10 @@ enum DateBound {
     Until,
 }
 
-fn parse_date_bound(raw: Option<&str>, bound: DateBound) -> Result<Option<chrono::DateTime<Utc>>, CliError> {
+fn parse_date_bound(
+    raw: Option<&str>,
+    bound: DateBound,
+) -> Result<Option<chrono::DateTime<Utc>>, CliError> {
     let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
@@ -2533,7 +2630,9 @@ fn parse_date_bound(raw: Option<&str>, bound: DateBound) -> Result<Option<chrono
             DateBound::Until => date.and_hms_opt(23, 59, 59),
         }
         .ok_or_else(|| CliError::new("invalid_date", raw.to_string()))?;
-        return Ok(Some(chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc)));
+        return Ok(Some(chrono::DateTime::<Utc>::from_naive_utc_and_offset(
+            dt, Utc,
+        )));
     }
     Err(CliError::new(
         "invalid_date",
@@ -2628,7 +2727,10 @@ fn annotate_chain_fields(sessions: &mut [Value], dispatch_lineage: &[Value]) {
 
         if let Some(obj) = session.as_object_mut() {
             obj.insert("depth".to_string(), json!(depth));
-            obj.insert("parent".to_string(), parent.map(Value::from).unwrap_or(Value::Null));
+            obj.insert(
+                "parent".to_string(),
+                parent.map(Value::from).unwrap_or(Value::Null),
+            );
             obj.insert("children".to_string(), json!(children));
             obj.insert("chain_length".to_string(), json!(length));
         }
@@ -2658,15 +2760,12 @@ fn build_chain_metadata(sessions: &[Value]) -> Vec<Value> {
         if !root_order.iter().any(|value| value == &root) {
             root_order.push(root.clone());
         }
-        by_root
-            .entry(root)
-            .or_default()
-            .push(json!({
-                "session_id": id,
-                "depth": session.get("depth").cloned().unwrap_or_else(|| json!(0)),
-                "parent": session.get("parent").cloned().unwrap_or(Value::Null),
-                "children": session.get("children").cloned().unwrap_or_else(|| json!([])),
-            }));
+        by_root.entry(root).or_default().push(json!({
+            "session_id": id,
+            "depth": session.get("depth").cloned().unwrap_or_else(|| json!(0)),
+            "parent": session.get("parent").cloned().unwrap_or(Value::Null),
+            "children": session.get("children").cloned().unwrap_or_else(|| json!([])),
+        }));
     }
     let mut out = Vec::new();
     for root in root_order {
@@ -2684,11 +2783,7 @@ fn build_chain_metadata(sessions: &[Value]) -> Vec<Value> {
     out
 }
 
-fn default_peek_anchor_line(
-    index: &SqliteIndex,
-    session_id: &str,
-    rows: &[TapeRow],
-) -> usize {
+fn default_peek_anchor_line(index: &SqliteIndex, session_id: &str, rows: &[TapeRow]) -> usize {
     if let Ok(links) = index.dispatch_links_for_tape(session_id)
         && let Some(received) = links
             .into_iter()
@@ -2701,11 +2796,7 @@ fn default_peek_anchor_line(
             return pos + 1;
         }
     }
-    if rows.is_empty() {
-        1
-    } else {
-        1
-    }
+    if rows.is_empty() { 1 } else { 1 }
 }
 
 fn collect_dispatch_upstream_sessions(
@@ -3619,6 +3710,76 @@ fn path_string(path: &Path) -> String {
 fn print_json(value: &Value) -> Result<(), CliError> {
     let rendered = serde_json::to_string(value)?;
     println!("{rendered}");
+    Ok(())
+}
+
+fn emit_query_result(index: &SqliteIndex, command: &str, payload: Value) -> Result<(), CliError> {
+    let payload_json = canonical_json_string(&payload)?;
+    let result_id = format!(
+        "result_{}",
+        sha256_hex(&format!("{command}:{payload_json}"))
+    );
+    let created_at = Utc::now().to_rfc3339();
+    index.record_query_result(&result_id, command, &payload_json, &created_at)?;
+
+    let mut object = match payload {
+        Value::Object(map) => map,
+        _ => {
+            return Err(CliError::new(
+                "invalid_query_payload",
+                format!("{command} payload must be a JSON object"),
+            ));
+        }
+    };
+    object.insert("result_id".to_string(), Value::String(result_id.clone()));
+    object.insert(
+        "rating_hint".to_string(),
+        Value::String(format!(
+            "If this materially changed your plan or prevented a mistake, run: engram rate {result_id} --outcome found_answer"
+        )),
+    );
+    print_json(&Value::Object(object))
+}
+
+fn canonical_json_string(value: &Value) -> Result<String, CliError> {
+    let mut out = String::new();
+    write_canonical_json(value, &mut out)?;
+    Ok(out)
+}
+
+fn write_canonical_json(value: &Value, out: &mut String) -> Result<(), CliError> {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+            out.push_str(&serde_json::to_string(value)?);
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (idx, item) in items.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                write_canonical_json(item, out)?;
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            out.push('{');
+            let mut keys = map.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for (idx, key) in keys.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::to_string(key)?);
+                out.push(':');
+                let value = map
+                    .get(*key)
+                    .expect("canonical json key collected from same map");
+                write_canonical_json(value, out)?;
+            }
+            out.push('}');
+        }
+    }
     Ok(())
 }
 

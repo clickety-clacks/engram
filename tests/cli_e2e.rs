@@ -103,6 +103,8 @@ fn init_record_tapes_show_and_explain_roundtrip() {
     assert_eq!(String::from_utf8_lossy(&raw.stdout), transcript);
 
     let explain = run_json(repo, &["explain", "src/lib.rs:2-2"], None);
+    let result_id = explain["result_id"].as_str().expect("result_id");
+    assert!(result_id.starts_with("result_"));
     let query_anchors = explain["query"]["anchors"].as_array().expect("anchors");
     assert!(query_anchors.len() >= 1);
     // query_anchors are individual tokens; verify at least one token from the
@@ -120,6 +122,36 @@ fn init_record_tapes_show_and_explain_roundtrip() {
     assert!(sessions[0]["confidence"].as_f64().unwrap_or(0.0) >= 0.0);
     assert!(sessions[0]["window_start"].as_u64().unwrap_or(0) >= 1);
     assert!(sessions[0]["window_end"].as_u64().unwrap_or(0) >= 1);
+
+    let rate = run_json(
+        repo,
+        &[
+            "rate",
+            result_id,
+            "--outcome",
+            "found_answer",
+            "--note",
+            "helped find the right provenance chain",
+        ],
+        None,
+    );
+    assert_eq!(rate["status"], "ok");
+    assert_eq!(rate["result_id"], result_id);
+    assert_eq!(rate["outcome"], "found_answer");
+
+    let conn = Connection::open(repo.join(".home/.engram/index.sqlite")).expect("sqlite");
+    let stored: (String, Option<String>) = conn
+        .query_row(
+            "SELECT outcome, note FROM result_feedback WHERE result_id = ?1",
+            [result_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("stored feedback");
+    assert_eq!(stored.0, "found_answer");
+    assert_eq!(
+        stored.1.as_deref(),
+        Some("helped find the right provenance chain")
+    );
 }
 
 #[test]
@@ -149,6 +181,7 @@ fn explain_matches_winnow_edit_anchor_for_span_targets() {
     let _ = run_json(repo, &["record", "--stdin"], Some(&transcript));
 
     let explain = run_json(repo, &["explain", "src/lib.rs:2-2"], None);
+    assert!(explain["result_id"].is_string());
     let query_anchors = explain["query"]["anchors"].as_array().expect("anchors");
     // query_anchors are individual tokens; verify at least one token from the
     // span's fingerprint is present.
@@ -169,6 +202,44 @@ fn explain_matches_winnow_edit_anchor_for_span_targets() {
         explain["lineage"].as_array().expect("lineage").len() >= 1,
         "expected at least one inbound edit linkage for matched winnow anchor"
     );
+}
+
+#[test]
+fn grep_and_peek_emit_stable_result_ids_and_rate_rejects_unknown_ids() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+    let _ = run_json(repo, &["init"], None);
+
+    let transcript = concat!(
+        "{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"meta\",\"model\":\"gpt-5\"}\n",
+        "{\"t\":\"2026-02-22T00:00:01Z\",\"k\":\"message\",\"role\":\"user\",\"content\":\"retry logic discussion\"}\n"
+    );
+    let recorded = run_json(repo, &["record", "--stdin"], Some(transcript));
+    let session_id = recorded["tape_id"].as_str().expect("tape id").to_string();
+
+    let grep_one = run_json(repo, &["grep", "retry"], None);
+    let grep_two = run_json(repo, &["grep", "retry"], None);
+    assert_eq!(grep_one["result_id"], grep_two["result_id"]);
+    assert!(grep_one["rating_hint"].as_str().is_some());
+
+    let peek_one = run_json(repo, &["peek", &session_id], None);
+    let peek_two = run_json(repo, &["peek", &session_id], None);
+    assert_eq!(peek_one["result_id"], peek_two["result_id"]);
+    assert!(peek_one["rating_hint"].as_str().is_some());
+
+    let output = run_cli(
+        repo,
+        &["rate", "result_missing", "--outcome", "noise"],
+        None,
+    );
+    assert!(
+        !output.status.success(),
+        "expected unknown result_id to fail: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown_result_id"), "stderr={stderr}");
 }
 
 #[test]
@@ -478,7 +549,10 @@ fn explain_orders_sessions_by_touch_count_then_recency() {
         sessions[0]["timestamp"],
         Value::String("2026-02-22T00:00:12Z".to_string())
     );
-    assert_eq!(sessions[1]["timestamp"], Value::String("2026-02-22T00:00:01Z".to_string()));
+    assert_eq!(
+        sessions[1]["timestamp"],
+        Value::String("2026-02-22T00:00:01Z".to_string())
+    );
 }
 
 #[test]
