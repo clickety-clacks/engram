@@ -4,7 +4,7 @@
 
 *An automatically built index into why things are the way they are.*
 
-Your code started as a conversation. Every agent reasoning through a problem, every decision handed off, every rationale spoken aloud — that is the exhaust of agentic engineering, and it carries more signal than the code itself. Engram fingerprints and indexes that exhaust across conversations, creating a foundation for institutional knowledge — the kind you forget is there until you realize nothing works without it.
+Your code started as a conversation. Every agent reasoning through a problem, every handoff, every rationale spoken aloud leaves a trail. Engram fingerprints and indexes that trail so you can recover why a system ended up the way it did.
 
 Engram answers one question: **why does this exist?**
 
@@ -14,7 +14,7 @@ Licensed under the Apache License, Version 2.0.
 
 Engram is a deterministic provenance index for agent-driven work.
 
-It stores immutable tapes and indexes their fingerprints in SQLite so a query on any text can return the sessions that causally produced it.
+It stores immutable tapes and indexes their fingerprints in SQLite so a query on code or text can return the conversations that causally produced it.
 
 Core model:
 - Tapes are immutable files.
@@ -43,13 +43,13 @@ engram explain src/auth.rs:40-78
 engram watch
 ```
 
-`engram watch` monitors directories listed under the `watch:` key in config.yml, runs ingest on each new or changed file that matches the configured pattern, and logs activity to `watch.log`. This is the recommended integration pattern — file watchers, not git hooks.
+`engram watch` monitors directories listed under the `watch:` key in config.yml, runs ingest on each new or changed file that matches the configured pattern, and logs activity to `watch.log`. This is the recommended integration pattern.
 
 ### How commands work
 
-- `engram ingest [PATH...]`: local-scoped. Walks the current directory tree (or given paths) for transcript files, converts recognized harness logs into tapes, and fingerprints those tapes into the resolved DB.
+- `engram ingest [PATH...]`: discovers transcript files, converts recognized logs into tapes, and fingerprints those tapes into the resolved DB.
 - `engram watch`: long-running file watcher. Reads `watch.sources` from the resolved config.yml, watches those directories for new/changed files, debounces, and runs ingest on each matching file. Requires a `watch:` section in config.
-- `engram fingerprint`: local-scoped. Indexes existing `./.engram/tapes/*.jsonl.zst` into the resolved DB (no transcript parsing, no tape creation).
+- `engram fingerprint`: indexes existing `./.engram/tapes/*.jsonl.zst` into the resolved DB (no transcript parsing, no tape creation).
 - `engram explain <file>:<start>-<end>`: computes anchors for the selected span, queries the resolved DB, follows lineage and dispatch-marker links, and returns evidence sessions/windows.
 
 Dispatch markers are traversed during normal explain:
@@ -141,7 +141,7 @@ engram --help
 
 `engram init` is optional: it creates `./.engram/config.yml` with `db: .engram/index.sqlite` and local store directories.
 
-## 5. How you link multiple levels of agents together
+## 5. How you link multi-step work together
 
 Include the same marker in handoff content across sessions:
 
@@ -150,14 +150,12 @@ Include the same marker in handoff content across sessions:
 ```
 
 Human model:
-1. Upstream session sends work with marker `X`.
-2. Downstream session receives marker `X` and edits code.
-3. A later session continues with marker `X`.
+1. One conversation sends work with marker `X`.
+2. A later conversation receives marker `X` and edits code.
+3. Another follow-up continues with marker `X`.
 4. `engram explain` on touched code follows dispatch links upstream and returns the causal chain.
 
-OpenClaw note (example only):
-- An OpenClaw submitter can propagate the UUID in a header and mirror it in message content as `<engram-src .../>`.
-- That submitter/header pattern is an integration example, not Engram core behavior.
+This marker pattern is an integration example, not Engram core behavior.
 
 ## 6. Regression Testing
 
@@ -168,6 +166,8 @@ cargo test --test regression_suite
 ```
 
 ## 7. Usage Metrics & Tuning Defaults
+
+These metrics are for local tuning and evaluation. They are not part of Engram's user-facing provenance model.
 
 Engram logs minimal per-call metrics to `~/.engram/metrics.jsonl` so you can tune default window sizes from real usage data.
 
