@@ -3735,7 +3735,7 @@ fn emit_query_result(index: &SqliteIndex, command: &str, payload: Value) -> Resu
     object.insert(
         "rating_hint".to_string(),
         Value::String(format!(
-            "If this materially changed your plan or prevented a mistake, run: engram rate {result_id} --outcome found_answer"
+            "Rate this result: engram rate {result_id} --outcome <found_answer|partially_helped|noise|misleading|not_used>"
         )),
     );
     print_json(&Value::Object(object))
