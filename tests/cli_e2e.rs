@@ -155,6 +155,128 @@ fn init_record_tapes_show_and_explain_roundtrip() {
 }
 
 #[test]
+fn existing_db_upgrade_bootstraps_rating_schema_before_rate() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+    fs::create_dir_all(repo.join("src")).expect("src dir");
+    fs::write(
+        repo.join("src/lib.rs"),
+        "alpha\nretry logic discussion\nzeta\n",
+    )
+    .expect("seed file");
+
+    let home_db = repo.join(".home/.engram/index.sqlite");
+    fs::create_dir_all(home_db.parent().expect("db parent")).expect("db dir");
+    let conn = Connection::open(&home_db).expect("sqlite");
+    conn.execute_batch(
+        "
+        PRAGMA user_version = 3;
+        CREATE TABLE evidence (
+            anchor TEXT NOT NULL,
+            tape_id TEXT NOT NULL,
+            event_offset INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            UNIQUE(anchor, tape_id, event_offset, kind)
+        );
+        CREATE INDEX idx_evidence_anchor ON evidence(anchor);
+        CREATE TABLE edges (
+            from_anchor TEXT NOT NULL,
+            to_anchor TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            location_delta TEXT NOT NULL,
+            cardinality TEXT NOT NULL,
+            agent_link INTEGER NOT NULL,
+            note TEXT NOT NULL DEFAULT '',
+            UNIQUE(from_anchor, to_anchor, confidence, location_delta, cardinality, agent_link, note)
+        );
+        CREATE INDEX idx_edges_from_anchor ON edges(from_anchor);
+        CREATE INDEX idx_edges_to_anchor ON edges(to_anchor);
+        CREATE TABLE tombstones (
+            anchor TEXT NOT NULL,
+            tape_id TEXT NOT NULL,
+            event_offset INTEGER NOT NULL,
+            file_path TEXT NOT NULL,
+            range_start INTEGER NOT NULL,
+            range_end INTEGER NOT NULL,
+            timestamp TEXT NOT NULL,
+            UNIQUE(anchor, tape_id, event_offset)
+        );
+        CREATE INDEX idx_tombstones_anchor ON tombstones(anchor);
+        CREATE TABLE tapes (
+            tape_id TEXT PRIMARY KEY
+        );
+        CREATE TABLE dispatch_links (
+            tape_id TEXT NOT NULL,
+            uuid TEXT NOT NULL,
+            first_turn_index INTEGER NOT NULL,
+            direction TEXT NOT NULL CHECK(direction IN ('received', 'sent')),
+            PRIMARY KEY (tape_id, uuid)
+        );
+        CREATE INDEX idx_dispatch_links_uuid ON dispatch_links(uuid);
+        CREATE INDEX idx_dispatch_links_tape ON dispatch_links(tape_id);
+        CREATE INDEX idx_dispatch_links_received
+            ON dispatch_links(tape_id, direction, first_turn_index);
+        ",
+    )
+    .expect("seed pre-rating schema");
+    drop(conn);
+
+    let transcript = concat!(
+        "{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"meta\",\"model\":\"gpt-5\"}\n",
+        "{\"t\":\"2026-02-22T00:00:01Z\",\"k\":\"message\",\"role\":\"user\",\"content\":\"retry logic discussion\"}\n"
+    );
+    let _ = run_json(repo, &["record", "--stdin"], Some(transcript));
+
+    let grep = run_json(repo, &["grep", "retry"], None);
+    let result_id = grep["result_id"].as_str().expect("result_id");
+
+    let rate = run_json(
+        repo,
+        &[
+            "rate",
+            result_id,
+            "--outcome",
+            "found_answer",
+            "--note",
+            "upgrade path",
+        ],
+        None,
+    );
+    assert_eq!(rate["status"], "ok");
+
+    let conn = Connection::open(&home_db).expect("sqlite");
+    let tables: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name IN ('query_results', 'result_feedback')
+                 ORDER BY name",
+            )
+            .expect("tables stmt");
+        stmt.query_map([], |row| row.get(0))
+            .expect("tables query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("table rows")
+    };
+    assert_eq!(
+        tables,
+        vec!["query_results".to_string(), "result_feedback".to_string()]
+    );
+
+    let stored: (String, Option<String>) = conn
+        .query_row(
+            "SELECT outcome, note FROM result_feedback WHERE result_id = ?1",
+            [result_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("stored feedback");
+    assert_eq!(stored.0, "found_answer");
+    assert_eq!(stored.1.as_deref(), Some("upgrade path"));
+}
+
+#[test]
 fn explain_matches_winnow_edit_anchor_for_span_targets() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();

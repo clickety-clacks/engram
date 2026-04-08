@@ -186,6 +186,11 @@ impl SqliteIndex {
 
     fn create_schema_v3(&self) -> rusqlite::Result<()> {
         self.create_schema_v2()?;
+        self.ensure_query_feedback_schema()?;
+        Ok(())
+    }
+
+    fn ensure_query_feedback_schema(&self) -> rusqlite::Result<()> {
         self.conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS query_results (
@@ -206,8 +211,7 @@ impl SqliteIndex {
                 FOREIGN KEY(result_id) REFERENCES query_results(result_id) ON DELETE CASCADE
             );
             ",
-        )?;
-        Ok(())
+        )
     }
 
     fn migrate_v1_to_v2(&self) -> rusqlite::Result<()> {
@@ -385,6 +389,7 @@ impl SqliteIndex {
         payload_json: &str,
         created_at: &str,
     ) -> rusqlite::Result<()> {
+        self.ensure_query_feedback_schema()?;
         self.conn.execute(
             "INSERT OR REPLACE INTO query_results (result_id, command, payload_json, created_at)
              VALUES (?1, ?2, ?3, ?4)",
@@ -394,6 +399,7 @@ impl SqliteIndex {
     }
 
     pub fn query_result_exists(&self, result_id: &str) -> rusqlite::Result<bool> {
+        self.ensure_query_feedback_schema()?;
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM query_results WHERE result_id = ?1",
             params![result_id],
@@ -409,6 +415,7 @@ impl SqliteIndex {
         note: Option<&str>,
         rated_at: &str,
     ) -> rusqlite::Result<()> {
+        self.ensure_query_feedback_schema()?;
         self.conn.execute(
             "INSERT INTO result_feedback (result_id, outcome, note, rated_at)
              VALUES (?1, ?2, ?3, ?4)
