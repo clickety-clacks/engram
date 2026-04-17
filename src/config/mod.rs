@@ -42,6 +42,7 @@ pub struct EffectiveWatchConfig {
 pub struct EffectiveWatchSource {
     pub path: PathBuf,
     pub pattern: String,
+    pub glob: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +87,7 @@ pub struct ParsedWatchConfig {
 pub struct ParsedWatchSource {
     pub path: String,
     pub pattern: String,
+    pub glob: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,6 +156,8 @@ struct RawWatchConfig {
 struct RawWatchSource {
     path: String,
     pattern: String,
+    #[serde(default)]
+    glob: Option<String>,
 }
 
 #[derive(Debug)]
@@ -250,14 +254,17 @@ pub fn load_effective_config_with_override(
         if explain_default_limit.is_none()
             && let Some(raw_explain) = raw.explain.as_ref()
         {
-            explain_default_limit = Some(raw_explain.default_limit.unwrap_or(default_explain_limit));
+            explain_default_limit =
+                Some(raw_explain.default_limit.unwrap_or(default_explain_limit));
         }
         if peek.is_none()
             && let Some(raw_peek) = raw.peek.as_ref()
         {
             peek = Some(EffectivePeekConfig {
                 default_lines: raw_peek.default_lines.unwrap_or(default_peek.default_lines),
-                default_before: raw_peek.default_before.unwrap_or(default_peek.default_before),
+                default_before: raw_peek
+                    .default_before
+                    .unwrap_or(default_peek.default_before),
                 default_after: raw_peek.default_after.unwrap_or(default_peek.default_after),
                 grep_context: raw_peek.grep_context.unwrap_or(default_peek.grep_context),
             });
@@ -291,6 +298,7 @@ pub fn load_effective_config_with_override(
                     sources.push(EffectiveWatchSource {
                         path: resolve_path(&source.path, &base_dir, home)?,
                         pattern: source.pattern.clone(),
+                        glob: source.glob.clone(),
                     });
                 }
             }
@@ -387,6 +395,7 @@ fn parse_config(content: &str) -> Result<ParsedConfig, ConfigError> {
             .map(|source| ParsedWatchSource {
                 path: source.path,
                 pattern: source.pattern,
+                glob: source.glob,
             })
             .collect(),
     });
@@ -745,6 +754,31 @@ mod tests {
         assert_eq!(watch.sources.len(), 1);
         assert_eq!(watch.sources[0].path, home.join("shared/openclaw"));
         assert_eq!(watch.sources[0].pattern, "*.jsonl");
+        assert_eq!(watch.sources[0].glob, None);
+    }
+
+    #[test]
+    fn resolves_watch_source_optional_glob_filter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        let workspace = home.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(home.join(".engram")).expect("home");
+        std::fs::write(
+            home.join(".engram/config.yml"),
+            "db: ~/.engram/index.sqlite\nwatch:\n  sources:\n    - path: ~/shared/openclaw\n      pattern: \"*.jsonl\"\n      glob: \"sessions/**/*.jsonl\"\n",
+        )
+        .expect("home config");
+
+        let cfg = load_effective_config(&workspace, &home).expect("config");
+        let watch = cfg.watch.expect("watch config");
+        assert_eq!(watch.sources.len(), 1);
+        assert_eq!(watch.sources[0].path, home.join("shared/openclaw"));
+        assert_eq!(watch.sources[0].pattern, "*.jsonl");
+        assert_eq!(
+            watch.sources[0].glob.as_deref(),
+            Some("sessions/**/*.jsonl")
+        );
     }
 
     #[test]
@@ -774,5 +808,6 @@ mod tests {
         assert_eq!(watch.sources.len(), 1);
         assert_eq!(watch.sources[0].path, custom_root.join("sessions"));
         assert_eq!(watch.sources[0].pattern, "session-*.json");
+        assert_eq!(watch.sources[0].glob, None);
     }
 }

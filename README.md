@@ -43,12 +43,12 @@ engram explain src/auth.rs:40-78
 engram watch
 ```
 
-`engram watch` monitors directories listed under the `watch:` key in config.yml, runs ingest on each new or changed file that matches the configured pattern, and logs activity to `watch.log`. This is the recommended integration pattern.
+`engram watch` monitors directories listed under the `watch:` key in config.yml, runs ingest on each new or changed file that matches the configured pattern and optional glob filter, and logs activity to `watch.log`. This is the recommended integration pattern.
 
 ### How commands work
 
 - `engram ingest [PATH...]`: discovers transcript files, converts recognized logs into tapes, and fingerprints those tapes into the resolved DB.
-- `engram watch`: long-running file watcher. Reads `watch.sources` from the resolved config.yml, watches those directories for new/changed files, debounces, and runs ingest on each matching file. Requires a `watch:` section in config.
+- `engram watch`: long-running file watcher. Reads `watch.sources` from the resolved config.yml, watches those directories for new/changed files, debounces, and runs ingest on each file matching the source pattern and optional glob. Requires a `watch:` section in config.
 - `engram fingerprint`: indexes existing `./.engram/tapes/*.jsonl.zst` into the resolved DB (no transcript parsing, no tape creation).
 - `engram explain <file>:<start>-<end>`: computes anchors for the selected span, queries the resolved DB, follows lineage and dispatch-marker links, and returns evidence sessions/windows.
 
@@ -110,11 +110,14 @@ watch:
       pattern: "*.jsonl"
     - path: ~/sessions
       pattern: "session-*.json"
+      glob: "codex/**/*.json"
 ```
 
 Each source entry:
 - `path`: directory to watch (recursive).
 - `pattern`: glob pattern for files to ingest within that directory.
+- `glob`: optional glob matched against each changed path relative to `path`.
+  When omitted, existing `pattern`-only behavior is unchanged.
 
 ## 4. How you install it
 

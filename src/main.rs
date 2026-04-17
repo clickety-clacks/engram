@@ -953,6 +953,7 @@ fn cmd_ingest(
 struct WatchSourceRuntime {
     source: EffectiveWatchSource,
     pattern: glob::Pattern,
+    glob: Option<glob::Pattern>,
     debounce: Duration,
     ingest_timeout: Duration,
 }
@@ -1024,6 +1025,12 @@ fn cmd_watch_with_home(cwd: &Path, args: WatchArgs, home: &Path) -> Result<(), C
     for source in watch_config.sources {
         let pattern = glob::Pattern::new(&source.pattern)
             .map_err(|err| CliError::new("watch_config_error", err.to_string()))?;
+        let glob = source
+            .glob
+            .as_deref()
+            .map(glob::Pattern::new)
+            .transpose()
+            .map_err(|err| CliError::new("watch_config_error", err.to_string()))?;
         if !source.path.is_dir() {
             watch_log_line(
                 &mut log,
@@ -1031,19 +1038,34 @@ fn cmd_watch_with_home(cwd: &Path, args: WatchArgs, home: &Path) -> Result<(), C
             )?;
             continue;
         }
-        watch_log_line(
-            &mut log,
-            &format!(
-                "watch source path={} pattern={} debounce={} timeout={}",
-                source.path.display(),
-                source.pattern,
-                watch_config.debounce_secs,
-                watch_config.ingest_timeout_secs
-            ),
-        )?;
+        if let Some(glob) = source.glob.as_deref() {
+            watch_log_line(
+                &mut log,
+                &format!(
+                    "watch source path={} pattern={} glob={} debounce={} timeout={}",
+                    source.path.display(),
+                    source.pattern,
+                    glob,
+                    watch_config.debounce_secs,
+                    watch_config.ingest_timeout_secs
+                ),
+            )?;
+        } else {
+            watch_log_line(
+                &mut log,
+                &format!(
+                    "watch source path={} pattern={} debounce={} timeout={}",
+                    source.path.display(),
+                    source.pattern,
+                    watch_config.debounce_secs,
+                    watch_config.ingest_timeout_secs
+                ),
+            )?;
+        }
         runtimes.push(WatchSourceRuntime {
             source,
             pattern,
+            glob,
             debounce: Duration::from_secs(watch_config.debounce_secs),
             ingest_timeout: Duration::from_secs(watch_config.ingest_timeout_secs),
         });
@@ -1085,13 +1107,7 @@ fn cmd_watch_with_home(cwd: &Path, args: WatchArgs, home: &Path) -> Result<(), C
                 }
                 for path in event.paths {
                     for (idx, runtime) in runtimes.iter().enumerate() {
-                        if !path.starts_with(&runtime.source.path) {
-                            continue;
-                        }
-                        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-                            continue;
-                        };
-                        if !runtime.pattern.matches(name) {
+                        if !watch_path_matches(runtime, &path) {
                             continue;
                         }
                         let key = (idx, path.clone());
@@ -1155,6 +1171,25 @@ fn watch_event_kind_supported(kind: &EventKind) -> bool {
         EventKind::Modify(_) => true,
         _ => false,
     }
+}
+
+fn watch_path_matches(runtime: &WatchSourceRuntime, path: &Path) -> bool {
+    if !path.starts_with(&runtime.source.path) {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    if !runtime.pattern.matches(name) {
+        return false;
+    }
+    let Some(glob) = runtime.glob.as_ref() else {
+        return true;
+    };
+    let Ok(relative_path) = path.strip_prefix(&runtime.source.path) else {
+        return false;
+    };
+    glob.matches_path(relative_path)
 }
 
 fn run_watch_ingest(
@@ -3954,6 +3989,60 @@ mod tests {
         assert!(!watch_event_kind_supported(&EventKind::Remove(
             RemoveKind::Any
         )));
+    }
+
+    #[test]
+    fn watch_path_matches_preserves_filename_pattern_without_glob() {
+        let source_path = PathBuf::from("/tmp/source");
+        let runtime = WatchSourceRuntime {
+            source: EffectiveWatchSource {
+                path: source_path.clone(),
+                pattern: "*.jsonl".to_string(),
+                glob: None,
+            },
+            pattern: glob::Pattern::new("*.jsonl").expect("pattern"),
+            glob: None,
+            debounce: Duration::from_secs(1),
+            ingest_timeout: Duration::from_secs(1),
+        };
+
+        assert!(watch_path_matches(
+            &runtime,
+            &source_path.join("nested/session.jsonl")
+        ));
+        assert!(!watch_path_matches(
+            &runtime,
+            &source_path.join("nested/session.txt")
+        ));
+    }
+
+    #[test]
+    fn watch_path_matches_optional_glob_against_relative_path() {
+        let source_path = PathBuf::from("/tmp/source");
+        let runtime = WatchSourceRuntime {
+            source: EffectiveWatchSource {
+                path: source_path.clone(),
+                pattern: "*.jsonl".to_string(),
+                glob: Some("accepted/**/*.jsonl".to_string()),
+            },
+            pattern: glob::Pattern::new("*.jsonl").expect("pattern"),
+            glob: Some(glob::Pattern::new("accepted/**/*.jsonl").expect("glob")),
+            debounce: Duration::from_secs(1),
+            ingest_timeout: Duration::from_secs(1),
+        };
+
+        assert!(watch_path_matches(
+            &runtime,
+            &source_path.join("accepted/nested/session.jsonl")
+        ));
+        assert!(!watch_path_matches(
+            &runtime,
+            &source_path.join("ignored/nested/session.jsonl")
+        ));
+        assert!(!watch_path_matches(
+            &runtime,
+            &source_path.join("accepted/nested/session.txt")
+        ));
     }
 
     #[test]
