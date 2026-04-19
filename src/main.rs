@@ -952,6 +952,7 @@ fn cmd_ingest(
 #[derive(Debug, Clone)]
 struct WatchSourceRuntime {
     source: EffectiveWatchSource,
+    match_root: PathBuf,
     pattern: glob::Pattern,
     glob: Option<glob::Pattern>,
     debounce: Duration,
@@ -1062,8 +1063,18 @@ fn cmd_watch_with_home(cwd: &Path, args: WatchArgs, home: &Path) -> Result<(), C
                 ),
             )?;
         }
+        let match_root = fs::canonicalize(&source.path).map_err(|err| {
+            CliError::new(
+                "watch_config_error",
+                format!(
+                    "failed to canonicalize watch source {}: {err}",
+                    source.path.display()
+                ),
+            )
+        })?;
         runtimes.push(WatchSourceRuntime {
             source,
+            match_root,
             pattern,
             glob,
             debounce: Duration::from_secs(watch_config.debounce_secs),
@@ -1174,9 +1185,9 @@ fn watch_event_kind_supported(kind: &EventKind) -> bool {
 }
 
 fn watch_path_matches(runtime: &WatchSourceRuntime, path: &Path) -> bool {
-    if !path.starts_with(&runtime.source.path) {
+    let Some(relative_path) = watch_path_relative_to_source(runtime, path) else {
         return false;
-    }
+    };
     let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
         return false;
     };
@@ -1186,10 +1197,22 @@ fn watch_path_matches(runtime: &WatchSourceRuntime, path: &Path) -> bool {
     let Some(glob) = runtime.glob.as_ref() else {
         return true;
     };
-    let Ok(relative_path) = path.strip_prefix(&runtime.source.path) else {
-        return false;
-    };
-    glob.matches_path(relative_path)
+    glob.matches_path(&relative_path)
+}
+
+fn watch_path_relative_to_source(runtime: &WatchSourceRuntime, path: &Path) -> Option<PathBuf> {
+    if let Ok(relative_path) = path.strip_prefix(&runtime.source.path) {
+        return Some(relative_path.to_path_buf());
+    }
+    if let Ok(relative_path) = path.strip_prefix(&runtime.match_root) {
+        return Some(relative_path.to_path_buf());
+    }
+    if let Ok(canonical_path) = fs::canonicalize(path)
+        && let Ok(relative_path) = canonical_path.strip_prefix(&runtime.match_root)
+    {
+        return Some(relative_path.to_path_buf());
+    }
+    None
 }
 
 fn run_watch_ingest(
@@ -4000,6 +4023,7 @@ mod tests {
                 pattern: "*.jsonl".to_string(),
                 glob: None,
             },
+            match_root: source_path.clone(),
             pattern: glob::Pattern::new("*.jsonl").expect("pattern"),
             glob: None,
             debounce: Duration::from_secs(1),
@@ -4025,6 +4049,7 @@ mod tests {
                 pattern: "*.jsonl".to_string(),
                 glob: Some("accepted/**/*.jsonl".to_string()),
             },
+            match_root: source_path.clone(),
             pattern: glob::Pattern::new("*.jsonl").expect("pattern"),
             glob: Some(glob::Pattern::new("accepted/**/*.jsonl").expect("glob")),
             debounce: Duration::from_secs(1),
@@ -4042,6 +4067,33 @@ mod tests {
         assert!(!watch_path_matches(
             &runtime,
             &source_path.join("accepted/nested/session.txt")
+        ));
+    }
+
+    #[test]
+    fn watch_path_matches_canonical_event_path_for_symlinked_source() {
+        let source_path = PathBuf::from("/tmp/source");
+        let match_root = PathBuf::from("/private/tmp/source");
+        let runtime = WatchSourceRuntime {
+            source: EffectiveWatchSource {
+                path: source_path,
+                pattern: "*.jsonl".to_string(),
+                glob: Some("accepted/**/*.jsonl".to_string()),
+            },
+            match_root: match_root.clone(),
+            pattern: glob::Pattern::new("*.jsonl").expect("pattern"),
+            glob: Some(glob::Pattern::new("accepted/**/*.jsonl").expect("glob")),
+            debounce: Duration::from_secs(1),
+            ingest_timeout: Duration::from_secs(1),
+        };
+
+        assert!(watch_path_matches(
+            &runtime,
+            &match_root.join("accepted/nested/session.jsonl")
+        ));
+        assert!(!watch_path_matches(
+            &runtime,
+            &match_root.join("ignored/nested/session.jsonl")
         ));
     }
 
