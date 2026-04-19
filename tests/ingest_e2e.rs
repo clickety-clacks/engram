@@ -230,7 +230,7 @@ fn ingest_path_args_respect_local_scope_and_limit_candidates() {
         failures[0]["error"]
             .as_str()
             .expect("error")
-            .contains("outside local ingest scope"),
+            .contains("outside current working directory scope"),
         "failures={failures:?}"
     );
 }
