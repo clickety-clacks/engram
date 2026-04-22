@@ -511,6 +511,64 @@ fn grep_count_returns_metadata_only() {
 }
 
 #[test]
+fn grep_ranks_provenance_matches_before_recent_text_mentions() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = home.join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    write_repo_file(&repo, "src/ranked.rs", "fn ranked() {}\n");
+    let _ = run_json(&repo, &["init"], None, &home);
+
+    let provenance_record = json!({
+        "t": "2026-03-17T00:00:00Z",
+        "k": "code.edit",
+        "file": "src/ranked.rs",
+        "before_range": [1, 1],
+        "after_range": [1, 1],
+        "before_text": "fn ranked() {}\n",
+        "after_text": "fn ranked() { grep_rank_target(); }\n",
+        "similarity": 0.9,
+    })
+    .to_string()
+        + "\n";
+    let _ = run_json(
+        &repo,
+        &["record", "--stdin"],
+        Some(&provenance_record),
+        &home,
+    );
+
+    for i in 0..11 {
+        let record_line = json!({
+            "t": format!("2026-03-18T03:{i:02}:00Z"),
+            "k": "msg.out",
+            "role": "assistant",
+            "content": format!("grep_rank_target text mention {i}"),
+        })
+        .to_string()
+            + "\n";
+        let _ = run_json(&repo, &["record", "--stdin"], Some(&record_line), &home);
+    }
+
+    let grep = run_json(&repo, &["grep", "grep_rank_target"], None, &home);
+    let sessions = grep["sessions"].as_array().expect("sessions");
+    assert_eq!(grep["total"], Value::from(12));
+    assert_eq!(grep["returned"], Value::from(10));
+    assert_eq!(grep["truncated"], Value::Bool(true));
+    assert_eq!(
+        sessions[0]["timestamp"],
+        Value::from("2026-03-17T00:00:00Z")
+    );
+    assert_eq!(sessions[0]["files_touched"], json!(["src/ranked.rs"]));
+    assert!(
+        sessions
+            .iter()
+            .any(|session| session["timestamp"] == Value::from("2026-03-17T00:00:00Z")),
+        "older provenance-bearing match should survive default-limit truncation"
+    );
+}
+
+#[test]
 fn metrics_logging_writes_expected_jsonl_row() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");

@@ -2118,16 +2118,17 @@ fn cmd_grep(paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Resu
     ensure_db_parent(&context.db_path)?;
 
     let indexes = open_query_indexes(context)?;
-    let (raw_sessions, score_by_session) = collect_grep_matches(context, &indexes, &args.pattern)?;
+    let (raw_sessions, grep_rank_by_session) =
+        collect_grep_matches(context, &indexes, &args.pattern)?;
+    let score_by_session = grep_rank_by_session
+        .iter()
+        .map(|(session_id, rank)| (session_id.clone(), rank.match_count as f32))
+        .collect::<HashMap<_, _>>();
     let date_filter = DateFilter::parse(args.since.as_deref(), args.until.as_deref())?;
     let mut sessions =
         format_sessions_for_agent(context, &indexes[0], raw_sessions, &score_by_session, None)?;
     sessions.retain(|session| session_matches_date_filter(session, &date_filter));
-    sessions.sort_by(|a, b| {
-        let a_ts = a.get("timestamp").and_then(Value::as_str).unwrap_or("");
-        let b_ts = b.get("timestamp").and_then(Value::as_str).unwrap_or("");
-        b_ts.cmp(a_ts)
-    });
+    sessions.sort_by(|a, b| compare_grep_sessions(a, b, &grep_rank_by_session));
     if sessions.is_empty() {
         return Err(CliError::new("no_results", args.pattern));
     }
@@ -2405,7 +2406,7 @@ fn collect_grep_matches(
     context: &RuntimeContext,
     indexes: &[SqliteIndex],
     pattern: &str,
-) -> Result<(Vec<Value>, HashMap<String, f32>), CliError> {
+) -> Result<(Vec<Value>, HashMap<String, GrepRank>), CliError> {
     let mut tape_ids = HashSet::new();
     for index in indexes {
         for tape_id in index.referenced_tape_ids()? {
@@ -2426,7 +2427,7 @@ fn collect_grep_matches(
     }
 
     let mut raw_sessions = Vec::new();
-    let mut score_by_session = HashMap::new();
+    let mut rank_by_session = HashMap::new();
 
     for tape_id in tape_ids {
         let Some(path) = resolve_tape_path(context, &tape_id) else {
@@ -2434,13 +2435,30 @@ fn collect_grep_matches(
         };
         let content = read_tape_content(&path)?;
         let lines = content.lines().collect::<Vec<_>>();
+        let rows = parse_jsonl_rows(&content)?;
+        let provenance_offsets = rows
+            .iter()
+            .filter(|row| is_provenance_row(&row.value))
+            .map(|row| row.offset)
+            .collect::<HashSet<_>>();
+        let provenance_event_count = provenance_offsets.len();
+
         let mut first_match = None;
+        let mut first_provenance_match = None;
         let mut match_count = 0usize;
+        let mut provenance_match_count = 0usize;
         for (idx, line) in lines.iter().enumerate() {
             if line.contains(pattern) {
                 match_count += 1;
                 if first_match.is_none() {
                     first_match = Some(idx as u64);
+                }
+                let offset = idx as u64;
+                if provenance_offsets.contains(&offset) {
+                    provenance_match_count += 1;
+                    if first_provenance_match.is_none() {
+                        first_provenance_match = Some(offset);
+                    }
                 }
             }
         }
@@ -2448,8 +2466,8 @@ fn collect_grep_matches(
             continue;
         };
 
-        let rows = parse_jsonl_rows(&content)?;
-        let windows = event_window(&rows, first_match, TRANSCRIPT_WINDOW_RADIUS)
+        let anchor_offset = first_provenance_match.unwrap_or(first_match);
+        let windows = event_window(&rows, anchor_offset, TRANSCRIPT_WINDOW_RADIUS)
             .into_iter()
             .collect::<Vec<_>>();
         raw_sessions.push(json!({
@@ -2460,18 +2478,67 @@ fn collect_grep_matches(
             "touches": [],
             "windows": windows,
         }));
-        score_by_session.insert(
+        rank_by_session.insert(
             raw_sessions
                 .last()
                 .and_then(|v| v.get("tape_id"))
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
-            match_count as f32,
+            GrepRank {
+                provenance_match_count,
+                match_count,
+                provenance_event_count,
+            },
         );
     }
 
-    Ok((raw_sessions, score_by_session))
+    Ok((raw_sessions, rank_by_session))
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct GrepRank {
+    provenance_match_count: usize,
+    match_count: usize,
+    provenance_event_count: usize,
+}
+
+fn compare_grep_sessions(
+    a: &Value,
+    b: &Value,
+    rank_by_session: &HashMap<String, GrepRank>,
+) -> std::cmp::Ordering {
+    let a_session_id = a.get("session_id").and_then(Value::as_str).unwrap_or("");
+    let b_session_id = b.get("session_id").and_then(Value::as_str).unwrap_or("");
+    let a_rank = rank_by_session
+        .get(a_session_id)
+        .copied()
+        .unwrap_or_default();
+    let b_rank = rank_by_session
+        .get(b_session_id)
+        .copied()
+        .unwrap_or_default();
+    let a_ts = a.get("timestamp").and_then(Value::as_str).unwrap_or("");
+    let b_ts = b.get("timestamp").and_then(Value::as_str).unwrap_or("");
+
+    b_rank
+        .provenance_match_count
+        .cmp(&a_rank.provenance_match_count)
+        .then_with(|| b_rank.match_count.cmp(&a_rank.match_count))
+        .then_with(|| {
+            b_rank
+                .provenance_event_count
+                .cmp(&a_rank.provenance_event_count)
+        })
+        .then_with(|| b_ts.cmp(a_ts))
+        .then_with(|| a_session_id.cmp(b_session_id))
+}
+
+fn is_provenance_row(value: &Value) -> bool {
+    matches!(
+        value.get("k").and_then(Value::as_str),
+        Some("code.edit" | "code.read" | "span.link")
+    )
 }
 
 fn format_sessions_for_agent(
