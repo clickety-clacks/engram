@@ -1,0 +1,30 @@
+{
+  "name": "@clickety-clacks/engram",
+  "version": "0.2.1",
+  "description": "Deterministic provenance index for agent-driven work",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/clickety-clacks/engram#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/clickety-clacks/engram.git"
+  },
+  "bugs": {
+    "url": "https://github.com/clickety-clacks/engram/issues"
+  },
+  "bin": {
+    "engram": "npm/bin/engram.js"
+  },
+  "scripts": {
+    "postinstall": "node npm/scripts/install.js",
+    "test:npm-package": "node npm/scripts/install.js --dry-run && npm pack --dry-run"
+  },
+  "files": [
+    "npm/bin/engram.js",
+    "npm/scripts/install.js",
+    "README.md",
+    "LICENSE*"
+  ],
+  "engram": {
+    "githubRepo": "clickety-clacks/engram"
+  }
+}
