@@ -103,6 +103,8 @@ fn init_record_tapes_show_and_explain_roundtrip() {
     assert_eq!(String::from_utf8_lossy(&raw.stdout), transcript);
 
     let explain = run_json(repo, &["explain", "src/lib.rs:2-2"], None);
+    let result_id = explain["result_id"].as_str().expect("result_id");
+    assert!(result_id.starts_with("result_"));
     let query_anchors = explain["query"]["anchors"].as_array().expect("anchors");
     assert!(query_anchors.len() >= 1);
     // query_anchors are individual tokens; verify at least one token from the
@@ -116,7 +118,162 @@ fn init_record_tapes_show_and_explain_roundtrip() {
     );
     let sessions = explain["sessions"].as_array().expect("sessions");
     assert_eq!(sessions.len(), 1);
-    assert!(sessions[0]["touch_count"].as_u64().unwrap_or(0) >= 1);
+    assert!(sessions[0]["session_id"].is_string());
+    assert!(sessions[0]["confidence"].as_f64().unwrap_or(0.0) >= 0.0);
+    assert!(sessions[0]["window_start"].as_u64().unwrap_or(0) >= 1);
+    assert!(sessions[0]["window_end"].as_u64().unwrap_or(0) >= 1);
+
+    let rate = run_json(
+        repo,
+        &[
+            "rate",
+            result_id,
+            "--outcome",
+            "found_answer",
+            "--note",
+            "helped find the right provenance chain",
+        ],
+        None,
+    );
+    assert_eq!(rate["status"], "ok");
+    assert_eq!(rate["result_id"], result_id);
+    assert_eq!(rate["outcome"], "found_answer");
+
+    let conn = Connection::open(repo.join(".home/.engram/index.sqlite")).expect("sqlite");
+    let stored: (String, Option<String>) = conn
+        .query_row(
+            "SELECT outcome, note FROM result_feedback WHERE result_id = ?1",
+            [result_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("stored feedback");
+    assert_eq!(stored.0, "found_answer");
+    assert_eq!(
+        stored.1.as_deref(),
+        Some("helped find the right provenance chain")
+    );
+}
+
+#[test]
+fn existing_db_upgrade_bootstraps_rating_schema_before_rate() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+    fs::create_dir_all(repo.join("src")).expect("src dir");
+    fs::write(
+        repo.join("src/lib.rs"),
+        "alpha\nretry logic discussion\nzeta\n",
+    )
+    .expect("seed file");
+
+    let home_db = repo.join(".home/.engram/index.sqlite");
+    fs::create_dir_all(home_db.parent().expect("db parent")).expect("db dir");
+    let conn = Connection::open(&home_db).expect("sqlite");
+    conn.execute_batch(
+        "
+        PRAGMA user_version = 3;
+        CREATE TABLE evidence (
+            anchor TEXT NOT NULL,
+            tape_id TEXT NOT NULL,
+            event_offset INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            UNIQUE(anchor, tape_id, event_offset, kind)
+        );
+        CREATE INDEX idx_evidence_anchor ON evidence(anchor);
+        CREATE TABLE edges (
+            from_anchor TEXT NOT NULL,
+            to_anchor TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            location_delta TEXT NOT NULL,
+            cardinality TEXT NOT NULL,
+            agent_link INTEGER NOT NULL,
+            note TEXT NOT NULL DEFAULT '',
+            UNIQUE(from_anchor, to_anchor, confidence, location_delta, cardinality, agent_link, note)
+        );
+        CREATE INDEX idx_edges_from_anchor ON edges(from_anchor);
+        CREATE INDEX idx_edges_to_anchor ON edges(to_anchor);
+        CREATE TABLE tombstones (
+            anchor TEXT NOT NULL,
+            tape_id TEXT NOT NULL,
+            event_offset INTEGER NOT NULL,
+            file_path TEXT NOT NULL,
+            range_start INTEGER NOT NULL,
+            range_end INTEGER NOT NULL,
+            timestamp TEXT NOT NULL,
+            UNIQUE(anchor, tape_id, event_offset)
+        );
+        CREATE INDEX idx_tombstones_anchor ON tombstones(anchor);
+        CREATE TABLE tapes (
+            tape_id TEXT PRIMARY KEY
+        );
+        CREATE TABLE dispatch_links (
+            tape_id TEXT NOT NULL,
+            uuid TEXT NOT NULL,
+            first_turn_index INTEGER NOT NULL,
+            direction TEXT NOT NULL CHECK(direction IN ('received', 'sent')),
+            PRIMARY KEY (tape_id, uuid)
+        );
+        CREATE INDEX idx_dispatch_links_uuid ON dispatch_links(uuid);
+        CREATE INDEX idx_dispatch_links_tape ON dispatch_links(tape_id);
+        CREATE INDEX idx_dispatch_links_received
+            ON dispatch_links(tape_id, direction, first_turn_index);
+        ",
+    )
+    .expect("seed pre-rating schema");
+    drop(conn);
+
+    let transcript = concat!(
+        "{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"meta\",\"model\":\"gpt-5\"}\n",
+        "{\"t\":\"2026-02-22T00:00:01Z\",\"k\":\"message\",\"role\":\"user\",\"content\":\"retry logic discussion\"}\n"
+    );
+    let _ = run_json(repo, &["record", "--stdin"], Some(transcript));
+
+    let grep = run_json(repo, &["grep", "retry"], None);
+    let result_id = grep["result_id"].as_str().expect("result_id");
+
+    let rate = run_json(
+        repo,
+        &[
+            "rate",
+            result_id,
+            "--outcome",
+            "found_answer",
+            "--note",
+            "upgrade path",
+        ],
+        None,
+    );
+    assert_eq!(rate["status"], "ok");
+
+    let conn = Connection::open(&home_db).expect("sqlite");
+    let tables: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name IN ('query_results', 'result_feedback')
+                 ORDER BY name",
+            )
+            .expect("tables stmt");
+        stmt.query_map([], |row| row.get(0))
+            .expect("tables query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("table rows")
+    };
+    assert_eq!(
+        tables,
+        vec!["query_results".to_string(), "result_feedback".to_string()]
+    );
+
+    let stored: (String, Option<String>) = conn
+        .query_row(
+            "SELECT outcome, note FROM result_feedback WHERE result_id = ?1",
+            [result_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("stored feedback");
+    assert_eq!(stored.0, "found_answer");
+    assert_eq!(stored.1.as_deref(), Some("upgrade path"));
 }
 
 #[test]
@@ -146,6 +303,7 @@ fn explain_matches_winnow_edit_anchor_for_span_targets() {
     let _ = run_json(repo, &["record", "--stdin"], Some(&transcript));
 
     let explain = run_json(repo, &["explain", "src/lib.rs:2-2"], None);
+    assert!(explain["result_id"].is_string());
     let query_anchors = explain["query"]["anchors"].as_array().expect("anchors");
     // query_anchors are individual tokens; verify at least one token from the
     // span's fingerprint is present.
@@ -163,13 +321,47 @@ fn explain_matches_winnow_edit_anchor_for_span_targets() {
     );
     // With individual-token edges, each matched token produces one lineage edge.
     assert!(
-        explain["lineage"]
-            .as_array()
-            .expect("lineage")
-            .len()
-            >= 1,
+        explain["lineage"].as_array().expect("lineage").len() >= 1,
         "expected at least one inbound edit linkage for matched winnow anchor"
     );
+}
+
+#[test]
+fn grep_and_peek_emit_stable_result_ids_and_rate_rejects_unknown_ids() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+    let _ = run_json(repo, &["init"], None);
+
+    let transcript = concat!(
+        "{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"meta\",\"model\":\"gpt-5\"}\n",
+        "{\"t\":\"2026-02-22T00:00:01Z\",\"k\":\"message\",\"role\":\"user\",\"content\":\"retry logic discussion\"}\n"
+    );
+    let recorded = run_json(repo, &["record", "--stdin"], Some(transcript));
+    let session_id = recorded["tape_id"].as_str().expect("tape id").to_string();
+
+    let grep_one = run_json(repo, &["grep", "retry"], None);
+    let grep_two = run_json(repo, &["grep", "retry"], None);
+    assert_eq!(grep_one["result_id"], grep_two["result_id"]);
+    assert!(grep_one["rating_hint"].as_str().is_some());
+
+    let peek_one = run_json(repo, &["peek", &session_id], None);
+    let peek_two = run_json(repo, &["peek", &session_id], None);
+    assert_eq!(peek_one["result_id"], peek_two["result_id"]);
+    assert!(peek_one["rating_hint"].as_str().is_some());
+
+    let output = run_cli(
+        repo,
+        &["rate", "result_missing", "--outcome", "noise"],
+        None,
+    );
+    assert!(
+        !output.status.success(),
+        "expected unknown result_id to fail: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown_result_id"), "stderr={stderr}");
 }
 
 #[test]
@@ -368,6 +560,7 @@ fn explain_forensics_and_agent_links_behave_as_specified() {
             "{{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"code.edit\",\"file\":\"src/lib.rs\",",
             "\"before_range\":[1,1],\"after_range\":[1,1],",
             "\"before_anchor_hashes\":[\"{0}\"],\"after_anchor_hashes\":[\"{1}\"]}}\n",
+            "{{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"code.read\",\"file\":\"src/b.rs\",\"range\":[10,20],\"anchor_hashes\":[\"span:src/b.rs:10-20\"]}}\n",
             "{{\"t\":\"2026-02-22T00:00:01Z\",\"k\":\"span.link\",\"from_file\":\"src/a.rs\",",
             "\"from_range\":[1,2],\"to_file\":\"src/b.rs\",\"to_range\":[10,20],\"note\":\"extract\"}}\n"
         ),
@@ -473,12 +666,15 @@ fn explain_orders_sessions_by_touch_count_then_recency() {
     let explain = run_json(repo, &["explain", anchor, "--anchor"], None);
     let sessions = explain["sessions"].as_array().expect("sessions");
     assert_eq!(sessions.len(), 2);
-    assert_eq!(sessions[0]["touch_count"], 2);
+    assert_eq!(sessions[0]["session_id"], second["tape_id"]);
     assert_eq!(
-        sessions[0]["tape_id"], second["tape_id"],
-        "higher touch-count tape should rank first"
+        sessions[0]["timestamp"],
+        Value::String("2026-02-22T00:00:12Z".to_string())
     );
-    assert_eq!(sessions[1]["touch_count"], 1);
+    assert_eq!(
+        sessions[1]["timestamp"],
+        Value::String("2026-02-22T00:00:01Z".to_string())
+    );
 }
 
 #[test]
@@ -528,13 +724,18 @@ fn record_recovers_when_tape_file_exists_but_index_missing() {
     let compressed = zstd::stream::encode_all(transcript.as_bytes(), 0).expect("compress");
     fs::write(&tape_path, compressed).expect("write tape");
 
-    let explain_before = run_json(repo, &["explain", "orphan-anchor", "--anchor"], None);
+    let explain_before = run_cli(repo, &["explain", "orphan-anchor", "--anchor"], None);
+    assert!(!explain_before.status.success());
+    let explain_before_stderr = String::from_utf8_lossy(&explain_before.stderr);
+    let explain_before_json = explain_before_stderr
+        .lines()
+        .last()
+        .expect("no_results stderr line");
+    let explain_before_payload: Value =
+        serde_json::from_str(explain_before_json).expect("no_results payload");
     assert_eq!(
-        explain_before["sessions"]
-            .as_array()
-            .expect("sessions")
-            .len(),
-        0
+        explain_before_payload["error"],
+        Value::String("no_results".to_string())
     );
 
     let record = run_json(repo, &["record", "--stdin"], Some(transcript));

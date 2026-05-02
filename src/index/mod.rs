@@ -85,13 +85,19 @@ impl SqliteIndex {
                     self.conn.execute_batch("PRAGMA user_version = 1;")?;
                 }
                 self.migrate_v1_to_v2()?;
+                self.migrate_v2_to_v3()?;
             }
             1 => {
                 self.create_schema_v1()?;
                 self.migrate_v1_to_v2()?;
+                self.migrate_v2_to_v3()?;
             }
             2 => {
                 self.create_schema_v2()?;
+                self.migrate_v2_to_v3()?;
+            }
+            3 => {
+                self.create_schema_v3()?;
             }
             _ => return Err(rusqlite::Error::InvalidQuery),
         }
@@ -178,9 +184,45 @@ impl SqliteIndex {
         Ok(())
     }
 
+    fn create_schema_v3(&self) -> rusqlite::Result<()> {
+        self.create_schema_v2()?;
+        self.ensure_query_feedback_schema()?;
+        Ok(())
+    }
+
+    fn ensure_query_feedback_schema(&self) -> rusqlite::Result<()> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS query_results (
+                result_id TEXT PRIMARY KEY,
+                command TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_query_results_command
+                ON query_results(command, created_at);
+
+            CREATE TABLE IF NOT EXISTS result_feedback (
+                result_id TEXT PRIMARY KEY,
+                outcome TEXT NOT NULL,
+                note TEXT,
+                rated_at TEXT NOT NULL,
+                FOREIGN KEY(result_id) REFERENCES query_results(result_id) ON DELETE CASCADE
+            );
+            ",
+        )
+    }
+
     fn migrate_v1_to_v2(&self) -> rusqlite::Result<()> {
         self.create_schema_v2()?;
         self.conn.execute_batch("PRAGMA user_version = 2;")?;
+        Ok(())
+    }
+
+    fn migrate_v2_to_v3(&self) -> rusqlite::Result<()> {
+        self.create_schema_v3()?;
+        self.conn.execute_batch("PRAGMA user_version = 3;")?;
         Ok(())
     }
 
@@ -336,6 +378,52 @@ impl SqliteIndex {
                 link.first_turn_index,
                 encode_dispatch_direction(link.direction)
             ],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_query_result(
+        &self,
+        result_id: &str,
+        command: &str,
+        payload_json: &str,
+        created_at: &str,
+    ) -> rusqlite::Result<()> {
+        self.ensure_query_feedback_schema()?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO query_results (result_id, command, payload_json, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![result_id, command, payload_json, created_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn query_result_exists(&self, result_id: &str) -> rusqlite::Result<bool> {
+        self.ensure_query_feedback_schema()?;
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM query_results WHERE result_id = ?1",
+            params![result_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn upsert_result_feedback(
+        &self,
+        result_id: &str,
+        outcome: &str,
+        note: Option<&str>,
+        rated_at: &str,
+    ) -> rusqlite::Result<()> {
+        self.ensure_query_feedback_schema()?;
+        self.conn.execute(
+            "INSERT INTO result_feedback (result_id, outcome, note, rated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(result_id) DO UPDATE SET
+               outcome = excluded.outcome,
+               note = excluded.note,
+               rated_at = excluded.rated_at",
+            params![result_id, outcome, note, rated_at],
         )?;
         Ok(())
     }
@@ -837,7 +925,6 @@ fn expand_legacy_anchors(hash: Option<&str>, anchors: &[String]) -> Vec<String> 
 
     out
 }
-
 
 impl SqliteIndex {
     fn validate_anchor(anchor: &str) -> rusqlite::Result<()> {
@@ -1420,5 +1507,54 @@ mod tests {
             .latest_received_dispatch_before_turn("tape-pre", 3)
             .expect("query");
         assert!(picked.is_none());
+    }
+
+    #[test]
+    fn query_results_and_feedback_round_trip() {
+        let index = SqliteIndex::open_in_memory().expect("sqlite");
+        index
+            .record_query_result(
+                "result_123",
+                "explain",
+                "{\"query\":{\"command\":\"explain\"}}",
+                "2026-04-03T00:00:00Z",
+            )
+            .expect("record query result");
+
+        assert!(
+            index
+                .query_result_exists("result_123")
+                .expect("query result exists"),
+            "expected recorded result to be queryable"
+        );
+
+        index
+            .upsert_result_feedback(
+                "result_123",
+                "found_answer",
+                Some("prevented a bad edit"),
+                "2026-04-03T00:01:00Z",
+            )
+            .expect("insert feedback");
+        index
+            .upsert_result_feedback(
+                "result_123",
+                "partially_helped",
+                None,
+                "2026-04-03T00:02:00Z",
+            )
+            .expect("update feedback");
+
+        let (outcome, note, rated_at): (String, Option<String>, String) = index
+            .conn
+            .query_row(
+                "SELECT outcome, note, rated_at FROM result_feedback WHERE result_id = ?1",
+                params!["result_123"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("feedback row");
+        assert_eq!(outcome, "partially_helped");
+        assert_eq!(note, None);
+        assert_eq!(rated_at, "2026-04-03T00:02:00Z");
     }
 }

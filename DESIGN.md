@@ -639,6 +639,248 @@ Garbage-collect unreferenced content-addressed blobs. Keeps index entries and li
 
 Concept search over tape contents. Requires optional vector index bolt-on.
 
+## Agent Tool Surface
+
+### Design principle
+
+Provenance has a topology. Engram's job is to provide tools that let agents navigate that topology. The agent is the intelligence — Engram is navigational infrastructure.
+
+Engram does not interpret, summarize, or understand provenance. It makes the provenance corpus efficiently traversable. The agent does all the thinking — discovering causality, extracting semantics, judging relevance.
+
+### Invariants
+
+1. **Token efficiency**: results include content by default (small default window), but the agent controls sizing to avoid reading more than it needs.
+
+2. **Token exhaustion protection**: if a query would produce a result exceeding a safe threshold, engram truncates the result and tells the agent to constrain its query further.
+
+3. **Useful metadata on large corpora**: when a result is truncated, engram returns actionable metadata about what it didn't return. The agent should never be left guessing about the shape of what it hasn't seen.
+
+### The provenance topology
+
+Provenance is organized as chains: the root is WHY (product decisions, design rationale), descendants are HOW (specs, implementation). The chain is a gradient of abstraction — not fixed layers.
+
+Two dimensions of navigation:
+- **Reference depth**: traversal along dispatch-link chains from abstract (root) toward concrete (implementation).
+- **Window positioning**: at each node, the agent controls what slice of the session it reads, using absolute line positioning.
+
+#### Edge visibility
+
+Explain returns the full chain structure in metadata — root with all descendant IDs, depths, and dispatch links. The agent has the complete map. Peek reads content at any point on the map without returning chain metadata — it's a content reader, not a query.
+
+#### Filtering
+
+`--grep-filter` winnows which results are returned before the agent reads content. It uses grep pattern syntax and operates on window content only.
+
+### API surface
+
+Three commands. Explain and grep are the query layer (find provenance). Peek is the navigation layer (read content).
+
+#### `engram explain`
+
+Query provenance by code fingerprint.
+
+```
+engram explain <file>:<start>-<end>   Find provenance for a code span
+engram explain <file>                 Find provenance for an entire file
+engram explain "<string>"             Find provenance for arbitrary text
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--grep-filter <pattern>` | — | Only include results mentioning this term (grep syntax) |
+| `--limit N` | 10 | Max sessions returned |
+| `--offset N` | 0 | Skip first N results (pagination) |
+| `--min-confidence N` | — | Only results above this match quality (0.0-1.0) |
+| `--since <date>` | — | Only sessions after this date |
+| `--until <date>` | — | Only sessions before this date |
+| `--count` | off | Show result count and metadata only, no content (dry run) |
+
+Default behavior:
+- Finds matching sessions via winnow k-gram fingerprinting
+- Follows dispatch links upstream to chain roots
+- Returns root-first (most abstract → most concrete)
+- Each result includes a default content window
+- Results include full chain structure in metadata (all descendant IDs, depths)
+
+Per-result metadata:
+
+| Field | Description |
+|-------|-------------|
+| `session_id` | Stable identifier for this session |
+| `confidence` | How strongly this session's fingerprints match the query (0.0-1.0) |
+| `timestamp` | When this session occurred |
+| `window_start` | First line number of returned content |
+| `window_end` | Last line number of returned content |
+| `total_lines` | Total lines in session |
+| `depth` | Position in chain (0 = root) |
+| `parent` | Parent session ID (null at root) |
+| `children` | Child session IDs |
+| `chain_length` | Total sessions in this chain |
+| `files_touched` | Files this session modified |
+
+Truncation header (when result exceeds safe threshold):
+
+| Field | Description |
+|-------|-------------|
+| `returned` | Number of sessions returned |
+| `total` | Total sessions matching |
+| `time_range` | Earliest and latest session timestamps |
+| `truncated` | true |
+
+#### `engram grep <pattern>`
+
+Query provenance by literal text search across all tapes.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--limit N` | 10 | Max sessions returned |
+| `--offset N` | 0 | Skip first N results |
+| `--since <date>` | — | Only sessions after this date |
+| `--until <date>` | — | Only sessions before this date |
+| `--count` | off | Show result count only, no content |
+
+Same output shape as explain.
+
+#### `engram peek <session_id>`
+
+Read content from a session. Explain gives you the map; peek gives you the content at any point on the map.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--start N` | — | Absolute line position in the session |
+| `--lines N` | config | Number of lines to return from start |
+| `--before N` | config | Lines before the anchor point |
+| `--after N` | config | Lines after the anchor point |
+| `--grep-filter <pattern>` | — | Search within this session; returns matching lines with context |
+
+Default behavior (no flags): returns configured default window anchored at the dispatch link point (if this session was reached via a chain) or head-of-session (if standalone).
+
+Config:
+
+```yaml
+explain:
+  default_limit: 10
+peek:
+  default_lines: 40
+  default_before: 30
+  default_after: 10
+  grep_context: 5
+```
+
+Error responses:
+
+```json
+{"error": "session_not_found", "session_id": "..."}
+{"error": "no_results", "query": "..."}
+{"error": "invalid_span", "detail": "..."}
+```
+
+### Help text
+
+#### `engram --help`
+
+```
+Engram indexes agent conversations that produced your code.
+
+Results are organized as provenance chains: the root is WHY
+(product decisions, design rationale), descendants are HOW
+(specs, implementation). Use explain to find chains, peek to
+read them.
+
+COMMANDS:
+  explain    Find provenance for code (by fingerprint)
+  grep       Find provenance for a term (by text search)
+  peek       Read content from a provenance session
+  ingest     Import transcripts into the index
+  watch      Continuously watch for new transcripts
+
+Run engram <command> --help for details.
+```
+
+#### `engram explain --help`
+
+```
+Find the conversations that produced this code.
+
+Returns the root of each provenance chain — the highest-level
+context explaining WHY this code exists. Results include chain
+metadata (children, depth) so you can walk down to HOW with peek.
+
+USAGE:
+  engram explain <file>:<start>-<end>   Provenance for a code span
+  engram explain <file>                 Provenance for an entire file  
+  engram explain "<string>"             Provenance for arbitrary text
+
+OPTIONS:
+  --grep-filter <pattern>   Only results whose content matches (grep syntax)
+  --limit N                 Max results [default: 10]
+  --offset N                Skip first N results (pagination)
+  --min-confidence N        Only results above this match quality (0.0-1.0)
+  --since <date>            Only sessions after this date
+  --until <date>            Only sessions before this date
+  --count                   Show counts only, no content (token budgeting)
+
+EXAMPLES:
+  engram explain src/server.ts:40-78
+  engram explain src/server.ts:40-78 --grep-filter "retry"
+  engram explain src/server.ts --since 2026-03-01 --limit 5
+```
+
+#### `engram grep --help`
+
+```
+Search all provenance sessions for a term.
+
+Unlike explain (which matches by code fingerprint), grep searches
+for literal text across all indexed conversations.
+
+USAGE:
+  engram grep <pattern>
+
+OPTIONS:
+  --limit N       Max results [default: 10]
+  --offset N      Skip first N results
+  --since <date>  Only sessions after this date
+  --until <date>  Only sessions before this date
+  --count         Show counts only, no content
+
+EXAMPLES:
+  engram grep "maxMessageBytes"
+  engram grep "retry logic" --since 2026-03-01
+```
+
+#### `engram peek --help`
+
+```
+Read content from a provenance session.
+
+Use explain or grep to find sessions, then peek to read them.
+By default returns a window around the anchor point (where the
+session connects to its parent chain). Use --start/--lines for
+absolute positioning.
+
+USAGE:
+  engram peek <session_id>
+
+OPTIONS:
+  --start N                 Read from this line number
+  --lines N                 Number of lines to return [default: 40]
+  --before N                Lines before the anchor point [default: 30]
+  --after N                 Lines after the anchor point [default: 10]
+  --grep-filter <pattern>   Find lines matching this term within the session
+
+EXAMPLES:
+  engram peek af156abd
+  engram peek af156abd --start 421 --lines 30
+  engram peek af156abd --grep-filter "NO_REPLY"
+```
+
+### Open questions
+
+1. **Output format**: JSON only (current). Human-readable format deferred unless needed.
+2. **Whole-file explain**: may produce broad/noisy results. Help text should note preference for spans.
+
+
 ## Continuation Detection: Open Question
 
 ### What we investigated
@@ -1002,6 +1244,75 @@ engram/
       opencode.rs        # OpenCode adapter
       gemini_cli.rs      # Gemini CLI adapter
       cursor.rs          # Cursor adapter
+```
+
+## Usage Metrics
+
+### Why we collect metrics
+
+Engram's default window sizes (how many lines of content to return with explain results and peek calls) are configurable but we don't yet know the right defaults. Too small and the agent has to immediately re-request more. Too big and tokens are wasted on content the agent ignores.
+
+Rather than guess, engram logs minimal per-call metrics so defaults can be tuned from real usage data.
+
+### What is collected
+
+Each CLI call appends one JSON line to `~/.engram/metrics.jsonl`:
+
+```json
+{"ts":"2026-03-19T14:30:00Z","command":"explain","target":"server.ts:3398-3412","session_id":null,"window_start":null,"window_lines":null,"total_lines":null}
+{"ts":"2026-03-19T14:30:05Z","command":"peek","target":"af156abd","session_id":"af156abd...","window_start":2754,"window_lines":30,"total_lines":7418}
+{"ts":"2026-03-19T14:30:08Z","command":"peek","target":"af156abd","session_id":"af156abd...","window_start":2784,"window_lines":30,"total_lines":7418}
+```
+
+Seven fields per call:
+
+| Field | Description |
+|-------|-------------|
+| `ts` | Timestamp for temporal grouping |
+| `command` | explain, grep, or peek |
+| `target` | What was queried (span, pattern, or session_id) |
+| `session_id` | Session being read (null for explain/grep) |
+| `window_start` | First line of returned content |
+| `window_lines` | Lines returned |
+| `total_lines` | Total lines available in the session |
+
+### How to use the metrics
+
+The key insight: `session_id` is the natural correlation key. You don't need a synthetic correlation ID because the session_id links explain results to follow-up peek calls.
+
+**"Is the default window too small?"** Look for multiple peek calls to the same session_id within a short time window. If the agent does `peek X lines 1-30` then immediately `peek X lines 31-60`, the default was too small — the agent needed more than it got.
+
+**"Is the default window too big?"** If explain returns 10 sessions with 30-line windows and the agent only peeks 2 of them, most of that content was wasted. A smaller default would save tokens.
+
+**"How deep do agents navigate?"** Count distinct session_ids peeked per explain target. 1 = stopped at root. 3+ = walked the chain.
+
+An agent (or user) can analyze `~/.engram/metrics.jsonl` periodically and adjust defaults in config:
+
+```yaml
+explain:
+  default_limit: 10
+peek:
+  default_lines: 40    # tune this based on metrics
+  default_before: 30
+  default_after: 10
+```
+
+Over time, the metrics reveal the right balance between token efficiency and orientation quality for your specific usage patterns.
+
+### Config
+
+Metrics logging is on by default. To disable:
+
+```yaml
+metrics:
+  enabled: false
+```
+
+To change the log path:
+
+```yaml
+metrics:
+  log: /custom/path/metrics.jsonl
 ```
 
 ## Open Questions

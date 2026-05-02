@@ -2,17 +2,19 @@
 
 **How did we get here?**
 
-*An automatically built index into why your code is the way it is.*
+*An automatically built index into why things are the way they are.*
 
-Your code started as a conversation. Every agent reasoning through a problem, every decision handed off, every rationale spoken aloud — that is the exhaust of agentic engineering, and it carries more signal than the code itself. Engram fingerprints and indexes that exhaust across conversations, creating a foundation for institutional knowledge — the kind you forget is there until you realize nothing works without it.
+Your code started as a conversation. Every agent reasoning through a problem, every handoff, every rationale spoken aloud leaves a trail. Engram fingerprints and indexes that trail so you can recover why a system ended up the way it did.
 
-Engram answers one question: **why does this code span exist?**
+Engram answers one question: **why does this exist?**
+
+Licensed under the Apache License, Version 2.0.
 
 ## 1. What it is
 
-Engram is a deterministic provenance index for agent-driven software work.
+Engram is a deterministic provenance index for agent-driven work.
 
-It stores immutable tapes and indexes their fingerprints in SQLite so a code-span query can return the sessions that causally produced that span.
+It stores immutable tapes and indexes their fingerprints in SQLite so a query on code or text can return the conversations that causally produced it.
 
 Core model:
 - Tapes are immutable files.
@@ -41,13 +43,13 @@ engram explain src/auth.rs:40-78
 engram watch
 ```
 
-`engram watch` monitors directories listed under the `watch:` key in config.yml, runs ingest on each new or changed file that matches the configured pattern, and logs activity to `watch.log`. This is the recommended integration pattern — file watchers, not git hooks.
+`engram watch` monitors directories listed under the `watch:` key in config.yml, runs ingest on each new or changed file that matches the configured pattern and optional glob filter, and logs activity to `watch.log`. This is the recommended integration pattern.
 
 ### How commands work
 
-- `engram ingest [PATH...]`: local-scoped. Walks the current directory tree (or given paths) for transcript files, converts recognized harness logs into tapes, and fingerprints those tapes into the resolved DB.
-- `engram watch`: long-running file watcher. Reads `watch.sources` from the resolved config.yml, watches those directories for new/changed files, debounces, and runs ingest on each matching file. Requires a `watch:` section in config.
-- `engram fingerprint`: local-scoped. Indexes existing `./.engram/tapes/*.jsonl.zst` into the resolved DB (no transcript parsing, no tape creation).
+- `engram ingest [PATH...]`: discovers transcript files, converts recognized logs into tapes, and fingerprints those tapes into the resolved DB.
+- `engram watch`: long-running file watcher. Reads `watch.sources` from the resolved config.yml, watches those directories for new/changed files, debounces, and runs ingest on each file matching the source pattern and optional glob. Requires a `watch:` section in config.
+- `engram fingerprint`: indexes existing `./.engram/tapes/*.jsonl.zst` into the resolved DB (no transcript parsing, no tape creation).
 - `engram explain <file>:<start>-<end>`: computes anchors for the selected span, queries the resolved DB, follows lineage and dispatch-marker links, and returns evidence sessions/windows.
 
 Dispatch markers are traversed during normal explain:
@@ -62,7 +64,7 @@ There is no separate `--dispatch` explain mode.
 
 ### Config resolution
 
-Engram walks up the directory tree from the current working directory looking for `.engram/config.yml`. The first one found wins. No merge between levels. If none is found, falls back to `~/.engram/config.yml`.
+Engram walks up the directory tree from the current working directory, collecting `.engram/config.yml` files from the nearest directory up through `~/.engram/config.yml`. Config values inherit per key across that chain: the nearest config that sets a given key wins, and missing keys fall through to parent configs. If the current working directory is outside `HOME`, Engram skips the walk-up chain and uses `~/.engram/config.yml` directly.
 
 On first invocation, Engram auto-creates `~/.engram/config.yml` if missing.
 
@@ -108,11 +110,14 @@ watch:
       pattern: "*.jsonl"
     - path: ~/sessions
       pattern: "session-*.json"
+      glob: "codex/**/*.json"
 ```
 
 Each source entry:
 - `path`: directory to watch (recursive).
 - `pattern`: glob pattern for files to ingest within that directory.
+- `glob`: optional glob matched against each changed path relative to `path`.
+  When omitted, existing `pattern`-only behavior is unchanged.
 
 ## 4. How you install it
 
@@ -139,7 +144,7 @@ engram --help
 
 `engram init` is optional: it creates `./.engram/config.yml` with `db: .engram/index.sqlite` and local store directories.
 
-## 5. How you link multiple levels of agents together
+## 5. How you link multi-step work together
 
 Include the same marker in handoff content across sessions:
 
@@ -148,14 +153,12 @@ Include the same marker in handoff content across sessions:
 ```
 
 Human model:
-1. Upstream session sends work with marker `X`.
-2. Downstream session receives marker `X` and edits code.
-3. A later session continues with marker `X`.
+1. One conversation sends work with marker `X`.
+2. A later conversation receives marker `X` and edits code.
+3. Another follow-up continues with marker `X`.
 4. `engram explain` on touched code follows dispatch links upstream and returns the causal chain.
 
-OpenClaw note (example only):
-- An OpenClaw submitter can propagate the UUID in a header and mirror it in message content as `<engram-src .../>`.
-- That submitter/header pattern is an integration example, not Engram core behavior.
+This marker pattern is an integration example, not Engram core behavior.
 
 ## 6. Regression Testing
 
@@ -165,8 +168,77 @@ Run the dedicated regression suite that guards explain anchor granularity, scale
 cargo test --test regression_suite
 ```
 
+## 7. Usage Metrics & Tuning Defaults
+
+These metrics are for local tuning and evaluation. They are not part of Engram's user-facing provenance model.
+
+Engram logs minimal per-call metrics to `~/.engram/metrics.jsonl` so you can tune default window sizes from real usage data.
+
+### For agents: auto-tuning defaults
+
+An agent can periodically analyze the metrics log and update `config.yml` defaults. Here's the pattern:
+
+```bash
+# Check if default window is too small (agents immediately re-requesting more)
+cat ~/.engram/metrics.jsonl | python3 -c "
+import sys, json
+from collections import defaultdict
+
+calls = [json.loads(l) for l in sys.stdin if l.strip()]
+peeks = [c for c in calls if c['command'] == 'peek' and c['session_id']]
+
+# Group peeks by session_id, sorted by timestamp
+by_session = defaultdict(list)
+for p in peeks:
+    by_session[p['session_id']].append(p)
+
+# Count sessions where agent made 2+ sequential peeks (expanding window)
+sequential = 0
+for sid, ps in by_session.items():
+    ps.sort(key=lambda x: x['ts'])
+    for i in range(1, len(ps)):
+        if ps[i]['window_start'] == ps[i-1]['window_start'] + ps[i-1]['window_lines']:
+            sequential += 1
+            break
+
+total = len(by_session)
+if total > 0:
+    pct = sequential / total * 100
+    print(f'{sequential}/{total} sessions ({pct:.0f}%) had sequential window expansion')
+    if pct > 50:
+        print('Recommendation: increase peek.default_lines in config.yml')
+    else:
+        print('Current default window size looks adequate')
+"
+```
+
+### Config defaults to tune
+
+```yaml
+peek:
+  default_lines: 40    # increase if agents frequently expand
+  default_before: 30   # lines before anchor point
+  default_after: 10    # lines after anchor point
+  grep_context: 5      # lines around grep matches in peek
+
+explain:
+  default_limit: 10    # sessions per query
+```
+
+### Disabling metrics
+
+```yaml
+metrics:
+  enabled: false
+```
+
 ## Specs
 
 - Core event contract: `specs/core/event-contract.md`
 - Dispatch marker: `specs/core/dispatch-marker.md`
 - Adapter contracts: `specs/adapters/*.md`
+
+
+## License
+
+Apache License 2.0. See `LICENSE` for the full text.

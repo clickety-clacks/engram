@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -10,7 +10,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use engram::anchor::fingerprint_token_hashes;
 use engram::config::{
     EffectiveWatchConfig, EffectiveWatchSource, ensure_user_config,
@@ -40,6 +40,9 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 const MAX_QUERY_WINDOW_ANCHORS: usize = 16;
+const DEFAULT_WINDOW_BEFORE_RATIO_NUM: usize = 3;
+const DEFAULT_WINDOW_BEFORE_RATIO_DEN: usize = 4;
+const SAFE_RESULT_SESSION_THRESHOLD: usize = 25;
 
 const TAPE_SUFFIX: &str = ".jsonl.zst";
 const TRANSCRIPT_WINDOW_RADIUS: usize = 2;
@@ -92,6 +95,9 @@ enum Command {
     Fingerprint,
     Record(RecordArgs),
     Explain(ExplainArgs),
+    Grep(GrepArgs),
+    Peek(PeekArgs),
+    Rate(RateArgs),
     Tapes,
     Show(ShowArgs),
     Gc,
@@ -127,22 +133,95 @@ struct ShowArgs {
 #[derive(Args, Debug)]
 struct ExplainArgs {
     target: Option<String>,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     anchor: bool,
-    #[arg(long, default_value_t = 0.50)]
+    #[arg(long)]
+    grep_filter: Option<String>,
+    #[arg(long)]
+    limit: Option<usize>,
+    #[arg(long, default_value_t = 0.5)]
     min_confidence: f32,
-    #[arg(long, default_value_t = 50)]
+    #[arg(long, default_value_t = 0)]
+    offset: usize,
+    #[arg(long)]
+    since: Option<String>,
+    #[arg(long)]
+    until: Option<String>,
+    #[arg(long)]
+    count: bool,
+    #[arg(long, default_value_t = 50, hide = true)]
     max_fanout: usize,
-    #[arg(long, default_value_t = 500)]
+    #[arg(long, default_value_t = 500, hide = true)]
     max_edges: usize,
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 10, hide = true)]
     depth: usize,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     include_deleted: bool,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     forensics: bool,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pretty: bool,
+}
+
+#[derive(Args, Debug)]
+struct GrepArgs {
+    pattern: String,
+    #[arg(long)]
+    limit: Option<usize>,
+    #[arg(long, default_value_t = 0)]
+    offset: usize,
+    #[arg(long)]
+    since: Option<String>,
+    #[arg(long)]
+    until: Option<String>,
+    #[arg(long)]
+    count: bool,
+}
+
+#[derive(Args, Debug)]
+struct PeekArgs {
+    session_id: String,
+    #[arg(long)]
+    start: Option<usize>,
+    #[arg(long)]
+    lines: Option<usize>,
+    #[arg(long)]
+    before: Option<usize>,
+    #[arg(long)]
+    after: Option<usize>,
+    #[arg(long)]
+    grep_filter: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct RateArgs {
+    result_id: String,
+    #[arg(long)]
+    outcome: RateOutcome,
+    #[arg(long)]
+    note: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "snake_case")]
+enum RateOutcome {
+    FoundAnswer,
+    PartiallyHelped,
+    Noise,
+    Misleading,
+    NotUsed,
+}
+
+impl RateOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FoundAnswer => "found_answer",
+            Self::PartiallyHelped => "partially_helped",
+            Self::Noise => "noise",
+            Self::Misleading => "misleading",
+            Self::NotUsed => "not_used",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +239,13 @@ struct RuntimeContext {
     tapes_dir: PathBuf,
     tape_lookup_dirs: Vec<PathBuf>,
     additional_stores: Vec<PathBuf>,
+    explain_default_limit: usize,
+    peek_default_lines: usize,
+    peek_default_before: usize,
+    peek_default_after: usize,
+    peek_grep_context: usize,
+    metrics_enabled: bool,
+    metrics_log: PathBuf,
     watch: Option<EffectiveWatchConfig>,
 }
 
@@ -188,12 +274,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            let payload = json!({
-                "error": {
-                    "code": err.code,
-                    "message": err.message,
-                }
-            });
+            let payload = error_payload(&err);
             eprintln!("{payload}");
             ExitCode::FAILURE
         }
@@ -201,6 +282,9 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), CliError> {
+    if maybe_print_spec_help()? {
+        return Ok(());
+    }
     let cli = Cli::parse();
     let cwd = std::env::current_dir().map_err(|err| CliError::io("cwd_error", err))?;
     let paths = repo_paths(&cwd)?;
@@ -223,6 +307,18 @@ fn run() -> Result<(), CliError> {
             let context = resolve_runtime_context(&cwd)?;
             cmd_explain(&cwd, &paths, &context, args)
         }
+        Command::Grep(args) => {
+            let context = resolve_runtime_context(&cwd)?;
+            cmd_grep(&paths, &context, args)
+        }
+        Command::Peek(args) => {
+            let context = resolve_runtime_context(&cwd)?;
+            cmd_peek(&paths, &context, args)
+        }
+        Command::Rate(args) => {
+            let context = resolve_runtime_context(&cwd)?;
+            cmd_rate(&paths, &context, args)
+        }
         Command::Tapes => {
             let context = resolve_runtime_context(&cwd)?;
             cmd_tapes(&paths, &context)
@@ -238,6 +334,168 @@ fn run() -> Result<(), CliError> {
     }
 }
 
+fn error_payload(err: &CliError) -> Value {
+    match err.code {
+        "session_not_found" => json!({
+            "error": "session_not_found",
+            "session_id": err.message,
+        }),
+        "no_results" => json!({
+            "error": "no_results",
+            "query": err.message,
+        }),
+        "invalid_span" => json!({
+            "error": "invalid_span",
+            "detail": err.message,
+        }),
+        _ => json!({
+            "error": {
+                "code": err.code,
+                "message": err.message,
+            }
+        }),
+    }
+}
+
+const HELP_ENGRAM: &str = r#"Engram indexes agent conversations that produced your code.
+
+Results are organized as provenance chains: the root is WHY
+(product decisions, design rationale), descendants are HOW
+(specs, implementation). Use explain to find chains, peek to
+read them.
+
+COMMANDS:
+  explain    Find provenance for code (by fingerprint)
+  grep       Find provenance for a term (by text search)
+  peek       Read content from a provenance session
+  rate       Record whether a returned result was useful
+  ingest     Import transcripts into the index
+  watch      Continuously watch for new transcripts
+
+Run engram <command> --help for details.
+"#;
+
+const HELP_EXPLAIN: &str = r#"Find the conversations that produced this code.
+
+Returns the root of each provenance chain — the highest-level
+context explaining WHY this code exists. Results include chain
+metadata (children, depth) so you can walk down to HOW with peek.
+Returns metadata only. Use peek <session_id> to read content.
+
+USAGE:
+  engram explain <file>:<start>-<end>   Provenance for a code span
+  engram explain <file>                 Provenance for an entire file  
+  engram explain "<string>"             Provenance for arbitrary text
+
+OPTIONS:
+  --grep-filter <pattern>   Only results whose content matches (grep syntax)
+  --limit N                 Max results [default: 10]
+  --offset N                Skip first N results (pagination)
+  --min-confidence N        Only results above this match quality (0.0-1.0)
+  --since <date>            Only sessions after this date
+  --until <date>            Only sessions before this date
+  --count                   Show counts only, no content (token budgeting)
+
+EXAMPLES:
+  engram explain src/server.ts:40-78
+  engram explain src/server.ts:40-78 --grep-filter "retry"
+  engram explain src/server.ts --since 2026-03-01 --limit 5
+"#;
+
+const HELP_GREP: &str = r#"Search all provenance sessions for a term.
+
+Unlike explain (which matches by code fingerprint), grep searches
+for literal text across all indexed conversations.
+
+USAGE:
+  engram grep <pattern>
+
+OPTIONS:
+  --limit N       Max results [default: 10]
+  --offset N      Skip first N results
+  --since <date>  Only sessions after this date
+  --until <date>  Only sessions before this date
+  --count         Show counts only, no content
+
+EXAMPLES:
+  engram grep "maxMessageBytes"
+  engram grep "retry logic" --since 2026-03-01
+"#;
+
+const HELP_PEEK: &str = r#"Read content from a provenance session.
+
+Use explain or grep to find sessions, then peek to read them.
+By default returns a window around the anchor point (where the
+session connects to its parent chain). Use --start/--lines for
+absolute positioning.
+
+USAGE:
+  engram peek <session_id>
+
+OPTIONS:
+  --start N                 Read from this line number
+  --lines N                 Number of lines to return [default: 30]
+  --before N                Lines before the anchor point [default: 30]
+  --after N                 Lines after the anchor point [default: 10]
+  --grep-filter <pattern>   Find lines matching this term within the session
+
+EXAMPLES:
+  engram peek af156abd
+  engram peek af156abd --start 421 --lines 30
+  engram peek af156abd --grep-filter "NO_REPLY"
+"#;
+
+const HELP_RATE: &str = r#"Record usefulness feedback for a prior query result.
+
+USAGE:
+  engram rate <result_id> --outcome <class> [--note "..."]
+
+OUTCOMES:
+  found_answer
+  partially_helped
+  noise
+  misleading
+  not_used
+
+EXAMPLES:
+  engram rate result_abc123 --outcome found_answer
+  engram rate result_abc123 --outcome misleading --note "sent me to the wrong session"
+"#;
+
+fn maybe_print_spec_help() -> Result<bool, CliError> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let help_flag = |value: &str| value == "--help" || value == "-h";
+
+    if args.len() == 1 && help_flag(&args[0]) {
+        print!("{HELP_ENGRAM}");
+        return Ok(true);
+    }
+
+    if args.len() == 2 && help_flag(&args[1]) {
+        match args[0].as_str() {
+            "explain" => {
+                print!("{HELP_EXPLAIN}");
+                return Ok(true);
+            }
+            "grep" => {
+                print!("{HELP_GREP}");
+                return Ok(true);
+            }
+            "peek" => {
+                print!("{HELP_PEEK}");
+                return Ok(true);
+            }
+            "rate" => {
+                print!("{HELP_RATE}");
+                return Ok(true);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(false)
+}
+
 fn cmd_init(paths: &RepoPaths) -> Result<(), CliError> {
     let home = home_dir()?;
     ensure_user_config(&home).map_err(|err| CliError::new("config_error", err.to_string()))?;
@@ -249,6 +507,13 @@ fn cmd_init(paths: &RepoPaths) -> Result<(), CliError> {
         tapes_dir: local_tapes_dir.clone(),
         tape_lookup_dirs: vec![local_tapes_dir, home.join(".engram").join("tapes")],
         additional_stores: Vec::new(),
+        explain_default_limit: 10,
+        peek_default_lines: 40,
+        peek_default_before: 30,
+        peek_default_after: 10,
+        peek_grep_context: 5,
+        metrics_enabled: true,
+        metrics_log: home.join(".engram").join("metrics.jsonl"),
         watch: None,
     };
     print_context_conspicuity(&context);
@@ -269,6 +534,34 @@ fn cmd_init(paths: &RepoPaths) -> Result<(), CliError> {
         "status": "ok",
         "created": true,
         "message": "created local workspace config at .engram/config.yml",
+    }))
+}
+
+fn cmd_rate(paths: &RepoPaths, context: &RuntimeContext, args: RateArgs) -> Result<(), CliError> {
+    ensure_local_store(paths)?;
+    print_context_conspicuity(context);
+    ensure_db_parent(&context.db_path)?;
+
+    let index = SqliteIndex::open(&path_string(&context.db_path))?;
+    if !index.query_result_exists(&args.result_id)? {
+        return Err(CliError::new("unknown_result_id", args.result_id));
+    }
+
+    let rated_at = Utc::now().to_rfc3339();
+    index.upsert_result_feedback(
+        &args.result_id,
+        args.outcome.as_str(),
+        args.note.as_deref(),
+        &rated_at,
+    )?;
+
+    print_json(&json!({
+        "status": "ok",
+        "result_id": args.result_id,
+        "outcome": args.outcome.as_str(),
+        "note": args.note,
+        "rated_at": rated_at,
+        "storage": "local_index",
     }))
 }
 
@@ -659,7 +952,9 @@ fn cmd_ingest(
 #[derive(Debug, Clone)]
 struct WatchSourceRuntime {
     source: EffectiveWatchSource,
+    match_root: PathBuf,
     pattern: glob::Pattern,
+    glob: Option<glob::Pattern>,
     debounce: Duration,
     ingest_timeout: Duration,
 }
@@ -691,6 +986,13 @@ fn cmd_watch_with_home(cwd: &Path, args: WatchArgs, home: &Path) -> Result<(), C
         tapes_dir: config.tapes_dir,
         tape_lookup_dirs,
         additional_stores: config.additional_stores,
+        explain_default_limit: config.explain_default_limit,
+        peek_default_lines: config.peek.default_lines,
+        peek_default_before: config.peek.default_before,
+        peek_default_after: config.peek.default_after,
+        peek_grep_context: config.peek.grep_context,
+        metrics_enabled: config.metrics.enabled,
+        metrics_log: config.metrics.log,
         watch: config.watch,
     };
     print_context_conspicuity(&context);
@@ -724,6 +1026,12 @@ fn cmd_watch_with_home(cwd: &Path, args: WatchArgs, home: &Path) -> Result<(), C
     for source in watch_config.sources {
         let pattern = glob::Pattern::new(&source.pattern)
             .map_err(|err| CliError::new("watch_config_error", err.to_string()))?;
+        let glob = source
+            .glob
+            .as_deref()
+            .map(glob::Pattern::new)
+            .transpose()
+            .map_err(|err| CliError::new("watch_config_error", err.to_string()))?;
         if !source.path.is_dir() {
             watch_log_line(
                 &mut log,
@@ -731,19 +1039,44 @@ fn cmd_watch_with_home(cwd: &Path, args: WatchArgs, home: &Path) -> Result<(), C
             )?;
             continue;
         }
-        watch_log_line(
-            &mut log,
-            &format!(
-                "watch source path={} pattern={} debounce={} timeout={}",
-                source.path.display(),
-                source.pattern,
-                watch_config.debounce_secs,
-                watch_config.ingest_timeout_secs
-            ),
-        )?;
+        if let Some(glob) = source.glob.as_deref() {
+            watch_log_line(
+                &mut log,
+                &format!(
+                    "watch source path={} pattern={} glob={} debounce={} timeout={}",
+                    source.path.display(),
+                    source.pattern,
+                    glob,
+                    watch_config.debounce_secs,
+                    watch_config.ingest_timeout_secs
+                ),
+            )?;
+        } else {
+            watch_log_line(
+                &mut log,
+                &format!(
+                    "watch source path={} pattern={} debounce={} timeout={}",
+                    source.path.display(),
+                    source.pattern,
+                    watch_config.debounce_secs,
+                    watch_config.ingest_timeout_secs
+                ),
+            )?;
+        }
+        let match_root = fs::canonicalize(&source.path).map_err(|err| {
+            CliError::new(
+                "watch_config_error",
+                format!(
+                    "failed to canonicalize watch source {}: {err}",
+                    source.path.display()
+                ),
+            )
+        })?;
         runtimes.push(WatchSourceRuntime {
             source,
+            match_root,
             pattern,
+            glob,
             debounce: Duration::from_secs(watch_config.debounce_secs),
             ingest_timeout: Duration::from_secs(watch_config.ingest_timeout_secs),
         });
@@ -785,13 +1118,7 @@ fn cmd_watch_with_home(cwd: &Path, args: WatchArgs, home: &Path) -> Result<(), C
                 }
                 for path in event.paths {
                     for (idx, runtime) in runtimes.iter().enumerate() {
-                        if !path.starts_with(&runtime.source.path) {
-                            continue;
-                        }
-                        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-                            continue;
-                        };
-                        if !runtime.pattern.matches(name) {
+                        if !watch_path_matches(runtime, &path) {
                             continue;
                         }
                         let key = (idx, path.clone());
@@ -855,6 +1182,45 @@ fn watch_event_kind_supported(kind: &EventKind) -> bool {
         EventKind::Modify(_) => true,
         _ => false,
     }
+}
+
+fn watch_path_matches(runtime: &WatchSourceRuntime, path: &Path) -> bool {
+    let Some(relative_path) = watch_path_relative_to_source(runtime, path) else {
+        return false;
+    };
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    if !runtime.pattern.matches(name) {
+        return false;
+    }
+    let Some(glob) = runtime.glob.as_ref() else {
+        return true;
+    };
+    glob.matches_path_with(&relative_path, watch_glob_match_options())
+}
+
+fn watch_glob_match_options() -> glob::MatchOptions {
+    glob::MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: true,
+        require_literal_leading_dot: false,
+    }
+}
+
+fn watch_path_relative_to_source(runtime: &WatchSourceRuntime, path: &Path) -> Option<PathBuf> {
+    if let Ok(relative_path) = path.strip_prefix(&runtime.source.path) {
+        return Some(relative_path.to_path_buf());
+    }
+    if let Ok(relative_path) = path.strip_prefix(&runtime.match_root) {
+        return Some(relative_path.to_path_buf());
+    }
+    if let Ok(canonical_path) = fs::canonicalize(path)
+        && let Ok(relative_path) = canonical_path.strip_prefix(&runtime.match_root)
+    {
+        return Some(relative_path.to_path_buf());
+    }
+    None
 }
 
 fn run_watch_ingest(
@@ -1126,7 +1492,7 @@ fn discover_ingest_candidates(
         if !canonical.starts_with(&scope_root) {
             failures.push(json!({
                 "path": path_string(&canonical),
-                "error": "path is outside local ingest scope",
+                "error": "path is outside current working directory scope (run `engram ingest` from a parent directory, e.g. $HOME)",
             }));
             continue;
         }
@@ -1531,67 +1897,201 @@ fn cmd_explain(
     ensure_local_store(paths)?;
     print_context_conspicuity(context);
     ensure_db_parent(&context.db_path)?;
-    let mut indexes = Vec::new();
-    indexes.push(SqliteIndex::open(&path_string(&context.db_path))?);
-    for store in &context.additional_stores {
-        if store.exists() {
-            indexes.push(SqliteIndex::open(&path_string(store))?);
-        }
-    }
+
+    let indexes = open_query_indexes(context)?;
     let target = args
         .target
         .clone()
         .ok_or_else(|| CliError::new("invalid_explain_target", "target is required"))?;
-    let query_anchors = resolve_explain_anchors(cwd, &args)?;
-    let lookup_anchors = resolve_explain_lookup_anchors(&indexes, &target, &args, &query_anchors)?;
-    let traversal = ExplainTraversal {
-        min_confidence: args.min_confidence,
-        max_fanout: args.max_fanout,
-        max_edges: args.max_edges,
-        max_depth: args.depth,
-    };
-    let result = explain_across_indexes(&indexes, &lookup_anchors, traversal, args.forensics)?;
+    let target_kind = classify_explain_target(cwd, context, &indexes, &target, args.anchor)?;
 
-    let touches = collect_touch_evidence(&indexes, &result.direct, &result.touched_anchors)?;
-    let mut sessions = build_session_windows(context, touches)?;
-    let (dispatch_lineage, dispatch_sessions) =
-        collect_dispatch_upstream_sessions(context, &indexes[0], &sessions)?;
-    sessions.extend(dispatch_sessions);
-
+    let mut query_anchors = Vec::new();
+    let mut raw_sessions: Vec<Value>;
+    let mut dispatch_lineage = Vec::new();
+    let mut lineage = Vec::new();
     let mut tombstones = Vec::new();
-    if args.include_deleted {
-        for anchor in &result.touched_anchors {
-            for index in &indexes {
-                for tombstone in index.tombstones_for_anchor(anchor)? {
-                    tombstones.push(json!({
-                        "anchor": anchor,
-                        "tape_id": tombstone.tape_id,
-                        "event_offset": tombstone.event_offset,
-                        "file_path": tombstone.file_path,
-                        "range": {
-                            "start": tombstone.range_at_deletion.start,
-                            "end": tombstone.range_at_deletion.end
-                        },
-                        "timestamp": tombstone.timestamp,
-                    }));
+    let mut score_by_session = HashMap::new();
+    let date_filter = DateFilter::parse(args.since.as_deref(), args.until.as_deref())?;
+
+    match target_kind {
+        ExplainTarget::FileRange { file, start, end } => {
+            let span_texts = read_file_span_variants(&cwd.join(file), start, end)?;
+            query_anchors = derive_anchor_candidates(&span_texts);
+            let traversal = ExplainTraversal {
+                min_confidence: args.min_confidence,
+                max_fanout: args.max_fanout,
+                max_edges: args.max_edges,
+                max_depth: args.depth,
+            };
+            let result =
+                explain_across_indexes(&indexes, &query_anchors, traversal, args.forensics)?;
+            let touches =
+                collect_touch_evidence(&indexes, &result.direct, &result.touched_anchors)?;
+            raw_sessions = build_session_windows(context, touches)?;
+            let (chain, dispatch_sessions) =
+                collect_dispatch_upstream_sessions(context, &indexes[0], &raw_sessions)?;
+            dispatch_lineage = chain;
+            raw_sessions.extend(dispatch_sessions);
+            lineage = result.lineage.iter().map(edge_to_json).collect::<Vec<_>>();
+            score_by_session = collect_anchor_scores(&indexes, &query_anchors)?;
+
+            if args.include_deleted {
+                for anchor in &result.touched_anchors {
+                    for index in &indexes {
+                        for tombstone in index.tombstones_for_anchor(anchor)? {
+                            tombstones.push(json!({
+                                "anchor": anchor,
+                                "tape_id": tombstone.tape_id,
+                                "event_offset": tombstone.event_offset,
+                                "file_path": tombstone.file_path,
+                                "range": {
+                                    "start": tombstone.range_at_deletion.start,
+                                    "end": tombstone.range_at_deletion.end
+                                },
+                                "timestamp": tombstone.timestamp,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+        ExplainTarget::FileWhole { file } => {
+            let full_text = fs::read_to_string(cwd.join(file))
+                .map_err(|err| CliError::io("read_span_error", err))?;
+            query_anchors = derive_anchor_candidates(&[full_text]);
+            let traversal = ExplainTraversal {
+                min_confidence: args.min_confidence,
+                max_fanout: args.max_fanout,
+                max_edges: args.max_edges,
+                max_depth: args.depth,
+            };
+            let result =
+                explain_across_indexes(&indexes, &query_anchors, traversal, args.forensics)?;
+            let touches =
+                collect_touch_evidence(&indexes, &result.direct, &result.touched_anchors)?;
+            raw_sessions = build_session_windows(context, touches)?;
+            let (chain, dispatch_sessions) =
+                collect_dispatch_upstream_sessions(context, &indexes[0], &raw_sessions)?;
+            dispatch_lineage = chain;
+            raw_sessions.extend(dispatch_sessions);
+            lineage = result.lineage.iter().map(edge_to_json).collect::<Vec<_>>();
+            score_by_session = collect_anchor_scores(&indexes, &query_anchors)?;
+        }
+        ExplainTarget::Literal(text) => {
+            query_anchors = if args.anchor {
+                vec![text]
+            } else {
+                derive_anchor_candidates(&[text])
+            };
+            let traversal = ExplainTraversal {
+                min_confidence: args.min_confidence,
+                max_fanout: args.max_fanout,
+                max_edges: args.max_edges,
+                max_depth: args.depth,
+            };
+            let result =
+                explain_across_indexes(&indexes, &query_anchors, traversal, args.forensics)?;
+            let touches =
+                collect_touch_evidence(&indexes, &result.direct, &result.touched_anchors)?;
+            raw_sessions = build_session_windows(context, touches)?;
+            let (chain, dispatch_sessions) =
+                collect_dispatch_upstream_sessions(context, &indexes[0], &raw_sessions)?;
+            dispatch_lineage = chain;
+            raw_sessions.extend(dispatch_sessions);
+            lineage = result.lineage.iter().map(edge_to_json).collect::<Vec<_>>();
+            score_by_session = collect_anchor_scores(&indexes, &query_anchors)?;
+
+            if args.include_deleted {
+                for anchor in &result.touched_anchors {
+                    for index in &indexes {
+                        for tombstone in index.tombstones_for_anchor(anchor)? {
+                            tombstones.push(json!({
+                                "anchor": anchor,
+                                "tape_id": tombstone.tape_id,
+                                "event_offset": tombstone.event_offset,
+                                "file_path": tombstone.file_path,
+                                "range": {
+                                    "start": tombstone.range_at_deletion.start,
+                                    "end": tombstone.range_at_deletion.end
+                                },
+                                "timestamp": tombstone.timestamp,
+                            }));
+                        }
+                    }
                 }
             }
         }
     }
 
     if args.pretty {
-        print_pretty_explain(&target, &result.lineage, &sessions, &tombstones);
+        print_pretty_explain(&target, &[], &raw_sessions, &tombstones);
         return Ok(());
     }
 
-    let lineage = result.lineage.iter().map(edge_to_json).collect::<Vec<_>>();
+    let mut sessions = format_sessions_for_agent(
+        context,
+        &indexes[0],
+        raw_sessions,
+        &score_by_session,
+        args.grep_filter.as_deref(),
+    )?;
+    sessions.retain(|session| session_matches_date_filter(session, &date_filter));
+    annotate_chain_fields(&mut sessions, &dispatch_lineage);
+    sessions.sort_by(|a, b| {
+        let a_depth = a.get("depth").and_then(Value::as_u64).unwrap_or(0);
+        let b_depth = b.get("depth").and_then(Value::as_u64).unwrap_or(0);
+        let a_score = a.get("confidence").and_then(Value::as_f64).unwrap_or(0.0);
+        let b_score = b.get("confidence").and_then(Value::as_f64).unwrap_or(0.0);
+        let a_ts = a.get("timestamp").and_then(Value::as_str).unwrap_or("");
+        let b_ts = b.get("timestamp").and_then(Value::as_str).unwrap_or("");
+        a_depth
+            .cmp(&b_depth)
+            .then_with(|| {
+                b_score
+                    .partial_cmp(&a_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| b_ts.cmp(a_ts))
+    });
+    if sessions.is_empty() {
+        return Err(CliError::new("no_results", target));
+    }
 
-    print_json(&json!({
+    let (sessions, returned, total, time_range, truncated) = apply_session_truncation(
+        sessions,
+        args.limit,
+        args.offset,
+        context.explain_default_limit,
+    );
+    if sessions.is_empty() {
+        return Err(CliError::new("no_results", target));
+    }
+    let chain_metadata = build_chain_metadata(&sessions);
+    append_metrics(
+        context,
+        "explain",
+        &target,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+    );
+
+    emit_query_result(
+        &indexes[0],
+        "explain",
+        json!({
         "query": {
+            "command": "explain",
             "target": target,
-            "anchor_mode": args.anchor,
             "anchors": query_anchors,
+            "grep_filter": args.grep_filter,
+            "limit": args.limit,
+            "offset": args.offset,
             "min_confidence": args.min_confidence,
+            "since": args.since,
+            "until": args.until,
+            "count": args.count,
             "max_fanout": args.max_fanout,
             "max_edges": args.max_edges,
             "depth": args.depth,
@@ -1599,11 +2099,837 @@ fn cmd_explain(
             "include_deleted": args.include_deleted,
         },
         "sessions": sessions,
+        "chains": chain_metadata,
         "lineage": lineage,
         "dispatch_lineage": dispatch_lineage,
         "tombstones": tombstones,
         "stores_queried": indexes.len(),
-    }))
+        "returned": returned,
+        "total": total,
+        "time_range": time_range,
+        "truncated": truncated,
+        }),
+    )
+}
+
+fn cmd_grep(paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Result<(), CliError> {
+    ensure_local_store(paths)?;
+    print_context_conspicuity(context);
+    ensure_db_parent(&context.db_path)?;
+
+    let indexes = open_query_indexes(context)?;
+    let (raw_sessions, grep_rank_by_session) =
+        collect_grep_matches(context, &indexes, &args.pattern)?;
+    let score_by_session = grep_rank_by_session
+        .iter()
+        .map(|(session_id, rank)| (session_id.clone(), rank.match_count as f32))
+        .collect::<HashMap<_, _>>();
+    let date_filter = DateFilter::parse(args.since.as_deref(), args.until.as_deref())?;
+    let mut sessions =
+        format_sessions_for_agent(context, &indexes[0], raw_sessions, &score_by_session, None)?;
+    sessions.retain(|session| session_matches_date_filter(session, &date_filter));
+    sessions.sort_by(|a, b| compare_grep_sessions(a, b, &grep_rank_by_session));
+    if sessions.is_empty() {
+        return Err(CliError::new("no_results", args.pattern));
+    }
+
+    let (sessions, returned, total, time_range, truncated) = apply_session_truncation(
+        sessions,
+        args.limit,
+        args.offset,
+        context.explain_default_limit,
+    );
+    if sessions.is_empty() {
+        return Err(CliError::new("no_results", args.pattern));
+    }
+
+    let metrics_sessions = if args.count { Vec::new() } else { sessions };
+    append_metrics(
+        context,
+        "grep",
+        &args.pattern,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+    );
+
+    emit_query_result(
+        &indexes[0],
+        "grep",
+        json!({
+        "query": {
+            "command": "grep",
+            "pattern": args.pattern,
+            "limit": args.limit,
+            "offset": args.offset,
+            "since": args.since,
+            "until": args.until,
+            "count": args.count,
+        },
+        "sessions": metrics_sessions,
+        "lineage": [],
+        "dispatch_lineage": [],
+        "tombstones": [],
+        "stores_queried": indexes.len(),
+        "returned": returned,
+        "total": total,
+        "time_range": time_range,
+        "truncated": truncated,
+        }),
+    )
+}
+
+fn cmd_peek(paths: &RepoPaths, context: &RuntimeContext, args: PeekArgs) -> Result<(), CliError> {
+    ensure_local_store(paths)?;
+    print_context_conspicuity(context);
+    ensure_db_parent(&context.db_path)?;
+
+    let indexes = open_query_indexes(context)?;
+    let session_id = args.session_id;
+    let Some(tape_path) = resolve_tape_path(context, &session_id) else {
+        return Err(CliError::new("session_not_found", session_id));
+    };
+    let raw_text = read_tape_content(&tape_path)?;
+    let rows = parse_jsonl_rows(&raw_text)?;
+    let total_lines = raw_text.lines().count();
+    let content_lines = raw_text.lines().collect::<Vec<_>>();
+    let timestamp = extract_latest_timestamp_from_rows(&rows);
+    let grep_context = context.peek_grep_context.max(1);
+
+    let (window_start, window_end, content) = if let Some(pattern) = args.grep_filter.as_deref() {
+        let mut hits = Vec::new();
+        for (idx, line) in content_lines.iter().enumerate() {
+            if line.contains(pattern) {
+                hits.push(idx);
+            }
+        }
+        if hits.is_empty() {
+            return Err(CliError::new("no_results", pattern.to_string()));
+        }
+        let mut ranges = Vec::new();
+        for idx in hits {
+            let start = idx.saturating_sub(grep_context);
+            let end = usize::min(total_lines.saturating_sub(1), idx + grep_context);
+            ranges.push((start, end));
+        }
+        ranges.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for (start, end) in ranges {
+            if let Some(last) = merged.last_mut()
+                && start <= last.1.saturating_add(1)
+            {
+                last.1 = usize::max(last.1, end);
+                continue;
+            }
+            merged.push((start, end));
+        }
+        let mut out = Vec::new();
+        let mut first = usize::MAX;
+        let mut last = 0usize;
+        for (start, end) in merged {
+            first = usize::min(first, start);
+            last = usize::max(last, end);
+            for idx in start..=end {
+                out.push(json!({
+                    "line": idx + 1,
+                    "text": content_lines.get(idx).copied().unwrap_or_default(),
+                }));
+            }
+        }
+        (first + 1, last + 1, out)
+    } else {
+        let anchor_line = default_peek_anchor_line(&indexes[0], &session_id, &rows);
+        if let Some(start) = args.start {
+            let line_count = args.lines.unwrap_or(context.peek_default_lines).max(1);
+            let end = usize::min(
+                total_lines,
+                start.saturating_add(line_count).saturating_sub(1),
+            );
+            let content = if total_lines == 0 || end == 0 {
+                Vec::new()
+            } else {
+                ((start.saturating_sub(1))..end)
+                    .map(|idx| {
+                        json!({
+                            "line": idx + 1,
+                            "text": content_lines.get(idx).copied().unwrap_or_default(),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            (start, end, content)
+        } else {
+            let before = args.before.unwrap_or(context.peek_default_before);
+            let after = args.after.unwrap_or(context.peek_default_after);
+            let start = anchor_line.saturating_sub(before).max(1);
+            let end = usize::min(total_lines, anchor_line.saturating_add(after));
+            let content = if total_lines == 0 || end == 0 {
+                Vec::new()
+            } else {
+                ((start - 1)..end)
+                    .map(|idx| {
+                        json!({
+                            "line": idx + 1,
+                            "text": content_lines.get(idx).copied().unwrap_or_default(),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            (start, end, content)
+        }
+    };
+
+    if content.is_empty() {
+        return Err(CliError::new("no_results", session_id.clone()));
+    }
+    let window_lines = content.len();
+    append_metrics(
+        context,
+        "peek",
+        &session_id,
+        Value::String(session_id.clone()),
+        json!(window_start),
+        json!(window_lines),
+        json!(total_lines),
+    );
+
+    emit_query_result(
+        &indexes[0],
+        "peek",
+        json!({
+        "query": {
+            "command": "peek",
+            "session_id": session_id,
+            "start": args.start,
+            "lines": args.lines,
+            "before": args.before,
+            "after": args.after,
+            "grep_filter": args.grep_filter,
+        },
+        "session": {
+            "session_id": session_id,
+            "timestamp": timestamp,
+            "window_start": window_start,
+            "window_end": window_end,
+            "total_lines": total_lines,
+            "content": content,
+        }
+        }),
+    )
+}
+
+#[derive(Debug, Clone)]
+enum ExplainTarget {
+    FileRange { file: String, start: u32, end: u32 },
+    FileWhole { file: String },
+    Literal(String),
+}
+
+fn open_query_indexes(context: &RuntimeContext) -> Result<Vec<SqliteIndex>, CliError> {
+    let mut indexes = Vec::new();
+    indexes.push(SqliteIndex::open(&path_string(&context.db_path))?);
+    for store in &context.additional_stores {
+        if store.exists() {
+            indexes.push(SqliteIndex::open(&path_string(store))?);
+        }
+    }
+    Ok(indexes)
+}
+
+fn classify_explain_target(
+    cwd: &Path,
+    _context: &RuntimeContext,
+    _indexes: &[SqliteIndex],
+    target: &str,
+    anchor_mode: bool,
+) -> Result<ExplainTarget, CliError> {
+    if anchor_mode {
+        return Ok(ExplainTarget::Literal(target.to_string()));
+    }
+
+    if has_span_shape(target) {
+        let (file, start, end) = parse_file_range_target(target)?;
+        if cwd.join(file).exists() {
+            return Ok(ExplainTarget::FileRange {
+                file: file.to_string(),
+                start,
+                end,
+            });
+        }
+    }
+
+    if cwd.join(target).is_file() {
+        return Ok(ExplainTarget::FileWhole {
+            file: target.to_string(),
+        });
+    }
+
+    Ok(ExplainTarget::Literal(target.to_string()))
+}
+
+fn has_span_shape(target: &str) -> bool {
+    target
+        .rsplit_once(':')
+        .is_some_and(|(_, rhs)| rhs.contains('-'))
+}
+
+fn collect_anchor_scores(
+    indexes: &[SqliteIndex],
+    anchors: &[String],
+) -> Result<HashMap<String, f32>, CliError> {
+    if anchors.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut by_tape: HashMap<String, HashSet<String>> = HashMap::new();
+    for anchor in anchors {
+        for index in indexes {
+            for fragment in index.evidence_for_anchor(anchor)? {
+                by_tape
+                    .entry(fragment.tape_id)
+                    .or_default()
+                    .insert(anchor.clone());
+            }
+        }
+    }
+
+    let denom = anchors.len() as f32;
+    let mut out = HashMap::new();
+    for (tape_id, hits) in by_tape {
+        out.insert(tape_id, hits.len() as f32 / denom);
+    }
+    Ok(out)
+}
+
+fn collect_grep_matches(
+    context: &RuntimeContext,
+    indexes: &[SqliteIndex],
+    pattern: &str,
+) -> Result<(Vec<Value>, HashMap<String, GrepRank>), CliError> {
+    let mut tape_ids = HashSet::new();
+    for index in indexes {
+        for tape_id in index.referenced_tape_ids()? {
+            tape_ids.insert(tape_id);
+        }
+    }
+    for dir in &context.tape_lookup_dirs {
+        if !dir.exists() {
+            continue;
+        }
+        let entries = fs::read_dir(dir).map_err(|err| CliError::io("read_dir_error", err))?;
+        for entry in entries {
+            let entry = entry.map_err(|err| CliError::io("read_dir_error", err))?;
+            if let Some(tape_id) = tape_id_from_path(&entry.path()) {
+                tape_ids.insert(tape_id);
+            }
+        }
+    }
+
+    let mut raw_sessions = Vec::new();
+    let mut rank_by_session = HashMap::new();
+
+    for tape_id in tape_ids {
+        let Some(path) = resolve_tape_path(context, &tape_id) else {
+            continue;
+        };
+        let content = read_tape_content(&path)?;
+        let lines = content.lines().collect::<Vec<_>>();
+        let rows = parse_jsonl_rows(&content)?;
+        let provenance_offsets = rows
+            .iter()
+            .filter(|row| is_provenance_row(&row.value))
+            .map(|row| row.offset)
+            .collect::<HashSet<_>>();
+        let provenance_event_count = provenance_offsets.len();
+
+        let mut first_match = None;
+        let mut first_provenance_match = None;
+        let mut match_count = 0usize;
+        let mut provenance_match_count = 0usize;
+        for (idx, line) in lines.iter().enumerate() {
+            if line.contains(pattern) {
+                match_count += 1;
+                if first_match.is_none() {
+                    first_match = Some(idx as u64);
+                }
+                let offset = idx as u64;
+                if provenance_offsets.contains(&offset) {
+                    provenance_match_count += 1;
+                    if first_provenance_match.is_none() {
+                        first_provenance_match = Some(offset);
+                    }
+                }
+            }
+        }
+        let Some(first_match) = first_match else {
+            continue;
+        };
+
+        let anchor_offset = first_provenance_match.unwrap_or(first_match);
+        let windows = event_window(&rows, anchor_offset, TRANSCRIPT_WINDOW_RADIUS)
+            .into_iter()
+            .collect::<Vec<_>>();
+        raw_sessions.push(json!({
+            "tape_id": tape_id,
+            "tape_present_locally": true,
+            "touch_count": match_count,
+            "latest_touch_timestamp": extract_latest_timestamp_from_rows(&rows),
+            "touches": [],
+            "windows": windows,
+        }));
+        rank_by_session.insert(
+            raw_sessions
+                .last()
+                .and_then(|v| v.get("tape_id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            GrepRank {
+                provenance_match_count,
+                match_count,
+                provenance_event_count,
+            },
+        );
+    }
+
+    Ok((raw_sessions, rank_by_session))
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct GrepRank {
+    provenance_match_count: usize,
+    match_count: usize,
+    provenance_event_count: usize,
+}
+
+fn compare_grep_sessions(
+    a: &Value,
+    b: &Value,
+    rank_by_session: &HashMap<String, GrepRank>,
+) -> std::cmp::Ordering {
+    let a_session_id = a.get("session_id").and_then(Value::as_str).unwrap_or("");
+    let b_session_id = b.get("session_id").and_then(Value::as_str).unwrap_or("");
+    let a_rank = rank_by_session
+        .get(a_session_id)
+        .copied()
+        .unwrap_or_default();
+    let b_rank = rank_by_session
+        .get(b_session_id)
+        .copied()
+        .unwrap_or_default();
+    let a_ts = a.get("timestamp").and_then(Value::as_str).unwrap_or("");
+    let b_ts = b.get("timestamp").and_then(Value::as_str).unwrap_or("");
+
+    b_rank
+        .provenance_match_count
+        .cmp(&a_rank.provenance_match_count)
+        .then_with(|| b_rank.match_count.cmp(&a_rank.match_count))
+        .then_with(|| {
+            b_rank
+                .provenance_event_count
+                .cmp(&a_rank.provenance_event_count)
+        })
+        .then_with(|| b_ts.cmp(a_ts))
+        .then_with(|| a_session_id.cmp(b_session_id))
+}
+
+fn is_provenance_row(value: &Value) -> bool {
+    matches!(
+        value.get("k").and_then(Value::as_str),
+        Some("code.edit" | "code.read" | "span.link")
+    )
+}
+
+fn format_sessions_for_agent(
+    context: &RuntimeContext,
+    primary_index: &SqliteIndex,
+    raw_sessions: Vec<Value>,
+    score_by_session: &HashMap<String, f32>,
+    grep: Option<&str>,
+) -> Result<Vec<Value>, CliError> {
+    let mut out = Vec::new();
+    let line_count = context.peek_default_lines.max(1);
+
+    for raw in raw_sessions {
+        let Some(session_id) = raw.get("tape_id").and_then(Value::as_str) else {
+            continue;
+        };
+
+        let tape_path = resolve_tape_path(context, session_id);
+        let (rows, raw_text, total_lines) = if let Some(path) = tape_path.as_ref() {
+            let content = read_tape_content(path)?;
+            let rows = parse_jsonl_rows(&content)?;
+            let total = content.lines().count();
+            (rows, content, total)
+        } else {
+            (Vec::new(), String::new(), 0usize)
+        };
+
+        let content_lines = raw_text.lines().collect::<Vec<_>>();
+        let anchor_line = raw
+            .get("windows")
+            .and_then(Value::as_array)
+            .and_then(|windows| windows.first())
+            .and_then(|window| window.get("touch_offset"))
+            .and_then(Value::as_u64)
+            .map(|offset| offset as usize + 1)
+            .unwrap_or(1);
+
+        let default_before =
+            line_count * DEFAULT_WINDOW_BEFORE_RATIO_NUM / DEFAULT_WINDOW_BEFORE_RATIO_DEN;
+        let window_start = anchor_line.saturating_sub(default_before).max(1);
+        let window_end = if total_lines == 0 {
+            0
+        } else {
+            usize::min(
+                total_lines,
+                window_start.saturating_add(line_count).saturating_sub(1),
+            )
+        };
+
+        let window_texts = if total_lines == 0 || window_end == 0 {
+            Vec::new()
+        } else {
+            ((window_start - 1)..window_end)
+                .map(|idx| content_lines.get(idx).copied().unwrap_or_default())
+                .collect::<Vec<_>>()
+        };
+
+        if let Some(pattern) = grep
+            && !window_texts.iter().any(|text| text.contains(pattern))
+        {
+            continue;
+        }
+
+        let mut files_touched = raw
+            .get("touches")
+            .and_then(Value::as_array)
+            .map(|touches| {
+                touches
+                    .iter()
+                    .filter_map(|touch| touch.get("file_path").and_then(Value::as_str))
+                    .map(ToOwned::to_owned)
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        if files_touched.is_empty() {
+            for file in collect_files_touched_from_rows(&rows) {
+                files_touched.insert(file);
+            }
+        }
+        let mut files_touched = files_touched.into_iter().collect::<Vec<_>>();
+        files_touched.sort();
+
+        let (refs_up, refs_down) = dispatch_ref_counts(primary_index, session_id)?;
+        let timestamp = raw
+            .get("latest_touch_timestamp")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| extract_latest_timestamp_from_rows(&rows));
+
+        out.push(json!({
+            "session_id": session_id,
+            "timestamp": timestamp,
+            "window_start": window_start,
+            "window_end": window_end,
+            "total_lines": total_lines,
+            "confidence": score_by_session.get(session_id).copied().unwrap_or(0.0),
+            "refs_up": refs_up,
+            "refs_down": refs_down,
+            "files_touched": files_touched,
+        }));
+    }
+
+    Ok(out)
+}
+
+fn dispatch_ref_counts(index: &SqliteIndex, tape_id: &str) -> Result<(usize, usize), CliError> {
+    let mut up = 0usize;
+    let mut down = 0usize;
+    for link in index.dispatch_links_for_tape(tape_id)? {
+        match link.direction {
+            DispatchDirection::Received => up += 1,
+            DispatchDirection::Sent => down += 1,
+        }
+    }
+    Ok((up, down))
+}
+
+fn extract_latest_timestamp_from_rows(rows: &[TapeRow]) -> String {
+    rows.iter()
+        .filter_map(|row| row.value.get("t").and_then(Value::as_str))
+        .max()
+        .unwrap_or("")
+        .to_string()
+}
+
+fn collect_files_touched_from_rows(rows: &[TapeRow]) -> Vec<String> {
+    let mut files = HashSet::new();
+    for row in rows {
+        if let Some(file) = row.value.get("file").and_then(Value::as_str) {
+            files.insert(file.to_string());
+        }
+        if let Some(file) = row.value.get("from_file").and_then(Value::as_str) {
+            files.insert(file.to_string());
+        }
+        if let Some(file) = row.value.get("to_file").and_then(Value::as_str) {
+            files.insert(file.to_string());
+        }
+    }
+    let mut out = files.into_iter().collect::<Vec<_>>();
+    out.sort();
+    out
+}
+
+fn apply_session_truncation(
+    sessions: Vec<Value>,
+    limit: Option<usize>,
+    offset: usize,
+    default_limit: usize,
+) -> (Vec<Value>, usize, usize, Value, bool) {
+    let total = sessions.len();
+    let start = usize::min(offset, total);
+    let remaining = total.saturating_sub(start);
+    let max_return = usize::min(
+        limit.unwrap_or(default_limit),
+        SAFE_RESULT_SESSION_THRESHOLD,
+    );
+    let returned_count = usize::min(remaining, max_return);
+
+    let mut timestamps = sessions
+        .iter()
+        .filter_map(|session| session.get("timestamp").and_then(Value::as_str))
+        .filter(|timestamp| !timestamp.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    timestamps.sort();
+
+    let time_range = if timestamps.is_empty() {
+        json!({"start": Value::Null, "end": Value::Null})
+    } else {
+        json!({
+            "start": timestamps.first().cloned().unwrap_or_default(),
+            "end": timestamps.last().cloned().unwrap_or_default(),
+        })
+    };
+
+    let truncated = start > 0 || start.saturating_add(returned_count) < total;
+    let sessions = sessions
+        .into_iter()
+        .skip(start)
+        .take(returned_count)
+        .collect::<Vec<_>>();
+
+    (sessions, returned_count, total, time_range, truncated)
+}
+
+#[derive(Debug, Clone)]
+struct DateFilter {
+    since: Option<chrono::DateTime<Utc>>,
+    until: Option<chrono::DateTime<Utc>>,
+}
+
+impl DateFilter {
+    fn parse(since: Option<&str>, until: Option<&str>) -> Result<Self, CliError> {
+        Ok(Self {
+            since: parse_date_bound(since, DateBound::Since)?,
+            until: parse_date_bound(until, DateBound::Until)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DateBound {
+    Since,
+    Until,
+}
+
+fn parse_date_bound(
+    raw: Option<&str>,
+    bound: DateBound,
+) -> Result<Option<chrono::DateTime<Utc>>, CliError> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+
+    if let Ok(value) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Ok(Some(value.with_timezone(&Utc)));
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+        let dt = match bound {
+            DateBound::Since => date.and_hms_opt(0, 0, 0),
+            DateBound::Until => date.and_hms_opt(23, 59, 59),
+        }
+        .ok_or_else(|| CliError::new("invalid_date", raw.to_string()))?;
+        return Ok(Some(chrono::DateTime::<Utc>::from_naive_utc_and_offset(
+            dt, Utc,
+        )));
+    }
+    Err(CliError::new(
+        "invalid_date",
+        format!("invalid date format `{raw}`"),
+    ))
+}
+
+fn session_matches_date_filter(session: &Value, filter: &DateFilter) -> bool {
+    let Some(raw_ts) = session.get("timestamp").and_then(Value::as_str) else {
+        return true;
+    };
+    if raw_ts.is_empty() {
+        return true;
+    }
+    let Ok(ts) = chrono::DateTime::parse_from_rfc3339(raw_ts) else {
+        return true;
+    };
+    let ts = ts.with_timezone(&Utc);
+    if let Some(since) = filter.since
+        && ts < since
+    {
+        return false;
+    }
+    if let Some(until) = filter.until
+        && ts > until
+    {
+        return false;
+    }
+    true
+}
+
+fn annotate_chain_fields(sessions: &mut [Value], dispatch_lineage: &[Value]) {
+    let ids = sessions
+        .iter()
+        .filter_map(|session| session.get("session_id").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect::<HashSet<_>>();
+
+    let mut parent_of = HashMap::<String, String>::new();
+    let mut children_of = HashMap::<String, Vec<String>>::new();
+    for link in dispatch_lineage {
+        let Some(child) = link.get("session").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(parent) = link.get("parent_session").and_then(Value::as_str) else {
+            continue;
+        };
+        if !ids.contains(child) || !ids.contains(parent) {
+            continue;
+        }
+        parent_of.insert(child.to_string(), parent.to_string());
+        children_of
+            .entry(parent.to_string())
+            .or_default()
+            .push(child.to_string());
+    }
+    for children in children_of.values_mut() {
+        children.sort();
+    }
+
+    let mut root_for = HashMap::<String, String>::new();
+    for id in &ids {
+        let mut current = id.clone();
+        while let Some(parent) = parent_of.get(&current) {
+            current = parent.clone();
+        }
+        root_for.insert(id.clone(), current);
+    }
+    let mut chain_len = HashMap::<String, usize>::new();
+    for root in root_for.values() {
+        *chain_len.entry(root.clone()).or_insert(0) += 1;
+    }
+
+    for session in sessions {
+        let Some(id) = session
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+        else {
+            continue;
+        };
+        let mut depth = 0usize;
+        let mut current = id.clone();
+        while let Some(parent) = parent_of.get(&current) {
+            depth += 1;
+            current = parent.clone();
+        }
+        let parent = parent_of.get(&id).cloned();
+        let children = children_of.get(&id).cloned().unwrap_or_default();
+        let root = root_for.get(&id).cloned().unwrap_or_else(|| id.clone());
+        let length = chain_len.get(&root).copied().unwrap_or(1);
+
+        if let Some(obj) = session.as_object_mut() {
+            obj.insert("depth".to_string(), json!(depth));
+            obj.insert(
+                "parent".to_string(),
+                parent.map(Value::from).unwrap_or(Value::Null),
+            );
+            obj.insert("children".to_string(), json!(children));
+            obj.insert("chain_length".to_string(), json!(length));
+        }
+    }
+}
+
+fn build_chain_metadata(sessions: &[Value]) -> Vec<Value> {
+    let mut parent_of = HashMap::<String, String>::new();
+    for session in sessions {
+        if let (Some(id), Some(parent)) = (
+            session.get("session_id").and_then(Value::as_str),
+            session.get("parent").and_then(Value::as_str),
+        ) {
+            parent_of.insert(id.to_string(), parent.to_string());
+        }
+    }
+    let mut by_root = HashMap::<String, Vec<Value>>::new();
+    let mut root_order = Vec::<String>::new();
+    for session in sessions {
+        let Some(id) = session.get("session_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let mut root = id.to_string();
+        while let Some(parent) = parent_of.get(&root) {
+            root = parent.clone();
+        }
+        if !root_order.iter().any(|value| value == &root) {
+            root_order.push(root.clone());
+        }
+        by_root.entry(root).or_default().push(json!({
+            "session_id": id,
+            "depth": session.get("depth").cloned().unwrap_or_else(|| json!(0)),
+            "parent": session.get("parent").cloned().unwrap_or(Value::Null),
+            "children": session.get("children").cloned().unwrap_or_else(|| json!([])),
+        }));
+    }
+    let mut out = Vec::new();
+    for root in root_order {
+        let mut descendants = by_root.remove(&root).unwrap_or_default();
+        descendants.sort_by(|a, b| {
+            let ad = a.get("depth").and_then(Value::as_u64).unwrap_or(0);
+            let bd = b.get("depth").and_then(Value::as_u64).unwrap_or(0);
+            ad.cmp(&bd)
+        });
+        out.push(json!({
+            "root_session_id": root,
+            "descendants": descendants,
+        }));
+    }
+    out
+}
+
+fn default_peek_anchor_line(index: &SqliteIndex, session_id: &str, rows: &[TapeRow]) -> usize {
+    if let Ok(links) = index.dispatch_links_for_tape(session_id)
+        && let Some(received) = links
+            .into_iter()
+            .filter(|link| matches!(link.direction, DispatchDirection::Received))
+            .min_by_key(|link| link.first_turn_index)
+    {
+        if let Some(offset) = message_turn_to_event_offset(rows, received.first_turn_index)
+            && let Some(pos) = rows.iter().position(|row| row.offset == offset)
+        {
+            return pos + 1;
+        }
+    }
+    if rows.is_empty() { 1 } else { 1 }
 }
 
 fn collect_dispatch_upstream_sessions(
@@ -1943,39 +3269,6 @@ fn print_pretty_explain(
     }
 }
 
-fn resolve_explain_anchors(cwd: &Path, args: &ExplainArgs) -> Result<Vec<String>, CliError> {
-    if args.anchor {
-        let target = args.target.clone().ok_or_else(|| {
-            CliError::new(
-                "invalid_explain_target",
-                "target is required for --anchor mode",
-            )
-        })?;
-        return Ok(vec![target]);
-    }
-
-    let target = args
-        .target
-        .as_deref()
-        .ok_or_else(|| CliError::new("invalid_explain_target", "target is required"))?;
-    let (file, start, end) = parse_file_range_target(target)?;
-    let file_path = cwd.join(file);
-    let span_texts = read_file_span_variants(&file_path, start, end)?;
-    Ok(derive_anchor_candidates(&span_texts))
-}
-
-fn resolve_explain_lookup_anchors(
-    _indexes: &[SqliteIndex],
-    _target: &str,
-    _args: &ExplainArgs,
-    query_anchors: &[String],
-) -> Result<Vec<String>, CliError> {
-    // query_anchors are individual winnow hash tokens — each maps to an
-    // evidence row via an exact-equality index scan.  No similarity scoring
-    // or full-table scan needed.
-    Ok(query_anchors.to_vec())
-}
-
 fn derive_anchor_candidates(span_texts: &[String]) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -2014,20 +3307,20 @@ fn sample_anchor_candidates(anchors: Vec<String>, max_anchors: usize) -> Vec<Str
 fn parse_file_range_target(target: &str) -> Result<(&str, u32, u32), CliError> {
     let (file, range) = target
         .rsplit_once(':')
-        .ok_or_else(|| CliError::new("invalid_explain_target", "expected <file>:<start>-<end>"))?;
+        .ok_or_else(|| CliError::new("invalid_span", "expected <file>:<start>-<end>"))?;
     let (start_raw, end_raw) = range
         .split_once('-')
-        .ok_or_else(|| CliError::new("invalid_explain_target", "expected <file>:<start>-<end>"))?;
+        .ok_or_else(|| CliError::new("invalid_span", "expected <file>:<start>-<end>"))?;
 
     let start: u32 = start_raw
         .parse()
-        .map_err(|_| CliError::new("invalid_explain_target", "start line must be an integer"))?;
+        .map_err(|_| CliError::new("invalid_span", "start line must be an integer"))?;
     let end: u32 = end_raw
         .parse()
-        .map_err(|_| CliError::new("invalid_explain_target", "end line must be an integer"))?;
+        .map_err(|_| CliError::new("invalid_span", "end line must be an integer"))?;
     if start == 0 || end == 0 || end < start {
         return Err(CliError::new(
-            "invalid_explain_target",
+            "invalid_span",
             "line range must be 1-based and end must be >= start",
         ));
     }
@@ -2043,7 +3336,7 @@ fn read_file_span_variants(path: &Path, start: u32, end: u32) -> Result<Vec<Stri
 
     if end_idx >= lines.len() {
         return Err(CliError::new(
-            "span_out_of_bounds",
+            "invalid_span",
             format!(
                 "requested range {}-{} exceeds file length {}",
                 start,
@@ -2417,6 +3710,13 @@ fn resolve_runtime_context_with_override(
         tapes_dir: config.tapes_dir,
         tape_lookup_dirs,
         additional_stores: config.additional_stores,
+        explain_default_limit: config.explain_default_limit,
+        peek_default_lines: config.peek.default_lines,
+        peek_default_before: config.peek.default_before,
+        peek_default_after: config.peek.default_after,
+        peek_grep_context: config.peek.grep_context,
+        metrics_enabled: config.metrics.enabled,
+        metrics_log: config.metrics.log,
         watch: config.watch,
     })
 }
@@ -2439,6 +3739,44 @@ fn ensure_db_parent(db_path: &Path) -> Result<(), CliError> {
 fn print_context_conspicuity(context: &RuntimeContext) {
     eprintln!("config: {}", context.config_path.display());
     eprintln!("db: {}", context.db_path.display());
+}
+
+fn append_metrics(
+    context: &RuntimeContext,
+    command: &str,
+    target: &str,
+    session_id: Value,
+    window_start: Value,
+    window_lines: Value,
+    total_lines: Value,
+) {
+    if !context.metrics_enabled {
+        return;
+    }
+
+    if let Some(parent) = context.metrics_log.parent()
+        && fs::create_dir_all(parent).is_err()
+    {
+        return;
+    }
+
+    let payload = json!({
+        "ts": Utc::now().to_rfc3339(),
+        "command": command,
+        "target": target,
+        "session_id": session_id,
+        "window_start": window_start,
+        "window_lines": window_lines,
+        "total_lines": total_lines,
+    });
+    let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&context.metrics_log)
+    else {
+        return;
+    };
+    let _ = writeln!(file, "{payload}");
 }
 
 fn home_dir() -> Result<PathBuf, CliError> {
@@ -2505,6 +3843,76 @@ fn path_string(path: &Path) -> String {
 fn print_json(value: &Value) -> Result<(), CliError> {
     let rendered = serde_json::to_string(value)?;
     println!("{rendered}");
+    Ok(())
+}
+
+fn emit_query_result(index: &SqliteIndex, command: &str, payload: Value) -> Result<(), CliError> {
+    let payload_json = canonical_json_string(&payload)?;
+    let result_id = format!(
+        "result_{}",
+        sha256_hex(&format!("{command}:{payload_json}"))
+    );
+    let created_at = Utc::now().to_rfc3339();
+    index.record_query_result(&result_id, command, &payload_json, &created_at)?;
+
+    let mut object = match payload {
+        Value::Object(map) => map,
+        _ => {
+            return Err(CliError::new(
+                "invalid_query_payload",
+                format!("{command} payload must be a JSON object"),
+            ));
+        }
+    };
+    object.insert("result_id".to_string(), Value::String(result_id.clone()));
+    object.insert(
+        "rating_hint".to_string(),
+        Value::String(format!(
+            "Rate this result: engram rate {result_id} --outcome <found_answer|partially_helped|noise|misleading|not_used>"
+        )),
+    );
+    print_json(&Value::Object(object))
+}
+
+fn canonical_json_string(value: &Value) -> Result<String, CliError> {
+    let mut out = String::new();
+    write_canonical_json(value, &mut out)?;
+    Ok(out)
+}
+
+fn write_canonical_json(value: &Value, out: &mut String) -> Result<(), CliError> {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+            out.push_str(&serde_json::to_string(value)?);
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (idx, item) in items.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                write_canonical_json(item, out)?;
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            out.push('{');
+            let mut keys = map.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for (idx, key) in keys.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::to_string(key)?);
+                out.push(':');
+                let value = map
+                    .get(*key)
+                    .expect("canonical json key collected from same map");
+                write_canonical_json(value, out)?;
+            }
+            out.push('}');
+        }
+    }
     Ok(())
 }
 
@@ -2679,6 +4087,202 @@ mod tests {
         assert!(!watch_event_kind_supported(&EventKind::Remove(
             RemoveKind::Any
         )));
+    }
+
+    #[test]
+    fn watch_path_matches_preserves_filename_pattern_without_glob() {
+        let source_path = PathBuf::from("/tmp/source");
+        let runtime = WatchSourceRuntime {
+            source: EffectiveWatchSource {
+                path: source_path.clone(),
+                pattern: "*.jsonl".to_string(),
+                glob: None,
+            },
+            match_root: source_path.clone(),
+            pattern: glob::Pattern::new("*.jsonl").expect("pattern"),
+            glob: None,
+            debounce: Duration::from_secs(1),
+            ingest_timeout: Duration::from_secs(1),
+        };
+
+        assert!(watch_path_matches(
+            &runtime,
+            &source_path.join("nested/session.jsonl")
+        ));
+        assert!(!watch_path_matches(
+            &runtime,
+            &source_path.join("nested/session.txt")
+        ));
+    }
+
+    #[test]
+    fn watch_path_matches_without_glob_accepts_canonical_event_path() {
+        let source_path = PathBuf::from("/tmp/source");
+        let match_root = PathBuf::from("/private/tmp/source");
+        let runtime = WatchSourceRuntime {
+            source: EffectiveWatchSource {
+                path: source_path,
+                pattern: "*.jsonl".to_string(),
+                glob: None,
+            },
+            match_root: match_root.clone(),
+            pattern: glob::Pattern::new("*.jsonl").expect("pattern"),
+            glob: None,
+            debounce: Duration::from_secs(1),
+            ingest_timeout: Duration::from_secs(1),
+        };
+
+        assert!(watch_path_matches(
+            &runtime,
+            &match_root.join("nested/session.jsonl")
+        ));
+        assert!(!watch_path_matches(
+            &runtime,
+            &match_root.join("nested/session.txt")
+        ));
+    }
+
+    #[test]
+    fn watch_path_matches_optional_glob_against_relative_path() {
+        let source_path = PathBuf::from("/tmp/source");
+        let runtime = WatchSourceRuntime {
+            source: EffectiveWatchSource {
+                path: source_path.clone(),
+                pattern: "*.jsonl".to_string(),
+                glob: Some("accepted/**/*.jsonl".to_string()),
+            },
+            match_root: source_path.clone(),
+            pattern: glob::Pattern::new("*.jsonl").expect("pattern"),
+            glob: Some(glob::Pattern::new("accepted/**/*.jsonl").expect("glob")),
+            debounce: Duration::from_secs(1),
+            ingest_timeout: Duration::from_secs(1),
+        };
+
+        assert!(watch_path_matches(
+            &runtime,
+            &source_path.join("accepted/nested/session.jsonl")
+        ));
+        assert!(!watch_path_matches(
+            &runtime,
+            &source_path.join("ignored/nested/session.jsonl")
+        ));
+        assert!(!watch_path_matches(
+            &runtime,
+            &source_path.join("accepted/nested/session.txt")
+        ));
+    }
+
+    #[test]
+    fn watch_path_matches_glob_treats_separator_literally() {
+        let source_path = PathBuf::from("/tmp/source");
+        let runtime = WatchSourceRuntime {
+            source: EffectiveWatchSource {
+                path: source_path.clone(),
+                pattern: "*.jsonl".to_string(),
+                glob: Some("logs/*.jsonl".to_string()),
+            },
+            match_root: source_path.clone(),
+            pattern: glob::Pattern::new("*.jsonl").expect("pattern"),
+            glob: Some(glob::Pattern::new("logs/*.jsonl").expect("glob")),
+            debounce: Duration::from_secs(1),
+            ingest_timeout: Duration::from_secs(1),
+        };
+
+        assert!(watch_path_matches(
+            &runtime,
+            &source_path.join("logs/session.jsonl")
+        ));
+        assert!(!watch_path_matches(
+            &runtime,
+            &source_path.join("logs/nested/session.jsonl")
+        ));
+        assert!(!watch_path_matches(
+            &runtime,
+            &source_path.join("ignored/session.jsonl")
+        ));
+    }
+
+    #[test]
+    fn watch_path_matches_glob_double_star_allows_nested_paths() {
+        let source_path = PathBuf::from("/tmp/source");
+        let runtime = WatchSourceRuntime {
+            source: EffectiveWatchSource {
+                path: source_path.clone(),
+                pattern: "*.jsonl".to_string(),
+                glob: Some("logs/**/*.jsonl".to_string()),
+            },
+            match_root: source_path.clone(),
+            pattern: glob::Pattern::new("*.jsonl").expect("pattern"),
+            glob: Some(glob::Pattern::new("logs/**/*.jsonl").expect("glob")),
+            debounce: Duration::from_secs(1),
+            ingest_timeout: Duration::from_secs(1),
+        };
+
+        assert!(watch_path_matches(
+            &runtime,
+            &source_path.join("logs/nested/session.jsonl")
+        ));
+    }
+
+    #[test]
+    fn watch_path_matches_canonical_event_path_for_symlinked_source() {
+        let source_path = PathBuf::from("/tmp/source");
+        let match_root = PathBuf::from("/private/tmp/source");
+        let runtime = WatchSourceRuntime {
+            source: EffectiveWatchSource {
+                path: source_path,
+                pattern: "*.jsonl".to_string(),
+                glob: Some("accepted/**/*.jsonl".to_string()),
+            },
+            match_root: match_root.clone(),
+            pattern: glob::Pattern::new("*.jsonl").expect("pattern"),
+            glob: Some(glob::Pattern::new("accepted/**/*.jsonl").expect("glob")),
+            debounce: Duration::from_secs(1),
+            ingest_timeout: Duration::from_secs(1),
+        };
+
+        assert!(watch_path_matches(
+            &runtime,
+            &match_root.join("accepted/nested/session.jsonl")
+        ));
+        assert!(!watch_path_matches(
+            &runtime,
+            &match_root.join("ignored/nested/session.jsonl")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watch_path_matches_canonicalized_source_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_source = dir.path().join("real-source");
+        let linked_source = dir.path().join("linked-source");
+        fs::create_dir_all(real_source.join("accepted/nested")).expect("real source");
+        fs::write(real_source.join("accepted/session.jsonl"), "{}\n").expect("shallow file");
+        fs::write(real_source.join("accepted/nested/session.jsonl"), "{}\n").expect("nested file");
+        std::os::unix::fs::symlink(&real_source, &linked_source).expect("symlink source");
+        let match_root = fs::canonicalize(&linked_source).expect("canonical source");
+        let runtime = WatchSourceRuntime {
+            source: EffectiveWatchSource {
+                path: linked_source,
+                pattern: "*.jsonl".to_string(),
+                glob: Some("accepted/*.jsonl".to_string()),
+            },
+            match_root: match_root.clone(),
+            pattern: glob::Pattern::new("*.jsonl").expect("pattern"),
+            glob: Some(glob::Pattern::new("accepted/*.jsonl").expect("glob")),
+            debounce: Duration::from_secs(1),
+            ingest_timeout: Duration::from_secs(1),
+        };
+
+        assert!(watch_path_matches(
+            &runtime,
+            &real_source.join("accepted/session.jsonl")
+        ));
+        assert!(!watch_path_matches(
+            &runtime,
+            &real_source.join("accepted/nested/session.jsonl")
+        ));
     }
 
     #[test]
