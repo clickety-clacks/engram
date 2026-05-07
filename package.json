@@ -1,6 +1,6 @@
 {
   "name": "@clickety-clacks/engram",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Deterministic provenance index for agent-driven work",
   "license": "Apache-2.0",
   "homepage": "https://github.com/clickety-clacks/engram#readme",
