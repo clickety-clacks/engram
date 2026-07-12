@@ -290,8 +290,13 @@ fn emit_tool_call(
     }
     out.push(Value::Object(call_event));
 
-    if tool == "apply_patch" {
-        for edit in extract_apply_patch_edits(args) {
+    let patch = match tool {
+        "apply_patch" => Some(args.to_string()),
+        "exec" => extract_exec_apply_patch(args),
+        _ => None,
+    };
+    if let Some(patch) = patch {
+        for edit in extract_apply_patch_edits(&patch) {
             let mut event = serde_json::Map::new();
             event.insert("t".to_string(), json!(timestamp));
             event.insert("k".to_string(), json!("code.edit"));
@@ -306,6 +311,16 @@ fn emit_tool_call(
             out.push(Value::Object(event));
         }
     }
+}
+
+fn extract_exec_apply_patch(arguments: &str) -> Option<String> {
+    let call_offset = arguments.find("tools.apply_patch(patch)")?;
+    let assignment = arguments[..call_offset].rfind("const patch = ")?;
+    let literal = &arguments[assignment + "const patch = ".len()..];
+    serde_json::Deserializer::from_str(literal)
+        .into_iter::<String>()
+        .next()?
+        .ok()
 }
 
 fn value_to_argument_string(value: &Value) -> String {
@@ -472,5 +487,25 @@ mod tests {
                 .is_some_and(|text| text.contains("import OSLog")),
             "events={events:?}"
         );
+    }
+
+    #[test]
+    fn codex_adapter_emits_edit_for_exec_wrapped_apply_patch() {
+        let input = r#"{"timestamp":"2026-07-12T14:38:30.523Z","type":"session_meta","payload":{"id":"019f56c0-d31f-7a60-ad43-9441eb21c6d0","model_provider":"openai"}}
+{"timestamp":"2026-07-12T14:38:30.523Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call_patch","name":"exec","input":"const patch = \"*** Begin Patch\\n*** Update File: src/main.rs\\n@@\\n-old value\\n+new value\\n*** End Patch\";\\ntext(await tools.apply_patch(patch));"}}"#;
+
+        let out = codex_jsonl_to_tape_jsonl(input).expect("adapter should parse");
+        let events: Vec<Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid JSON event"))
+            .collect();
+
+        let edit = events
+            .iter()
+            .find(|event| event["k"] == "code.edit")
+            .expect("code.edit event");
+        assert_eq!(edit["file"], "src/main.rs");
+        assert_eq!(edit["before_text"], "old value\n");
+        assert_eq!(edit["after_text"], "new value\n");
     }
 }
