@@ -17,6 +17,15 @@ fn parse_output_events(output: &str) -> Vec<Value> {
 }
 
 #[test]
+fn claude_model_fixture_preserves_source_model_in_meta() {
+    let input = load_fixture("tests/fixtures/claude_adapter_input.jsonl");
+    let output = claude_jsonl_to_tape_jsonl(&input).expect("adapter should parse fixture");
+    let events = parse_output_events(&output);
+
+    assert_eq!(events[0]["model"], "claude-fable-5");
+}
+
+#[test]
 fn claude_multiedit_fixture_emits_expanded_edits_and_full_coverage() {
     let input = load_fixture("tests/fixtures/claude_adapter_multiedit_input.jsonl");
     let output = claude_jsonl_to_tape_jsonl(&input).expect("adapter should parse fixture");
@@ -55,6 +64,8 @@ fn claude_missing_session_fixture_omits_source_session_id() {
     let input = load_fixture("tests/fixtures/claude_adapter_no_session_input.jsonl");
     let output = claude_jsonl_to_tape_jsonl(&input).expect("adapter should parse fixture");
     let events = parse_output_events(&output);
+
+    assert_eq!(events[0].get("model"), Some(&Value::Null));
 
     for event in events {
         assert_eq!(event["source"]["harness"], "claude-code");

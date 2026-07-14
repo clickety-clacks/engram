@@ -14,6 +14,7 @@ pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
     let mut tool_by_id: HashMap<String, ClaudeToolContext> = HashMap::new();
     let mut session_id: Option<String> = None;
     let mut first_timestamp: Option<String> = None;
+    let mut model: Option<String> = None;
 
     let mut read_total = 0u32;
     let mut read_emitted = 0u32;
@@ -100,6 +101,12 @@ pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
             }
             "assistant" => {
                 let message = row.get("message").and_then(Value::as_object);
+                if model.is_none() {
+                    model = message
+                        .and_then(|obj| obj.get("model"))
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
+                }
                 let role = message
                     .and_then(|obj| obj.get("role"))
                     .and_then(Value::as_str)
@@ -264,6 +271,7 @@ pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
         json!({
             "t": first_timestamp.unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string()),
             "k": "meta",
+            "model": model,
             "source": source_block("claude-code", session_id.as_deref()),
             "coverage.read": coverage_grade(read_total, read_emitted),
             "coverage.edit": coverage_grade(edit_total, edit_emitted),
@@ -365,6 +373,7 @@ mod tests {
         assert_eq!(meta["coverage.tool"], "full");
         assert_eq!(meta["coverage.read"], "full");
         assert_eq!(meta["coverage.edit"], "full");
+        assert_eq!(meta["model"], "claude-fable-5");
         assert_eq!(meta["source"]["harness"], "claude-code");
         assert_eq!(meta["source"]["session_id"], "session-claude-1");
 
