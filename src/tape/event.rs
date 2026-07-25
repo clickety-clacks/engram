@@ -30,8 +30,15 @@ pub enum TapeEventData {
     CodeRead(CodeReadEvent),
     CodeEdit(CodeEditEvent),
     SpanLink(SpanLinkEvent),
+    Textual(TextualEvent),
     Meta(MetaEvent),
     Other { kind: EventKind },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextualEvent {
+    pub kind: EventKind,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -181,6 +188,12 @@ struct RawEvent {
     to_range: Option<[u32; 2]>,
     #[serde(default)]
     note: Option<String>,
+    #[serde(default)]
+    content: Option<serde_json::Value>,
+    #[serde(default)]
+    args: Option<serde_json::Value>,
+    #[serde(default)]
+    stdout: Option<serde_json::Value>,
 }
 
 impl RawEvent {
@@ -223,6 +236,15 @@ impl RawEvent {
                 }
                 _ => TapeEventData::Other { kind },
             },
+            "msg.in" | "msg.out" => textual_payload(self.content)
+                .map(|text| TapeEventData::Textual(TextualEvent { kind, text }))
+                .unwrap_or(TapeEventData::Other { kind }),
+            "tool.call" => textual_payload(self.args)
+                .map(|text| TapeEventData::Textual(TextualEvent { kind, text }))
+                .unwrap_or(TapeEventData::Other { kind }),
+            "tool.result" => textual_payload(self.stdout)
+                .map(|text| TapeEventData::Textual(TextualEvent { kind, text }))
+                .unwrap_or(TapeEventData::Other { kind }),
             "meta" => TapeEventData::Meta(MetaEvent {
                 model: self.model,
                 repo_head: self.repo_head,
@@ -239,6 +261,10 @@ impl RawEvent {
             data,
         }
     }
+}
+
+fn textual_payload(value: Option<serde_json::Value>) -> Option<String> {
+    value?.as_str().map(ToOwned::to_owned)
 }
 
 fn file_range(raw: [u32; 2]) -> FileRange {

@@ -2628,6 +2628,7 @@ fn format_sessions_for_agent(
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| extract_latest_timestamp_from_rows(&rows));
+        let touches = raw.get("touches").cloned().unwrap_or_else(|| json!([]));
 
         out.push(json!({
             "session_id": session_id,
@@ -2639,6 +2640,7 @@ fn format_sessions_for_agent(
             "refs_up": refs_up,
             "refs_down": refs_down,
             "files_touched": files_touched,
+            "touches": touches,
         }));
     }
 

@@ -291,7 +291,9 @@ fn explain_supports_string_file_and_peek_navigation() {
     );
     assert!(sessions[0].get("content").is_none());
     assert!(sessions[0].get("windows").is_none());
-    assert!(sessions[0].get("touches").is_none());
+    assert!(sessions[0]["touches"].as_array().is_some_and(|touches| {
+        !touches.is_empty() && touches.iter().all(|entry| entry.get("kind").is_some())
+    }));
 
     let by_session = run_json(
         &repo,

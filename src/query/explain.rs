@@ -78,6 +78,7 @@ pub fn retrieve_lineage(
     let mut queue: VecDeque<(String, usize)> =
         anchors.iter().cloned().map(|anchor| (anchor, 0)).collect();
     let mut visited = HashSet::new();
+    let mut seen_edges = HashSet::new();
     let mut out = Vec::new();
 
     while let Some((anchor, depth)) = queue.pop_front() {
@@ -90,13 +91,29 @@ pub fn retrieve_lineage(
         if out.len() >= traversal.max_edges {
             break;
         }
-        let edges = index.inbound_edges(&anchor, traversal.min_confidence, include_forensics)?;
+        let mut edges =
+            index.inbound_edges(&anchor, traversal.min_confidence, include_forensics)?;
+        edges.extend(index.outbound_edges(&anchor, traversal.min_confidence, include_forensics)?);
         for edge in edges.into_iter().take(traversal.max_fanout) {
             if out.len() >= traversal.max_edges {
                 break;
             }
-            if !visited.contains(&edge.from_anchor) {
-                queue.push_back((edge.from_anchor.clone(), depth + 1));
+            let key = (
+                edge.from_anchor.clone(),
+                edge.to_anchor.clone(),
+                edge.confidence.to_bits(),
+                edge.agent_link,
+            );
+            if !seen_edges.insert(key) {
+                continue;
+            }
+            let next = if edge.from_anchor == anchor {
+                &edge.to_anchor
+            } else {
+                &edge.from_anchor
+            };
+            if !visited.contains(next) {
+                queue.push_back((next.clone(), depth + 1));
             }
             out.push(edge);
         }

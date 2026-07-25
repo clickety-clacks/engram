@@ -5,7 +5,9 @@ use std::ops::Deref;
 
 use rusqlite::{Connection, params};
 
-use crate::anchor::{expand_winnow_anchor, fingerprint_anchor_hashes, fingerprint_token_hashes};
+use crate::anchor::{
+    expand_winnow_anchor, fingerprint_similarity, fingerprint_text, fingerprint_token_hashes,
+};
 use crate::index::lineage::{
     Cardinality, EvidenceFragmentRef, EvidenceKind, LINK_THRESHOLD_DEFAULT, LocationDelta,
     SpanEdge, StoredEdgeClass, Tombstone,
@@ -624,6 +626,19 @@ impl SqliteIndex {
     ) -> rusqlite::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         for item in events {
+            if let Some((kind, anchors)) = fingerprint_evidence_policy(&item.event.data) {
+                let fragment = EvidenceFragmentRef {
+                    tape_id: tape_id.to_string(),
+                    event_offset: item.offset,
+                    kind,
+                    file_path: String::new(),
+                    timestamp: item.event.timestamp.clone(),
+                };
+                for anchor in anchors {
+                    Self::insert_evidence_on(tx.deref(), &anchor, &fragment)?;
+                }
+                continue;
+            }
             match &item.event.data {
                 TapeEventData::CodeRead(read) => {
                     let fragment = EvidenceFragmentRef {
@@ -649,18 +664,6 @@ impl SqliteIndex {
                         edit.after_hash.as_deref(),
                         &edit.after_anchor_hashes,
                     );
-                    // Window-level anchors for edges (avoids N×M explosion).
-                    let before_edge = edit_side_edge_anchors(
-                        edit.before_text.as_deref(),
-                        edit.before_hash.as_deref(),
-                        &edit.before_anchor_hashes,
-                    );
-                    let after_edge = edit_side_edge_anchors(
-                        edit.after_text.as_deref(),
-                        edit.after_hash.as_deref(),
-                        &edit.after_anchor_hashes,
-                    );
-
                     if !before_tokens.is_empty() {
                         let fragment = EvidenceFragmentRef {
                             tape_id: tape_id.to_string(),
@@ -687,29 +690,25 @@ impl SqliteIndex {
                         }
                     }
 
-                    if !before_edge.is_empty() && !after_edge.is_empty() {
-                        let confidence = if before_edge == after_edge {
-                            1.0
-                        } else {
-                            edit.similarity.unwrap_or(0.0)
-                        };
+                    if !before_tokens.is_empty() && !after_tokens.is_empty() {
+                        let confidence = edit_similarity(edit);
                         Self::validate_confidence(confidence)?;
-                        for before_anchor in &before_edge {
-                            for after_anchor in &after_edge {
-                                Self::insert_edge_on(
-                                    tx.deref(),
-                                    &SpanEdge {
-                                        from_anchor: before_anchor.clone(),
-                                        to_anchor: after_anchor.clone(),
-                                        confidence,
-                                        location_delta: LocationDelta::Same,
-                                        cardinality: Cardinality::OneToOne,
-                                        agent_link: false,
-                                        note: None,
-                                    },
-                                    link_threshold,
-                                )?;
-                            }
+                        for (before_anchor, after_anchor) in
+                            query_compatible_edge_pairs(&before_tokens, &after_tokens)
+                        {
+                            Self::insert_edge_on(
+                                tx.deref(),
+                                &SpanEdge {
+                                    from_anchor: before_anchor,
+                                    to_anchor: after_anchor,
+                                    confidence,
+                                    location_delta: LocationDelta::Same,
+                                    cardinality: Cardinality::OneToOne,
+                                    agent_link: false,
+                                    note: None,
+                                },
+                                link_threshold,
+                            )?;
                         }
                     }
 
@@ -752,7 +751,9 @@ impl SqliteIndex {
                         link_threshold,
                     )?;
                 }
-                TapeEventData::Meta(_) | TapeEventData::Other { .. } => {}
+                TapeEventData::Textual(_)
+                | TapeEventData::Meta(_)
+                | TapeEventData::Other { .. } => {}
             }
         }
 
@@ -868,6 +869,22 @@ fn read_evidence_anchors(read: &crate::tape::event::CodeReadEvent) -> Vec<String
     expand_legacy_anchors(None, &read.anchor_hashes)
 }
 
+fn fingerprint_evidence_policy(data: &TapeEventData) -> Option<(EvidenceKind, Vec<String>)> {
+    let TapeEventData::Textual(event) = data else {
+        return None;
+    };
+    let kind = match event.kind {
+        crate::tape::event::EventKind::MsgIn | crate::tape::event::EventKind::MsgOut => {
+            EvidenceKind::Message
+        }
+        crate::tape::event::EventKind::ToolCall | crate::tape::event::EventKind::ToolResult => {
+            EvidenceKind::Tool
+        }
+        _ => return None,
+    };
+    Some((kind, fingerprint_token_hashes(&event.text)))
+}
+
 /// Anchors used to insert evidence rows for one side of a code-edit event.
 /// Returns individual winnow hash tokens.
 fn edit_side_tokens(text: Option<&str>, hash: Option<&str>, anchors: &[String]) -> Vec<String> {
@@ -877,22 +894,28 @@ fn edit_side_tokens(text: Option<&str>, hash: Option<&str>, anchors: &[String]) 
     expand_legacy_anchors(hash, anchors)
 }
 
-/// Anchors used to insert edge rows for one side of a code-edit event.
-///
-/// * When `text` is available, returns window-level (comma-separated)
-///   fingerprints — one per 24-line window — to prevent N×M edge explosion.
-/// * For legacy tape events with pre-computed `anchor_hashes`, expands any
-///   comma-separated winnow entries into individual tokens so that edge
-///   targets remain queryable by exact equality.
-fn edit_side_edge_anchors(
-    text: Option<&str>,
-    hash: Option<&str>,
-    anchors: &[String],
-) -> Vec<String> {
-    if let Some(text) = text {
-        return fingerprint_anchor_hashes(text);
+fn edit_similarity(edit: &crate::tape::event::CodeEditEvent) -> f32 {
+    match (edit.before_text.as_deref(), edit.after_text.as_deref()) {
+        (Some(before), Some(after)) => {
+            let before = fingerprint_text(before);
+            let after = fingerprint_text(after);
+            fingerprint_similarity(&before.fingerprint, &after.fingerprint)
+                .or(edit.similarity)
+                .unwrap_or(0.0)
+        }
+        _ => edit.similarity.unwrap_or(0.0),
     }
-    expand_legacy_anchors(hash, anchors)
+}
+
+fn query_compatible_edge_pairs(before: &[String], after: &[String]) -> Vec<(String, String)> {
+    let pair_count = before.len().max(after.len());
+    (0..pair_count)
+        .map(|index| {
+            let before_index = index * before.len() / pair_count;
+            let after_index = index * after.len() / pair_count;
+            (before[before_index].clone(), after[after_index].clone())
+        })
+        .collect()
 }
 
 /// Expand legacy anchor_hashes into individual winnow tokens.

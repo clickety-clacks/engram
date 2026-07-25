@@ -1296,9 +1296,12 @@ mod tests {
             let evidence = index
                 .evidence_for_anchor(token)
                 .expect("evidence query should succeed");
-            assert_eq!(evidence.len(), 1, "token={token} evidence={evidence:?}");
-            assert_eq!(evidence[0].event_offset, edit.0);
-            assert_eq!(evidence[0].kind, EvidenceKind::Edit);
+            let edit_evidence = evidence
+                .iter()
+                .find(|row| row.kind == EvidenceKind::Edit && row.event_offset == edit.0)
+                .unwrap_or_else(|| panic!("token={token} evidence={evidence:?}"));
+            assert_eq!(edit_evidence.event_offset, edit.0);
+            assert_eq!(edit_evidence.kind, EvidenceKind::Edit);
         }
     }
 
