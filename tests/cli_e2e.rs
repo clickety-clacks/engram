@@ -678,7 +678,7 @@ fn explain_orders_sessions_by_touch_count_then_recency() {
 }
 
 #[test]
-fn gc_removes_unreferenced_tapes() {
+fn gc_preserves_unreferenced_tapes() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();
     let _ = run_json(repo, &["init"], None);
@@ -699,10 +699,11 @@ fn gc_removes_unreferenced_tapes() {
     assert_eq!(before["tapes"].as_array().expect("tapes").len(), 2);
 
     let gc = run_json(repo, &["gc"], None);
-    assert_eq!(gc["deleted_count"], 1);
+    assert_eq!(gc["deleted_count"], 0);
 
     let after = run_json(repo, &["tapes"], None);
-    assert_eq!(after["tapes"].as_array().expect("tapes").len(), 1);
+    assert_eq!(after["tapes"].as_array().expect("tapes").len(), 2);
+    assert_eq!(after["tapes"], before["tapes"]);
 }
 
 #[test]

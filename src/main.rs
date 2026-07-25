@@ -26,7 +26,8 @@ use engram::query::explain::{
 };
 use engram::store::atomic::atomic_write;
 use engram::tape::adapter::{
-    AdapterId, adapter_registry, convert_with_adapter, discover_sessions_with_adapter,
+    AdapterId, adapter_claims_input, adapter_registry, convert_with_adapter,
+    discover_sessions_with_adapter,
 };
 use engram::tape::compress::{compress_jsonl, decompress_jsonl};
 use engram::tape::event::{TapeEventAt, TapeEventData, parse_jsonl_events};
@@ -799,15 +800,7 @@ fn cmd_ingest(
             }
         };
 
-        let adapter = if let Some(adapter) = adapter_hint {
-            if convert_with_adapter(adapter, ingest_input).is_ok() {
-                Some(adapter)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let adapter = adapter_hint.filter(|adapter| adapter_claims_input(*adapter, ingest_input));
         let adapter = if let Some(value) = adapter {
             value
         } else if let Some(value) = detect_adapter_for_input(&abs_path, ingest_input) {
@@ -887,6 +880,13 @@ fn cmd_ingest(
                 continue;
             }
         };
+        if !events
+            .iter()
+            .any(|event| !matches!(event.event.data, TapeEventData::Meta(_)))
+        {
+            skipped_non_transcript += 1;
+            continue;
+        }
         let dispatch_links = extract_dispatch_links_from_transcript(ingest_input);
 
         let tape_id = tape_id_for_contents(&normalized);
@@ -1374,12 +1374,10 @@ fn detect_adapter_for_input(path: &Path, input: &str) -> Option<AdapterId> {
             None
         };
 
+    let mut candidates = Vec::new();
     if let Some(adapter) = preferred {
-        if convert_with_adapter(adapter, input).is_ok() {
-            return Some(adapter);
-        }
+        candidates.push(adapter);
     }
-
     for adapter in [
         AdapterId::CodexCli,
         AdapterId::ClaudeCode,
@@ -1388,7 +1386,13 @@ fn detect_adapter_for_input(path: &Path, input: &str) -> Option<AdapterId> {
         AdapterId::GeminiCli,
         AdapterId::OpenClaw,
     ] {
-        if convert_with_adapter(adapter, input).is_ok() {
+        if !candidates.contains(&adapter) {
+            candidates.push(adapter);
+        }
+    }
+
+    for adapter in candidates {
+        if adapter_claims_input(adapter, input) {
             return Some(adapter);
         }
     }
@@ -1852,38 +1856,22 @@ fn cmd_show(paths: &RepoPaths, context: &RuntimeContext, args: ShowArgs) -> Resu
 fn cmd_gc(paths: &RepoPaths, context: &RuntimeContext) -> Result<(), CliError> {
     ensure_local_store(paths)?;
     print_context_conspicuity(context);
-    ensure_db_parent(&context.db_path)?;
-    let index = SqliteIndex::open(&path_string(&context.db_path))?;
-    let referenced = index
-        .referenced_tape_ids()?
-        .into_iter()
-        .collect::<HashSet<_>>();
-
-    let mut deleted = Vec::new();
     let mut kept = 0usize;
 
     let entries = fs::read_dir(&paths.tapes).map_err(|err| CliError::io("read_dir_error", err))?;
     for entry in entries {
         let entry = entry.map_err(|err| CliError::io("read_dir_error", err))?;
         let path = entry.path();
-        let Some(tape_id) = tape_id_from_path(&path) else {
+        let Some(_) = tape_id_from_path(&path) else {
             continue;
         };
-
-        if referenced.contains(&tape_id) {
-            kept += 1;
-            continue;
-        }
-
-        fs::remove_file(&path).map_err(|err| CliError::io("remove_file_error", err))?;
-        deleted.push(tape_id);
+        kept += 1;
     }
 
-    deleted.sort();
     print_json(&json!({
         "status": "ok",
-        "deleted_tape_ids": deleted,
-        "deleted_count": deleted.len(),
+        "deleted_tape_ids": [],
+        "deleted_count": 0,
         "kept_count": kept,
     }))
 }

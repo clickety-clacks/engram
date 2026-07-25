@@ -837,6 +837,8 @@ impl From<serde_json::Error> for AdapterError {
 pub trait HarnessAdapter {
     fn adapter_id(&self) -> AdapterId;
 
+    fn claims_input(&self, input: &str) -> bool;
+
     fn convert_to_tape_jsonl(&self, input: &str) -> Result<String, AdapterError>;
 
     fn discover_sessions_for_repo(&self, repo_path: &Path, home_dir: &Path) -> Vec<PathBuf> {
@@ -857,6 +859,16 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         AdapterId::ClaudeCode
     }
 
+    fn claims_input(&self, input: &str) -> bool {
+        jsonl_has_matching_row(input, |row| {
+            matches!(
+                row.get("type").and_then(Value::as_str),
+                Some("user" | "assistant")
+            ) && row.get("message").is_some_and(Value::is_object)
+        })
+        .unwrap_or(false)
+    }
+
     fn discover_sessions_for_repo(&self, repo_path: &Path, home_dir: &Path) -> Vec<PathBuf> {
         discover_claude_sessions(repo_path, home_dir)
     }
@@ -872,6 +884,16 @@ pub struct CodexCliAdapter;
 impl HarnessAdapter for CodexCliAdapter {
     fn adapter_id(&self) -> AdapterId {
         AdapterId::CodexCli
+    }
+
+    fn claims_input(&self, input: &str) -> bool {
+        jsonl_has_matching_row(input, |row| {
+            matches!(
+                row.get("type").and_then(Value::as_str),
+                Some("session_meta" | "response_item")
+            ) && row.get("payload").is_some_and(Value::is_object)
+        })
+        .unwrap_or(false)
     }
 
     fn discover_sessions_for_repo(&self, repo_path: &Path, home_dir: &Path) -> Vec<PathBuf> {
@@ -891,6 +913,25 @@ impl HarnessAdapter for OpenCodeAdapter {
         AdapterId::OpenCode
     }
 
+    fn claims_input(&self, input: &str) -> bool {
+        serde_json::from_str::<Value>(input).is_ok_and(|root| {
+            root.get("info").is_some_and(Value::is_object)
+                && root
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .is_some_and(|messages| {
+                        messages.iter().any(|message| {
+                            message
+                                .get("info")
+                                .and_then(|info| info.get("role"))
+                                .and_then(Value::as_str)
+                                .is_some_and(|role| matches!(role, "user" | "assistant"))
+                                && message.get("parts").is_some_and(Value::is_array)
+                        })
+                    })
+        })
+    }
+
     fn discover_sessions_for_repo(&self, repo_path: &Path, home_dir: &Path) -> Vec<PathBuf> {
         discover_opencode_sessions(repo_path, home_dir)
     }
@@ -906,6 +947,29 @@ pub struct CursorAdapter;
 impl HarnessAdapter for CursorAdapter {
     fn adapter_id(&self) -> AdapterId {
         AdapterId::Cursor
+    }
+
+    fn claims_input(&self, input: &str) -> bool {
+        jsonl_has_matching_row(input, |row| {
+            (row.get("type").and_then(Value::as_str) == Some("system")
+                && row.get("subtype").and_then(Value::as_str) == Some("init"))
+                || (row.get("type").and_then(Value::as_str) == Some("tool_call")
+                    && matches!(
+                        row.get("subtype").and_then(Value::as_str),
+                        Some("started" | "completed")
+                    )
+                    && row.get("tool_call").is_some_and(Value::is_object))
+                || (matches!(
+                    row.get("type").and_then(Value::as_str),
+                    Some("user" | "assistant")
+                ) && row.get("session_id").and_then(Value::as_str).is_some()
+                    && row
+                        .get("message")
+                        .and_then(|message| message.get("content"))
+                        .and_then(Value::as_str)
+                        .is_some())
+        })
+        .unwrap_or(false)
     }
 
     fn discover_sessions_for_repo(&self, repo_path: &Path, home_dir: &Path) -> Vec<PathBuf> {
@@ -925,6 +989,34 @@ impl HarnessAdapter for GeminiCliAdapter {
         AdapterId::GeminiCli
     }
 
+    fn claims_input(&self, input: &str) -> bool {
+        serde_json::from_str::<Value>(input).is_ok_and(|root| match root {
+            Value::Array(rows) => rows.iter().any(|row| {
+                row.get("sessionId").and_then(Value::as_str).is_some()
+                    && matches!(
+                        row.get("type").and_then(Value::as_str),
+                        Some("user" | "gemini")
+                    )
+                    && row.get("message").and_then(Value::as_str).is_some()
+            }),
+            Value::Object(_) => {
+                root.get("sessionId").and_then(Value::as_str).is_some()
+                    && root
+                        .get("messages")
+                        .and_then(Value::as_array)
+                        .is_some_and(|messages| {
+                            messages.iter().any(|message| {
+                                matches!(
+                                    message.get("type").and_then(Value::as_str),
+                                    Some("user" | "gemini")
+                                ) && message.get("content").is_some()
+                            })
+                        })
+            }
+            _ => false,
+        })
+    }
+
     fn discover_sessions_for_repo(&self, repo_path: &Path, home_dir: &Path) -> Vec<PathBuf> {
         discover_gemini_sessions(repo_path, home_dir)
     }
@@ -940,6 +1032,28 @@ pub struct OpenClawAdapter;
 impl HarnessAdapter for OpenClawAdapter {
     fn adapter_id(&self) -> AdapterId {
         AdapterId::OpenClaw
+    }
+
+    fn claims_input(&self, input: &str) -> bool {
+        jsonl_has_matching_row(input, |row| {
+            (row.get("type").and_then(Value::as_str) == Some("session")
+                && (row.get("id").and_then(Value::as_str).is_some()
+                    || row.get("session_id").and_then(Value::as_str).is_some()
+                    || row.get("sessionId").and_then(Value::as_str).is_some()))
+                || (row.get("type").and_then(Value::as_str) == Some("message")
+                    && row
+                        .get("message")
+                        .and_then(|message| message.get("role"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|role| {
+                            matches!(role, "user" | "assistant" | "toolResult")
+                        })
+                    && row
+                        .get("message")
+                        .and_then(|message| message.get("content"))
+                        .is_some_and(Value::is_array))
+        })
+        .unwrap_or(false)
     }
 
     fn discover_sessions_for_repo(&self, repo_path: &Path, home_dir: &Path) -> Vec<PathBuf> {
@@ -960,6 +1074,31 @@ pub fn convert_with_adapter(id: AdapterId, input: &str) -> Result<String, Adapte
         AdapterId::GeminiCli => GeminiCliAdapter.convert_to_tape_jsonl(input),
         AdapterId::OpenClaw => OpenClawAdapter.convert_to_tape_jsonl(input),
     }
+}
+
+pub fn adapter_claims_input(id: AdapterId, input: &str) -> bool {
+    match id {
+        AdapterId::ClaudeCode => ClaudeCodeAdapter.claims_input(input),
+        AdapterId::CodexCli => CodexCliAdapter.claims_input(input),
+        AdapterId::OpenCode => OpenCodeAdapter.claims_input(input),
+        AdapterId::Cursor => CursorAdapter.claims_input(input),
+        AdapterId::GeminiCli => GeminiCliAdapter.claims_input(input),
+        AdapterId::OpenClaw => OpenClawAdapter.claims_input(input),
+    }
+}
+
+fn jsonl_has_matching_row(
+    input: &str,
+    mut matches_signature: impl FnMut(&Value) -> bool,
+) -> Option<bool> {
+    let mut saw_row = false;
+    let mut matched = false;
+    for line in input.lines().filter(|line| !line.trim().is_empty()) {
+        saw_row = true;
+        let row = serde_json::from_str(line).ok()?;
+        matched |= matches_signature(&row);
+    }
+    saw_row.then_some(matched)
 }
 
 pub fn discover_sessions_with_adapter(
