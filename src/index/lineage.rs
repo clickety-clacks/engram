@@ -11,7 +11,7 @@ pub enum EvidenceKind {
     Message,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LocationDelta {
     Same,
     Adjacent,
@@ -19,7 +19,7 @@ pub enum LocationDelta {
     Absent,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Cardinality {
     OneToOne,
     OneToMany,

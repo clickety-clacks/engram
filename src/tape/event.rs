@@ -194,6 +194,8 @@ struct RawEvent {
     args: Option<serde_json::Value>,
     #[serde(default)]
     stdout: Option<serde_json::Value>,
+    #[serde(default)]
+    stderr: Option<serde_json::Value>,
 }
 
 impl RawEvent {
@@ -242,7 +244,7 @@ impl RawEvent {
             "tool.call" => textual_payload(self.args)
                 .map(|text| TapeEventData::Textual(TextualEvent { kind, text }))
                 .unwrap_or(TapeEventData::Other { kind }),
-            "tool.result" => textual_payload(self.stdout)
+            "tool.result" => tool_result_payload(self.stdout, self.stderr)
                 .map(|text| TapeEventData::Textual(TextualEvent { kind, text }))
                 .unwrap_or(TapeEventData::Other { kind }),
             "meta" => TapeEventData::Meta(MetaEvent {
@@ -265,6 +267,18 @@ impl RawEvent {
 
 fn textual_payload(value: Option<serde_json::Value>) -> Option<String> {
     value?.as_str().map(ToOwned::to_owned)
+}
+
+fn tool_result_payload(
+    stdout: Option<serde_json::Value>,
+    stderr: Option<serde_json::Value>,
+) -> Option<String> {
+    match (textual_payload(stdout), textual_payload(stderr)) {
+        (Some(stdout), Some(stderr)) => Some(format!("{stdout}\n{stderr}")),
+        (Some(stdout), None) => Some(stdout),
+        (None, Some(stderr)) => Some(stderr),
+        (None, None) => None,
+    }
 }
 
 fn file_range(raw: [u32; 2]) -> FileRange {

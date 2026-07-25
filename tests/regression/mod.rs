@@ -571,6 +571,66 @@ fn grep_ranks_provenance_matches_before_recent_text_mentions() {
 }
 
 #[test]
+fn stderr_only_tool_result_is_fingerprinted_without_empty_file_touch() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = home.join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    write_repo_file(&repo, "src/stderr.rs", "fn stderr_after() { fixed(); }\n");
+    let _ = run_json(&repo, &["init"], None, &home);
+
+    let stderr_text = "compiler stderr reports the unresolved repair target in this module";
+    let record = [
+        json!({
+            "t": "2026-03-18T04:00:00Z",
+            "k": "code.edit",
+            "file": "src/stderr.rs",
+            "before_range": [1, 1],
+            "after_range": [1, 1],
+            "before_text": "fn stderr_before() { broken(); }\n",
+            "after_text": "fn stderr_after() { fixed(); }\n",
+            "similarity": 0.8,
+        })
+        .to_string(),
+        json!({
+            "t": "2026-03-18T04:00:01Z",
+            "k": "tool.result",
+            "tool": "cargo check",
+            "exit": 1,
+            "stderr": stderr_text,
+        })
+        .to_string(),
+    ]
+    .join("\n")
+        + "\n";
+    let _ = run_json(&repo, &["record", "--stdin"], Some(&record), &home);
+
+    let stderr_explain = run_json(&repo, &["explain", stderr_text], None, &home);
+    let stderr_sessions = stderr_explain["sessions"].as_array().expect("sessions");
+    assert_eq!(stderr_sessions.len(), 1);
+    assert!(stderr_sessions[0]["touches"].as_array().is_some_and(|touches| {
+        touches.iter().any(|touch| touch["kind"] == "tool")
+    }));
+    assert_eq!(
+        stderr_sessions[0]["files_touched"],
+        json!(["src/stderr.rs"]),
+        "textual evidence should use transcript file fallback without an empty path"
+    );
+
+    let edit_explain = run_json(
+        &repo,
+        &["explain", "fn stderr_after() { fixed(); }\n"],
+        None,
+        &home,
+    );
+    assert_eq!(
+        edit_explain["sessions"][0]["files_touched"],
+        json!(["src/stderr.rs"]),
+        "direct edit evidence should retain exactly the real file list"
+    );
+}
+
+#[test]
 fn metrics_logging_writes_expected_jsonl_row() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");

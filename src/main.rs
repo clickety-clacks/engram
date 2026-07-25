@@ -2609,6 +2609,7 @@ fn format_sessions_for_agent(
                 touches
                     .iter()
                     .filter_map(|touch| touch.get("file_path").and_then(Value::as_str))
+                    .filter(|file| !file.is_empty())
                     .map(ToOwned::to_owned)
                     .collect::<HashSet<_>>()
             })

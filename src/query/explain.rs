@@ -94,19 +94,17 @@ pub fn retrieve_lineage(
         let mut edges =
             index.inbound_edges(&anchor, traversal.min_confidence, include_forensics)?;
         edges.extend(index.outbound_edges(&anchor, traversal.min_confidence, include_forensics)?);
+        let mut candidate_edges = HashSet::new();
+        edges.retain(|edge| {
+            let key = edge_key(edge);
+            !seen_edges.contains(&key) && candidate_edges.insert(key)
+        });
+        edges.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
         for edge in edges.into_iter().take(traversal.max_fanout) {
             if out.len() >= traversal.max_edges {
                 break;
             }
-            let key = (
-                edge.from_anchor.clone(),
-                edge.to_anchor.clone(),
-                edge.confidence.to_bits(),
-                edge.agent_link,
-            );
-            if !seen_edges.insert(key) {
-                continue;
-            }
+            seen_edges.insert(edge_key(&edge));
             let next = if edge.from_anchor == anchor {
                 &edge.to_anchor
             } else {
@@ -120,6 +118,28 @@ pub fn retrieve_lineage(
     }
 
     Ok(out)
+}
+
+fn edge_key(
+    edge: &EdgeRow,
+) -> (
+    String,
+    String,
+    u32,
+    crate::index::lineage::LocationDelta,
+    crate::index::lineage::Cardinality,
+    bool,
+    Option<String>,
+) {
+    (
+        edge.from_anchor.clone(),
+        edge.to_anchor.clone(),
+        edge.confidence.to_bits(),
+        edge.location_delta,
+        edge.cardinality,
+        edge.agent_link,
+        edge.note.clone(),
+    )
 }
 
 pub fn explain_by_anchor(
@@ -337,5 +357,59 @@ mod tests {
         assert_eq!(lineage.len(), 1);
         assert_eq!(lineage[0].from_anchor, "b");
         assert_eq!(lineage[0].to_anchor, "c");
+    }
+
+    #[test]
+    fn lineage_fanout_sorts_mixed_directions_after_dropping_seen_edges() {
+        let index = SqliteIndex::open_in_memory().expect("sqlite");
+        for (from_anchor, to_anchor, confidence) in [
+            ("start", "pivot", 0.99),
+            ("other", "pivot", 0.80),
+            ("pivot", "best", 0.95),
+        ] {
+            index
+                .insert_edge(
+                    &SpanEdge {
+                        from_anchor: from_anchor.to_string(),
+                        to_anchor: to_anchor.to_string(),
+                        confidence,
+                        location_delta: LocationDelta::Moved,
+                        cardinality: Cardinality::OneToOne,
+                        agent_link: false,
+                        note: None,
+                    },
+                    LINK_THRESHOLD_DEFAULT,
+                )
+                .expect("insert edge");
+        }
+
+        let lineage = retrieve_lineage(
+            &index,
+            &["start".to_string()],
+            ExplainTraversal {
+                max_fanout: 2,
+                max_depth: 2,
+                ..ExplainTraversal::default()
+            },
+            false,
+        )
+        .expect("retrieve lineage");
+
+        assert_eq!(lineage.len(), 3);
+        assert_eq!(
+            lineage
+                .iter()
+                .map(|edge| (
+                    edge.from_anchor.as_str(),
+                    edge.to_anchor.as_str(),
+                    edge.confidence
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("start", "pivot", 0.99),
+                ("pivot", "best", 0.95),
+                ("other", "pivot", 0.80),
+            ]
+        );
     }
 }

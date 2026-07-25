@@ -889,7 +889,10 @@ fn fingerprint_evidence_policy(data: &TapeEventData) -> Option<(EvidenceKind, Ve
 /// Returns individual winnow hash tokens.
 fn edit_side_tokens(text: Option<&str>, hash: Option<&str>, anchors: &[String]) -> Vec<String> {
     if let Some(text) = text {
-        return fingerprint_token_hashes(text);
+        let tokens = fingerprint_token_hashes(text);
+        if !tokens.is_empty() {
+            return tokens;
+        }
     }
     expand_legacy_anchors(hash, anchors)
 }
@@ -1205,6 +1208,57 @@ mod tests {
             .expect("after winnow token evidence");
         assert_eq!(after_refs.len(), 1);
         assert_eq!(after_refs[0].kind, EvidenceKind::Edit);
+    }
+
+    #[test]
+    fn empty_computed_edit_fingerprints_fall_back_to_location_only_anchor_edge() {
+        let index = SqliteIndex::open_in_memory().expect("in-memory sqlite");
+        let before_anchor = "winnow:0000000000000001";
+        let after_anchor = "winnow:0000000000000002";
+        let events = vec![TapeEventAt {
+            offset: 1,
+            event: TapeEvent {
+                timestamp: "2026-02-22T00:00:01Z".to_string(),
+                data: TapeEventData::CodeEdit(CodeEditEvent {
+                    file: "src/lib.rs".to_string(),
+                    before_range: Some(FileRange { start: 10, end: 10 }),
+                    after_range: Some(FileRange { start: 10, end: 10 }),
+                    before_text: Some(String::new()),
+                    after_text: Some(String::new()),
+                    before_hash: None,
+                    after_hash: None,
+                    before_anchor_hashes: vec![before_anchor.to_string()],
+                    after_anchor_hashes: vec![after_anchor.to_string()],
+                    similarity: Some(0.20),
+                }),
+            },
+        }];
+
+        index
+            .ingest_tape_events("tape-1", &events, LINK_THRESHOLD_DEFAULT)
+            .expect("ingest succeeds");
+
+        assert_eq!(
+            index
+                .evidence_for_anchor(before_anchor)
+                .expect("before fallback evidence")
+                .len(),
+            1
+        );
+        assert_eq!(
+            index
+                .evidence_for_anchor(after_anchor)
+                .expect("after fallback evidence")
+                .len(),
+            1
+        );
+        let edges = index
+            .outbound_edges(before_anchor, 0.0, true)
+            .expect("fallback edge");
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].to_anchor, after_anchor);
+        assert_eq!(edges[0].confidence, 0.20);
+        assert_eq!(edges[0].stored_class, StoredEdgeClass::LocationOnly);
     }
 
     #[test]
