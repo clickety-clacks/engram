@@ -1,4 +1,5 @@
 pub mod explain;
+pub mod format;
 pub mod rank;
 
 pub use explain::{
