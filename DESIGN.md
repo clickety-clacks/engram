@@ -633,7 +633,9 @@ Dump a tape's events. Default: compacted view. `--raw` for full event stream.
 
 ### `engram gc`
 
-Garbage-collect unreferenced content-addressed blobs. Keeps index entries and lineage links.
+<!-- CHANGED: Deprecated generic gc and replaced the fictional blob-store behavior with the explicit derived-index lifecycle. -->
+
+Deprecated and permanently non-destructive. `engram gc` reports the tape store and never deletes anything. Tapes are immutable, and no blob store exists today. The disposable derived index is maintained through the explicit rebuild, validate, atomic swap, and deliberate retire runbook in [`docs/index-lifecycle.md`](docs/index-lifecycle.md).
 
 ### `engram search <query>` (future)
 

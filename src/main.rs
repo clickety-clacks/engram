@@ -384,6 +384,30 @@ EXAMPLES:
   engram rate result_abc123 --outcome misleading --note "sent me to the wrong session"
 "#;
 
+const HELP_GC: &str = r#"Deprecated. Reports the tape store; deletes nothing, ever.
+
+Tapes are immutable and permanent — never a GC target.
+The blob store this command was designed for does not exist.
+The derived index is a disposable cache with an explicit
+lifecycle instead of garbage collection:
+
+  rebuild   re-ingest all tapes into a staging index
+            (isolated config; never rebuild in place)
+  validate  PRAGMA quick_check + sanity queries on staging
+  swap      atomic rename of staging over live
+  retire    keep the old index as a rollback artifact;
+            delete it only as a deliberate operator action
+
+See docs/index-lifecycle.md in the Engram repo for the runbook.
+
+OUTPUT:
+  JSON on stdout: {"status":"ok","deprecated":true,
+  "deleted_tape_ids":[],"deleted_count":0,"kept_count":N}
+
+This command is retained for compatibility; it exits 0 on
+success and always reports deleted_count 0.
+"#;
+
 fn maybe_print_spec_help() -> Result<bool, CliError> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let help_flag = |value: &str| value == "--help" || value == "-h";
@@ -409,6 +433,10 @@ fn maybe_print_spec_help() -> Result<bool, CliError> {
             }
             "rate" => {
                 print!("{HELP_RATE}");
+                return Ok(true);
+            }
+            "gc" => {
+                print!("{HELP_GC}");
                 return Ok(true);
             }
             _ => {}
@@ -1089,6 +1117,9 @@ fn cmd_show(paths: &RepoPaths, context: &RuntimeContext, args: ShowArgs) -> Resu
 fn cmd_gc(paths: &RepoPaths, context: &RuntimeContext) -> Result<(), CliError> {
     ensure_local_store(paths)?;
     print_context_conspicuity(context);
+    eprintln!(
+        "deprecation: engram gc is deprecated and permanently non-destructive; tapes are immutable and the derived index is maintained by explicit rebuild/validate/swap/retire (see `engram gc --help`)"
+    );
     let mut kept = 0usize;
 
     let entries = fs::read_dir(&paths.tapes).map_err(|err| CliError::io("read_dir_error", err))?;
@@ -1103,6 +1134,7 @@ fn cmd_gc(paths: &RepoPaths, context: &RuntimeContext) -> Result<(), CliError> {
 
     print_json(&json!({
         "status": "ok",
+        "deprecated": true,
         "deleted_tape_ids": [],
         "deleted_count": 0,
         "kept_count": kept,
