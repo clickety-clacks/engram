@@ -1,3 +1,15 @@
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use serde_json::{Value, json};
+
+use crate::config::EffectiveConfig;
+use crate::tape::compress::decompress_jsonl;
+use crate::{CliError, RepoPaths, RuntimeContext};
+
+const TAPE_SUFFIX: &str = ".jsonl.zst";
+
 pub(crate) fn tape_path_for_id(paths: &RepoPaths, tape_id: &str) -> PathBuf {
     paths.tapes.join(format!("{tape_id}{TAPE_SUFFIX}"))
 }
@@ -44,11 +56,66 @@ pub fn read_tape_content(path: &Path) -> Result<String, CliError> {
     let bytes = fs::read(path).map_err(|err| CliError::io("read_error", err))?;
     decompress_jsonl(&bytes).map_err(|err| CliError::io("decompress_error", err))
 }
-use std::fs;
-use std::path::{Path, PathBuf};
 
-use crate::config::EffectiveConfig;
-use crate::tape::compress::decompress_jsonl;
-use crate::{CliError, RepoPaths, RuntimeContext};
+#[derive(Debug, Clone)]
+pub struct TapeRow {
+    pub offset: u64,
+    pub value: Value,
+}
 
-const TAPE_SUFFIX: &str = ".jsonl.zst";
+pub(crate) fn event_window(rows: &[TapeRow], target_offset: u64, radius: usize) -> Option<Value> {
+    let pos = rows.iter().position(|row| row.offset == target_offset)?;
+    let start = pos.saturating_sub(radius);
+    let end = usize::min(rows.len().saturating_sub(1), pos + radius);
+    let events = rows[start..=end]
+        .iter()
+        .map(|row| {
+            json!({
+                "offset": row.offset,
+                "event": row.value,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Some(json!({
+        "touch_offset": target_offset,
+        "events": events,
+    }))
+}
+
+pub fn parse_jsonl_rows(input: &str) -> Result<Vec<TapeRow>, CliError> {
+    let mut rows = Vec::new();
+    for (idx, line) in input.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(line)?;
+        rows.push(TapeRow {
+            offset: idx as u64,
+            value,
+        });
+    }
+    Ok(rows)
+}
+
+pub(crate) fn load_tape_rows_cached<'a>(
+    context: &RuntimeContext,
+    cache: &'a mut HashMap<String, Vec<TapeRow>>,
+    tape_id: &str,
+) -> Result<&'a Vec<TapeRow>, CliError> {
+    if !cache.contains_key(tape_id) {
+        let Some(tape_path) = resolve_tape_path(context, tape_id) else {
+            cache.insert(tape_id.to_string(), Vec::new());
+            return Ok(cache.get(tape_id).expect("cache entry inserted"));
+        };
+        let content = read_tape_content(&tape_path)?;
+        cache.insert(tape_id.to_string(), parse_jsonl_rows(&content)?);
+    }
+    Ok(cache.get(tape_id).expect("cache entry inserted"))
+}
+
+pub fn print_json(value: &Value) -> Result<(), CliError> {
+    let rendered = serde_json::to_string(value)?;
+    println!("{rendered}");
+    Ok(())
+}

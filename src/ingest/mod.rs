@@ -1,3 +1,29 @@
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
+
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
+use walkdir::WalkDir;
+
+use crate::dispatch::extract_dispatch_links_from_transcript;
+use crate::index::SqliteIndex;
+use crate::index::lineage::LINK_THRESHOLD_DEFAULT;
+use crate::store::atomic::atomic_write;
+use crate::store::tapes::{print_json, tape_path_for_id, tape_path_for_tapes_dir};
+use crate::tape::adapter::{
+    AdapterId, adapter_claims_input, adapter_registry, convert_with_adapter,
+    discover_sessions_with_adapter,
+};
+use crate::tape::compress::compress_jsonl;
+use crate::tape::event::{TapeEventAt, TapeEventData, parse_jsonl_events};
+use crate::{CliError, RepoPaths, RuntimeContext, ensure_db_parent, home_dir, path_string};
+
+const CURSOR_GUARD_WINDOW: usize = 512;
+
 pub fn run_ingest(
     cwd: &Path,
     paths: &RepoPaths,
@@ -321,33 +347,6 @@ pub fn run_ingest(
         "failures": failures,
     }))
 }
-
-use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
-
-use chrono::Utc;
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
-use walkdir::WalkDir;
-
-use crate::dispatch::extract_dispatch_links_from_transcript;
-use crate::index::SqliteIndex;
-use crate::index::lineage::LINK_THRESHOLD_DEFAULT;
-use crate::query::format::print_json;
-use crate::store::atomic::atomic_write;
-use crate::store::tapes::{tape_path_for_id, tape_path_for_tapes_dir};
-use crate::tape::adapter::{
-    AdapterId, adapter_claims_input, adapter_registry, convert_with_adapter,
-    discover_sessions_with_adapter,
-};
-use crate::tape::compress::compress_jsonl;
-use crate::tape::event::{TapeEventAt, TapeEventData, parse_jsonl_events};
-use crate::{CliError, RepoPaths, RuntimeContext, ensure_db_parent, home_dir, path_string};
-
-const CURSOR_GUARD_WINDOW: usize = 512;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct IngestCursorGuard {

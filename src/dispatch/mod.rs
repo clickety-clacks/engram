@@ -1,3 +1,13 @@
+use std::collections::{HashMap, HashSet};
+
+use serde_json::{Value, json};
+
+use crate::index::{DispatchDirection, DispatchLink, DispatchLinkRow, SqliteIndex};
+use crate::store::tapes::{TapeRow, event_window, load_tape_rows_cached};
+use crate::{CliError, RuntimeContext};
+
+const TRANSCRIPT_WINDOW_RADIUS: usize = 2;
+
 pub fn collect_dispatch_upstream_sessions(
     context: &RuntimeContext,
     index: &SqliteIndex,
@@ -354,12 +364,3 @@ pub(crate) fn is_uuid_format(raw: &str) -> bool {
     }
     true
 }
-use std::collections::{HashMap, HashSet};
-
-use serde_json::{Value, json};
-
-use crate::index::{DispatchDirection, DispatchLink, DispatchLinkRow, SqliteIndex};
-use crate::query::format::{TapeRow, event_window, load_tape_rows_cached};
-use crate::{CliError, RuntimeContext};
-
-const TRANSCRIPT_WINDOW_RADIUS: usize = 2;

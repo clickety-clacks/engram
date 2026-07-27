@@ -14,16 +14,30 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use engram::config::{
     EffectiveWatchSource, ensure_user_config, load_effective_config_with_override,
 };
-use engram::dispatch::*;
+use engram::dispatch::{
+    collect_dispatch_upstream_sessions, extract_dispatch_links_from_transcript,
+};
 #[cfg(test)]
 use engram::index::DispatchDirection;
 use engram::index::SqliteIndex;
 use engram::index::lineage::LINK_THRESHOLD_DEFAULT;
-use engram::ingest::*;
+use engram::ingest::{extract_meta, git_head, now_iso8601, record_transcript, run_ingest};
 use engram::query::explain::ExplainTraversal;
-use engram::query::format::*;
+#[cfg(test)]
+use engram::query::format::MAX_QUERY_WINDOW_ANCHORS;
+use engram::query::format::{
+    DateFilter, ExplainTarget, annotate_chain_fields, apply_session_truncation,
+    build_chain_metadata, build_session_windows, classify_explain_target, collect_anchor_scores,
+    collect_grep_matches, collect_touch_evidence, compact_event, compare_grep_sessions,
+    default_peek_anchor_line, derive_anchor_candidates, edge_to_json, emit_query_result,
+    explain_across_indexes, extract_latest_timestamp_from_rows, format_sessions_for_agent,
+    open_query_indexes, print_pretty_explain, read_file_span_variants, session_matches_date_filter,
+};
 use engram::store::atomic::atomic_write;
-use engram::store::tapes::*;
+use engram::store::tapes::{
+    parse_jsonl_rows, print_json, read_tape_content, resolve_tape_path, tape_id_from_path,
+    tape_lookup_dirs,
+};
 use engram::tape::compress::decompress_jsonl;
 use engram::tape::event::parse_jsonl_events;
 use engram::{CliError, RepoPaths, RuntimeContext, ensure_db_parent, home_dir, path_string};
