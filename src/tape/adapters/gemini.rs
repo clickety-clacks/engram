@@ -188,14 +188,14 @@ pub fn gemini_json_to_tape_jsonl(input: &str) -> Result<String, serde_json::Erro
                             && tool_call.get("status").and_then(Value::as_str) == Some("success")
                         {
                             if tool.eq_ignore_ascii_case("read_file")
-                                && !stdout.is_empty()
+                                && let Some(output) = gemini_response_output(tool_call)
                                 && let Some(file) = args.get("file_path").and_then(Value::as_str)
                             {
-                                let count = stdout.lines().count() as u32;
+                                let count = output.lines().count().max(1) as u32;
                                 out.push(json!({
                                     "t": tool_timestamp, "k": "code.read",
                                     "source": source_block(session_id), "file": file,
-                                    "range": [1, count], "text": stdout, "range_basis": "line"
+                                    "range": [1, count], "text": output, "range_basis": "line"
                                 }));
                                 read_emitted = read_emitted.saturating_add(1);
                             } else if tool.eq_ignore_ascii_case("write_file")
@@ -289,6 +289,21 @@ fn extract_gemini_tool_result(tool_call: &Value) -> (String, String, i32) {
     }
 
     (stdout, stderr, exit)
+}
+
+fn gemini_response_output(tool_call: &Value) -> Option<&str> {
+    tool_call
+        .get("result")
+        .and_then(Value::as_array)?
+        .iter()
+        .rev()
+        .find_map(|result| {
+            result
+                .get("functionResponse")
+                .and_then(|item| item.get("response"))
+                .and_then(|response| response.get("output"))
+                .and_then(Value::as_str)
+        })
 }
 
 fn source_block(session_id: Option<&str>) -> Value {

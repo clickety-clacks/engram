@@ -200,8 +200,8 @@ fn native_adapters_emit_only_conclusive_success_with_required_material() {
         (
             gemini_json_to_tape_jsonl,
             include_str!("fixtures/t1772/gemini.json"),
-            2,
-            "partial",
+            3,
+            "full",
             "partial",
         ),
         (
@@ -235,11 +235,58 @@ fn native_adapters_emit_only_conclusive_success_with_required_material() {
                     .get("text")
                     .and_then(Value::as_str)
                     .is_some_and(|text| !text.is_empty())
+                    || (event["source"]["harness"] == "gemini-cli"
+                        && event["k"] == "code.read"
+                        && event["text"] == ""
+                        && event["range"] == serde_json::json!([1, 1])
+                        && event["range_basis"] == "line")
                     || event.get("before_text").and_then(Value::as_str).is_some()
                     || event.get("after_text").and_then(Value::as_str).is_some()
             );
         }
     }
+}
+
+#[test]
+fn gemini_empty_native_read_is_conclusive_but_missing_output_and_empty_shell_are_not() {
+    let fixture_rows =
+        events(&gemini_json_to_tape_jsonl(include_str!("fixtures/t1772/gemini.json")).unwrap());
+    assert_eq!(fixture_rows.len(), 14, "{fixture_rows:?}");
+    let empty_result_index = fixture_rows
+        .iter()
+        .position(|row| row["k"] == "tool.result" && row["call_id"] == "read-empty")
+        .unwrap();
+    assert_eq!(fixture_rows[empty_result_index + 1]["k"], "code.read");
+    assert_eq!(fixture_rows[empty_result_index + 1]["file"], "src/empty.rs");
+    assert_eq!(
+        fixture_rows[empty_result_index + 1]["range"],
+        serde_json::json!([1, 1])
+    );
+    assert_eq!(fixture_rows[empty_result_index + 1]["text"], "");
+    assert_eq!(fixture_rows[empty_result_index + 1]["range_basis"], "line");
+
+    let empty_native = r#"{"sessionId":"empty-native","messages":[{"type":"gemini","toolCalls":[{"id":"empty-native","name":"read_file","args":{"file_path":"src/empty.rs"},"status":"success","result":[{"functionResponse":{"response":{"output":""}}}]}]}]}"#;
+    let rows = events(&gemini_json_to_tape_jsonl(empty_native).unwrap());
+    assert_eq!(rows.len(), 4, "{rows:?}");
+    assert_eq!(rows[0]["coverage.read"], "full");
+    assert_eq!(rows[1]["k"], "tool.call");
+    assert_eq!(rows[2]["k"], "tool.result");
+    assert_eq!(rows[3]["k"], "code.read");
+    assert_eq!(rows[3]["file"], "src/empty.rs");
+    assert_eq!(rows[3]["range"], serde_json::json!([1, 1]));
+    assert_eq!(rows[3]["text"], "");
+    assert_eq!(rows[3]["range_basis"], "line");
+
+    let missing_output = r#"{"sessionId":"missing-output","messages":[{"type":"gemini","toolCalls":[{"id":"missing-output","name":"read_file","args":{"file_path":"src/unknown.rs"},"status":"success","result":[{"functionResponse":{"response":{}}}]}]}]}"#;
+    let rows = events(&gemini_json_to_tape_jsonl(missing_output).unwrap());
+    assert_eq!(rows[0]["coverage.read"], "partial", "{rows:?}");
+    assert!(structured(&rows).is_empty(), "{rows:?}");
+
+    let empty_shell = r#"{"sessionId":"empty-shell","messages":[{"type":"gemini","toolCalls":[{"id":"empty-shell","name":"run_shell_command","args":{"command":"cat src/empty.rs"},"status":"success","result":[{"functionResponse":{"response":{"output":""}}}]}]}]}"#;
+    let rows = events(&gemini_json_to_tape_jsonl(empty_shell).unwrap());
+    assert_eq!(rows[0]["coverage.read"], "partial", "{rows:?}");
+    assert_eq!(rows[0]["coverage.edit"], "partial", "{rows:?}");
+    assert!(structured(&rows).is_empty(), "{rows:?}");
 }
 
 #[test]
