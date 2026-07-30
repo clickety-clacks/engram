@@ -81,13 +81,23 @@ pub struct DispatchLinkRow {
 
 pub struct SqliteIndex {
     conn: Connection,
+    access_kind: AccessKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessKind {
+    Reader,
+    Writer,
 }
 
 impl SqliteIndex {
     pub fn open_writer(path: &str) -> rusqlite::Result<Self> {
         let existed = Path::new(path).exists();
         let conn = Connection::open(path)?;
-        let index = Self { conn };
+        let index = Self {
+            conn,
+            access_kind: AccessKind::Writer,
+        };
         let version = index.user_version()?;
         if existed && version != SCHEMA_VERSION {
             return Err(rusqlite::Error::InvalidQuery);
@@ -116,7 +126,10 @@ impl SqliteIndex {
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
             )?
         };
-        let index = Self { conn };
+        let index = Self {
+            conn,
+            access_kind: AccessKind::Reader,
+        };
         if index.user_version()? != SCHEMA_VERSION {
             return Err(rusqlite::Error::InvalidQuery);
         }
@@ -125,10 +138,36 @@ impl SqliteIndex {
 
     pub fn open_in_memory() -> rusqlite::Result<Self> {
         let conn = Connection::open_in_memory()?;
-        let index = Self { conn };
+        let index = Self {
+            conn,
+            access_kind: AccessKind::Writer,
+        };
         index.configure_writer()?;
         index.create_schema_v4()?;
         Ok(index)
+    }
+
+    pub fn with_read_transaction<T>(
+        &self,
+        operation: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
+        if self.access_kind != AccessKind::Reader {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        self.conn.execute_batch("BEGIN DEFERRED")?;
+        match operation(&self.conn) {
+            Ok(value) => match self.conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(value),
+                Err(error) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            },
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     fn configure_writer(&self) -> rusqlite::Result<()> {
@@ -1265,6 +1304,141 @@ mod tests {
         }
 
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!path.with_extension("sqlite-wal").exists());
+        assert!(!path.with_extension("sqlite-shm").exists());
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn read_transaction_pins_snapshot_while_writer_commits() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index.sqlite");
+        let writer = SqliteIndex::open_writer(path.to_str().unwrap()).unwrap();
+        writer
+            .conn
+            .execute("INSERT INTO tapes (tape_id) VALUES ('before')", [])
+            .unwrap();
+        let reader = SqliteIndex::open_reader(path.to_str().unwrap()).unwrap();
+
+        reader
+            .with_read_transaction(|conn| {
+                let before =
+                    conn.query_row("SELECT COUNT(*) FROM tapes", [], |row| row.get::<_, i64>(0))?;
+                assert_eq!(before, 1);
+
+                writer
+                    .conn
+                    .execute("INSERT INTO tapes (tape_id) VALUES ('during')", [])?;
+
+                let pinned =
+                    conn.query_row("SELECT COUNT(*) FROM tapes", [], |row| row.get::<_, i64>(0))?;
+                assert_eq!(pinned, 1, "reader must retain its established snapshot");
+                Ok(())
+            })
+            .unwrap();
+
+        let fresh_reader = SqliteIndex::open_reader(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            fresh_reader
+                .with_read_transaction(|conn| {
+                    conn.query_row("SELECT COUNT(*) FROM tapes", [], |row| row.get::<_, i64>(0))
+                })
+                .unwrap(),
+            2,
+            "a fresh transaction must observe the committed writer row"
+        );
+    }
+
+    #[test]
+    fn read_transaction_rejects_non_reader_indexes_before_invoking_operation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index.sqlite");
+        let writer = SqliteIndex::open_writer(path.to_str().unwrap()).unwrap();
+        let in_memory = SqliteIndex::open_in_memory().unwrap();
+
+        for index in [&writer, &in_memory] {
+            let invoked = std::cell::Cell::new(false);
+            let result = index.with_read_transaction(|_| {
+                invoked.set(true);
+                Ok(())
+            });
+            assert!(matches!(result, Err(rusqlite::Error::InvalidQuery)));
+            assert!(!invoked.get(), "non-reader closure must not be invoked");
+            assert!(index.conn.is_autocommit(), "no transaction may be opened");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_transaction_rolls_back_errors_without_store_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index.sqlite");
+        {
+            let writer = SqliteIndex::open_writer(path.to_str().unwrap()).unwrap();
+            writer
+                .conn
+                .execute("INSERT INTO tapes (tape_id) VALUES ('existing')", [])
+                .unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        let before_entries = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        {
+            let reader = SqliteIndex::open_reader(path.to_str().unwrap()).unwrap();
+            let operation_error = reader.with_read_transaction(|conn| -> rusqlite::Result<()> {
+                assert_eq!(
+                    conn.query_row("SELECT COUNT(*) FROM tapes", [], |row| row.get::<_, i64>(0))?,
+                    1
+                );
+                Err(rusqlite::Error::InvalidQuery)
+            });
+            assert!(matches!(
+                operation_error,
+                Err(rusqlite::Error::InvalidQuery)
+            ));
+            assert!(
+                reader.conn.is_autocommit(),
+                "operation error must leave no transaction open"
+            );
+
+            let write_error = reader.with_read_transaction(|conn| -> rusqlite::Result<()> {
+                conn.execute("INSERT INTO tapes (tape_id) VALUES ('forbidden')", [])?;
+                Ok(())
+            });
+            assert!(
+                write_error.is_err(),
+                "read-only transaction must reject writes"
+            );
+            assert!(
+                reader.conn.is_autocommit(),
+                "read-only write error must leave no transaction open"
+            );
+            assert_eq!(
+                reader
+                    .with_read_transaction(|conn| {
+                        conn.query_row("SELECT COUNT(*) FROM tapes", [], |row| row.get::<_, i64>(0))
+                    })
+                    .unwrap(),
+                1,
+                "reader must remain usable after rollback"
+            );
+        }
+
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            before_entries
+        );
         assert!(!path.with_extension("sqlite-wal").exists());
         assert!(!path.with_extension("sqlite-shm").exists());
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
