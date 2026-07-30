@@ -290,6 +290,46 @@ fn gemini_empty_native_read_is_conclusive_but_missing_output_and_empty_shell_are
 }
 
 #[test]
+fn gemini_result_display_is_the_same_material_for_raw_and_structured_reads() {
+    let cases = [
+        (
+            "display-nonempty",
+            r#"{"sessionId":"display-nonempty","messages":[{"type":"gemini","toolCalls":[{"id":"display-nonempty","name":"read_file","args":{"file_path":"src/nonempty.rs"},"status":"success","resultDisplay":"one\ntwo\n"}]}]}"#,
+            "one\ntwo\n",
+            serde_json::json!([1, 2]),
+        ),
+        (
+            "display-empty",
+            r#"{"sessionId":"display-empty","messages":[{"type":"gemini","toolCalls":[{"id":"display-empty","name":"read_file","args":{"file_path":"src/empty.rs"},"status":"success","resultDisplay":""}]}]}"#,
+            "",
+            serde_json::json!([1, 1]),
+        ),
+        (
+            "nested-empty-display-nonempty",
+            r#"{"sessionId":"nested-empty-display-nonempty","messages":[{"type":"gemini","toolCalls":[{"id":"nested-empty-display-nonempty","name":"read_file","args":{"file_path":"src/fallback.rs"},"status":"success","result":[{"functionResponse":{"response":{"output":""}}}],"resultDisplay":"fallback\n"}]}]}"#,
+            "fallback\n",
+            serde_json::json!([1, 1]),
+        ),
+    ];
+
+    for (call_id, raw, expected_text, expected_range) in cases {
+        let rows = events(&gemini_json_to_tape_jsonl(raw).unwrap());
+        assert_eq!(rows[0]["coverage.read"], "full", "{rows:?}");
+        let result_index = rows
+            .iter()
+            .position(|row| row["k"] == "tool.result" && row["call_id"] == call_id)
+            .unwrap();
+        let result = &rows[result_index];
+        let read = &rows[result_index + 1];
+        assert_eq!(read["k"], "code.read", "{rows:?}");
+        assert_eq!(result["stdout"], expected_text, "{rows:?}");
+        assert_eq!(read["text"], expected_text, "{rows:?}");
+        assert_eq!(read["range"], expected_range, "{rows:?}");
+        assert_eq!(read["range_basis"], "line", "{rows:?}");
+    }
+}
+
+#[test]
 fn gemini_message_only_fallback_has_none_coverage() {
     let rows =
         events(&gemini_json_to_tape_jsonl(include_str!("fixtures/gemini/logs.json")).unwrap());

@@ -163,7 +163,8 @@ pub fn gemini_json_to_tape_jsonl(input: &str) -> Result<String, serde_json::Erro
                             edit_total = edit_total.saturating_add(1);
                         }
 
-                        let (stdout, stderr, exit) = extract_gemini_tool_result(tool_call);
+                        let (stdout, stderr, exit, result_text) =
+                            extract_gemini_tool_result(tool_call);
                         out.push(json!({
                             "t": tool_timestamp,
                             "k": "tool.result",
@@ -188,7 +189,7 @@ pub fn gemini_json_to_tape_jsonl(input: &str) -> Result<String, serde_json::Erro
                             && tool_call.get("status").and_then(Value::as_str) == Some("success")
                         {
                             if tool.eq_ignore_ascii_case("read_file")
-                                && let Some(output) = gemini_response_output(tool_call)
+                                && let Some(output) = result_text
                                 && let Some(file) = args.get("file_path").and_then(Value::as_str)
                             {
                                 let count = output.lines().count().max(1) as u32;
@@ -250,13 +251,14 @@ pub fn gemini_json_to_tape_jsonl(input: &str) -> Result<String, serde_json::Erro
     to_jsonl(&out)
 }
 
-fn extract_gemini_tool_result(tool_call: &Value) -> (String, String, i32) {
+fn extract_gemini_tool_result(tool_call: &Value) -> (String, String, i32, Option<String>) {
     let status = tool_call
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or("");
     let mut stdout = String::new();
     let mut stderr = String::new();
+    let mut result_text = None;
     let mut exit = if status == "success" { 0 } else { 1 };
 
     if let Some(results) = tool_call.get("result").and_then(Value::as_array) {
@@ -276,8 +278,10 @@ fn extract_gemini_tool_result(tool_call: &Value) -> (String, String, i32) {
                 exit = 1;
             } else if let Some(output) = response.get("output").and_then(Value::as_str) {
                 stdout = output.to_string();
+                result_text = Some(stdout.clone());
             } else if let Ok(serialized) = serde_json::to_string(response) {
                 stdout = serialized;
+                result_text = None;
             }
         }
     }
@@ -285,25 +289,11 @@ fn extract_gemini_tool_result(tool_call: &Value) -> (String, String, i32) {
     if stdout.is_empty() && stderr.is_empty() {
         if let Some(display) = tool_call.get("resultDisplay").and_then(Value::as_str) {
             stdout = display.to_string();
+            result_text = Some(stdout.clone());
         }
     }
 
-    (stdout, stderr, exit)
-}
-
-fn gemini_response_output(tool_call: &Value) -> Option<&str> {
-    tool_call
-        .get("result")
-        .and_then(Value::as_array)?
-        .iter()
-        .rev()
-        .find_map(|result| {
-            result
-                .get("functionResponse")
-                .and_then(|item| item.get("response"))
-                .and_then(|response| response.get("output"))
-                .and_then(Value::as_str)
-        })
+    (stdout, stderr, exit, result_text)
 }
 
 fn source_block(session_id: Option<&str>) -> Value {
