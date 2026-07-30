@@ -7,58 +7,58 @@ pub use winnow::{SpanAnchor, expand_winnow_anchor, fingerprint_similarity, finge
 const WINDOW_LINES: usize = 24;
 const WINDOW_OVERLAP_LINES: usize = 12;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FingerprintedWindow {
+    pub ordinal: u32,
+    pub anchor: String,
+    pub features: Vec<String>,
+}
+
+pub fn fingerprint_windows(text: &str) -> Vec<FingerprintedWindow> {
+    line_windows(text, WINDOW_LINES, WINDOW_OVERLAP_LINES)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(ordinal, window)| {
+            let anchor = fingerprint_text(&window).fingerprint;
+            if anchor.is_empty() {
+                return None;
+            }
+            let mut seen = HashSet::new();
+            let features = expand_winnow_anchor(&anchor)
+                .into_iter()
+                .filter(|feature| seen.insert(feature.clone()))
+                .collect();
+            Some(FingerprintedWindow {
+                ordinal: ordinal as u32,
+                anchor,
+                features,
+            })
+        })
+        .collect()
+}
+
 pub fn fingerprint_anchor_hashes(text: &str) -> Vec<String> {
-    collect_window_anchors(text, |window| {
-        let fingerprint = fingerprint_text(window).fingerprint;
-        if fingerprint.is_empty() {
-            Vec::new()
-        } else {
-            vec![fingerprint]
-        }
-    })
+    fingerprint_windows(text)
+        .into_iter()
+        .map(|window| window.anchor)
+        .collect()
 }
 
 pub fn fingerprint_window_hashes(text: &str) -> Vec<String> {
     fingerprint_anchor_hashes(text)
 }
 
-/// Return individual winnow hash tokens for `text`, using the same overlapping
-/// window strategy as [`fingerprint_anchor_hashes`] but expanding each window
-/// fingerprint into one entry per hash token.
-///
-/// Suitable for storing as individual `evidence` rows so that each token can
-/// be looked up via an exact-equality index scan.
+/// Return the ordered unique winnow features in `text`.
 pub fn fingerprint_token_hashes(text: &str) -> Vec<String> {
-    collect_window_anchors(text, |window| {
-        let fingerprint = fingerprint_text(window).fingerprint;
-        if fingerprint.is_empty() {
-            Vec::new()
-        } else {
-            expand_winnow_anchor(&fingerprint)
-        }
-    })
-}
-
-fn collect_window_anchors<F>(text: &str, anchors_for_window: F) -> Vec<String>
-where
-    F: Fn(&str) -> Vec<String>,
-{
-    if text.is_empty() {
-        return Vec::new();
-    }
-
-    let windows = line_windows(text, WINDOW_LINES, WINDOW_OVERLAP_LINES);
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-
-    for window in windows {
-        for anchor in anchors_for_window(&window) {
-            if !anchor.is_empty() && seen.insert(anchor.clone()) {
-                out.push(anchor);
+    for window in fingerprint_windows(text) {
+        for feature in window.features {
+            if seen.insert(feature.clone()) {
+                out.push(feature);
             }
         }
     }
-
     out
 }
 
@@ -106,7 +106,7 @@ fn split_lines_preserving_terminators(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{fingerprint_anchor_hashes, fingerprint_window_hashes};
+    use super::{fingerprint_anchor_hashes, fingerprint_window_hashes, fingerprint_windows};
 
     #[test]
     fn short_text_emits_window_anchor() {
@@ -148,5 +148,26 @@ mod tests {
             "expected window-scale anchor count, got {}",
             anchors.len()
         );
+    }
+
+    #[test]
+    fn fingerprinted_windows_preserve_equal_physical_windows_and_ordinals() {
+        let block = (1..=24)
+            .map(|line| format!("fn repeated_{line}() {{ value_{line}(); }}\n"))
+            .collect::<String>();
+        let text = format!("{block}{block}");
+
+        let windows = fingerprint_windows(&text);
+
+        assert_eq!(windows.len(), 3);
+        assert_eq!(
+            windows
+                .iter()
+                .map(|window| window.ordinal)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(windows[0].anchor, windows[2].anchor);
+        assert_eq!(windows[0].features, windows[2].features);
     }
 }

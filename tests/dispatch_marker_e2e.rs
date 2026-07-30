@@ -3,7 +3,6 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-use engram::anchor::fingerprint_text;
 use serde_json::Value;
 
 fn run_cli(repo: &Path, args: &[&str], stdin: Option<&str>) -> Output {
@@ -53,7 +52,7 @@ fn explain_dispatch_chain_includes_a_to_b_to_c_and_excludes_sibling() {
     let uuid_ab = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     let uuid_bc = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
     let span_text = "pub fn continuation_probe() -> &'static str { \"T126\" }";
-    let span_anchor = fingerprint_text(span_text).fingerprint;
+    let span_json = serde_json::to_string(span_text).unwrap();
 
     let tape_a = format!(
         concat!(
@@ -71,9 +70,9 @@ fn explain_dispatch_chain_includes_a_to_b_to_c_and_excludes_sibling() {
     let tape_c = format!(
         concat!(
             "{{\"t\":\"2026-02-27T12:10:01Z\",\"k\":\"msg.in\",\"role\":\"user\",\"content\":\"<engram-src id=\\\"{0}\\\"/> execute\"}}\n",
-            "{{\"t\":\"2026-02-27T12:10:02Z\",\"k\":\"code.edit\",\"file\":\"src/engine.rs\",\"before_range\":[2,2],\"after_range\":[2,2],\"before_anchor_hashes\":[\"winnow:0000000000000101\"],\"after_anchor_hashes\":[\"{1}\"],\"similarity\":0.95}}\n"
+            "{{\"t\":\"2026-02-27T12:10:02Z\",\"k\":\"code.edit\",\"file\":\"src/engine.rs\",\"before_range\":[2,2],\"after_range\":[2,2],\"before_text\":{1},\"after_text\":{1},\"similarity\":0.95}}\n"
         ),
-        uuid_bc, span_anchor
+        uuid_bc, span_json
     );
     let tape_sibling = format!(
         "{{\"t\":\"2026-02-27T12:06:01Z\",\"k\":\"msg.in\",\"role\":\"user\",\"content\":\"<engram-src id=\\\"{uuid_ab}\\\"/> sibling\"}}\n"
@@ -121,7 +120,7 @@ fn compact_restart_reingest_adds_new_tape_without_duplication() {
 
     let uuid = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
     let span_text = "pub fn continuation_probe() -> &'static str { \"T126R\" }";
-    let span_anchor = fingerprint_text(span_text).fingerprint;
+    let span_json = serde_json::to_string(span_text).unwrap();
 
     let tape_base = format!(
         "{{\"t\":\"2026-02-27T13:00:01Z\",\"k\":\"msg.out\",\"role\":\"assistant\",\"content\":[{{\"type\":\"toolCall\",\"arguments\":{{\"payload\":\"<engram-src id=\\\"{uuid}\\\"/>\"}}}}]}}\n"
@@ -129,16 +128,16 @@ fn compact_restart_reingest_adds_new_tape_without_duplication() {
     let tape_worker = format!(
         concat!(
             "{{\"t\":\"2026-02-27T13:05:01Z\",\"k\":\"msg.in\",\"role\":\"user\",\"content\":\"<engram-src id=\\\"{0}\\\"/> run\"}}\n",
-            "{{\"t\":\"2026-02-27T13:05:02Z\",\"k\":\"code.edit\",\"file\":\"src/engine.rs\",\"before_range\":[2,2],\"after_range\":[2,2],\"before_anchor_hashes\":[\"winnow:0000000000000102\"],\"after_anchor_hashes\":[\"{1}\"],\"similarity\":0.95}}\n"
+            "{{\"t\":\"2026-02-27T13:05:02Z\",\"k\":\"code.edit\",\"file\":\"src/engine.rs\",\"before_range\":[2,2],\"after_range\":[2,2],\"before_text\":{1},\"after_text\":{1},\"similarity\":0.95}}\n"
         ),
-        uuid, span_anchor
+        uuid, span_json
     );
     let tape_restart = format!(
         concat!(
             "{{\"t\":\"2026-02-27T13:20:01Z\",\"k\":\"msg.in\",\"role\":\"user\",\"content\":\"<engram-src id=\\\"{0}\\\"/> resumed after compact\"}}\n",
-            "{{\"t\":\"2026-02-27T13:20:02Z\",\"k\":\"code.edit\",\"file\":\"src/engine.rs\",\"before_range\":[2,2],\"after_range\":[2,2],\"before_anchor_hashes\":[\"winnow:0000000000000103\"],\"after_anchor_hashes\":[\"{1}\"],\"similarity\":0.95}}\n"
+            "{{\"t\":\"2026-02-27T13:20:02Z\",\"k\":\"code.edit\",\"file\":\"src/engine.rs\",\"before_range\":[2,2],\"after_range\":[2,2],\"before_text\":{1},\"after_text\":{1},\"similarity\":0.95}}\n"
         ),
-        uuid, span_anchor
+        uuid, span_json
     );
 
     let _ = run_json(repo, &["record", "--stdin"], Some(&tape_base));

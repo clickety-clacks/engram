@@ -1,0 +1,8 @@
+{"type":"session","id":"t1772-openclaw"}
+{"type":"message","timestamp":"2026-07-29T00:00:00Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"read-ok","name":"read","arguments":{"path":"src/read.rs"}},{"type":"toolCall","id":"cat-ok","name":"cat","arguments":{"path":"src/cat.rs"}},{"type":"toolCall","id":"read-fail","name":"read","arguments":{"path":"src/a.rs"}},{"type":"toolCall","id":"edit-ok","name":"edit","arguments":{"path":"src/b.rs","old_string":"old","new_string":"new"}},{"type":"toolCall","id":"write-ok","name":"write","arguments":{"path":"src/write.rs","content":"written"}},{"type":"toolCall","id":"patch-path-only","name":"patch","arguments":{"path":"src/path.rs"}}]}}
+{"type":"message","timestamp":"2026-07-29T00:00:01Z","message":{"role":"toolResult","toolCallId":"read-ok","toolName":"read","content":[{"type":"text","text":"hello\n"}]}}
+{"type":"message","timestamp":"2026-07-29T00:00:02Z","message":{"role":"toolResult","toolCallId":"cat-ok","toolName":"cat","content":[{"type":"text","text":"cat\n"}]}}
+{"type":"message","timestamp":"2026-07-29T00:00:03Z","message":{"role":"toolResult","toolCallId":"read-fail","toolName":"read","isError":true,"content":[{"type":"text","text":"no"}]}}
+{"type":"message","timestamp":"2026-07-29T00:00:04Z","message":{"role":"toolResult","toolCallId":"edit-ok","toolName":"edit","content":[{"type":"text","text":"done"}]}}
+{"type":"message","timestamp":"2026-07-29T00:00:05Z","message":{"role":"toolResult","toolCallId":"write-ok","toolName":"write","content":[{"type":"text","text":"done"}]}}
+{"type":"message","timestamp":"2026-07-29T00:00:06Z","message":{"role":"toolResult","toolCallId":"patch-path-only","toolName":"patch","content":[{"type":"text","text":"done"}]}}

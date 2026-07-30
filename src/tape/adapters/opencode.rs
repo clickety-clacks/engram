@@ -1,6 +1,8 @@
 use chrono::{SecondsFormat, TimeZone, Utc};
 use serde_json::{Value, json};
 
+use super::structured::{bounded_shell_read, parse_patch, patch_is_complete};
+
 pub fn opencode_json_to_tape_jsonl(input: &str) -> Result<String, serde_json::Error> {
     let root: Value = serde_json::from_str(input)?;
     let session_id = root
@@ -18,6 +20,10 @@ pub fn opencode_json_to_tape_jsonl(input: &str) -> Result<String, serde_json::Er
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
 
     let mut out = Vec::new();
+    let mut read_total = 0u32;
+    let mut read_accounted = 0u32;
+    let mut edit_total = 0u32;
+    let mut edit_accounted = 0u32;
 
     out.push(json!({
         "t": default_timestamp,
@@ -86,6 +92,14 @@ pub fn opencode_json_to_tape_jsonl(input: &str) -> Result<String, serde_json::Er
                             .unwrap_or_else(|| json!({}));
                         let args =
                             serde_json::to_string(&tool_input).unwrap_or_else(|_| "{}".to_string());
+                        let (read_claims, edit_claims) = match tool.to_ascii_lowercase().as_str() {
+                            "read" => (1, 0),
+                            "edit" | "write" | "patch" => (0, 1),
+                            "bash" | "exec" | "shell" | "process" => (1, 1),
+                            _ => (0, 0),
+                        };
+                        read_total = read_total.saturating_add(read_claims);
+                        edit_total = edit_total.saturating_add(edit_claims);
 
                         let mut call = serde_json::Map::new();
                         call.insert("t".to_string(), json!(timestamp));
@@ -101,80 +115,32 @@ pub fn opencode_json_to_tape_jsonl(input: &str) -> Result<String, serde_json::Er
                         }
                         out.push(Value::Object(call));
 
-                        if tool.eq_ignore_ascii_case("read") {
-                            if let Some(file) = tool_input
-                                .get("filePath")
-                                .and_then(Value::as_str)
-                                .map(ToOwned::to_owned)
-                            {
-                                let start_zero = tool_input
-                                    .get("offset")
-                                    .and_then(Value::as_u64)
-                                    .unwrap_or(0);
-                                let start = start_zero.saturating_add(1) as u32;
-                                let end = tool_input
-                                    .get("limit")
-                                    .and_then(Value::as_u64)
-                                    .map(|n| start.saturating_add((n as u32).saturating_sub(1)))
-                                    .unwrap_or(start);
-                                out.push(json!({
-                                    "t": timestamp,
-                                    "k": "code.read",
-                                    "source": source_block("opencode", session_id.as_deref()),
-                                    "file": file,
-                                    "range": [start, end],
-                                    "text": state.and_then(|obj| obj.get("output")).and_then(Value::as_str),
-                                    "range_basis": "line"
-                                }));
+                        if let Some(error) = state
+                            .and_then(|obj| obj.get("error"))
+                            .filter(|error| !error.is_null())
+                        {
+                            read_accounted = read_accounted.saturating_add(read_claims);
+                            edit_accounted = edit_accounted.saturating_add(edit_claims);
+                            let error =
+                                error.as_str().map(ToOwned::to_owned).unwrap_or_else(|| {
+                                    serde_json::to_string(error).unwrap_or_default()
+                                });
+                            let mut result = serde_json::Map::new();
+                            result.insert("t".to_string(), json!(timestamp));
+                            result.insert("k".to_string(), json!("tool.result"));
+                            result.insert(
+                                "source".to_string(),
+                                source_block("opencode", session_id.as_deref()),
+                            );
+                            result.insert("tool".to_string(), json!(tool));
+                            result.insert("stdout".to_string(), json!(""));
+                            result.insert("stderr".to_string(), json!(error));
+                            result.insert("exit".to_string(), json!(1));
+                            if let Some(call_id) = &call_id {
+                                result.insert("call_id".to_string(), json!(call_id));
                             }
-                        }
-
-                        if tool.eq_ignore_ascii_case("edit") {
-                            if let Some(file) = tool_input
-                                .get("filePath")
-                                .and_then(Value::as_str)
-                                .map(ToOwned::to_owned)
-                            {
-                                out.push(json!({
-                                    "t": timestamp,
-                                    "k": "code.edit",
-                                    "source": source_block("opencode", session_id.as_deref()),
-                                    "file": file,
-                                    "before_text": tool_input.get("oldString").and_then(Value::as_str),
-                                    "after_text": tool_input.get("newString").and_then(Value::as_str)
-                                }));
-                            }
-                        }
-
-                        if tool.eq_ignore_ascii_case("write") {
-                            if let Some(file) = tool_input
-                                .get("filePath")
-                                .and_then(Value::as_str)
-                                .map(ToOwned::to_owned)
-                            {
-                                out.push(json!({
-                                    "t": timestamp,
-                                    "k": "code.edit",
-                                    "source": source_block("opencode", session_id.as_deref()),
-                                    "file": file,
-                                    "after_text": tool_input.get("content").and_then(Value::as_str)
-                                }));
-                            }
-                        }
-
-                        if tool.eq_ignore_ascii_case("patch") {
-                            let patch = tool_input
-                                .get("patchText")
-                                .and_then(Value::as_str)
-                                .unwrap_or("");
-                            for file in extract_patch_files(patch) {
-                                out.push(json!({
-                                    "t": timestamp,
-                                    "k": "code.edit",
-                                    "source": source_block("opencode", session_id.as_deref()),
-                                    "file": file
-                                }));
-                            }
+                            out.push(Value::Object(result));
+                            continue;
                         }
 
                         if let Some(status) = state
@@ -203,8 +169,24 @@ pub fn opencode_json_to_tape_jsonl(input: &str) -> Result<String, serde_json::Er
                                         result.insert("call_id".to_string(), json!(call_id));
                                     }
                                     out.push(Value::Object(result));
+                                    let (reads, edits) = emit_completed_structured(
+                                        &mut out,
+                                        &timestamp,
+                                        session_id.as_deref(),
+                                        &tool,
+                                        &tool_input,
+                                        &output,
+                                        root.get("info")
+                                            .and_then(|info| info.get("path"))
+                                            .and_then(|path| path.get("cwd"))
+                                            .and_then(Value::as_str),
+                                    );
+                                    read_accounted = read_accounted.saturating_add(reads);
+                                    edit_accounted = edit_accounted.saturating_add(edits);
                                 }
                                 "error" => {
+                                    read_accounted = read_accounted.saturating_add(read_claims);
+                                    edit_accounted = edit_accounted.saturating_add(edit_claims);
                                     let error = state
                                         .and_then(|obj| obj.get("error"))
                                         .and_then(Value::as_str)
@@ -236,6 +218,16 @@ pub fn opencode_json_to_tape_jsonl(input: &str) -> Result<String, serde_json::Er
         }
     }
 
+    if let Some(meta) = out.first_mut().and_then(Value::as_object_mut) {
+        meta.insert(
+            "coverage.read".to_string(),
+            json!(coverage(read_total, read_accounted)),
+        );
+        meta.insert(
+            "coverage.edit".to_string(),
+            json!(coverage(edit_total, edit_accounted)),
+        );
+    }
     to_jsonl(&out)
 }
 
@@ -260,26 +252,104 @@ fn source_block(harness: &str, session_id: Option<&str>) -> Value {
     }
 }
 
-fn extract_patch_files(patch_text: &str) -> Vec<String> {
-    let mut files = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for line in patch_text.lines() {
-        let file = line
-            .strip_prefix("*** Update File: ")
-            .or_else(|| line.strip_prefix("*** Add File: "))
-            .or_else(|| line.strip_prefix("*** Delete File: "))
-            .or_else(|| line.strip_prefix("+++ b/"))
-            .or_else(|| line.strip_prefix("--- a/"));
-        if let Some(path) = file.map(str::trim) {
-            if path.is_empty() || path == "/dev/null" {
-                continue;
-            }
-            if seen.insert(path.to_string()) {
-                files.push(path.to_string());
+fn emit_completed_structured(
+    out: &mut Vec<Value>,
+    timestamp: &str,
+    session_id: Option<&str>,
+    tool: &str,
+    input: &Value,
+    output: &str,
+    cwd: Option<&str>,
+) -> (u32, u32) {
+    let source = || source_block("opencode", session_id);
+    if tool.eq_ignore_ascii_case("read") {
+        if output.is_empty() {
+            return (0, 0);
+        }
+        if let Some(file) = input.get("filePath").and_then(Value::as_str) {
+            let start = input.get("offset").and_then(Value::as_u64).unwrap_or(0) as u32 + 1;
+            let lines = output.lines().count() as u32;
+            if lines > 0 {
+                out.push(
+                    json!({"t":timestamp,"k":"code.read","source":source(),"file":file,
+                    "range":[start,start + lines - 1],"text":output,"range_basis":"line"}),
+                );
+                return (1, 0);
             }
         }
+    } else if tool.eq_ignore_ascii_case("edit") {
+        if let (Some(file), Some(before), Some(after)) = (
+            input.get("filePath").and_then(Value::as_str),
+            input.get("oldString").and_then(Value::as_str),
+            input.get("newString").and_then(Value::as_str),
+        ) {
+            out.push(
+                json!({"t":timestamp,"k":"code.edit","source":source(),"file":file,
+                "before_text":before,"after_text":after}),
+            );
+            return (0, 1);
+        }
+    } else if tool.eq_ignore_ascii_case("write") {
+        if let (Some(file), Some(after)) = (
+            input.get("filePath").and_then(Value::as_str),
+            input.get("content").and_then(Value::as_str),
+        ) {
+            out.push(
+                json!({"t":timestamp,"k":"code.edit","source":source(),"file":file,
+                "after_text":after}),
+            );
+            return (0, 1);
+        }
+    } else if tool.eq_ignore_ascii_case("patch") {
+        if let Some(patch) = input.get("patchText").and_then(Value::as_str) {
+            let complete = patch_is_complete(patch);
+            let edits = parse_patch(patch);
+            if edits.is_empty() {
+                return (0, 0);
+            }
+            for edit in edits {
+                let mut event =
+                    json!({"t":timestamp,"k":"code.edit","source":source(),"file":edit.file});
+                if let Some(before) = edit.before_text {
+                    event["before_text"] = json!(before);
+                }
+                if let Some(after) = edit.after_text {
+                    event["after_text"] = json!(after);
+                }
+                out.push(event);
+            }
+            return (0, u32::from(complete));
+        }
+    } else if matches!(
+        tool.to_ascii_lowercase().as_str(),
+        "bash" | "exec" | "shell" | "process"
+    ) && let Some(command) = input
+        .get("command")
+        .or_else(|| input.get("cmd"))
+        .and_then(Value::as_str)
+        && let Some(read) = bounded_shell_read(
+            command,
+            output,
+            input.get("workdir").and_then(Value::as_str),
+            cwd,
+        )
+    {
+        let coverage_complete = read.coverage_complete;
+        out.push(
+            json!({"t":timestamp,"k":"code.read","source":source(),"file":read.file,
+            "range":read.range,"text":read.text,"range_basis":"line"}),
+        );
+        return if coverage_complete { (1, 1) } else { (0, 0) };
     }
-    files
+    (0, 0)
+}
+
+fn coverage(total: u32, accounted: u32) -> &'static str {
+    if total == accounted {
+        "full"
+    } else {
+        "partial"
+    }
 }
 
 fn timestamp_from_millis(ms: i64) -> Option<String> {

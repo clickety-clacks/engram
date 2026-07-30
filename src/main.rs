@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -9,10 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 use engram::config::{
-    EffectiveWatchSource, ensure_user_config, load_effective_config_with_override,
+    EffectiveWatchSource, ensure_user_config, load_effective_config_read_only,
+    load_effective_config_with_override,
 };
 use engram::dispatch::{
     collect_dispatch_upstream_sessions, extract_dispatch_links_from_transcript,
@@ -28,10 +28,11 @@ use engram::query::format::MAX_QUERY_WINDOW_ANCHORS;
 use engram::query::format::{
     DateFilter, ExplainTarget, annotate_chain_fields, apply_session_truncation,
     build_chain_metadata, build_session_windows, classify_explain_target, collect_anchor_scores,
-    collect_grep_matches, collect_touch_evidence, compact_event, compare_grep_sessions,
-    default_peek_anchor_line, derive_anchor_candidates, edge_to_json, emit_query_result,
-    explain_across_indexes, extract_latest_timestamp_from_rows, format_sessions_for_agent,
-    open_query_indexes, print_pretty_explain, read_file_span_variants, session_matches_date_filter,
+    collect_grep_matches, collect_touch_evidence, compact_event, compare_explain_sessions,
+    compare_grep_sessions, default_peek_anchor_line, derive_anchor_candidates, edge_to_json,
+    emit_query_result, explain_across_indexes, extract_latest_timestamp_from_rows,
+    format_sessions_for_agent, open_query_indexes, print_pretty_explain, read_file_span_variants,
+    session_matches_date_filter,
 };
 use engram::store::atomic::atomic_write;
 use engram::store::tapes::{
@@ -65,7 +66,6 @@ enum Command {
     Explain(ExplainArgs),
     Grep(GrepArgs),
     Peek(PeekArgs),
-    Rate(RateArgs),
     Tapes,
     Show(ShowArgs),
     Gc,
@@ -161,37 +161,6 @@ struct PeekArgs {
     grep_filter: Option<String>,
 }
 
-#[derive(Args, Debug)]
-struct RateArgs {
-    result_id: String,
-    #[arg(long)]
-    outcome: RateOutcome,
-    #[arg(long)]
-    note: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-#[value(rename_all = "snake_case")]
-enum RateOutcome {
-    FoundAnswer,
-    PartiallyHelped,
-    Noise,
-    Misleading,
-    NotUsed,
-}
-
-impl RateOutcome {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::FoundAnswer => "found_answer",
-            Self::PartiallyHelped => "partially_helped",
-            Self::Noise => "noise",
-            Self::Misleading => "misleading",
-            Self::NotUsed => "not_used",
-        }
-    }
-}
-
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -226,20 +195,16 @@ fn run() -> Result<(), CliError> {
             cmd_record(&cwd, &paths, &context, args)
         }
         Command::Explain(args) => {
-            let context = resolve_runtime_context(&cwd)?;
+            let context = resolve_query_runtime_context(&cwd)?;
             cmd_explain(&cwd, &paths, &context, args)
         }
         Command::Grep(args) => {
-            let context = resolve_runtime_context(&cwd)?;
+            let context = resolve_query_runtime_context(&cwd)?;
             cmd_grep(&paths, &context, args)
         }
         Command::Peek(args) => {
-            let context = resolve_runtime_context(&cwd)?;
+            let context = resolve_query_runtime_context(&cwd)?;
             cmd_peek(&paths, &context, args)
-        }
-        Command::Rate(args) => {
-            let context = resolve_runtime_context(&cwd)?;
-            cmd_rate(&paths, &context, args)
         }
         Command::Tapes => {
             let context = resolve_runtime_context(&cwd)?;
@@ -290,7 +255,6 @@ COMMANDS:
   explain    Find provenance for code (by fingerprint)
   grep       Find provenance for a term (by text search)
   peek       Read content from a provenance session
-  rate       Record whether a returned result was useful
   ingest     Import transcripts into the index
   watch      Continuously watch for new transcripts
 
@@ -367,23 +331,6 @@ EXAMPLES:
   engram peek af156abd --grep-filter "NO_REPLY"
 "#;
 
-const HELP_RATE: &str = r#"Record usefulness feedback for a prior query result.
-
-USAGE:
-  engram rate <result_id> --outcome <class> [--note "..."]
-
-OUTCOMES:
-  found_answer
-  partially_helped
-  noise
-  misleading
-  not_used
-
-EXAMPLES:
-  engram rate result_abc123 --outcome found_answer
-  engram rate result_abc123 --outcome misleading --note "sent me to the wrong session"
-"#;
-
 const HELP_GC: &str = r#"Deprecated. Reports the tape store; deletes nothing, ever.
 
 Tapes are immutable and permanent — never a GC target.
@@ -429,10 +376,6 @@ fn maybe_print_spec_help() -> Result<bool, CliError> {
             }
             "peek" => {
                 print!("{HELP_PEEK}");
-                return Ok(true);
-            }
-            "rate" => {
-                print!("{HELP_RATE}");
                 return Ok(true);
             }
             "gc" => {
@@ -484,34 +427,6 @@ fn cmd_init(paths: &RepoPaths) -> Result<(), CliError> {
         "status": "ok",
         "created": true,
         "message": "created local workspace config at .engram/config.yml",
-    }))
-}
-
-fn cmd_rate(paths: &RepoPaths, context: &RuntimeContext, args: RateArgs) -> Result<(), CliError> {
-    ensure_local_store(paths)?;
-    print_context_conspicuity(context);
-    ensure_db_parent(&context.db_path)?;
-
-    let index = SqliteIndex::open(&path_string(&context.db_path))?;
-    if !index.query_result_exists(&args.result_id)? {
-        return Err(CliError::new("unknown_result_id", args.result_id));
-    }
-
-    let rated_at = Utc::now().to_rfc3339();
-    index.upsert_result_feedback(
-        &args.result_id,
-        args.outcome.as_str(),
-        args.note.as_deref(),
-        &rated_at,
-    )?;
-
-    print_json(&json!({
-        "status": "ok",
-        "result_id": args.result_id,
-        "outcome": args.outcome.as_str(),
-        "note": args.note,
-        "rated_at": rated_at,
-        "storage": "local_index",
     }))
 }
 
@@ -970,7 +885,7 @@ fn cmd_fingerprint(paths: &RepoPaths, context: &RuntimeContext) -> Result<(), Cl
     ensure_local_store(paths)?;
     print_context_conspicuity(context);
     ensure_db_parent(&context.db_path)?;
-    let index = SqliteIndex::open(&path_string(&context.db_path))?;
+    let index = SqliteIndex::open_writer(&path_string(&context.db_path))?;
 
     let mut scanned = 0usize;
     let mut fingerprinted = 0usize;
@@ -978,6 +893,7 @@ fn cmd_fingerprint(paths: &RepoPaths, context: &RuntimeContext) -> Result<(), Cl
     let mut failures = Vec::new();
 
     let entries = fs::read_dir(&paths.tapes).map_err(|err| CliError::io("read_dir_error", err))?;
+    let mut candidates = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|err| CliError::io("read_dir_error", err))?;
         let path = entry.path();
@@ -987,6 +903,11 @@ fn cmd_fingerprint(paths: &RepoPaths, context: &RuntimeContext) -> Result<(), Cl
         let Some(tape_id) = tape_id_from_path(&path) else {
             continue;
         };
+        candidates.push((tape_id, path));
+    }
+    sort_fingerprint_candidates(&mut candidates);
+
+    for (tape_id, path) in candidates {
         scanned += 1;
         if index.has_tape(&tape_id)? {
             skipped_existing += 1;
@@ -1031,6 +952,14 @@ fn cmd_fingerprint(paths: &RepoPaths, context: &RuntimeContext) -> Result<(), Cl
         "failure_count": failures.len(),
         "failures": failures,
     }))
+}
+
+fn sort_fingerprint_candidates(candidates: &mut [(String, PathBuf)]) {
+    candidates.sort_by(|(left_id, left_path), (right_id, right_path)| {
+        left_id
+            .cmp(right_id)
+            .then_with(|| left_path.cmp(right_path))
+    });
 }
 
 fn cmd_tapes(paths: &RepoPaths, context: &RuntimeContext) -> Result<(), CliError> {
@@ -1143,27 +1072,26 @@ fn cmd_gc(paths: &RepoPaths, context: &RuntimeContext) -> Result<(), CliError> {
 
 fn cmd_explain(
     cwd: &Path,
-    paths: &RepoPaths,
+    _paths: &RepoPaths,
     context: &RuntimeContext,
     args: ExplainArgs,
 ) -> Result<(), CliError> {
-    ensure_local_store(paths)?;
     print_context_conspicuity(context);
-    ensure_db_parent(&context.db_path)?;
 
-    let indexes = open_query_indexes(context)?;
     let target = args
         .target
         .clone()
         .ok_or_else(|| CliError::new("invalid_explain_target", "target is required"))?;
-    let target_kind = classify_explain_target(cwd, context, &indexes, &target, args.anchor)?;
+    let target_kind = classify_explain_target(cwd, context, &[], &target, args.anchor)?;
+    let indexes = open_query_indexes(context)?;
 
-    let mut query_anchors = Vec::new();
+    let query_anchors;
     let mut raw_sessions: Vec<Value>;
-    let mut dispatch_lineage = Vec::new();
-    let mut lineage = Vec::new();
+    let dispatch_lineage;
+    let lineage;
     let mut tombstones = Vec::new();
-    let mut score_by_session = HashMap::new();
+    let touched_anchors;
+    let score_by_session;
     let date_filter = DateFilter::parse(args.since.as_deref(), args.until.as_deref())?;
 
     match target_kind {
@@ -1178,35 +1106,16 @@ fn cmd_explain(
             };
             let result =
                 explain_across_indexes(&indexes, &query_anchors, traversal, args.forensics)?;
+            touched_anchors = result.touched_anchors.clone();
             let touches =
                 collect_touch_evidence(&indexes, &result.direct, &result.touched_anchors)?;
             raw_sessions = build_session_windows(context, touches)?;
             let (chain, dispatch_sessions) =
-                collect_dispatch_upstream_sessions(context, &indexes[0], &raw_sessions)?;
+                collect_dispatch_upstream_sessions(context, &indexes, &raw_sessions)?;
             dispatch_lineage = chain;
             raw_sessions.extend(dispatch_sessions);
             lineage = result.lineage.iter().map(edge_to_json).collect::<Vec<_>>();
             score_by_session = collect_anchor_scores(&indexes, &query_anchors)?;
-
-            if args.include_deleted {
-                for anchor in &result.touched_anchors {
-                    for index in &indexes {
-                        for tombstone in index.tombstones_for_anchor(anchor)? {
-                            tombstones.push(json!({
-                                "anchor": anchor,
-                                "tape_id": tombstone.tape_id,
-                                "event_offset": tombstone.event_offset,
-                                "file_path": tombstone.file_path,
-                                "range": {
-                                    "start": tombstone.range_at_deletion.start,
-                                    "end": tombstone.range_at_deletion.end
-                                },
-                                "timestamp": tombstone.timestamp,
-                            }));
-                        }
-                    }
-                }
-            }
         }
         ExplainTarget::FileWhole { file } => {
             let full_text = fs::read_to_string(cwd.join(file))
@@ -1220,11 +1129,12 @@ fn cmd_explain(
             };
             let result =
                 explain_across_indexes(&indexes, &query_anchors, traversal, args.forensics)?;
+            touched_anchors = result.touched_anchors.clone();
             let touches =
                 collect_touch_evidence(&indexes, &result.direct, &result.touched_anchors)?;
             raw_sessions = build_session_windows(context, touches)?;
             let (chain, dispatch_sessions) =
-                collect_dispatch_upstream_sessions(context, &indexes[0], &raw_sessions)?;
+                collect_dispatch_upstream_sessions(context, &indexes, &raw_sessions)?;
             dispatch_lineage = chain;
             raw_sessions.extend(dispatch_sessions);
             lineage = result.lineage.iter().map(edge_to_json).collect::<Vec<_>>();
@@ -1244,33 +1154,52 @@ fn cmd_explain(
             };
             let result =
                 explain_across_indexes(&indexes, &query_anchors, traversal, args.forensics)?;
+            touched_anchors = result.touched_anchors.clone();
             let touches =
                 collect_touch_evidence(&indexes, &result.direct, &result.touched_anchors)?;
             raw_sessions = build_session_windows(context, touches)?;
             let (chain, dispatch_sessions) =
-                collect_dispatch_upstream_sessions(context, &indexes[0], &raw_sessions)?;
+                collect_dispatch_upstream_sessions(context, &indexes, &raw_sessions)?;
             dispatch_lineage = chain;
             raw_sessions.extend(dispatch_sessions);
             lineage = result.lineage.iter().map(edge_to_json).collect::<Vec<_>>();
             score_by_session = collect_anchor_scores(&indexes, &query_anchors)?;
+        }
+    }
 
-            if args.include_deleted {
-                for anchor in &result.touched_anchors {
-                    for index in &indexes {
-                        for tombstone in index.tombstones_for_anchor(anchor)? {
-                            tombstones.push(json!({
-                                "anchor": anchor,
-                                "tape_id": tombstone.tape_id,
-                                "event_offset": tombstone.event_offset,
-                                "file_path": tombstone.file_path,
-                                "range": {
-                                    "start": tombstone.range_at_deletion.start,
-                                    "end": tombstone.range_at_deletion.end
-                                },
-                                "timestamp": tombstone.timestamp,
-                            }));
-                        }
+    if args.include_deleted {
+        let mut tombstone_anchors = query_anchors.clone();
+        for anchor in touched_anchors {
+            if !tombstone_anchors.contains(&anchor) {
+                tombstone_anchors.push(anchor);
+            }
+        }
+        let mut seen_tombstones = std::collections::HashSet::new();
+        for anchor in &tombstone_anchors {
+            for index in &indexes {
+                for tombstone in index.tombstones_for_anchor(anchor)? {
+                    let key = (
+                        tombstone.tape_id.clone(),
+                        tombstone.event_offset,
+                        tombstone.file_path.clone(),
+                        tombstone.range_at_deletion.start,
+                        tombstone.range_at_deletion.end,
+                        tombstone.timestamp.clone(),
+                    );
+                    if !seen_tombstones.insert(key) {
+                        continue;
                     }
+                    tombstones.push(json!({
+                        "anchor": tombstone.anchor_hashes.first().cloned().unwrap_or_default(),
+                        "tape_id": tombstone.tape_id,
+                        "event_offset": tombstone.event_offset,
+                        "file_path": tombstone.file_path,
+                        "range": {
+                            "start": tombstone.range_at_deletion.start,
+                            "end": tombstone.range_at_deletion.end
+                        },
+                        "timestamp": tombstone.timestamp,
+                    }));
                 }
             }
         }
@@ -1283,30 +1212,15 @@ fn cmd_explain(
 
     let mut sessions = format_sessions_for_agent(
         context,
-        &indexes[0],
+        &indexes,
         raw_sessions,
         &score_by_session,
         args.grep_filter.as_deref(),
     )?;
     sessions.retain(|session| session_matches_date_filter(session, &date_filter));
     annotate_chain_fields(&mut sessions, &dispatch_lineage);
-    sessions.sort_by(|a, b| {
-        let a_depth = a.get("depth").and_then(Value::as_u64).unwrap_or(0);
-        let b_depth = b.get("depth").and_then(Value::as_u64).unwrap_or(0);
-        let a_score = a.get("confidence").and_then(Value::as_f64).unwrap_or(0.0);
-        let b_score = b.get("confidence").and_then(Value::as_f64).unwrap_or(0.0);
-        let a_ts = a.get("timestamp").and_then(Value::as_str).unwrap_or("");
-        let b_ts = b.get("timestamp").and_then(Value::as_str).unwrap_or("");
-        a_depth
-            .cmp(&b_depth)
-            .then_with(|| {
-                b_score
-                    .partial_cmp(&a_score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| b_ts.cmp(a_ts))
-    });
-    if sessions.is_empty() {
+    sessions.sort_by(compare_explain_sessions);
+    if sessions.is_empty() && tombstones.is_empty() && lineage.is_empty() {
         return Err(CliError::new("no_results", target));
     }
 
@@ -1316,22 +1230,11 @@ fn cmd_explain(
         args.offset,
         context.explain_default_limit,
     );
-    if sessions.is_empty() {
+    if sessions.is_empty() && tombstones.is_empty() && lineage.is_empty() {
         return Err(CliError::new("no_results", target));
     }
     let chain_metadata = build_chain_metadata(&sessions);
-    append_metrics(
-        context,
-        "explain",
-        &target,
-        Value::Null,
-        Value::Null,
-        Value::Null,
-        Value::Null,
-    );
-
     emit_query_result(
-        &indexes[0],
         "explain",
         json!({
         "query": {
@@ -1365,10 +1268,8 @@ fn cmd_explain(
     )
 }
 
-fn cmd_grep(paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Result<(), CliError> {
-    ensure_local_store(paths)?;
+fn cmd_grep(_paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Result<(), CliError> {
     print_context_conspicuity(context);
-    ensure_db_parent(&context.db_path)?;
 
     let indexes = open_query_indexes(context)?;
     let (raw_sessions, grep_rank_by_session) =
@@ -1379,7 +1280,7 @@ fn cmd_grep(paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Resu
         .collect::<HashMap<_, _>>();
     let date_filter = DateFilter::parse(args.since.as_deref(), args.until.as_deref())?;
     let mut sessions =
-        format_sessions_for_agent(context, &indexes[0], raw_sessions, &score_by_session, None)?;
+        format_sessions_for_agent(context, &indexes, raw_sessions, &score_by_session, None)?;
     sessions.retain(|session| session_matches_date_filter(session, &date_filter));
     sessions.sort_by(|a, b| compare_grep_sessions(a, b, &grep_rank_by_session));
     if sessions.is_empty() {
@@ -1397,18 +1298,7 @@ fn cmd_grep(paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Resu
     }
 
     let metrics_sessions = if args.count { Vec::new() } else { sessions };
-    append_metrics(
-        context,
-        "grep",
-        &args.pattern,
-        Value::Null,
-        Value::Null,
-        Value::Null,
-        Value::Null,
-    );
-
     emit_query_result(
-        &indexes[0],
         "grep",
         json!({
         "query": {
@@ -1433,10 +1323,8 @@ fn cmd_grep(paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Resu
     )
 }
 
-fn cmd_peek(paths: &RepoPaths, context: &RuntimeContext, args: PeekArgs) -> Result<(), CliError> {
-    ensure_local_store(paths)?;
+fn cmd_peek(_paths: &RepoPaths, context: &RuntimeContext, args: PeekArgs) -> Result<(), CliError> {
     print_context_conspicuity(context);
-    ensure_db_parent(&context.db_path)?;
 
     let indexes = open_query_indexes(context)?;
     let session_id = args.session_id;
@@ -1492,7 +1380,7 @@ fn cmd_peek(paths: &RepoPaths, context: &RuntimeContext, args: PeekArgs) -> Resu
         }
         (first + 1, last + 1, out)
     } else {
-        let anchor_line = default_peek_anchor_line(&indexes[0], &session_id, &rows);
+        let anchor_line = default_peek_anchor_line(&indexes, &session_id, &rows);
         if let Some(start) = args.start {
             let line_count = args.lines.unwrap_or(context.peek_default_lines).max(1);
             let end = usize::min(
@@ -1536,19 +1424,7 @@ fn cmd_peek(paths: &RepoPaths, context: &RuntimeContext, args: PeekArgs) -> Resu
     if content.is_empty() {
         return Err(CliError::new("no_results", session_id.clone()));
     }
-    let window_lines = content.len();
-    append_metrics(
-        context,
-        "peek",
-        &session_id,
-        Value::String(session_id.clone()),
-        json!(window_start),
-        json!(window_lines),
-        json!(total_lines),
-    );
-
     emit_query_result(
-        &indexes[0],
         "peek",
         json!({
         "query": {
@@ -1586,6 +1462,13 @@ fn resolve_runtime_context(cwd: &Path) -> Result<RuntimeContext, CliError> {
     resolve_runtime_context_with_override(cwd, None)
 }
 
+fn resolve_query_runtime_context(cwd: &Path) -> Result<RuntimeContext, CliError> {
+    let home = home_dir()?;
+    let config = load_effective_config_read_only(cwd, &home)
+        .map_err(|err| CliError::new("config_error", err.to_string()))?;
+    runtime_context_from_config(cwd, &home, config)
+}
+
 fn resolve_runtime_context_with_override(
     cwd: &Path,
     config_override: Option<&Path>,
@@ -1593,6 +1476,14 @@ fn resolve_runtime_context_with_override(
     let home = home_dir()?;
     let config = load_effective_config_with_override(cwd, &home, config_override)
         .map_err(|err| CliError::new("config_error", err.to_string()))?;
+    runtime_context_from_config(cwd, &home, config)
+}
+
+fn runtime_context_from_config(
+    cwd: &Path,
+    home: &Path,
+    config: engram::config::EffectiveConfig,
+) -> Result<RuntimeContext, CliError> {
     let tape_lookup_dirs = tape_lookup_dirs(cwd, &home, &config);
     Ok(RuntimeContext {
         config_path: config.path,
@@ -1624,48 +1515,25 @@ fn print_context_conspicuity(context: &RuntimeContext) {
     eprintln!("db: {}", context.db_path.display());
 }
 
-fn append_metrics(
-    context: &RuntimeContext,
-    command: &str,
-    target: &str,
-    session_id: Value,
-    window_start: Value,
-    window_lines: Value,
-    total_lines: Value,
-) {
-    if !context.metrics_enabled {
-        return;
-    }
-
-    if let Some(parent) = context.metrics_log.parent()
-        && fs::create_dir_all(parent).is_err()
-    {
-        return;
-    }
-
-    let payload = json!({
-        "ts": Utc::now().to_rfc3339(),
-        "command": command,
-        "target": target,
-        "session_id": session_id,
-        "window_start": window_start,
-        "window_lines": window_lines,
-        "total_lines": total_lines,
-    });
-    let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&context.metrics_log)
-    else {
-        return;
-    };
-    let _ = writeln!(file, "{payload}");
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use notify::event::{CreateKind, RemoveKind};
+
+    #[test]
+    fn fingerprint_candidates_sort_by_tape_id_then_path() {
+        let expected = vec![
+            ("a-tape".to_string(), PathBuf::from("/tapes/a-first")),
+            ("a-tape".to_string(), PathBuf::from("/tapes/a-second")),
+            ("b-tape".to_string(), PathBuf::from("/tapes/b")),
+            ("c-tape".to_string(), PathBuf::from("/tapes/c")),
+        ];
+        let mut reversed = expected.iter().rev().cloned().collect::<Vec<_>>();
+
+        sort_fingerprint_candidates(&mut reversed);
+
+        assert_eq!(reversed, expected);
+    }
 
     #[test]
     fn dispatch_extraction_handles_same_uuid_in_surface_and_nested_locations() {

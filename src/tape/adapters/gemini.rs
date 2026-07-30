@@ -1,5 +1,7 @@
 use serde_json::{Value, json};
 
+use super::structured::bounded_shell_read;
+
 pub fn gemini_json_to_tape_jsonl(input: &str) -> Result<String, serde_json::Error> {
     let root: Value = serde_json::from_str(input)?;
 
@@ -154,33 +156,11 @@ pub fn gemini_json_to_tape_jsonl(input: &str) -> Result<String, serde_json::Erro
 
                         if tool.eq_ignore_ascii_case("read_file") {
                             read_total = read_total.saturating_add(1);
-                            if let Some(file) = args.get("file_path").and_then(Value::as_str) {
-                                let (stdout, _, _) = extract_gemini_tool_result(tool_call);
-                                out.push(json!({
-                                    "t": tool_timestamp,
-                                    "k": "code.read",
-                                    "source": source_block(session_id),
-                                    "file": file,
-                                    "range": [1, 1],
-                                    "text": if stdout.is_empty() { Value::Null } else { json!(stdout) },
-                                    "range_basis": "line"
-                                }));
-                                read_emitted = read_emitted.saturating_add(1);
-                            }
-                        }
-
-                        if tool.eq_ignore_ascii_case("write_file") {
+                        } else if tool.eq_ignore_ascii_case("write_file") {
                             edit_total = edit_total.saturating_add(1);
-                            if let Some(file) = args.get("file_path").and_then(Value::as_str) {
-                                out.push(json!({
-                                    "t": tool_timestamp,
-                                    "k": "code.edit",
-                                    "source": source_block(session_id),
-                                    "file": file,
-                                    "after_text": args.get("content").and_then(Value::as_str)
-                                }));
-                                edit_emitted = edit_emitted.saturating_add(1);
-                            }
+                        } else if tool.eq_ignore_ascii_case("run_shell_command") {
+                            read_total = read_total.saturating_add(1);
+                            edit_total = edit_total.saturating_add(1);
                         }
 
                         let (stdout, stderr, exit) = extract_gemini_tool_result(tool_call);
@@ -191,9 +171,61 @@ pub fn gemini_json_to_tape_jsonl(input: &str) -> Result<String, serde_json::Erro
                             "tool": tool,
                             "call_id": call_id,
                             "exit": exit,
-                            "stdout": stdout,
+                            "stdout": stdout.clone(),
                             "stderr": stderr
                         }));
+                        if exit != 0 {
+                            if tool.eq_ignore_ascii_case("read_file") {
+                                read_emitted = read_emitted.saturating_add(1);
+                            } else if tool.eq_ignore_ascii_case("write_file") {
+                                edit_emitted = edit_emitted.saturating_add(1);
+                            } else if tool.eq_ignore_ascii_case("run_shell_command") {
+                                read_emitted = read_emitted.saturating_add(1);
+                                edit_emitted = edit_emitted.saturating_add(1);
+                            }
+                        }
+                        if exit == 0
+                            && tool_call.get("status").and_then(Value::as_str) == Some("success")
+                        {
+                            if tool.eq_ignore_ascii_case("read_file")
+                                && !stdout.is_empty()
+                                && let Some(file) = args.get("file_path").and_then(Value::as_str)
+                            {
+                                let count = stdout.lines().count() as u32;
+                                out.push(json!({
+                                    "t": tool_timestamp, "k": "code.read",
+                                    "source": source_block(session_id), "file": file,
+                                    "range": [1, count], "text": stdout, "range_basis": "line"
+                                }));
+                                read_emitted = read_emitted.saturating_add(1);
+                            } else if tool.eq_ignore_ascii_case("write_file")
+                                && let (Some(file), Some(content)) = (
+                                    args.get("file_path").and_then(Value::as_str),
+                                    args.get("content").and_then(Value::as_str),
+                                )
+                            {
+                                out.push(json!({
+                                    "t": tool_timestamp, "k": "code.edit",
+                                    "source": source_block(session_id), "file": file,
+                                    "after_text": content
+                                }));
+                                edit_emitted = edit_emitted.saturating_add(1);
+                            } else if tool.eq_ignore_ascii_case("run_shell_command")
+                                && let Some(command) = args.get("command").and_then(Value::as_str)
+                                && let Some(read) = bounded_shell_read(command, &stdout, None, None)
+                            {
+                                let coverage_complete = read.coverage_complete;
+                                out.push(json!({
+                                    "t": tool_timestamp, "k": "code.read",
+                                    "source": source_block(session_id), "file": read.file,
+                                    "range": read.range, "text": read.text, "range_basis": "line"
+                                }));
+                                if coverage_complete {
+                                    read_emitted = read_emitted.saturating_add(1);
+                                    edit_emitted = edit_emitted.saturating_add(1);
+                                }
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -236,8 +268,11 @@ fn extract_gemini_tool_result(tool_call: &Value) -> (String, String, i32) {
             else {
                 continue;
             };
-            if let Some(error) = response.get("error").and_then(Value::as_str) {
-                stderr = error.to_string();
+            if let Some(error) = response.get("error").filter(|error| !error.is_null()) {
+                stderr = error
+                    .as_str()
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| serde_json::to_string(error).unwrap_or_default());
                 exit = 1;
             } else if let Some(output) = response.get("output").and_then(Value::as_str) {
                 stdout = output.to_string();

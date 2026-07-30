@@ -3,12 +3,15 @@ use std::collections::HashMap;
 use chrono::{SecondsFormat, TimeZone, Utc};
 use serde_json::{Value, json};
 
+use super::structured::{bounded_shell_read, parse_patch, patch_is_complete};
+
 const DEFAULT_TS: &str = "1970-01-01T00:00:00Z";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolKind {
     Read,
     Edit,
+    Shell,
     Other,
 }
 
@@ -19,6 +22,9 @@ struct ToolCallContext {
     range: [u32; 2],
     before_text: Option<String>,
     after_text: Option<String>,
+    patch_text: Option<String>,
+    command: Option<String>,
+    workdir: Option<String>,
 }
 
 pub fn openclaw_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Error> {
@@ -56,17 +62,102 @@ fn with_meta(session_id: Option<&str>, events: Vec<Value>) -> Vec<Value> {
         .find_map(|event| event.get("t").and_then(Value::as_str))
         .unwrap_or(DEFAULT_TS);
 
+    let (read_coverage, edit_coverage) = native_coverage(&events);
     let mut out = Vec::with_capacity(events.len() + 1);
     out.push(json!({
         "t": ts,
         "k": "meta",
         "source": source_block(session_id),
         "coverage.tool": "partial",
-        "coverage.read": "partial",
-        "coverage.edit": "partial"
+        "coverage.read": read_coverage,
+        "coverage.edit": edit_coverage
     }));
     out.extend(events);
     out
+}
+
+fn native_coverage(events: &[Value]) -> (&'static str, &'static str) {
+    let mut read_partial = false;
+    let mut edit_partial = false;
+    for (index, call) in events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event["k"] == "tool.call")
+    {
+        let tool = call["tool"].as_str().unwrap_or("").to_ascii_lowercase();
+        let kind = classify_tool(&tool);
+        if kind == ToolKind::Other {
+            continue;
+        }
+        let call_id = call.get("call_id");
+        let result_index = events
+            .iter()
+            .enumerate()
+            .skip(index + 1)
+            .find_map(|(i, event)| {
+                (event["k"] == "tool.result" && event.get("call_id") == call_id).then_some(i)
+            });
+        let Some(result_index) = result_index else {
+            match kind {
+                ToolKind::Read => read_partial = true,
+                ToolKind::Shell => {
+                    read_partial = true;
+                    edit_partial = true;
+                }
+                ToolKind::Edit => edit_partial = true,
+                ToolKind::Other => {}
+            }
+            continue;
+        };
+        if events[result_index]["exit"] == 1 {
+            continue;
+        }
+        if kind == ToolKind::Edit
+            && tool == "patch"
+            && let Some(arguments) = call["args"].as_str()
+            && let Ok(arguments) = serde_json::from_str::<Value>(arguments)
+            && let Some(patch) = arguments
+                .get("patch")
+                .or_else(|| arguments.get("patchText"))
+                .and_then(Value::as_str)
+            && !patch_is_complete(patch)
+        {
+            edit_partial = true;
+            continue;
+        }
+        let structured_kind = match kind {
+            ToolKind::Read | ToolKind::Shell => "code.read",
+            ToolKind::Edit => "code.edit",
+            ToolKind::Other => continue,
+        };
+        let emitted = events
+            .iter()
+            .skip(result_index + 1)
+            .take_while(|event| !matches!(event["k"].as_str(), Some("tool.call" | "tool.result")))
+            .find(|event| event["k"] == structured_kind);
+        if emitted.is_none() {
+            match kind {
+                ToolKind::Read => read_partial = true,
+                ToolKind::Shell => {
+                    read_partial = true;
+                    edit_partial = true;
+                }
+                ToolKind::Edit => edit_partial = true,
+                ToolKind::Other => {}
+            }
+        } else if kind == ToolKind::Shell
+            && emitted
+                .and_then(|event| event["file"].as_str())
+                .is_some_and(|file| !std::path::Path::new(file).is_absolute())
+        {
+            read_partial = true;
+            edit_partial = true;
+        }
+    }
+    (
+        if read_partial { "partial" } else { "full" },
+        if edit_partial { "partial" } else { "full" },
+    )
 }
 
 fn extract_from_row(
@@ -268,6 +359,9 @@ fn emit_tool_result_message(
         result.insert("call_id".to_string(), json!(call_id));
     }
     out.push(Value::Object(result));
+    if is_error {
+        return;
+    }
 
     let context = call_id
         .as_ref()
@@ -276,30 +370,38 @@ fn emit_tool_result_message(
 
     match context.kind {
         ToolKind::Read => {
-            if let Some(file) = context.file {
+            if !text.is_empty()
+                && let Some(file) = context.file
+            {
                 let mut event = serde_json::Map::new();
                 event.insert("t".to_string(), json!(timestamp));
                 event.insert("k".to_string(), json!("code.read"));
                 event.insert("source".to_string(), source_block(session_id));
                 event.insert("file".to_string(), json!(file));
                 event.insert("range".to_string(), json!(context.range));
-                if !text.is_empty() {
-                    event.insert("text".to_string(), json!(text));
-                }
+                event.insert("text".to_string(), json!(text));
                 event.insert("range_basis".to_string(), json!("line"));
                 out.push(Value::Object(event));
             }
         }
         ToolKind::Edit => {
-            if let Some(file) = context.file {
-                let before_text = context.before_text;
-                let after_text = context.after_text.or_else(|| {
-                    if text.is_empty() {
-                        None
-                    } else {
-                        Some(text.clone())
+            if let Some(patch) = context.patch_text {
+                for edit in parse_patch(&patch) {
+                    let mut event = json!({
+                        "t": timestamp, "k": "code.edit", "source": source_block(session_id),
+                        "file": edit.file
+                    });
+                    if let Some(before) = edit.before_text {
+                        event["before_text"] = json!(before);
                     }
-                });
+                    if let Some(after) = edit.after_text {
+                        event["after_text"] = json!(after);
+                    }
+                    out.push(event);
+                }
+            } else if let Some(file) = context.file {
+                let before_text = context.before_text;
+                let after_text = context.after_text;
                 if before_text.is_some() || after_text.is_some() {
                     let mut event = serde_json::Map::new();
                     event.insert("t".to_string(), json!(timestamp));
@@ -316,6 +418,18 @@ fn emit_tool_result_message(
                 }
             }
         }
+        ToolKind::Shell => {
+            if let Some(command) = context.command
+                && let Some(read) =
+                    bounded_shell_read(&command, &text, context.workdir.as_deref(), None)
+            {
+                out.push(json!({
+                    "t": timestamp, "k": "code.read", "source": source_block(session_id),
+                    "file": read.file, "range": read.range, "text": read.text,
+                    "range_basis": "line"
+                }));
+            }
+        }
         ToolKind::Other => {}
     }
 }
@@ -328,22 +442,36 @@ fn tool_context_for(tool_name: &str, args: &Value) -> ToolCallContext {
         range: extract_line_range(args),
         before_text: extract_before_text(args),
         after_text: extract_after_text(args),
+        patch_text: args
+            .get("patch")
+            .or_else(|| args.get("patchText"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        command: args
+            .get("command")
+            .or_else(|| args.get("cmd"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        workdir: args
+            .get("workdir")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
     }
 }
 
 fn classify_tool(tool_name: &str) -> ToolKind {
     let normalized = tool_name.to_ascii_lowercase();
-    if matches!(
-        normalized.as_str(),
-        "read" | "readfile" | "read_file" | "view" | "cat"
-    ) {
+    if matches!(normalized.as_str(), "read" | "cat") {
         return ToolKind::Read;
+    }
+    if matches!(normalized.as_str(), "edit" | "write" | "patch") {
+        return ToolKind::Edit;
     }
     if matches!(
         normalized.as_str(),
-        "edit" | "write" | "multiedit" | "apply" | "apply_patch" | "patch" | "write_file"
+        "bash" | "exec" | "shell" | "shell_command" | "process"
     ) {
-        return ToolKind::Edit;
+        return ToolKind::Shell;
     }
     ToolKind::Other
 }
@@ -505,8 +633,8 @@ mod tests {
         assert_eq!(rows[0]["k"], "meta");
         assert_eq!(rows[0]["source"]["harness"], "openclaw");
         assert_eq!(rows[0]["source"]["session_id"], "oc-main-1");
-        assert_eq!(rows[0]["coverage.read"], "partial");
-        assert_eq!(rows[0]["coverage.edit"], "partial");
+        assert_eq!(rows[0]["coverage.read"], "full");
+        assert_eq!(rows[0]["coverage.edit"], "full");
         assert_eq!(rows[0]["coverage.tool"], "partial");
 
         let kinds = rows

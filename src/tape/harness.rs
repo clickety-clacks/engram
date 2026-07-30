@@ -2,11 +2,15 @@ use std::collections::HashMap;
 
 use serde_json::{Value, json};
 
+use super::adapters::structured::bounded_shell_read;
+
 #[derive(Debug, Clone)]
 struct ClaudeToolContext {
     tool: String,
-    read_file: Option<String>,
-    read_range: Option<[u32; 2]>,
+    structured: Vec<Value>,
+    input: Value,
+    read_claims: u32,
+    edit_claims: u32,
 }
 
 pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Error> {
@@ -15,6 +19,7 @@ pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
     let mut session_id: Option<String> = None;
     let mut first_timestamp: Option<String> = None;
     let mut model: Option<String> = None;
+    let mut session_cwd: Option<String> = None;
 
     let mut read_total = 0u32;
     let mut read_emitted = 0u32;
@@ -35,6 +40,12 @@ pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
         }
         if session_id.is_none() {
             session_id = claude_session_id(&row);
+        }
+        if session_cwd.is_none() {
+            session_cwd = row
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
         }
         let row_type = row.get("type").and_then(Value::as_str).unwrap_or("");
 
@@ -80,21 +91,51 @@ pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
                             "stderr": ""
                         }));
 
-                        if let Some(context) = tool_by_id.remove(&tool_use_id)
-                            && context.tool == "Read"
-                            && let (Some(file), Some(range)) =
-                                (context.read_file, context.read_range)
-                        {
-                            out.push(json!({
-                                "t": timestamp,
-                                "k": "code.read",
-                                "source": source_block("claude-code", session_id.as_deref()),
-                                "file": file,
-                                "range": range,
-                                "text": content_text(block.get("content").unwrap_or(&Value::Null)),
-                                "range_basis": "line"
-                            }));
-                            read_emitted = read_emitted.saturating_add(1);
+                        if let Some(context) = tool_by_id.remove(&tool_use_id) {
+                            if block.get("is_error").and_then(Value::as_bool) == Some(true) {
+                                read_emitted = read_emitted.saturating_add(context.read_claims);
+                                edit_emitted = edit_emitted.saturating_add(context.edit_claims);
+                                continue;
+                            }
+                            let result_text =
+                                content_text(block.get("content").unwrap_or(&Value::Null));
+                            for mut event in context.structured {
+                                if event["k"] == "code.read" {
+                                    if result_text.is_empty() {
+                                        continue;
+                                    }
+                                    event["text"] = json!(result_text);
+                                    read_emitted = read_emitted.saturating_add(1);
+                                } else {
+                                    edit_emitted = edit_emitted.saturating_add(1);
+                                }
+                                event["t"] = json!(timestamp);
+                                out.push(event);
+                            }
+                            if context.tool == "Bash"
+                                && let Some(command) =
+                                    context.input.get("command").and_then(Value::as_str)
+                                && let Some(read) = bounded_shell_read(
+                                    command,
+                                    &result_text,
+                                    context.input.get("workdir").and_then(Value::as_str),
+                                    session_cwd.as_deref(),
+                                )
+                            {
+                                let coverage_complete = read.coverage_complete;
+                                out.push(json!({
+                                    "t": timestamp, "k": "code.read",
+                                    "source": source_block("claude-code", session_id.as_deref()),
+                                    "file": read.file, "range": read.range, "text": read.text,
+                                    "range_basis": "line"
+                                }));
+                                read_emitted = read_emitted.saturating_add(1);
+                                if coverage_complete {
+                                    edit_emitted = edit_emitted.saturating_add(1);
+                                } else {
+                                    read_emitted = read_emitted.saturating_sub(1);
+                                }
+                            }
                         }
                     }
                 }
@@ -145,10 +186,6 @@ pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
                                     .and_then(Value::as_str)
                                     .unwrap_or("")
                                     .to_string();
-                                let read_file = tool_input
-                                    .get("file_path")
-                                    .and_then(Value::as_str)
-                                    .map(ToOwned::to_owned);
                                 let read_range = if tool == "Read" {
                                     let start = tool_input
                                         .get("offset")
@@ -165,14 +202,87 @@ pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
                                 } else {
                                     None
                                 };
-                                tool_by_id.insert(
-                                    tool_use_id.clone(),
-                                    ClaudeToolContext {
-                                        tool: tool.to_string(),
-                                        read_file,
-                                        read_range,
-                                    },
-                                );
+                                let mut structured = Vec::new();
+                                match tool {
+                                    "Read" => {
+                                        if let (Some(file), Some(range)) = (
+                                            tool_input.get("file_path").and_then(Value::as_str),
+                                            read_range,
+                                        ) {
+                                            structured.push(json!({
+                                                "t": timestamp,
+                                                "k": "code.read",
+                                                "source": source_block("claude-code", session_id.as_deref()),
+                                                "file": file,
+                                                "range": range,
+                                                "range_basis": "line"
+                                            }));
+                                        }
+                                    }
+                                    "Edit" => {
+                                        if let (Some(file), Some(before), Some(after)) = (
+                                            tool_input.get("file_path").and_then(Value::as_str),
+                                            tool_input.get("old_string").and_then(Value::as_str),
+                                            tool_input.get("new_string").and_then(Value::as_str),
+                                        ) {
+                                            structured.push(json!({
+                                                "k": "code.edit", "file": file,
+                                                "before_text": before, "after_text": after,
+                                                "source": source_block("claude-code", session_id.as_deref())
+                                            }));
+                                        }
+                                    }
+                                    "Write" => {
+                                        if let (Some(file), Some(after)) = (
+                                            tool_input.get("file_path").and_then(Value::as_str),
+                                            tool_input.get("content").and_then(Value::as_str),
+                                        ) {
+                                            structured.push(json!({
+                                                "k": "code.edit", "file": file, "after_text": after,
+                                                "source": source_block("claude-code", session_id.as_deref())
+                                            }));
+                                        }
+                                    }
+                                    "MultiEdit" => {
+                                        if let (Some(file), Some(edits)) = (
+                                            tool_input.get("file_path").and_then(Value::as_str),
+                                            tool_input.get("edits").and_then(Value::as_array),
+                                        ) {
+                                            for edit in edits {
+                                                if let (Some(before), Some(after)) = (
+                                                    edit.get("old_string").and_then(Value::as_str),
+                                                    edit.get("new_string").and_then(Value::as_str),
+                                                ) {
+                                                    structured.push(json!({
+                                                        "k": "code.edit", "file": file,
+                                                        "before_text": before, "after_text": after,
+                                                        "source": source_block("claude-code", session_id.as_deref())
+                                                    }));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                if !tool_use_id.is_empty() {
+                                    tool_by_id.insert(
+                                        tool_use_id.clone(),
+                                        ClaudeToolContext {
+                                            tool: tool.to_string(),
+                                            structured,
+                                            input: tool_input.clone(),
+                                            read_claims: u32::from(matches!(tool, "Read" | "Bash")),
+                                            edit_claims: match tool {
+                                                "Edit" | "Write" | "Bash" => 1,
+                                                "MultiEdit" => tool_input
+                                                    .get("edits")
+                                                    .and_then(Value::as_array)
+                                                    .map_or(1, |edits| edits.len() as u32),
+                                                _ => 0,
+                                            },
+                                        },
+                                    );
+                                }
 
                                 out.push(json!({
                                     "t": timestamp,
@@ -184,49 +294,23 @@ pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
                                 }));
 
                                 match tool {
-                                    "Read" => {
+                                    "Read" | "Bash" => {
                                         read_total = read_total.saturating_add(1);
+                                        if tool == "Bash" {
+                                            edit_total = edit_total.saturating_add(1);
+                                        }
                                     }
                                     "Edit" => {
                                         edit_total = edit_total.saturating_add(1);
-                                        if let Some(file) = tool_input
-                                            .get("file_path")
-                                            .and_then(Value::as_str)
-                                            .map(ToOwned::to_owned)
-                                        {
-                                            out.push(json!({
-                                                "t": timestamp,
-                                                "k": "code.edit",
-                                                "source": source_block("claude-code", session_id.as_deref()),
-                                                "file": file,
-                                                "before_text": tool_input.get("old_string").and_then(Value::as_str),
-                                                "after_text": tool_input.get("new_string").and_then(Value::as_str)
-                                            }));
-                                            edit_emitted = edit_emitted.saturating_add(1);
-                                        }
                                     }
                                     "Write" => {
                                         edit_total = edit_total.saturating_add(1);
-                                        if let Some(file) = tool_input
-                                            .get("file_path")
-                                            .and_then(Value::as_str)
-                                            .map(ToOwned::to_owned)
-                                        {
-                                            out.push(json!({
-                                                "t": timestamp,
-                                                "k": "code.edit",
-                                                "source": source_block("claude-code", session_id.as_deref()),
-                                                "file": file,
-                                                "after_text": tool_input.get("content").and_then(Value::as_str)
-                                            }));
-                                            edit_emitted = edit_emitted.saturating_add(1);
-                                        }
                                     }
                                     "MultiEdit" => {
-                                        if let Some(file) = tool_input
+                                        if tool_input
                                             .get("file_path")
                                             .and_then(Value::as_str)
-                                            .map(ToOwned::to_owned)
+                                            .is_some()
                                         {
                                             if let Some(edits) =
                                                 tool_input.get("edits").and_then(Value::as_array)
@@ -235,17 +319,6 @@ pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
                                                     edit_total.saturating_add(edits.len() as u32);
                                                 if edits.is_empty() {
                                                     continue;
-                                                }
-                                                for edit in edits {
-                                                    out.push(json!({
-                                                        "t": timestamp,
-                                                        "k": "code.edit",
-                                                        "source": source_block("claude-code", session_id.as_deref()),
-                                                        "file": file,
-                                                        "before_text": edit.get("old_string").and_then(Value::as_str),
-                                                        "after_text": edit.get("new_string").and_then(Value::as_str)
-                                                    }));
-                                                    edit_emitted = edit_emitted.saturating_add(1);
                                                 }
                                             } else {
                                                 edit_total = edit_total.saturating_add(1);
@@ -372,7 +445,7 @@ mod tests {
             .expect("meta event");
         assert_eq!(meta["coverage.tool"], "full");
         assert_eq!(meta["coverage.read"], "full");
-        assert_eq!(meta["coverage.edit"], "full");
+        assert_eq!(meta["coverage.edit"], "partial");
         assert_eq!(meta["model"], "claude-fable-5");
         assert_eq!(meta["source"]["harness"], "claude-code");
         assert_eq!(meta["source"]["session_id"], "session-claude-1");
@@ -400,21 +473,9 @@ mod tests {
                 .is_some_and(|text| text.contains("10->line"))
         );
 
-        let edit = events
-            .iter()
-            .find(|event| {
-                event.get("k").and_then(Value::as_str) == Some("code.edit")
-                    && event.get("file").and_then(Value::as_str) == Some("/repo/src/lib.rs")
-            })
-            .expect("code.edit event");
-        assert_eq!(edit["source"]["harness"], "claude-code");
-        assert_eq!(
-            edit["before_text"].as_str(),
-            Some("fn alpha() { return value + 1; }")
-        );
-        assert_eq!(
-            edit["after_text"].as_str(),
-            Some("fn beta() { return value + 2; }")
+        assert!(
+            events.iter().all(|event| event["k"] != "code.edit"),
+            "the unpaired Edit call must remain raw-only: {events:?}"
         );
 
         let result = events
@@ -463,8 +524,8 @@ mod tests {
             "out={out}"
         );
         assert!(out.contains(r#""coverage.tool":"full""#), "out={out}");
-        assert!(out.contains(r#""coverage.read":"partial""#), "out={out}");
-        assert!(out.contains(r#""coverage.edit":"partial""#), "out={out}");
+        assert!(out.contains(r#""coverage.read":"full""#), "out={out}");
+        assert!(out.contains(r#""coverage.edit":"full""#), "out={out}");
         assert!(out.contains(r#""k":"msg.out""#), "out={out}");
         assert!(out.contains(r#""k":"tool.call""#), "out={out}");
         assert!(out.contains(r#""k":"tool.result""#), "out={out}");

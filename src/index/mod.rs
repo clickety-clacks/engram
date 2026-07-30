@@ -2,17 +2,33 @@ pub mod lineage;
 
 use std::collections::HashSet;
 use std::ops::Deref;
+use std::path::Path;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::anchor::{
-    expand_winnow_anchor, fingerprint_similarity, fingerprint_text, fingerprint_token_hashes,
+    FingerprintedWindow, fingerprint_similarity, fingerprint_text, fingerprint_windows,
 };
 use crate::index::lineage::{
     Cardinality, EvidenceFragmentRef, EvidenceKind, LINK_THRESHOLD_DEFAULT, LocationDelta,
     SpanEdge, StoredEdgeClass, Tombstone,
 };
 use crate::tape::event::{FileRange, TapeEventAt, TapeEventData};
+
+const SCHEMA_VERSION: i64 = 4;
+const EXACT_EVIDENCE_SQL: &str =
+    "SELECT evidence_id, anchor, tape_id, event_offset, kind, file_path, timestamp
+     FROM evidence_windows
+     WHERE anchor = ?1";
+const FEATURE_EVIDENCE_SQL: &str = "SELECT w.evidence_id, w.anchor, w.tape_id, w.event_offset,
+            w.kind, w.file_path, w.timestamp
+     FROM evidence_features f
+     JOIN evidence_windows w ON w.evidence_id = f.evidence_id
+     WHERE f.feature_hash = ?1";
+const FEATURE_WINDOW_ANCHORS_SQL: &str = "SELECT w.anchor
+     FROM evidence_features f
+     JOIN evidence_windows w ON w.evidence_id = f.evidence_id
+     WHERE f.feature_hash = ?1";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EdgeRow {
@@ -24,6 +40,22 @@ pub struct EdgeRow {
     pub agent_link: bool,
     pub note: Option<String>,
     pub stored_class: StoredEdgeClass,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeSourceKind {
+    Edit,
+    SpanLink,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeSource {
+    pub source_kind: EdgeSourceKind,
+    pub tape_id: String,
+    pub event_offset: u64,
+    pub pair_ordinal: u32,
+    pub from_window_ordinal: i64,
+    pub to_window_ordinal: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,311 +84,258 @@ pub struct SqliteIndex {
 }
 
 impl SqliteIndex {
-    pub fn open(path: &str) -> rusqlite::Result<Self> {
+    pub fn open_writer(path: &str) -> rusqlite::Result<Self> {
+        let existed = Path::new(path).exists();
         let conn = Connection::open(path)?;
         let index = Self { conn };
-        index.init_schema()?;
+        let version = index.user_version()?;
+        if existed && version != SCHEMA_VERSION {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        index.configure_writer()?;
+        if !existed {
+            index.create_schema_v4()?;
+        }
+        Ok(index)
+    }
+
+    pub fn open_reader(path: &str) -> rusqlite::Result<Self> {
+        let wal_path = format!("{path}-wal");
+        let shm_path = format!("{path}-shm");
+        let conn = if Path::new(&wal_path).exists() || Path::new(&shm_path).exists() {
+            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?
+        } else {
+            let absolute = std::fs::canonicalize(path)
+                .map_err(|_| rusqlite::Error::InvalidPath(Path::new(path).to_path_buf()))?;
+            let uri = format!(
+                "file:{}?mode=ro&immutable=1",
+                encode_sqlite_uri_path(&absolute.to_string_lossy())
+            );
+            Connection::open_with_flags(
+                uri,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+            )?
+        };
+        let index = Self { conn };
+        if index.user_version()? != SCHEMA_VERSION {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
         Ok(index)
     }
 
     pub fn open_in_memory() -> rusqlite::Result<Self> {
         let conn = Connection::open_in_memory()?;
         let index = Self { conn };
-        index.init_schema()?;
+        index.configure_writer()?;
+        index.create_schema_v4()?;
         Ok(index)
     }
 
-    fn init_schema(&self) -> rusqlite::Result<()> {
+    fn configure_writer(&self) -> rusqlite::Result<()> {
         self.conn.execute_batch(
             "
             PRAGMA foreign_keys = ON;
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = FULL;
             ",
-        )?;
-
-        let version: i64 = self
-            .conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        match version {
-            0 => {
-                if self.table_exists("evidence")? {
-                    self.migrate_legacy_schema_to_v1()?;
-                } else {
-                    self.create_schema_v1()?;
-                    self.conn.execute_batch("PRAGMA user_version = 1;")?;
-                }
-                self.migrate_v1_to_v2()?;
-                self.migrate_v2_to_v3()?;
-            }
-            1 => {
-                self.create_schema_v1()?;
-                self.migrate_v1_to_v2()?;
-                self.migrate_v2_to_v3()?;
-            }
-            2 => {
-                self.create_schema_v2()?;
-                self.migrate_v2_to_v3()?;
-            }
-            3 => {
-                self.create_schema_v3()?;
-            }
-            _ => return Err(rusqlite::Error::InvalidQuery),
-        }
-        Ok(())
+        )
     }
 
-    fn table_exists(&self, name: &str) -> rusqlite::Result<bool> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
-            params![name],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
+    fn user_version(&self) -> rusqlite::Result<i64> {
+        self.conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
     }
 
-    fn create_schema_v1(&self) -> rusqlite::Result<()> {
+    fn create_schema_v4(&self) -> rusqlite::Result<()> {
         self.conn.execute_batch(
             "
-            CREATE TABLE IF NOT EXISTS evidence (
-                anchor TEXT NOT NULL,
-                tape_id TEXT NOT NULL,
-                event_offset INTEGER NOT NULL,
-                kind TEXT NOT NULL,
-                file_path TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                UNIQUE(anchor, tape_id, event_offset, kind)
+            CREATE TABLE evidence_windows (
+              evidence_id INTEGER PRIMARY KEY,
+              anchor TEXT NOT NULL,
+              tape_id TEXT NOT NULL,
+              event_offset INTEGER NOT NULL,
+              kind TEXT NOT NULL CHECK (kind IN ('read','edit')),
+              file_path TEXT NOT NULL,
+              timestamp TEXT NOT NULL,
+              window_ordinal INTEGER NOT NULL,
+              UNIQUE(tape_id, event_offset, kind, window_ordinal)
             );
 
-            CREATE INDEX IF NOT EXISTS idx_evidence_anchor ON evidence(anchor);
+            CREATE TABLE evidence_features (
+              feature_hash TEXT NOT NULL,
+              evidence_id INTEGER NOT NULL REFERENCES evidence_windows(evidence_id) ON DELETE CASCADE,
+              PRIMARY KEY(feature_hash, evidence_id)
+            ) WITHOUT ROWID;
+            CREATE INDEX idx_evidence_windows_anchor ON evidence_windows(anchor);
 
-            CREATE TABLE IF NOT EXISTS edges (
-                from_anchor TEXT NOT NULL,
-                to_anchor TEXT NOT NULL,
-                confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
-                location_delta TEXT NOT NULL,
-                cardinality TEXT NOT NULL,
-                agent_link INTEGER NOT NULL CHECK (agent_link IN (0, 1)),
-                note TEXT NOT NULL DEFAULT '',
-                UNIQUE(from_anchor, to_anchor, confidence, location_delta, cardinality, agent_link, note)
+            CREATE TABLE edges (
+              edge_id INTEGER PRIMARY KEY,
+              source_kind TEXT NOT NULL CHECK (source_kind IN ('edit','span_link')),
+              tape_id TEXT NOT NULL,
+              event_offset INTEGER NOT NULL,
+              pair_ordinal INTEGER NOT NULL,
+              from_window_ordinal INTEGER NOT NULL,
+              to_window_ordinal INTEGER NOT NULL,
+              from_anchor TEXT NOT NULL,
+              to_anchor TEXT NOT NULL,
+              confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+              location_delta TEXT NOT NULL,
+              cardinality TEXT NOT NULL,
+              agent_link INTEGER NOT NULL CHECK (agent_link IN (0,1)),
+              note TEXT NOT NULL DEFAULT '',
+              UNIQUE(tape_id, event_offset, source_kind, pair_ordinal)
             );
+            CREATE INDEX idx_edges_from_anchor ON edges(from_anchor);
+            CREATE INDEX idx_edges_to_anchor ON edges(to_anchor);
 
-            CREATE INDEX IF NOT EXISTS idx_edges_from_anchor ON edges(from_anchor);
-            CREATE INDEX IF NOT EXISTS idx_edges_to_anchor ON edges(to_anchor);
-
-            CREATE TABLE IF NOT EXISTS tombstones (
-                anchor TEXT NOT NULL,
-                tape_id TEXT NOT NULL,
-                event_offset INTEGER NOT NULL,
-                file_path TEXT NOT NULL,
-                range_start INTEGER NOT NULL,
-                range_end INTEGER NOT NULL,
-                timestamp TEXT NOT NULL,
-                UNIQUE(anchor, tape_id, event_offset)
+            CREATE TABLE tombstones (
+              tombstone_id INTEGER PRIMARY KEY,
+              anchor TEXT NOT NULL,
+              tape_id TEXT NOT NULL,
+              event_offset INTEGER NOT NULL,
+              file_path TEXT NOT NULL,
+              range_start INTEGER NOT NULL,
+              range_end INTEGER NOT NULL,
+              timestamp TEXT NOT NULL,
+              window_ordinal INTEGER NOT NULL,
+              UNIQUE(tape_id, event_offset, window_ordinal)
             );
+            CREATE TABLE tombstone_features (
+              feature_hash TEXT NOT NULL,
+              tombstone_id INTEGER NOT NULL REFERENCES tombstones(tombstone_id) ON DELETE CASCADE,
+              PRIMARY KEY(feature_hash, tombstone_id)
+            ) WITHOUT ROWID;
+            CREATE INDEX idx_tombstones_anchor ON tombstones(anchor);
 
-            CREATE INDEX IF NOT EXISTS idx_tombstones_anchor ON tombstones(anchor);
+            CREATE TABLE tapes (tape_id TEXT PRIMARY KEY);
 
-            CREATE TABLE IF NOT EXISTS tapes (
-                tape_id TEXT PRIMARY KEY
+            CREATE TABLE dispatch_links (
+              tape_id TEXT NOT NULL,
+              uuid TEXT NOT NULL,
+              first_turn_index INTEGER NOT NULL,
+              direction TEXT NOT NULL CHECK(direction IN ('received','sent')),
+              PRIMARY KEY(tape_id, uuid)
             );
-            ",
-        )?;
-        Ok(())
-    }
+            CREATE INDEX idx_dispatch_links_uuid ON dispatch_links(uuid);
+            CREATE INDEX idx_dispatch_links_tape ON dispatch_links(tape_id);
+            CREATE INDEX idx_dispatch_links_received
+              ON dispatch_links(tape_id, direction, first_turn_index);
 
-    fn create_schema_v2(&self) -> rusqlite::Result<()> {
-        self.create_schema_v1()?;
-        self.conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS dispatch_links (
-                tape_id TEXT NOT NULL,
-                uuid TEXT NOT NULL,
-                first_turn_index INTEGER NOT NULL,
-                direction TEXT NOT NULL CHECK(direction IN ('received', 'sent')),
-                PRIMARY KEY (tape_id, uuid)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_dispatch_links_uuid ON dispatch_links(uuid);
-            CREATE INDEX IF NOT EXISTS idx_dispatch_links_tape ON dispatch_links(tape_id);
-            CREATE INDEX IF NOT EXISTS idx_dispatch_links_received
-                ON dispatch_links(tape_id, direction, first_turn_index);
-            ",
-        )?;
-        Ok(())
-    }
-
-    fn create_schema_v3(&self) -> rusqlite::Result<()> {
-        self.create_schema_v2()?;
-        self.ensure_query_feedback_schema()?;
-        Ok(())
-    }
-
-    fn ensure_query_feedback_schema(&self) -> rusqlite::Result<()> {
-        self.conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS query_results (
-                result_id TEXT PRIMARY KEY,
-                command TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_query_results_command
-                ON query_results(command, created_at);
-
-            CREATE TABLE IF NOT EXISTS result_feedback (
-                result_id TEXT PRIMARY KEY,
-                outcome TEXT NOT NULL,
-                note TEXT,
-                rated_at TEXT NOT NULL,
-                FOREIGN KEY(result_id) REFERENCES query_results(result_id) ON DELETE CASCADE
-            );
+            PRAGMA user_version = 4;
             ",
         )
     }
 
-    fn migrate_v1_to_v2(&self) -> rusqlite::Result<()> {
-        self.create_schema_v2()?;
-        self.conn.execute_batch("PRAGMA user_version = 2;")?;
-        Ok(())
-    }
-
-    fn migrate_v2_to_v3(&self) -> rusqlite::Result<()> {
-        self.create_schema_v3()?;
-        self.conn.execute_batch("PRAGMA user_version = 3;")?;
-        Ok(())
-    }
-
-    fn migrate_legacy_schema_to_v1(&self) -> rusqlite::Result<()> {
-        self.conn.execute_batch(
-            "
-            BEGIN IMMEDIATE;
-            ALTER TABLE evidence RENAME TO evidence_legacy;
-            ALTER TABLE edges RENAME TO edges_legacy;
-            ALTER TABLE tombstones RENAME TO tombstones_legacy;
-            COMMIT;
-            ",
-        )?;
-
-        self.create_schema_v1()?;
-        self.conn.execute_batch(
-            "
-            INSERT OR IGNORE INTO evidence (anchor, tape_id, event_offset, kind, file_path, timestamp)
-            SELECT anchor, tape_id, event_offset, kind, file_path, timestamp
-            FROM evidence_legacy;
-
-            INSERT OR IGNORE INTO edges (
-                from_anchor, to_anchor, confidence, location_delta, cardinality,
-                agent_link, note
-            )
-            SELECT
-                from_anchor,
-                to_anchor,
-                confidence,
-                location_delta,
-                cardinality,
-                agent_link,
-                COALESCE(note, '')
-            FROM edges_legacy;
-
-            INSERT OR IGNORE INTO tombstones (
-                anchor, tape_id, event_offset, file_path, range_start, range_end, timestamp
-            )
-            SELECT anchor, tape_id, event_offset, file_path, range_start, range_end, timestamp
-            FROM tombstones_legacy;
-
-            DROP TABLE evidence_legacy;
-            DROP TABLE edges_legacy;
-            DROP TABLE tombstones_legacy;
-            PRAGMA user_version = 1;
-            ",
-        )?;
-        Ok(())
-    }
-
-    pub fn insert_evidence(
-        &self,
-        anchor: &str,
-        fragment: &EvidenceFragmentRef,
-    ) -> rusqlite::Result<()> {
-        Self::validate_anchor(anchor)?;
-        Self::insert_evidence_on(&self.conn, anchor, fragment)
-    }
-
-    fn insert_evidence_on(
+    fn insert_evidence_window_on(
         conn: &Connection,
-        anchor: &str,
+        window: &FingerprintedWindow,
         fragment: &EvidenceFragmentRef,
     ) -> rusqlite::Result<()> {
-        Self::validate_anchor(anchor)?;
         conn.execute(
-            "INSERT OR IGNORE INTO evidence (anchor, tape_id, event_offset, kind, file_path, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT OR IGNORE INTO evidence_windows
+             (anchor, tape_id, event_offset, kind, file_path, timestamp, window_ordinal)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
-                anchor,
+                window.anchor,
                 fragment.tape_id,
                 fragment.event_offset,
                 encode_evidence_kind(fragment.kind),
                 fragment.file_path,
-                fragment.timestamp
+                fragment.timestamp,
+                window.ordinal
             ],
         )?;
+        let evidence_id: i64 = conn.query_row(
+            "SELECT evidence_id FROM evidence_windows
+             WHERE tape_id = ?1 AND event_offset = ?2 AND kind = ?3 AND window_ordinal = ?4",
+            params![
+                fragment.tape_id,
+                fragment.event_offset,
+                encode_evidence_kind(fragment.kind),
+                window.ordinal
+            ],
+            |row| row.get(0),
+        )?;
+        for feature in &window.features {
+            conn.execute(
+                "INSERT OR IGNORE INTO evidence_features (feature_hash, evidence_id)
+                 VALUES (?1, ?2)",
+                params![feature, evidence_id],
+            )?;
+        }
         Ok(())
     }
 
-    pub fn insert_edge(&self, edge: &SpanEdge, link_threshold: f32) -> rusqlite::Result<()> {
-        Self::validate_anchor(&edge.from_anchor)?;
-        Self::validate_anchor(&edge.to_anchor)?;
-        Self::insert_edge_on(&self.conn, edge, link_threshold)
+    pub fn insert_edge(&self, source: &EdgeSource, edge: &SpanEdge) -> rusqlite::Result<()> {
+        Self::insert_edge_on(&self.conn, source, edge)
     }
 
     fn insert_edge_on(
         conn: &Connection,
+        source: &EdgeSource,
         edge: &SpanEdge,
-        _link_threshold: f32,
     ) -> rusqlite::Result<()> {
         Self::validate_anchor(&edge.from_anchor)?;
         Self::validate_anchor(&edge.to_anchor)?;
         Self::validate_confidence(edge.confidence)?;
         conn.execute(
             "INSERT OR IGNORE INTO edges (
+                source_kind, tape_id, event_offset, pair_ordinal,
+                from_window_ordinal, to_window_ordinal,
                 from_anchor, to_anchor, confidence, location_delta, cardinality,
                 agent_link, note
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
+                encode_edge_source_kind(source.source_kind),
+                source.tape_id,
+                source.event_offset,
+                source.pair_ordinal,
+                source.from_window_ordinal,
+                source.to_window_ordinal,
                 edge.from_anchor,
                 edge.to_anchor,
                 edge.confidence,
                 encode_location_delta(edge.location_delta),
                 encode_cardinality(edge.cardinality),
-                if edge.agent_link { 1_i64 } else { 0_i64 },
+                i64::from(edge.agent_link),
                 edge.note.as_deref().unwrap_or("")
             ],
         )?;
         Ok(())
     }
 
-    pub fn insert_tombstone(&self, tombstone: &Tombstone) -> rusqlite::Result<()> {
-        Self::insert_tombstone_on(&self.conn, tombstone)
-    }
-
-    fn insert_tombstone_on(conn: &Connection, tombstone: &Tombstone) -> rusqlite::Result<()> {
-        for anchor in &tombstone.anchor_hashes {
-            Self::validate_anchor(anchor)?;
+    fn insert_tombstone_window_on(
+        conn: &Connection,
+        window: &FingerprintedWindow,
+        tombstone: &Tombstone,
+    ) -> rusqlite::Result<()> {
+        conn.execute(
+            "INSERT OR IGNORE INTO tombstones (
+                anchor, tape_id, event_offset, file_path, range_start, range_end,
+                timestamp, window_ordinal
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                window.anchor,
+                tombstone.tape_id,
+                tombstone.event_offset,
+                tombstone.file_path,
+                tombstone.range_at_deletion.start,
+                tombstone.range_at_deletion.end,
+                tombstone.timestamp,
+                window.ordinal
+            ],
+        )?;
+        let tombstone_id: i64 = conn.query_row(
+            "SELECT tombstone_id FROM tombstones
+             WHERE tape_id = ?1 AND event_offset = ?2 AND window_ordinal = ?3",
+            params![tombstone.tape_id, tombstone.event_offset, window.ordinal],
+            |row| row.get(0),
+        )?;
+        for feature in &window.features {
             conn.execute(
-                "INSERT OR IGNORE INTO tombstones (
-                    anchor, tape_id, event_offset, file_path, range_start, range_end, timestamp
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    anchor,
-                    tombstone.tape_id,
-                    tombstone.event_offset,
-                    tombstone.file_path,
-                    tombstone.range_at_deletion.start,
-                    tombstone.range_at_deletion.end,
-                    tombstone.timestamp
-                ],
+                "INSERT OR IGNORE INTO tombstone_features (feature_hash, tombstone_id)
+                 VALUES (?1, ?2)",
+                params![feature, tombstone_id],
             )?;
         }
         Ok(())
@@ -384,72 +363,82 @@ impl SqliteIndex {
         Ok(())
     }
 
-    pub fn record_query_result(
-        &self,
-        result_id: &str,
-        command: &str,
-        payload_json: &str,
-        created_at: &str,
-    ) -> rusqlite::Result<()> {
-        self.ensure_query_feedback_schema()?;
-        self.conn.execute(
-            "INSERT OR REPLACE INTO query_results (result_id, command, payload_json, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![result_id, command, payload_json, created_at],
-        )?;
-        Ok(())
-    }
-
-    pub fn query_result_exists(&self, result_id: &str) -> rusqlite::Result<bool> {
-        self.ensure_query_feedback_schema()?;
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM query_results WHERE result_id = ?1",
-            params![result_id],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
-    }
-
-    pub fn upsert_result_feedback(
-        &self,
-        result_id: &str,
-        outcome: &str,
-        note: Option<&str>,
-        rated_at: &str,
-    ) -> rusqlite::Result<()> {
-        self.ensure_query_feedback_schema()?;
-        self.conn.execute(
-            "INSERT INTO result_feedback (result_id, outcome, note, rated_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(result_id) DO UPDATE SET
-               outcome = excluded.outcome,
-               note = excluded.note,
-               rated_at = excluded.rated_at",
-            params![result_id, outcome, note, rated_at],
-        )?;
-        Ok(())
-    }
-
     pub fn evidence_for_anchor(&self, anchor: &str) -> rusqlite::Result<Vec<EvidenceFragmentRef>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT tape_id, event_offset, kind, file_path, timestamp
-             FROM evidence
-             WHERE anchor = ?1
-             ORDER BY timestamp ASC, tape_id ASC, event_offset ASC",
-        )?;
+        let mut matches = self.evidence_window_matches(anchor)?;
+        sort_evidence_window_matches(&mut matches);
+        Ok(matches
+            .into_iter()
+            .map(|(_, _, fragment)| fragment)
+            .collect())
+    }
 
-        let mut rows = stmt.query(params![anchor])?;
+    pub fn evidence_for_anchors(
+        &self,
+        anchors: &[String],
+    ) -> rusqlite::Result<Vec<EvidenceFragmentRef>> {
+        let mut seen_evidence_ids = HashSet::new();
         let mut out = Vec::new();
-        while let Some(row) = rows.next()? {
-            out.push(EvidenceFragmentRef {
-                tape_id: row.get(0)?,
-                event_offset: row.get(1)?,
-                kind: decode_evidence_kind(&row.get::<_, String>(2)?),
-                file_path: row.get(3)?,
-                timestamp: row.get(4)?,
-            });
+        for anchor in anchors {
+            for (evidence_id, _, fragment) in self.evidence_window_matches(anchor)? {
+                if seen_evidence_ids.insert(evidence_id) {
+                    out.push(fragment);
+                }
+            }
         }
+        out.sort_by(|a, b| {
+            a.timestamp
+                .cmp(&b.timestamp)
+                .then_with(|| a.tape_id.cmp(&b.tape_id))
+                .then_with(|| a.event_offset.cmp(&b.event_offset))
+        });
         Ok(out)
+    }
+
+    fn evidence_window_matches(
+        &self,
+        anchor: &str,
+    ) -> rusqlite::Result<Vec<(i64, String, EvidenceFragmentRef)>> {
+        if anchor.starts_with("span:") || !anchor.starts_with("winnow:") {
+            return Ok(Vec::new());
+        }
+        let sql = if anchor.contains(',') {
+            EXACT_EVIDENCE_SQL
+        } else {
+            FEATURE_EVIDENCE_SQL
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params![anchor], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                EvidenceFragmentRef {
+                    tape_id: row.get(2)?,
+                    event_offset: row.get(3)?,
+                    kind: decode_evidence_kind(&row.get::<_, String>(4)?),
+                    file_path: row.get(5)?,
+                    timestamp: row.get(6)?,
+                },
+            ))
+        })?;
+        rows.collect()
+    }
+
+    pub fn matching_window_anchors(&self, anchor: &str) -> rusqlite::Result<Vec<String>> {
+        if anchor.starts_with("span:") {
+            return Ok(vec![anchor.to_string()]);
+        }
+        if !anchor.starts_with("winnow:") {
+            return Ok(Vec::new());
+        }
+        if anchor.contains(',') {
+            return Ok(vec![anchor.to_string()]);
+        }
+        let mut stmt = self.conn.prepare(FEATURE_WINDOW_ANCHORS_SQL)?;
+        let rows = stmt.query_map(params![anchor], |row| row.get(0))?;
+        let mut anchors = rows.collect::<rusqlite::Result<HashSet<String>>>()?;
+        let mut anchors = anchors.drain().collect::<Vec<_>>();
+        anchors.sort();
+        Ok(anchors)
     }
 
     pub fn window_anchor_stats_for_file(
@@ -458,19 +447,13 @@ impl SqliteIndex {
     ) -> rusqlite::Result<Vec<(String, u64)>> {
         let mut stmt = self.conn.prepare(
             "SELECT anchor, COUNT(*) AS hits
-             FROM evidence
+             FROM evidence_windows
              WHERE file_path = ?1
-               AND instr(anchor, ',') > 0
              GROUP BY anchor
              ORDER BY hits DESC, anchor ASC",
         )?;
-
-        let mut rows = stmt.query(params![file_path])?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next()? {
-            out.push((row.get(0)?, row.get(1)?));
-        }
-        Ok(out)
+        stmt.query_map(params![file_path], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect()
     }
 
     pub fn outbound_edges(
@@ -479,41 +462,12 @@ impl SqliteIndex {
         min_confidence: f32,
         include_forensics: bool,
     ) -> rusqlite::Result<Vec<EdgeRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT from_anchor, to_anchor, confidence, location_delta, cardinality,
-                    agent_link, note
-             FROM edges
-             WHERE from_anchor = ?1
-             ORDER BY confidence DESC",
-        )?;
-
-        let mut rows = stmt.query(params![from_anchor])?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next()? {
-            let confidence: f32 = row.get(2)?;
-            let agent_link = row.get::<_, i64>(5)? != 0;
-            let stored_class = derive_stored_class(agent_link, confidence);
-            if !include_forensics && stored_class == StoredEdgeClass::LocationOnly && !agent_link {
-                continue;
-            }
-            if !include_forensics && !agent_link && confidence < min_confidence {
-                continue;
-            }
-            out.push(EdgeRow {
-                from_anchor: row.get(0)?,
-                to_anchor: row.get(1)?,
-                confidence,
-                location_delta: decode_location_delta(&row.get::<_, String>(3)?),
-                cardinality: decode_cardinality(&row.get::<_, String>(4)?),
-                agent_link,
-                note: {
-                    let note: String = row.get(6)?;
-                    if note.is_empty() { None } else { Some(note) }
-                },
-                stored_class,
-            });
-        }
-        Ok(out)
+        self.edges_for_anchor(
+            "from_anchor",
+            from_anchor,
+            min_confidence,
+            include_forensics,
+        )
     }
 
     pub fn inbound_edges(
@@ -522,90 +476,111 @@ impl SqliteIndex {
         min_confidence: f32,
         include_forensics: bool,
     ) -> rusqlite::Result<Vec<EdgeRow>> {
-        let mut stmt = self.conn.prepare(
+        self.edges_for_anchor("to_anchor", to_anchor, min_confidence, include_forensics)
+    }
+
+    fn edges_for_anchor(
+        &self,
+        column: &str,
+        anchor: &str,
+        min_confidence: f32,
+        include_forensics: bool,
+    ) -> rusqlite::Result<Vec<EdgeRow>> {
+        let sql = format!(
             "SELECT from_anchor, to_anchor, confidence, location_delta, cardinality,
                     agent_link, note
              FROM edges
-             WHERE to_anchor = ?1
-             ORDER BY confidence DESC",
-        )?;
-
-        let mut rows = stmt.query(params![to_anchor])?;
+             WHERE {column} = ?1
+             ORDER BY confidence DESC, edge_id ASC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params![anchor])?;
+        let mut seen = HashSet::new();
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
-            let confidence: f32 = row.get(2)?;
-            let agent_link = row.get::<_, i64>(5)? != 0;
-            let stored_class = derive_stored_class(agent_link, confidence);
-            if !include_forensics && stored_class == StoredEdgeClass::LocationOnly && !agent_link {
+            let edge = decode_edge_row(row)?;
+            if !seen.insert(semantic_edge_key(&edge)) {
                 continue;
             }
-            if !include_forensics && !agent_link && confidence < min_confidence {
+            if !include_forensics
+                && !edge.agent_link
+                && (edge.stored_class == StoredEdgeClass::LocationOnly
+                    || edge.confidence < min_confidence)
+            {
                 continue;
             }
-            out.push(EdgeRow {
-                from_anchor: row.get(0)?,
-                to_anchor: row.get(1)?,
-                confidence,
-                location_delta: decode_location_delta(&row.get::<_, String>(3)?),
-                cardinality: decode_cardinality(&row.get::<_, String>(4)?),
-                agent_link,
-                note: {
-                    let note: String = row.get(6)?;
-                    if note.is_empty() { None } else { Some(note) }
-                },
-                stored_class,
-            });
+            out.push(edge);
         }
         Ok(out)
     }
 
     pub fn tombstones_for_anchor(&self, anchor: &str) -> rusqlite::Result<Vec<Tombstone>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT tape_id, event_offset, file_path, range_start, range_end, timestamp
+        if anchor.starts_with("span:") || !anchor.starts_with("winnow:") {
+            return Ok(Vec::new());
+        }
+        let sql = if anchor.contains(',') {
+            "SELECT anchor, tape_id, event_offset, file_path, range_start, range_end, timestamp
              FROM tombstones
              WHERE anchor = ?1
-             ORDER BY event_offset ASC",
-        )?;
-
+             ORDER BY timestamp ASC, tape_id ASC, event_offset ASC, window_ordinal ASC"
+        } else {
+            "SELECT t.anchor, t.tape_id, t.event_offset, t.file_path,
+                    t.range_start, t.range_end, t.timestamp
+             FROM tombstone_features f
+             JOIN tombstones t ON t.tombstone_id = f.tombstone_id
+             WHERE f.feature_hash = ?1
+             ORDER BY t.timestamp ASC, t.tape_id ASC, t.event_offset ASC, t.window_ordinal ASC"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
         let mut rows = stmt.query(params![anchor])?;
+        let mut seen = HashSet::new();
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
-            out.push(Tombstone {
-                anchor_hashes: vec![anchor.to_string()],
-                tape_id: row.get(0)?,
-                event_offset: row.get(1)?,
-                file_path: row.get(2)?,
+            let tombstone = Tombstone {
+                anchor_hashes: vec![row.get(0)?],
+                tape_id: row.get(1)?,
+                event_offset: row.get(2)?,
+                file_path: row.get(3)?,
                 range_at_deletion: FileRange {
-                    start: row.get(3)?,
-                    end: row.get(4)?,
+                    start: row.get(4)?,
+                    end: row.get(5)?,
                 },
-                timestamp: row.get(5)?,
-            });
+                timestamp: row.get(6)?,
+            };
+            let key = (
+                tombstone.tape_id.clone(),
+                tombstone.event_offset,
+                tombstone.file_path.clone(),
+                tombstone.range_at_deletion.start,
+                tombstone.range_at_deletion.end,
+                tombstone.timestamp.clone(),
+            );
+            if seen.insert(key) {
+                out.push(tombstone);
+            }
         }
-
         Ok(out)
     }
 
     pub fn referenced_tape_ids(&self) -> rusqlite::Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT tape_id FROM evidence
+            "SELECT tape_id FROM evidence_windows
              UNION
              SELECT tape_id FROM tombstones",
         )?;
-        let mut rows = stmt.query([])?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next()? {
-            out.push(row.get(0)?);
-        }
-        Ok(out)
+        stmt.query_map([], |row| row.get(0))?.collect()
     }
 
     pub fn has_tape(&self, tape_id: &str) -> rusqlite::Result<bool> {
-        let mut stmt = self
+        Ok(self
             .conn
-            .prepare("SELECT 1 FROM tapes WHERE tape_id = ?1 LIMIT 1")?;
-        let mut rows = stmt.query(params![tape_id])?;
-        Ok(rows.next()?.is_some())
+            .query_row(
+                "SELECT 1 FROM tapes WHERE tape_id = ?1 LIMIT 1",
+                params![tape_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     pub fn ingest_tape_events(
@@ -622,25 +597,15 @@ impl SqliteIndex {
         tape_id: &str,
         events: &[TapeEventAt],
         dispatch_links: &[DispatchLink],
-        link_threshold: f32,
+        _link_threshold: f32,
     ) -> rusqlite::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         for item in events {
-            if let Some((kind, anchors)) = fingerprint_evidence_policy(&item.event.data) {
-                let fragment = EvidenceFragmentRef {
-                    tape_id: tape_id.to_string(),
-                    event_offset: item.offset,
-                    kind,
-                    file_path: String::new(),
-                    timestamp: item.event.timestamp.clone(),
-                };
-                for anchor in anchors {
-                    Self::insert_evidence_on(tx.deref(), &anchor, &fragment)?;
-                }
-                continue;
-            }
             match &item.event.data {
                 TapeEventData::CodeRead(read) => {
+                    let Some(text) = read.text.as_deref() else {
+                        continue;
+                    };
                     let fragment = EvidenceFragmentRef {
                         tape_id: tape_id.to_string(),
                         event_offset: item.offset,
@@ -648,107 +613,100 @@ impl SqliteIndex {
                         file_path: read.file.clone(),
                         timestamp: item.event.timestamp.clone(),
                     };
-                    for anchor in read_evidence_anchors(read) {
-                        Self::insert_evidence_on(tx.deref(), &anchor, &fragment)?;
+                    for window in fingerprint_windows(text) {
+                        Self::insert_evidence_window_on(tx.deref(), &window, &fragment)?;
                     }
                 }
                 TapeEventData::CodeEdit(edit) => {
-                    // Individual tokens for evidence rows (one DB row per hash).
-                    let before_tokens = edit_side_tokens(
-                        edit.before_text.as_deref(),
-                        edit.before_hash.as_deref(),
-                        &edit.before_anchor_hashes,
-                    );
-                    let after_tokens = edit_side_tokens(
-                        edit.after_text.as_deref(),
-                        edit.after_hash.as_deref(),
-                        &edit.after_anchor_hashes,
-                    );
-                    if !before_tokens.is_empty() {
-                        let fragment = EvidenceFragmentRef {
-                            tape_id: tape_id.to_string(),
-                            event_offset: item.offset,
-                            kind: EvidenceKind::Edit,
-                            file_path: edit.file.clone(),
-                            timestamp: item.event.timestamp.clone(),
-                        };
-                        for anchor in &before_tokens {
-                            Self::insert_evidence_on(tx.deref(), anchor, &fragment)?;
-                        }
+                    let before_windows = edit
+                        .before_text
+                        .as_deref()
+                        .map(fingerprint_windows)
+                        .unwrap_or_default();
+                    let after_windows = edit
+                        .after_text
+                        .as_deref()
+                        .map(fingerprint_windows)
+                        .unwrap_or_default();
+
+                    let fragment = EvidenceFragmentRef {
+                        tape_id: tape_id.to_string(),
+                        event_offset: item.offset,
+                        kind: EvidenceKind::Edit,
+                        file_path: edit.file.clone(),
+                        timestamp: item.event.timestamp.clone(),
+                    };
+                    for window in &after_windows {
+                        Self::insert_evidence_window_on(tx.deref(), window, &fragment)?;
                     }
 
-                    if !after_tokens.is_empty() {
-                        let fragment = EvidenceFragmentRef {
-                            tape_id: tape_id.to_string(),
-                            event_offset: item.offset,
-                            kind: EvidenceKind::Edit,
-                            file_path: edit.file.clone(),
-                            timestamp: item.event.timestamp.clone(),
-                        };
-                        for anchor in &after_tokens {
-                            Self::insert_evidence_on(tx.deref(), anchor, &fragment)?;
-                        }
-                    }
-
-                    if !before_tokens.is_empty() && !after_tokens.is_empty() {
+                    if !before_windows.is_empty() && !after_windows.is_empty() {
                         let confidence = edit_similarity(edit);
                         Self::validate_confidence(confidence)?;
-                        for (before_anchor, after_anchor) in
-                            query_compatible_edge_pairs(&before_tokens, &after_tokens)
+                        for (pair_ordinal, (before, after)) in
+                            proportional_window_pairs(&before_windows, &after_windows)
+                                .into_iter()
+                                .enumerate()
                         {
                             Self::insert_edge_on(
                                 tx.deref(),
+                                &EdgeSource {
+                                    source_kind: EdgeSourceKind::Edit,
+                                    tape_id: tape_id.to_string(),
+                                    event_offset: item.offset,
+                                    pair_ordinal: pair_ordinal as u32,
+                                    from_window_ordinal: i64::from(before.ordinal),
+                                    to_window_ordinal: i64::from(after.ordinal),
+                                },
                                 &SpanEdge {
-                                    from_anchor: before_anchor,
-                                    to_anchor: after_anchor,
+                                    from_anchor: before.anchor.clone(),
+                                    to_anchor: after.anchor.clone(),
                                     confidence,
                                     location_delta: LocationDelta::Same,
                                     cardinality: Cardinality::OneToOne,
                                     agent_link: false,
                                     note: None,
                                 },
-                                link_threshold,
                             )?;
                         }
-                    }
-
-                    if after_tokens.is_empty() && !before_tokens.is_empty() {
+                    } else if !before_windows.is_empty() && after_windows.is_empty() {
                         let range = edit
                             .before_range
                             .or(edit.after_range)
-                            .map(|r| FileRange {
-                                start: r.start,
-                                end: r.end,
-                            })
                             .unwrap_or(FileRange { start: 0, end: 0 });
-                        Self::insert_tombstone_on(
-                            tx.deref(),
-                            &Tombstone {
-                                anchor_hashes: before_tokens,
-                                tape_id: tape_id.to_string(),
-                                event_offset: item.offset,
-                                file_path: edit.file.clone(),
-                                range_at_deletion: range,
-                                timestamp: item.event.timestamp.clone(),
-                            },
-                        )?;
+                        let tombstone = Tombstone {
+                            anchor_hashes: Vec::new(),
+                            tape_id: tape_id.to_string(),
+                            event_offset: item.offset,
+                            file_path: edit.file.clone(),
+                            range_at_deletion: range,
+                            timestamp: item.event.timestamp.clone(),
+                        };
+                        for window in &before_windows {
+                            Self::insert_tombstone_window_on(tx.deref(), window, &tombstone)?;
+                        }
                     }
                 }
                 TapeEventData::SpanLink(link) => {
-                    let from_anchor = encode_span_link_anchor(&link.from_file, link.from_range);
-                    let to_anchor = encode_span_link_anchor(&link.to_file, link.to_range);
                     Self::insert_edge_on(
                         tx.deref(),
+                        &EdgeSource {
+                            source_kind: EdgeSourceKind::SpanLink,
+                            tape_id: tape_id.to_string(),
+                            event_offset: item.offset,
+                            pair_ordinal: 0,
+                            from_window_ordinal: -1,
+                            to_window_ordinal: -1,
+                        },
                         &SpanEdge {
-                            from_anchor,
-                            to_anchor,
+                            from_anchor: encode_span_link_anchor(&link.from_file, link.from_range),
+                            to_anchor: encode_span_link_anchor(&link.to_file, link.to_range),
                             confidence: 1.0,
                             location_delta: LocationDelta::Moved,
                             cardinality: Cardinality::OneToOne,
                             agent_link: true,
                             note: link.note.clone(),
                         },
-                        link_threshold,
                     )?;
                 }
                 TapeEventData::Textual(_)
@@ -760,14 +718,11 @@ impl SqliteIndex {
         for link in dispatch_links {
             Self::insert_dispatch_link_on(tx.deref(), tape_id, link)?;
         }
-
         tx.execute(
             "INSERT OR IGNORE INTO tapes (tape_id) VALUES (?1)",
             params![tape_id],
         )?;
-
-        tx.commit()?;
-        Ok(())
+        tx.commit()
     }
 
     pub fn dispatch_links_for_tape(&self, tape_id: &str) -> rusqlite::Result<Vec<DispatchLink>> {
@@ -777,16 +732,14 @@ impl SqliteIndex {
              WHERE tape_id = ?1
              ORDER BY first_turn_index ASC, uuid ASC",
         )?;
-        let mut rows = stmt.query(params![tape_id])?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next()? {
-            out.push(DispatchLink {
+        stmt.query_map(params![tape_id], |row| {
+            Ok(DispatchLink {
                 uuid: row.get(0)?,
                 first_turn_index: row.get(1)?,
                 direction: decode_dispatch_direction(&row.get::<_, String>(2)?),
-            });
-        }
-        Ok(out)
+            })
+        })?
+        .collect()
     }
 
     pub fn dispatch_links_for_uuid(&self, uuid: &str) -> rusqlite::Result<Vec<DispatchLinkRow>> {
@@ -796,17 +749,8 @@ impl SqliteIndex {
              WHERE uuid = ?1
              ORDER BY first_turn_index ASC, tape_id ASC",
         )?;
-        let mut rows = stmt.query(params![uuid])?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next()? {
-            out.push(DispatchLinkRow {
-                tape_id: row.get(0)?,
-                uuid: row.get(1)?,
-                first_turn_index: row.get(2)?,
-                direction: decode_dispatch_direction(&row.get::<_, String>(3)?),
-            });
-        }
-        Ok(out)
+        stmt.query_map(params![uuid], decode_dispatch_link_row)?
+            .collect()
     }
 
     pub fn latest_received_dispatch_before_turn(
@@ -814,87 +758,91 @@ impl SqliteIndex {
         tape_id: &str,
         turn_index: i64,
     ) -> rusqlite::Result<Option<DispatchLink>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT uuid, first_turn_index, direction
-             FROM dispatch_links
-             WHERE tape_id = ?1
-               AND direction = 'received'
-               AND first_turn_index < ?2
-             ORDER BY first_turn_index DESC, uuid ASC
-             LIMIT 1",
-        )?;
-        let mut rows = stmt.query(params![tape_id, turn_index])?;
-        if let Some(row) = rows.next()? {
-            return Ok(Some(DispatchLink {
-                uuid: row.get(0)?,
-                first_turn_index: row.get(1)?,
-                direction: decode_dispatch_direction(&row.get::<_, String>(2)?),
-            }));
-        }
-        Ok(None)
+        self.conn
+            .query_row(
+                "SELECT uuid, first_turn_index, direction
+                 FROM dispatch_links
+                 WHERE tape_id = ?1 AND direction = 'received' AND first_turn_index < ?2
+                 ORDER BY first_turn_index DESC, uuid ASC
+                 LIMIT 1",
+                params![tape_id, turn_index],
+                |row| {
+                    Ok(DispatchLink {
+                        uuid: row.get(0)?,
+                        first_turn_index: row.get(1)?,
+                        direction: decode_dispatch_direction(&row.get::<_, String>(2)?),
+                    })
+                },
+            )
+            .optional()
     }
 
     pub fn sent_dispatch_for_uuid(&self, uuid: &str) -> rusqlite::Result<Option<DispatchLinkRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT tape_id, uuid, first_turn_index, direction
-             FROM dispatch_links
-             WHERE uuid = ?1
-               AND direction = 'sent'
-             ORDER BY first_turn_index DESC, tape_id ASC
-             LIMIT 1",
-        )?;
-        let mut rows = stmt.query(params![uuid])?;
-        if let Some(row) = rows.next()? {
-            return Ok(Some(DispatchLinkRow {
-                tape_id: row.get(0)?,
-                uuid: row.get(1)?,
-                first_turn_index: row.get(2)?,
-                direction: decode_dispatch_direction(&row.get::<_, String>(3)?),
-            }));
+        self.conn
+            .query_row(
+                "SELECT tape_id, uuid, first_turn_index, direction
+                 FROM dispatch_links
+                 WHERE uuid = ?1 AND direction = 'sent'
+                 ORDER BY first_turn_index DESC, tape_id ASC
+                 LIMIT 1",
+                params![uuid],
+                decode_dispatch_link_row,
+            )
+            .optional()
+    }
+
+    fn validate_anchor(anchor: &str) -> rusqlite::Result<()> {
+        if anchor.is_empty() {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "anchor must not be empty".to_string(),
+            ));
         }
-        Ok(None)
+        Ok(())
+    }
+
+    fn validate_confidence(confidence: f32) -> rusqlite::Result<()> {
+        if !(0.0..=1.0).contains(&confidence) {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "confidence must be in [0.0, 1.0]".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn scalar_i64(&self, sql: &str) -> i64 {
+        self.conn.query_row(sql, [], |row| row.get(0)).unwrap()
     }
 }
 
-fn encode_span_link_anchor(file: &str, range: crate::tape::event::FileRange) -> String {
-    format!("span:{file}:{}-{}", range.start, range.end)
-}
-
-/// Anchors used to insert evidence rows for a code-read event.
-/// Returns individual winnow hash tokens so each can be indexed by equality.
-fn read_evidence_anchors(read: &crate::tape::event::CodeReadEvent) -> Vec<String> {
-    if let Some(text) = read.text.as_deref() {
-        return fingerprint_token_hashes(text);
-    }
-    expand_legacy_anchors(None, &read.anchor_hashes)
-}
-
-fn fingerprint_evidence_policy(data: &TapeEventData) -> Option<(EvidenceKind, Vec<String>)> {
-    let TapeEventData::Textual(event) = data else {
-        return None;
-    };
-    let kind = match event.kind {
-        crate::tape::event::EventKind::MsgIn | crate::tape::event::EventKind::MsgOut => {
-            EvidenceKind::Message
-        }
-        crate::tape::event::EventKind::ToolCall | crate::tape::event::EventKind::ToolResult => {
-            EvidenceKind::Tool
-        }
-        _ => return None,
-    };
-    Some((kind, fingerprint_token_hashes(&event.text)))
-}
-
-/// Anchors used to insert evidence rows for one side of a code-edit event.
-/// Returns individual winnow hash tokens.
-fn edit_side_tokens(text: Option<&str>, hash: Option<&str>, anchors: &[String]) -> Vec<String> {
-    if let Some(text) = text {
-        let tokens = fingerprint_token_hashes(text);
-        if !tokens.is_empty() {
-            return tokens;
+fn encode_sqlite_uri_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'-' | b'~' | b':' => {
+                out.push(char::from(byte))
+            }
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(&mut out, "%{byte:02X}");
+            }
         }
     }
-    expand_legacy_anchors(hash, anchors)
+    out
+}
+
+fn proportional_window_pairs<'a>(
+    before: &'a [FingerprintedWindow],
+    after: &'a [FingerprintedWindow],
+) -> Vec<(&'a FingerprintedWindow, &'a FingerprintedWindow)> {
+    let pair_count = before.len().max(after.len());
+    (0..pair_count)
+        .map(|index| {
+            let before_index = index * before.len() / pair_count;
+            let after_index = index * after.len() / pair_count;
+            (&before[before_index], &after[after_index])
+        })
+        .collect()
 }
 
 fn edit_similarity(edit: &crate::tape::event::CodeEditEvent) -> f32 {
@@ -910,84 +858,75 @@ fn edit_similarity(edit: &crate::tape::event::CodeEditEvent) -> f32 {
     }
 }
 
-fn query_compatible_edge_pairs(before: &[String], after: &[String]) -> Vec<(String, String)> {
-    let pair_count = before.len().max(after.len());
-    (0..pair_count)
-        .map(|index| {
-            let before_index = index * before.len() / pair_count;
-            let after_index = index * after.len() / pair_count;
-            (before[before_index].clone(), after[after_index].clone())
-        })
-        .collect()
+fn encode_span_link_anchor(file: &str, range: FileRange) -> String {
+    format!("span:{file}:{}-{}", range.start, range.end)
 }
 
-/// Expand legacy anchor_hashes into individual winnow tokens.
-/// A comma-separated entry like "winnow:aaa,bbb" becomes ["winnow:aaa","winnow:bbb"].
-fn expand_legacy_anchors(hash: Option<&str>, anchors: &[String]) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-
-    for anchor in anchors {
-        for token in expand_winnow_anchor(anchor) {
-            if seen.insert(token.clone()) {
-                out.push(token);
-            }
-        }
-        // Non-winnow anchors (e.g. span: links) are kept as-is.
-        if !anchor.starts_with("winnow:") && seen.insert(anchor.clone()) {
-            out.push(anchor.clone());
-        }
-    }
-
-    if out.is_empty()
-        && let Some(anchor) = hash.filter(|h| h.starts_with("winnow:"))
-    {
-        for token in expand_winnow_anchor(anchor) {
-            if seen.insert(token.clone()) {
-                out.push(token);
-            }
-        }
-    }
-
-    out
+pub(crate) fn semantic_edge_key(
+    edge: &EdgeRow,
+) -> (
+    String,
+    String,
+    u32,
+    LocationDelta,
+    Cardinality,
+    bool,
+    Option<String>,
+) {
+    (
+        edge.from_anchor.clone(),
+        edge.to_anchor.clone(),
+        edge.confidence.to_bits(),
+        edge.location_delta,
+        edge.cardinality,
+        edge.agent_link,
+        edge.note.clone(),
+    )
 }
 
-impl SqliteIndex {
-    fn validate_anchor(anchor: &str) -> rusqlite::Result<()> {
-        if anchor.is_empty() {
-            return Err(rusqlite::Error::InvalidParameterName(
-                "anchor_hash must not be empty".to_string(),
-            ));
-        }
-        Ok(())
-    }
+fn decode_edge_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EdgeRow> {
+    let confidence = row.get(2)?;
+    let agent_link = row.get::<_, i64>(5)? != 0;
+    let note: String = row.get(6)?;
+    Ok(EdgeRow {
+        from_anchor: row.get(0)?,
+        to_anchor: row.get(1)?,
+        confidence,
+        location_delta: decode_location_delta(&row.get::<_, String>(3)?),
+        cardinality: decode_cardinality(&row.get::<_, String>(4)?),
+        agent_link,
+        note: (!note.is_empty()).then_some(note),
+        stored_class: derive_stored_class(agent_link, confidence),
+    })
+}
 
-    fn validate_confidence(confidence: f32) -> rusqlite::Result<()> {
-        if !(0.0..=1.0).contains(&confidence) {
-            return Err(rusqlite::Error::InvalidParameterName(
-                "confidence must be in [0.0, 1.0]".to_string(),
-            ));
-        }
-        Ok(())
-    }
+fn decode_dispatch_link_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DispatchLinkRow> {
+    Ok(DispatchLinkRow {
+        tape_id: row.get(0)?,
+        uuid: row.get(1)?,
+        first_turn_index: row.get(2)?,
+        direction: decode_dispatch_direction(&row.get::<_, String>(3)?),
+    })
 }
 
 fn encode_evidence_kind(kind: EvidenceKind) -> &'static str {
     match kind {
         EvidenceKind::Edit => "edit",
         EvidenceKind::Read => "read",
-        EvidenceKind::Tool => "tool",
-        EvidenceKind::Message => "message",
     }
 }
 
 fn decode_evidence_kind(raw: &str) -> EvidenceKind {
     match raw {
         "edit" => EvidenceKind::Edit,
-        "read" => EvidenceKind::Read,
-        "tool" => EvidenceKind::Tool,
-        "message" => EvidenceKind::Message,
         _ => EvidenceKind::Read,
+    }
+}
+
+fn encode_edge_source_kind(kind: EdgeSourceKind) -> &'static str {
+    match kind {
+        EdgeSourceKind::Edit => "edit",
+        EdgeSourceKind::SpanLink => "span_link",
     }
 }
 
@@ -1005,7 +944,6 @@ fn decode_location_delta(raw: &str) -> LocationDelta {
         "same" => LocationDelta::Same,
         "adjacent" => LocationDelta::Adjacent,
         "moved" => LocationDelta::Moved,
-        "absent" => LocationDelta::Absent,
         _ => LocationDelta::Absent,
     }
 }
@@ -1020,7 +958,6 @@ fn encode_cardinality(cardinality: Cardinality) -> &'static str {
 
 fn decode_cardinality(raw: &str) -> Cardinality {
     match raw {
-        "1:1" => Cardinality::OneToOne,
         "1:N" => Cardinality::OneToMany,
         "N:1" => Cardinality::ManyToOne,
         _ => Cardinality::OneToOne,
@@ -1049,589 +986,287 @@ fn derive_stored_class(agent_link: bool, confidence: f32) -> StoredEdgeClass {
     }
 }
 
+fn sort_evidence_window_matches(matches: &mut [(i64, String, EvidenceFragmentRef)]) {
+    matches.sort_by(|left, right| {
+        left.2
+            .timestamp
+            .cmp(&right.2.timestamp)
+            .then_with(|| left.2.tape_id.cmp(&right.2.tape_id))
+            .then_with(|| left.2.event_offset.cmp(&right.2.event_offset))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::anchor::fingerprint_token_hashes;
-    use crate::index::lineage::LINK_THRESHOLD_DEFAULT;
-    use crate::tape::event::{CodeEditEvent, CodeReadEvent, FileRange, TapeEvent, TapeEventData};
+    use crate::tape::event::{CodeEditEvent, CodeReadEvent, EventKind, TapeEvent, TextualEvent};
 
-    fn read_event(anchor: &str, file: &str, offset: u64) -> TapeEventAt {
+    fn source_text(prefix: &str, lines: usize) -> String {
+        (1..=lines)
+            .map(|line| format!("fn {prefix}_{line}() {{ value_{line}(); }}\n"))
+            .collect()
+    }
+
+    fn event(offset: u64, data: TapeEventData) -> TapeEventAt {
         TapeEventAt {
             offset,
             event: TapeEvent {
-                timestamp: "2026-02-22T00:00:00Z".to_string(),
-                data: TapeEventData::CodeRead(CodeReadEvent {
-                    file: file.to_string(),
-                    range: FileRange { start: 1, end: 1 },
-                    text: None,
-                    anchor_hashes: vec![anchor.to_string()],
-                }),
+                timestamp: format!("2026-07-29T00:00:{offset:02}Z"),
+                data,
             },
         }
     }
 
-    fn edit_event(
-        before_hash: Option<&str>,
-        after_hash: Option<&str>,
-        file: &str,
-        offset: u64,
-    ) -> TapeEventAt {
-        edit_event_with_similarity(before_hash, after_hash, Some(0.80), file, offset)
-    }
-
-    fn edit_event_with_similarity(
-        before_hash: Option<&str>,
-        after_hash: Option<&str>,
-        similarity: Option<f32>,
-        file: &str,
-        offset: u64,
-    ) -> TapeEventAt {
-        TapeEventAt {
-            offset,
-            event: TapeEvent {
-                timestamp: "2026-02-22T00:00:01Z".to_string(),
-                data: TapeEventData::CodeEdit(CodeEditEvent {
-                    file: file.to_string(),
-                    before_range: Some(FileRange { start: 10, end: 12 }),
-                    after_range: Some(FileRange { start: 10, end: 13 }),
-                    before_text: None,
-                    after_text: None,
-                    before_hash: before_hash.map(ToOwned::to_owned),
-                    after_hash: after_hash.map(ToOwned::to_owned),
-                    before_anchor_hashes: before_hash
-                        .map(|anchor| vec![anchor.to_string()])
-                        .unwrap_or_default(),
-                    after_anchor_hashes: after_hash
-                        .map(|anchor| vec![anchor.to_string()])
-                        .unwrap_or_default(),
-                    similarity,
-                }),
-            },
-        }
+    fn query_plan(index: &SqliteIndex, sql: &str) -> Vec<String> {
+        let mut stmt = index
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        stmt.query_map(params!["winnow:feature"], |row| row.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap()
     }
 
     #[test]
-    fn ingests_reads_edits_edges_and_tombstones() {
-        let index = SqliteIndex::open_in_memory().expect("in-memory sqlite");
-        let events = vec![
-            read_event("read-anchor", "src/lib.rs", 0),
-            edit_event(Some("before"), Some("after"), "src/lib.rs", 1),
-            edit_event(Some("deleted"), None, "src/lib.rs", 2),
-        ];
-
-        index
-            .ingest_tape_events("tape-1", &events, LINK_THRESHOLD_DEFAULT)
-            .expect("ingest succeeds");
-
-        let read_refs = index
-            .evidence_for_anchor("read-anchor")
-            .expect("read evidence query");
-        assert_eq!(read_refs.len(), 1);
-        assert_eq!(read_refs[0].kind, EvidenceKind::Read);
-
-        let edit_refs = index
-            .evidence_for_anchor("after")
-            .expect("edit evidence query");
-        assert_eq!(edit_refs.len(), 1);
-        assert_eq!(edit_refs[0].kind, EvidenceKind::Edit);
-        let before_refs = index
-            .evidence_for_anchor("before")
-            .expect("before evidence query");
-        assert_eq!(before_refs.len(), 1);
-        assert_eq!(before_refs[0].kind, EvidenceKind::Edit);
-
-        let edges = index
-            .outbound_edges("before", 0.50, false)
-            .expect("edge query");
-        assert_eq!(edges.len(), 1);
-
-        let edges_forensics = index
-            .outbound_edges("before", 0.50, true)
-            .expect("edge query with forensics");
-        assert_eq!(edges_forensics.len(), 1);
-
-        let tombstones = index
-            .tombstones_for_anchor("deleted")
-            .expect("tombstone query");
-        assert_eq!(tombstones.len(), 1);
-        assert_eq!(tombstones[0].file_path, "src/lib.rs");
-    }
-
-    #[test]
-    fn ingests_windowed_edit_text_as_direct_evidence() {
-        let index = SqliteIndex::open_in_memory().expect("in-memory sqlite");
-        let before_text = (1..=72)
-            .map(|line| format!("fn before_{line}() {{ value_{line}(); }}\n"))
-            .collect::<String>();
-        let after_text = (1..=72)
-            .map(|line| format!("fn after_{line}() {{ value_{line}(); }}\n"))
-            .collect::<String>();
-        // Individual tokens are stored in evidence; window-level anchors are
-        // only used for edges.
-        let before_tokens = fingerprint_token_hashes(&before_text);
-        let after_tokens = fingerprint_token_hashes(&after_text);
-        let events = vec![TapeEventAt {
-            offset: 1,
-            event: TapeEvent {
-                timestamp: "2026-02-22T00:00:01Z".to_string(),
-                data: TapeEventData::CodeEdit(CodeEditEvent {
-                    file: "src/lib.rs".to_string(),
-                    before_range: Some(FileRange { start: 10, end: 12 }),
-                    after_range: Some(FileRange { start: 10, end: 13 }),
-                    before_text: Some(before_text),
-                    after_text: Some(after_text),
-                    before_hash: None,
-                    after_hash: None,
-                    before_anchor_hashes: Vec::new(),
-                    after_anchor_hashes: Vec::new(),
-                    similarity: Some(0.80),
-                }),
-            },
-        }];
-
-        index
-            .ingest_tape_events("tape-1", &events, LINK_THRESHOLD_DEFAULT)
-            .expect("ingest succeeds");
-
-        assert!(before_tokens.len() >= 3, "tokens={before_tokens:?}");
-        assert!(after_tokens.len() >= 3, "tokens={after_tokens:?}");
-
-        let before_refs = index
-            .evidence_for_anchor(&before_tokens[0])
-            .expect("before winnow token evidence");
-        assert_eq!(before_refs.len(), 1);
-        assert_eq!(before_refs[0].kind, EvidenceKind::Edit);
-
-        let after_refs = index
-            .evidence_for_anchor(&after_tokens[0])
-            .expect("after winnow token evidence");
-        assert_eq!(after_refs.len(), 1);
-        assert_eq!(after_refs[0].kind, EvidenceKind::Edit);
-    }
-
-    #[test]
-    fn empty_computed_edit_fingerprints_fall_back_to_location_only_anchor_edge() {
-        let index = SqliteIndex::open_in_memory().expect("in-memory sqlite");
-        let before_anchor = "winnow:0000000000000001";
-        let after_anchor = "winnow:0000000000000002";
-        let events = vec![TapeEventAt {
-            offset: 1,
-            event: TapeEvent {
-                timestamp: "2026-02-22T00:00:01Z".to_string(),
-                data: TapeEventData::CodeEdit(CodeEditEvent {
-                    file: "src/lib.rs".to_string(),
-                    before_range: Some(FileRange { start: 10, end: 10 }),
-                    after_range: Some(FileRange { start: 10, end: 10 }),
-                    before_text: Some(String::new()),
-                    after_text: Some(String::new()),
-                    before_hash: None,
-                    after_hash: None,
-                    before_anchor_hashes: vec![before_anchor.to_string()],
-                    after_anchor_hashes: vec![after_anchor.to_string()],
-                    similarity: Some(0.20),
-                }),
-            },
-        }];
-
-        index
-            .ingest_tape_events("tape-1", &events, LINK_THRESHOLD_DEFAULT)
-            .expect("ingest succeeds");
-
+    fn schema_v4_uses_wide_windows_and_narrow_postings_only() {
+        let index = SqliteIndex::open_in_memory().unwrap();
+        assert_eq!(index.scalar_i64("PRAGMA user_version"), 4);
         assert_eq!(
-            index
-                .evidence_for_anchor(before_anchor)
-                .expect("before fallback evidence")
-                .len(),
-            1
-        );
-        assert_eq!(
-            index
-                .evidence_for_anchor(after_anchor)
-                .expect("after fallback evidence")
-                .len(),
-            1
-        );
-        let edges = index
-            .outbound_edges(before_anchor, 0.0, true)
-            .expect("fallback edge");
-        assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].to_anchor, after_anchor);
-        assert_eq!(edges[0].confidence, 0.20);
-        assert_eq!(edges[0].stored_class, StoredEdgeClass::LocationOnly);
-    }
-
-    #[test]
-    fn span_link_is_agent_edge_and_survives_min_confidence() {
-        let index = SqliteIndex::open_in_memory().expect("in-memory sqlite");
-        let events = vec![TapeEventAt {
-            offset: 5,
-            event: TapeEvent {
-                timestamp: "2026-02-22T00:00:03Z".to_string(),
-                data: TapeEventData::SpanLink(crate::tape::event::SpanLinkEvent {
-                    from_file: "src/a.rs".to_string(),
-                    from_range: FileRange { start: 1, end: 2 },
-                    to_file: "src/b.rs".to_string(),
-                    to_range: FileRange { start: 10, end: 20 },
-                    note: Some("extract".to_string()),
-                }),
-            },
-        }];
-
-        index
-            .ingest_tape_events("tape-2", &events, LINK_THRESHOLD_DEFAULT)
-            .expect("ingest succeeds");
-
-        let from = "span:src/a.rs:1-2";
-        let edges = index
-            .outbound_edges(from, 0.99, false)
-            .expect("edge query for span link");
-        assert_eq!(edges.len(), 1);
-        assert!(edges[0].agent_link);
-        assert_eq!(edges[0].note.as_deref(), Some("extract"));
-    }
-
-    #[test]
-    fn ingest_is_idempotent_for_same_tape_events() {
-        let index = SqliteIndex::open_in_memory().expect("in-memory sqlite");
-        let events = vec![
-            read_event("read-anchor", "src/lib.rs", 0),
-            edit_event(Some("before"), Some("after"), "src/lib.rs", 1),
-        ];
-
-        index
-            .ingest_tape_events("tape-1", &events, LINK_THRESHOLD_DEFAULT)
-            .expect("first ingest");
-        index
-            .ingest_tape_events("tape-1", &events, LINK_THRESHOLD_DEFAULT)
-            .expect("second ingest");
-
-        assert_eq!(
-            index
-                .evidence_for_anchor("read-anchor")
-                .expect("read evidence")
-                .len(),
-            1
-        );
-        assert_eq!(
-            index
-                .evidence_for_anchor("after")
-                .expect("edit evidence")
-                .len(),
-            1
-        );
-        assert_eq!(
-            index
-                .outbound_edges("before", 0.0, true)
-                .expect("edges")
-                .len(),
-            1
-        );
-    }
-
-    #[test]
-    fn ingest_rolls_back_when_event_contains_invalid_anchor() {
-        let index = SqliteIndex::open_in_memory().expect("in-memory sqlite");
-        let events = vec![
-            read_event("anchor-1", "src/lib.rs", 0),
-            read_event("", "src/lib.rs", 1),
-        ];
-
-        let err = index.ingest_tape_events("tape-1", &events, LINK_THRESHOLD_DEFAULT);
-        assert!(err.is_err());
-        assert_eq!(
-            index
-                .evidence_for_anchor("anchor-1")
-                .expect("query after rollback")
-                .len(),
+            index.scalar_i64(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name IN ('query_results','result_feedback','evidence')"
+            ),
             0
         );
     }
 
     #[test]
-    fn location_only_edges_are_hidden_without_forensics_even_with_low_min_confidence() {
-        let index = SqliteIndex::open_in_memory().expect("in-memory sqlite");
-        let events = vec![edit_event_with_similarity(
-            Some("before"),
-            Some("after"),
-            Some(0.20),
-            "src/lib.rs",
-            1,
-        )];
+    fn direct_touch_plans_use_bounded_indexes_without_temporary_sorting() {
+        let index = SqliteIndex::open_in_memory().unwrap();
 
-        index
-            .ingest_tape_events("tape-1", &events, LINK_THRESHOLD_DEFAULT)
-            .expect("ingest succeeds");
-
-        let without_forensics = index
-            .outbound_edges("before", 0.10, false)
-            .expect("non-forensics query");
-        assert_eq!(without_forensics.len(), 0);
-
-        let with_forensics = index
-            .outbound_edges("before", 0.10, true)
-            .expect("forensics query");
-        assert_eq!(with_forensics.len(), 1);
-        assert_eq!(
-            with_forensics[0].stored_class,
-            StoredEdgeClass::LocationOnly
+        let exact = query_plan(&index, EXACT_EVIDENCE_SQL);
+        assert!(
+            exact
+                .iter()
+                .any(|detail| detail.contains("idx_evidence_windows_anchor")),
+            "exact plan must use the composite-anchor index: {exact:?}"
         );
-    }
 
-    #[test]
-    fn invalid_similarity_rejects_ingest_and_rolls_back() {
-        let index = SqliteIndex::open_in_memory().expect("in-memory sqlite");
-        let events = vec![
-            read_event("anchor-1", "src/lib.rs", 0),
-            edit_event_with_similarity(Some("a"), Some("b"), Some(1.2), "src/lib.rs", 1),
-        ];
-
-        let err = index.ingest_tape_events("tape-1", &events, LINK_THRESHOLD_DEFAULT);
-        assert!(err.is_err());
-        assert_eq!(
-            index
-                .evidence_for_anchor("anchor-1")
-                .expect("query after rollback")
-                .len(),
-            0
-        );
-    }
-
-    #[test]
-    fn ingest_persists_dispatch_links_and_queries_by_tape_and_uuid() {
-        let index = SqliteIndex::open_in_memory().expect("in-memory sqlite");
-        let events = vec![read_event("anchor-1", "src/lib.rs", 0)];
-        let links = vec![
-            DispatchLink {
-                uuid: "11111111-1111-4111-8111-111111111111".to_string(),
-                first_turn_index: 0,
-                direction: DispatchDirection::Received,
-            },
-            DispatchLink {
-                uuid: "22222222-2222-4222-8222-222222222222".to_string(),
-                first_turn_index: 3,
-                direction: DispatchDirection::Sent,
-            },
-        ];
-
-        index
-            .ingest_tape_events_with_dispatch(
-                "tape-dispatch",
-                &events,
-                &links,
-                LINK_THRESHOLD_DEFAULT,
-            )
-            .expect("ingest dispatch links");
-
-        let by_tape = index
-            .dispatch_links_for_tape("tape-dispatch")
-            .expect("dispatch links by tape");
-        assert_eq!(by_tape.len(), 2);
-        assert_eq!(by_tape[0].direction, DispatchDirection::Received);
-        assert_eq!(by_tape[1].direction, DispatchDirection::Sent);
-
-        let by_uuid = index
-            .dispatch_links_for_uuid("22222222-2222-4222-8222-222222222222")
-            .expect("dispatch links by uuid");
-        assert_eq!(by_uuid.len(), 1);
-        assert_eq!(by_uuid[0].tape_id, "tape-dispatch");
-        assert_eq!(by_uuid[0].direction, DispatchDirection::Sent);
-    }
-
-    #[test]
-    fn latest_received_dispatch_before_turn_selects_most_recent_prior() {
-        let index = SqliteIndex::open_in_memory().expect("in-memory sqlite");
-        index
-            .insert_dispatch_link(
-                "tape-a",
-                &DispatchLink {
-                    uuid: "a".to_string(),
-                    first_turn_index: 1,
-                    direction: DispatchDirection::Received,
-                },
-            )
-            .expect("insert");
-        index
-            .insert_dispatch_link(
-                "tape-a",
-                &DispatchLink {
-                    uuid: "b".to_string(),
-                    first_turn_index: 7,
-                    direction: DispatchDirection::Received,
-                },
-            )
-            .expect("insert");
-        index
-            .insert_dispatch_link(
-                "tape-a",
-                &DispatchLink {
-                    uuid: "c".to_string(),
-                    first_turn_index: 9,
-                    direction: DispatchDirection::Sent,
-                },
-            )
-            .expect("insert");
-
-        let link = index
-            .latest_received_dispatch_before_turn("tape-a", 8)
-            .expect("query")
-            .expect("link");
-        assert_eq!(link.uuid, "b");
-        assert_eq!(link.direction, DispatchDirection::Received);
-    }
-
-    #[test]
-    fn dispatch_links_are_idempotent_on_repeat_ingest() {
-        let index = SqliteIndex::open_in_memory().expect("sqlite");
-        let events = vec![read_event("anchor-1", "src/lib.rs", 0)];
-        let links = vec![DispatchLink {
-            uuid: "33333333-3333-4333-8333-333333333333".to_string(),
-            first_turn_index: 2,
-            direction: DispatchDirection::Received,
-        }];
-
-        index
-            .ingest_tape_events_with_dispatch(
-                "tape-repeat",
-                &events,
-                &links,
-                LINK_THRESHOLD_DEFAULT,
-            )
-            .expect("first ingest");
-        index
-            .ingest_tape_events_with_dispatch(
-                "tape-repeat",
-                &events,
-                &links,
-                LINK_THRESHOLD_DEFAULT,
-            )
-            .expect("second ingest");
-
-        let by_tape = index.dispatch_links_for_tape("tape-repeat").expect("query");
-        assert_eq!(by_tape.len(), 1);
-        assert_eq!(by_tape[0].uuid, "33333333-3333-4333-8333-333333333333");
-    }
-
-    #[test]
-    fn sent_dispatch_for_uuid_is_none_when_uuid_is_only_received() {
-        let index = SqliteIndex::open_in_memory().expect("sqlite");
-        index
-            .insert_dispatch_link(
-                "tape-r1",
-                &DispatchLink {
-                    uuid: "44444444-4444-4444-8444-444444444444".to_string(),
-                    first_turn_index: 0,
-                    direction: DispatchDirection::Received,
-                },
-            )
-            .expect("insert");
-        index
-            .insert_dispatch_link(
-                "tape-r2",
-                &DispatchLink {
-                    uuid: "44444444-4444-4444-8444-444444444444".to_string(),
-                    first_turn_index: 1,
-                    direction: DispatchDirection::Received,
-                },
-            )
-            .expect("insert");
-
-        let parent = index
-            .sent_dispatch_for_uuid("44444444-4444-4444-8444-444444444444")
-            .expect("query parent");
-        assert!(parent.is_none());
-    }
-
-    #[test]
-    fn latest_received_dispatch_before_turn_handles_long_running_tapes() {
-        let index = SqliteIndex::open_in_memory().expect("sqlite");
-        for i in 0..25 {
-            index
-                .insert_dispatch_link(
-                    "tape-long",
-                    &DispatchLink {
-                        uuid: format!("long-{i:02}"),
-                        first_turn_index: i,
-                        direction: DispatchDirection::Received,
-                    },
-                )
-                .expect("insert");
+        for (name, plan) in [
+            ("feature evidence", query_plan(&index, FEATURE_EVIDENCE_SQL)),
+            (
+                "feature window anchors",
+                query_plan(&index, FEATURE_WINDOW_ANCHORS_SQL),
+            ),
+        ] {
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.contains("PRIMARY KEY (feature_hash=?)")),
+                "{name} plan must use the posting-table primary key: {plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.contains("INTEGER PRIMARY KEY (rowid=?)")),
+                "{name} plan must use evidence-window primary-key lookup: {plan:?}"
+            );
         }
 
-        let picked = index
-            .latest_received_dispatch_before_turn("tape-long", 21)
-            .expect("query")
-            .expect("picked");
-        assert_eq!(picked.first_turn_index, 20);
-        assert_eq!(picked.uuid, "long-20");
+        for (name, plan) in [
+            ("exact evidence", exact),
+            ("feature evidence", query_plan(&index, FEATURE_EVIDENCE_SQL)),
+            (
+                "feature window anchors",
+                query_plan(&index, FEATURE_WINDOW_ANCHORS_SQL),
+            ),
+        ] {
+            assert!(
+                plan.iter().all(|detail| {
+                    !detail.contains("USE TEMP B-TREE")
+                        && !detail.contains("AUTOMATIC")
+                        && !detail.contains("SCAN evidence_windows")
+                }),
+                "{name} plan must not scan or sort direct touches: {plan:?}"
+            );
+        }
     }
 
     #[test]
-    fn latest_received_dispatch_before_turn_returns_none_when_edit_precedes_dispatch() {
-        let index = SqliteIndex::open_in_memory().expect("sqlite");
+    fn ingest_stores_physical_windows_without_cross_window_dedupe() {
+        let index = SqliteIndex::open_in_memory().unwrap();
+        let block = source_text("repeat", 24);
+        let text = format!("{block}{block}");
         index
-            .insert_dispatch_link(
-                "tape-pre",
-                &DispatchLink {
-                    uuid: "later-dispatch".to_string(),
-                    first_turn_index: 10,
-                    direction: DispatchDirection::Received,
-                },
+            .ingest_tape_events(
+                "tape",
+                &[event(
+                    1,
+                    TapeEventData::CodeRead(CodeReadEvent {
+                        file: "src/lib.rs".into(),
+                        range: FileRange { start: 1, end: 48 },
+                        text: Some(text),
+                        anchor_hashes: Vec::new(),
+                    }),
+                )],
+                LINK_THRESHOLD_DEFAULT,
             )
-            .expect("insert");
-
-        let picked = index
-            .latest_received_dispatch_before_turn("tape-pre", 3)
-            .expect("query");
-        assert!(picked.is_none());
+            .unwrap();
+        assert_eq!(index.scalar_i64("SELECT COUNT(*) FROM evidence_windows"), 3);
+        assert_eq!(
+            index.scalar_i64(
+                "SELECT COUNT(*) FROM evidence_windows
+                 WHERE window_ordinal IN (0, 2)"
+            ),
+            2
+        );
     }
 
     #[test]
-    fn query_results_and_feedback_round_trip() {
-        let index = SqliteIndex::open_in_memory().expect("sqlite");
+    fn evidence_is_after_edit_and_read_only() {
+        let index = SqliteIndex::open_in_memory().unwrap();
+        let before = source_text("before", 24);
+        let after = source_text("after", 24);
+        let tool = source_text("tool", 24);
+        let before_feature = fingerprint_windows(&before)[0].features[0].clone();
         index
-            .record_query_result(
-                "result_123",
-                "explain",
-                "{\"query\":{\"command\":\"explain\"}}",
-                "2026-04-03T00:00:00Z",
+            .ingest_tape_events(
+                "tape",
+                &[
+                    event(
+                        1,
+                        TapeEventData::CodeEdit(CodeEditEvent {
+                            file: "src/lib.rs".into(),
+                            before_range: None,
+                            after_range: None,
+                            before_text: Some(before),
+                            after_text: Some(after),
+                            before_hash: None,
+                            after_hash: None,
+                            before_anchor_hashes: Vec::new(),
+                            after_anchor_hashes: Vec::new(),
+                            similarity: None,
+                        }),
+                    ),
+                    event(
+                        2,
+                        TapeEventData::Textual(TextualEvent {
+                            kind: EventKind::ToolResult,
+                            text: tool,
+                        }),
+                    ),
+                ],
+                LINK_THRESHOLD_DEFAULT,
             )
-            .expect("record query result");
-
+            .unwrap();
+        assert_eq!(index.scalar_i64("SELECT COUNT(*) FROM evidence_windows"), 1);
+        assert_eq!(
+            index.scalar_i64("SELECT COUNT(*) FROM evidence_windows WHERE kind = 'edit'"),
+            1
+        );
         assert!(
             index
-                .query_result_exists("result_123")
-                .expect("query result exists"),
-            "expected recorded result to be queryable"
+                .evidence_for_anchor(&before_feature)
+                .unwrap()
+                .is_empty()
         );
+    }
 
-        index
-            .upsert_result_feedback(
-                "result_123",
-                "found_answer",
-                Some("prevented a bad edit"),
-                "2026-04-03T00:01:00Z",
-            )
-            .expect("insert feedback");
-        index
-            .upsert_result_feedback(
-                "result_123",
-                "partially_helped",
-                None,
-                "2026-04-03T00:02:00Z",
-            )
-            .expect("update feedback");
+    #[test]
+    fn physical_equal_edges_survive_and_queries_semantically_dedupe() {
+        let index = SqliteIndex::open_in_memory().unwrap();
+        let edge = SpanEdge {
+            from_anchor: "winnow:a,b".into(),
+            to_anchor: "winnow:c,d".into(),
+            confidence: 0.8,
+            location_delta: LocationDelta::Same,
+            cardinality: Cardinality::OneToOne,
+            agent_link: false,
+            note: None,
+        };
+        for pair_ordinal in 0..2 {
+            index
+                .insert_edge(
+                    &EdgeSource {
+                        source_kind: EdgeSourceKind::Edit,
+                        tape_id: "tape".into(),
+                        event_offset: 7,
+                        pair_ordinal,
+                        from_window_ordinal: i64::from(pair_ordinal),
+                        to_window_ordinal: i64::from(pair_ordinal),
+                    },
+                    &edge,
+                )
+                .unwrap();
+        }
+        assert_eq!(index.scalar_i64("SELECT COUNT(*) FROM edges"), 2);
+        assert_eq!(
+            index
+                .outbound_edges("winnow:a,b", 0.5, false)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 
-        let (outcome, note, rated_at): (String, Option<String>, String) = index
-            .conn
-            .query_row(
-                "SELECT outcome, note, rated_at FROM result_feedback WHERE result_id = ?1",
-                params!["result_123"],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    #[test]
+    fn writer_rejects_schema_v3_without_mutating_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE legacy_marker(value TEXT);
+                 PRAGMA user_version = 3;",
             )
-            .expect("feedback row");
-        assert_eq!(outcome, "partially_helped");
-        assert_eq!(note, None);
-        assert_eq!(rated_at, "2026-04-03T00:02:00Z");
+            .unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+
+        assert!(SqliteIndex::open_writer(path.to_str().unwrap()).is_err());
+
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'legacy_marker'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reader_opens_schema_v4_without_wal_shm_or_file_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index.sqlite");
+        {
+            let writer = SqliteIndex::open_writer(path.to_str().unwrap()).unwrap();
+            assert_eq!(writer.user_version().unwrap(), 4);
+        }
+        let before = std::fs::read(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        {
+            let reader = SqliteIndex::open_reader(path.to_str().unwrap()).unwrap();
+            assert!(reader.referenced_tape_ids().unwrap().is_empty());
+        }
+
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!path.with_extension("sqlite-wal").exists());
+        assert!(!path.with_extension("sqlite-shm").exists());
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 }

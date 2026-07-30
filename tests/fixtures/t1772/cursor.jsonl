@@ -1,0 +1,8 @@
+{"timestamp":"2026-07-29T00:00:00Z","type":"tool_call","subtype":"started","session_id":"t1772-cursor","call_id":"read-ok","tool_call":{"readToolCall":{"args":{"path":"src/read.rs"}}}}
+{"timestamp":"2026-07-29T00:00:01Z","type":"tool_call","subtype":"completed","session_id":"t1772-cursor","call_id":"read-ok","tool_call":{"readToolCall":{"result":{"success":{"content":"hello\n"}}}}}
+{"timestamp":"2026-07-29T00:00:02Z","type":"tool_call","subtype":"started","session_id":"t1772-cursor","call_id":"read-fail","tool_call":{"readToolCall":{"args":{"path":"src/a.rs"}}}}
+{"timestamp":"2026-07-29T00:00:03Z","type":"tool_call","subtype":"completed","session_id":"t1772-cursor","call_id":"read-fail","tool_call":{"readToolCall":{"result":{"error":{"message":"no"}}}}}
+{"timestamp":"2026-07-29T00:00:04Z","type":"tool_call","subtype":"started","session_id":"t1772-cursor","call_id":"write-ok","tool_call":{"writeToolCall":{"args":{"path":"src/b.rs","content":"hello"}}}}
+{"timestamp":"2026-07-29T00:00:05Z","type":"tool_call","subtype":"completed","session_id":"t1772-cursor","call_id":"write-ok","tool_call":{"writeToolCall":{"result":{"success":{"path":"src/b.rs"}}}}}
+{"timestamp":"2026-07-29T00:00:06Z","type":"tool_call","subtype":"started","session_id":"t1772-cursor","call_id":"write-path-only","tool_call":{"writeToolCall":{"args":{"path":"src/path.rs"}}}}
+{"timestamp":"2026-07-29T00:00:07Z","type":"tool_call","subtype":"completed","session_id":"t1772-cursor","call_id":"write-path-only","tool_call":{"writeToolCall":{"result":{"success":{"path":"src/path.rs"}}}}}

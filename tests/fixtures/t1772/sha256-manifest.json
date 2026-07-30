@@ -1,0 +1,13 @@
+{
+  "algorithm": "sha256",
+  "frozen_at": "2026-07-29T18:27:56-07:00",
+  "files": [
+    {"path": "tests/fixtures/t1772/claude.jsonl", "bytes": 1314, "sha256": "a0397a647c7644c3aa4573552543334ac6694d90e7f7858394440573e6b5d6f1"},
+    {"path": "tests/fixtures/t1772/codex.jsonl", "bytes": 6814, "sha256": "df5aaa4c8753cdf12bb6bab52a85bd7e112221bf0895b9fbc7d61b1a96bf88e9"},
+    {"path": "tests/fixtures/t1772/cursor.jsonl", "bytes": 1570, "sha256": "b41af956f0bc108fce55f0b8e6a0954b30db422b3604d984baca2a3d2d6f1b44"},
+    {"path": "tests/fixtures/t1772/gemini.json", "bytes": 932, "sha256": "d44a7862ab465b24660d3fe8efdb5019e332bb211c429a5154c7b62eb0554355"},
+    {"path": "tests/fixtures/t1772/openclaw.jsonl", "bytes": 1747, "sha256": "6771943c51d569f7641b61a687c6d6c15380489d40bf9ee9c9caed221db9321a"},
+    {"path": "tests/fixtures/t1772/opencode.json", "bytes": 1128, "sha256": "45dd61d57d7248be873df172416a8a7fca2f33124ea8d74d78301cddb04325d8"},
+    {"path": "tests/fixtures/gemini/logs.json", "bytes": 316, "sha256": "b6f094f65b6911512df46e6a35397ce394fa54bcff6cb67178c04ca1241ef8eb"}
+  ]
+}

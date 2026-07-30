@@ -28,7 +28,6 @@ fn linkage_and_query_defaults_work_together_at_boundaries() {
         pretty_tier(0.30, false, false),
         PrettyConfidenceTier::Hidden
     );
-
 }
 
 #[test]

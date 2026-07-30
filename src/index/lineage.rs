@@ -7,8 +7,6 @@ pub const IDENTICAL_REINSERTION_THRESHOLD: f32 = 0.90;
 pub enum EvidenceKind {
     Edit,
     Read,
-    Tool,
-    Message,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

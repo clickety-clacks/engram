@@ -10,7 +10,7 @@ const TRANSCRIPT_WINDOW_RADIUS: usize = 2;
 
 pub fn collect_dispatch_upstream_sessions(
     context: &RuntimeContext,
-    index: &SqliteIndex,
+    indexes: &[SqliteIndex],
     sessions: &[Value],
 ) -> Result<(Vec<Value>, Vec<Value>), CliError> {
     let mut chain = Vec::new();
@@ -21,6 +21,7 @@ pub fn collect_dispatch_upstream_sessions(
         .map(ToOwned::to_owned)
         .collect::<HashSet<_>>();
     let mut rows_cache = HashMap::<String, Vec<TapeRow>>::new();
+    let mut seen_hops = HashSet::new();
 
     for session in sessions {
         let Some(tape_id) = session.get("tape_id").and_then(Value::as_str) else {
@@ -46,27 +47,33 @@ pub fn collect_dispatch_upstream_sessions(
             let mut current_turn = edit_turn;
             let mut visited = HashSet::new();
             while let Some(received) =
-                index.latest_received_dispatch_before_turn(&current_tape, current_turn)?
+                latest_received_dispatch_before_turn(indexes, &current_tape, current_turn)?
             {
-                let Some(parent) = index.sent_dispatch_for_uuid(&received.uuid)? else {
+                let Some(parent) = sent_dispatch_for_uuid(indexes, &received.uuid)? else {
                     break;
                 };
-                let hop_key = format!(
-                    "{}:{}:{}:{}",
-                    current_tape, current_turn, received.uuid, parent.tape_id
+                let hop_key = (
+                    current_tape.clone(),
+                    current_turn,
+                    received.uuid.clone(),
+                    received.first_turn_index,
+                    parent.tape_id.clone(),
+                    parent.first_turn_index,
                 );
-                if !visited.insert(hop_key) {
+                if !visited.insert(hop_key.clone()) {
                     break;
                 }
 
-                chain.push(json!({
-                    "session": current_tape,
-                    "edit_turn_index": current_turn,
-                    "received_uuid": received.uuid,
-                    "received_turn_index": received.first_turn_index,
-                    "parent_session": parent.tape_id,
-                    "parent_sent_turn_index": parent.first_turn_index,
-                }));
+                if seen_hops.insert(hop_key) {
+                    chain.push(json!({
+                        "session": current_tape,
+                        "edit_turn_index": current_turn,
+                        "received_uuid": received.uuid,
+                        "received_turn_index": received.first_turn_index,
+                        "parent_session": parent.tape_id,
+                        "parent_sent_turn_index": parent.first_turn_index,
+                    }));
+                }
 
                 if seen_tapes.insert(parent.tape_id.clone())
                     && let Some(extra) = build_dispatch_session(context, &mut rows_cache, &parent)?
@@ -81,6 +88,45 @@ pub fn collect_dispatch_upstream_sessions(
     }
 
     Ok((chain, extras))
+}
+
+fn latest_received_dispatch_before_turn(
+    indexes: &[SqliteIndex],
+    tape_id: &str,
+    turn_index: i64,
+) -> Result<Option<DispatchLink>, CliError> {
+    let mut candidates = Vec::new();
+    for index in indexes {
+        if let Some(link) = index.latest_received_dispatch_before_turn(tape_id, turn_index)? {
+            candidates.push(link);
+        }
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .first_turn_index
+            .cmp(&left.first_turn_index)
+            .then_with(|| left.uuid.cmp(&right.uuid))
+    });
+    Ok(candidates.into_iter().next())
+}
+
+fn sent_dispatch_for_uuid(
+    indexes: &[SqliteIndex],
+    uuid: &str,
+) -> Result<Option<DispatchLinkRow>, CliError> {
+    let mut candidates = Vec::new();
+    for index in indexes {
+        if let Some(link) = index.sent_dispatch_for_uuid(uuid)? {
+            candidates.push(link);
+        }
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .first_turn_index
+            .cmp(&left.first_turn_index)
+            .then_with(|| left.tape_id.cmp(&right.tape_id))
+    });
+    Ok(candidates.into_iter().next())
 }
 
 pub(crate) fn build_dispatch_session(

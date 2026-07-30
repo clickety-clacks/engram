@@ -17,7 +17,7 @@ fn parse_output_events(output: &str) -> Vec<Value> {
 }
 
 #[test]
-fn cursor_supported_paths_emit_deterministic_events_and_partial_coverage_meta() {
+fn cursor_supported_paths_emit_deterministic_events_and_full_coverage_meta() {
     let input = load_fixture("tests/fixtures/cursor/supported_paths.jsonl");
     let output = cursor_jsonl_to_tape_jsonl(&input).expect("adapter should parse fixture");
     let events = parse_output_events(&output);
@@ -30,8 +30,8 @@ fn cursor_supported_paths_emit_deterministic_events_and_partial_coverage_meta() 
         "c6b62c6f-7ead-4fd6-9922-e952131177ff"
     );
     assert_eq!(meta["coverage.tool"], "full");
-    assert_eq!(meta["coverage.read"], "partial");
-    assert_eq!(meta["coverage.edit"], "partial");
+    assert_eq!(meta["coverage.read"], "full");
+    assert_eq!(meta["coverage.edit"], "full");
 
     assert!(
         events
@@ -62,12 +62,12 @@ fn cursor_supported_paths_emit_deterministic_events_and_partial_coverage_meta() 
 }
 
 #[test]
-fn cursor_conformance_reports_full_tool_and_partial_read_edit() {
+fn cursor_conformance_reports_full_coverage() {
     let input = load_fixture("tests/fixtures/cursor/supported_paths.jsonl");
     let report = run_conformance(AdapterId::Cursor, &input).expect("cursor conformance");
 
     assert!(report.issues.is_empty(), "issues={:?}", report.issues);
     assert_eq!(report.coverage.tool, CoverageGrade::Full);
-    assert_eq!(report.coverage.read, CoverageGrade::Partial);
-    assert_eq!(report.coverage.edit, CoverageGrade::Partial);
+    assert_eq!(report.coverage.read, CoverageGrade::Full);
+    assert_eq!(report.coverage.edit, CoverageGrade::Full);
 }

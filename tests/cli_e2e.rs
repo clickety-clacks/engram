@@ -71,14 +71,15 @@ fn init_record_tapes_show_and_explain_roundtrip() {
     assert_eq!(init["status"], "ok");
 
     let span_anchor = fingerprint_text(span_text).fingerprint;
+    let span_json = serde_json::to_string(span_text).expect("span json");
     let transcript = format!(
         concat!(
             "{{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"meta\",\"model\":\"gpt-5\",\"repo_head\":\"abc123\",\"label\":\"lane-c\"}}\n",
-            "{{\"t\":\"2026-02-22T00:00:01Z\",\"k\":\"code.read\",\"file\":\"src/lib.rs\",\"range\":[2,2],\"anchor_hashes\":[\"{0}\"]}}\n",
-            "{{\"t\":\"2026-02-22T00:00:02Z\",\"k\":\"code.edit\",\"file\":\"src/lib.rs\",\"before_range\":[2,2],\"after_range\":[2,2],\"before_anchor_hashes\":[\"winnow:00000000000000aa\"],\"after_anchor_hashes\":[\"{0}\"]}}\n",
-            "{{\"t\":\"2026-02-22T00:00:03Z\",\"k\":\"code.edit\",\"file\":\"src/lib.rs\",\"before_range\":[4,5],\"after_range\":[4,5],\"before_anchor_hashes\":[\"winnow:00000000000000bb\"]}}\n"
+            "{{\"t\":\"2026-02-22T00:00:01Z\",\"k\":\"code.read\",\"file\":\"src/lib.rs\",\"range\":[2,2],\"text\":{0}}}\n",
+            "{{\"t\":\"2026-02-22T00:00:02Z\",\"k\":\"code.edit\",\"file\":\"src/lib.rs\",\"before_range\":[2,2],\"after_range\":[2,2],\"before_text\":\"fn old() {{ return legacy + 1; }}\",\"after_text\":{0}}}\n",
+            "{{\"t\":\"2026-02-22T00:00:03Z\",\"k\":\"code.edit\",\"file\":\"src/lib.rs\",\"before_range\":[4,5],\"before_text\":\"fn removed() {{ return legacy + 2; }}\"}}\n"
         ),
-        span_anchor
+        span_json
     );
 
     let record = run_json(repo, &["record", "--stdin"], Some(&transcript));
@@ -103,8 +104,8 @@ fn init_record_tapes_show_and_explain_roundtrip() {
     assert_eq!(String::from_utf8_lossy(&raw.stdout), transcript);
 
     let explain = run_json(repo, &["explain", "src/lib.rs:2-2"], None);
-    let result_id = explain["result_id"].as_str().expect("result_id");
-    assert!(result_id.starts_with("result_"));
+    assert!(explain.get("result_id").is_none());
+    assert!(explain.get("rating_hint").is_none());
     let query_anchors = explain["query"]["anchors"].as_array().expect("anchors");
     assert!(query_anchors.len() >= 1);
     // query_anchors are individual tokens; verify at least one token from the
@@ -123,157 +124,43 @@ fn init_record_tapes_show_and_explain_roundtrip() {
     assert!(sessions[0]["window_start"].as_u64().unwrap_or(0) >= 1);
     assert!(sessions[0]["window_end"].as_u64().unwrap_or(0) >= 1);
 
-    let rate = run_json(
-        repo,
-        &[
-            "rate",
-            result_id,
-            "--outcome",
-            "found_answer",
-            "--note",
-            "helped find the right provenance chain",
-        ],
-        None,
-    );
-    assert_eq!(rate["status"], "ok");
-    assert_eq!(rate["result_id"], result_id);
-    assert_eq!(rate["outcome"], "found_answer");
-
     let conn = Connection::open(repo.join(".home/.engram/index.sqlite")).expect("sqlite");
-    let stored: (String, Option<String>) = conn
+    let feedback_tables: i64 = conn
         .query_row(
-            "SELECT outcome, note FROM result_feedback WHERE result_id = ?1",
-            [result_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name IN ('query_results','result_feedback')",
+            [],
+            |row| row.get(0),
         )
-        .expect("stored feedback");
-    assert_eq!(stored.0, "found_answer");
-    assert_eq!(
-        stored.1.as_deref(),
-        Some("helped find the right provenance chain")
-    );
+        .expect("feedback tables");
+    assert_eq!(feedback_tables, 0);
 }
 
 #[test]
-fn existing_db_upgrade_bootstraps_rating_schema_before_rate() {
+fn existing_schema_v3_is_rejected_without_mutation() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();
-    fs::create_dir_all(repo.join("src")).expect("src dir");
-    fs::write(
-        repo.join("src/lib.rs"),
-        "alpha\nretry logic discussion\nzeta\n",
-    )
-    .expect("seed file");
+    let _ = run_json(repo, &["init"], None);
 
     let home_db = repo.join(".home/.engram/index.sqlite");
-    fs::create_dir_all(home_db.parent().expect("db parent")).expect("db dir");
     let conn = Connection::open(&home_db).expect("sqlite");
     conn.execute_batch(
-        "
-        PRAGMA user_version = 3;
-        CREATE TABLE evidence (
-            anchor TEXT NOT NULL,
-            tape_id TEXT NOT NULL,
-            event_offset INTEGER NOT NULL,
-            kind TEXT NOT NULL,
-            file_path TEXT NOT NULL,
-            timestamp TEXT NOT NULL,
-            UNIQUE(anchor, tape_id, event_offset, kind)
-        );
-        CREATE INDEX idx_evidence_anchor ON evidence(anchor);
-        CREATE TABLE edges (
-            from_anchor TEXT NOT NULL,
-            to_anchor TEXT NOT NULL,
-            confidence REAL NOT NULL,
-            location_delta TEXT NOT NULL,
-            cardinality TEXT NOT NULL,
-            agent_link INTEGER NOT NULL,
-            note TEXT NOT NULL DEFAULT '',
-            UNIQUE(from_anchor, to_anchor, confidence, location_delta, cardinality, agent_link, note)
-        );
-        CREATE INDEX idx_edges_from_anchor ON edges(from_anchor);
-        CREATE INDEX idx_edges_to_anchor ON edges(to_anchor);
-        CREATE TABLE tombstones (
-            anchor TEXT NOT NULL,
-            tape_id TEXT NOT NULL,
-            event_offset INTEGER NOT NULL,
-            file_path TEXT NOT NULL,
-            range_start INTEGER NOT NULL,
-            range_end INTEGER NOT NULL,
-            timestamp TEXT NOT NULL,
-            UNIQUE(anchor, tape_id, event_offset)
-        );
-        CREATE INDEX idx_tombstones_anchor ON tombstones(anchor);
-        CREATE TABLE tapes (
-            tape_id TEXT PRIMARY KEY
-        );
-        CREATE TABLE dispatch_links (
-            tape_id TEXT NOT NULL,
-            uuid TEXT NOT NULL,
-            first_turn_index INTEGER NOT NULL,
-            direction TEXT NOT NULL CHECK(direction IN ('received', 'sent')),
-            PRIMARY KEY (tape_id, uuid)
-        );
-        CREATE INDEX idx_dispatch_links_uuid ON dispatch_links(uuid);
-        CREATE INDEX idx_dispatch_links_tape ON dispatch_links(tape_id);
-        CREATE INDEX idx_dispatch_links_received
-            ON dispatch_links(tape_id, direction, first_turn_index);
-        ",
+        "CREATE TABLE legacy_marker(value TEXT);
+         PRAGMA user_version = 3;",
     )
-    .expect("seed pre-rating schema");
+    .expect("seed v3 schema");
     drop(conn);
+    let before = fs::read(&home_db).expect("before bytes");
 
-    let transcript = concat!(
-        "{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"meta\",\"model\":\"gpt-5\"}\n",
-        "{\"t\":\"2026-02-22T00:00:01Z\",\"k\":\"message\",\"role\":\"user\",\"content\":\"retry logic discussion\"}\n"
-    );
-    let _ = run_json(repo, &["record", "--stdin"], Some(transcript));
-
-    let grep = run_json(repo, &["grep", "retry"], None);
-    let result_id = grep["result_id"].as_str().expect("result_id");
-
-    let rate = run_json(
-        repo,
-        &[
-            "rate",
-            result_id,
-            "--outcome",
-            "found_answer",
-            "--note",
-            "upgrade path",
-        ],
-        None,
-    );
-    assert_eq!(rate["status"], "ok");
+    let output = run_cli(repo, &["grep", "retry"], None);
+    assert!(!output.status.success());
+    assert_eq!(fs::read(&home_db).expect("after bytes"), before);
 
     let conn = Connection::open(&home_db).expect("sqlite");
-    let tables: Vec<String> = {
-        let mut stmt = conn
-            .prepare(
-                "SELECT name FROM sqlite_master
-                 WHERE type = 'table' AND name IN ('query_results', 'result_feedback')
-                 ORDER BY name",
-            )
-            .expect("tables stmt");
-        stmt.query_map([], |row| row.get(0))
-            .expect("tables query")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("table rows")
-    };
-    assert_eq!(
-        tables,
-        vec!["query_results".to_string(), "result_feedback".to_string()]
-    );
-
-    let stored: (String, Option<String>) = conn
-        .query_row(
-            "SELECT outcome, note FROM result_feedback WHERE result_id = ?1",
-            [result_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("stored feedback");
-    assert_eq!(stored.0, "found_answer");
-    assert_eq!(stored.1.as_deref(), Some("upgrade path"));
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("version");
+    assert_eq!(version, 3);
 }
 
 #[test]
@@ -295,15 +182,14 @@ fn explain_matches_winnow_edit_anchor_for_span_targets() {
         concat!(
             "{{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"code.edit\",\"file\":\"src/lib.rs\",",
             "\"before_range\":[2,2],\"after_range\":[2,2],",
-            "\"before_anchor_hashes\":[\"winnow:00000000000000cc\"],",
-            "\"after_anchor_hashes\":[\"{0}\"],\"similarity\":0.95}}\n"
+            "\"before_text\":{0},\"after_text\":{0},\"similarity\":0.95}}\n"
         ),
-        span_anchor
+        serde_json::to_string(span_text).unwrap()
     );
     let _ = run_json(repo, &["record", "--stdin"], Some(&transcript));
 
     let explain = run_json(repo, &["explain", "src/lib.rs:2-2"], None);
-    assert!(explain["result_id"].is_string());
+    assert!(explain.get("result_id").is_none());
     let query_anchors = explain["query"]["anchors"].as_array().expect("anchors");
     // query_anchors are individual tokens; verify at least one token from the
     // span's fingerprint is present.
@@ -319,15 +205,14 @@ fn explain_matches_winnow_edit_anchor_for_span_targets() {
         1,
         "expected explain to recover session via winnow edit anchor"
     );
-    // With individual-token edges, each matched token produces one lineage edge.
     assert!(
         explain["lineage"].as_array().expect("lineage").len() >= 1,
-        "expected at least one inbound edit linkage for matched winnow anchor"
+        "expected composite edit lineage for matched window"
     );
 }
 
 #[test]
-fn grep_and_peek_emit_stable_result_ids_and_rate_rejects_unknown_ids() {
+fn grep_and_peek_are_read_only_and_rate_is_removed() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();
     let _ = run_json(repo, &["init"], None);
@@ -341,13 +226,15 @@ fn grep_and_peek_emit_stable_result_ids_and_rate_rejects_unknown_ids() {
 
     let grep_one = run_json(repo, &["grep", "retry"], None);
     let grep_two = run_json(repo, &["grep", "retry"], None);
-    assert_eq!(grep_one["result_id"], grep_two["result_id"]);
-    assert!(grep_one["rating_hint"].as_str().is_some());
+    assert_eq!(grep_one, grep_two);
+    assert!(grep_one.get("result_id").is_none());
+    assert!(grep_one.get("rating_hint").is_none());
 
     let peek_one = run_json(repo, &["peek", &session_id], None);
     let peek_two = run_json(repo, &["peek", &session_id], None);
-    assert_eq!(peek_one["result_id"], peek_two["result_id"]);
-    assert!(peek_one["rating_hint"].as_str().is_some());
+    assert_eq!(peek_one, peek_two);
+    assert!(peek_one.get("result_id").is_none());
+    assert!(peek_one.get("rating_hint").is_none());
 
     let output = run_cli(
         repo,
@@ -356,12 +243,15 @@ fn grep_and_peek_emit_stable_result_ids_and_rate_rejects_unknown_ids() {
     );
     assert!(
         !output.status.success(),
-        "expected unknown result_id to fail: stdout={} stderr={}",
+        "expected removed rate command to fail: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("unknown_result_id"), "stderr={stderr}");
+    assert!(
+        stderr.contains("unrecognized subcommand"),
+        "stderr={stderr}"
+    );
 }
 
 #[test]
@@ -379,20 +269,19 @@ fn explain_matches_winnow_edit_anchor_for_multiline_span_with_trailing_newline()
         concat!(
             "{{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"code.edit\",\"file\":\"src/lib.rs\",",
             "\"before_range\":[1,3],\"after_range\":[1,3],",
-            "\"before_anchor_hashes\":[\"winnow:00000000000000dd\"],",
-            "\"after_anchor_hashes\":[\"{0}\"],\"similarity\":0.95}}\n"
+            "\"before_text\":{0},\"after_text\":{0},\"similarity\":0.95}}\n"
         ),
-        exact_anchor
+        serde_json::to_string(exact_span).unwrap()
     );
     let _ = run_json(repo, &["record", "--stdin"], Some(&transcript));
 
     let explain = run_json(repo, &["explain", "src/lib.rs:1-3"], None);
     let query_anchors = explain["query"]["anchors"].as_array().expect("anchors");
+    let exact_features = expand_winnow_anchor(&exact_anchor);
     assert!(
-        query_anchors
+        exact_features
             .iter()
-            .any(|anchor| anchor == &Value::String(exact_anchor.clone())),
-        "expected exact multiline winnow anchor in query anchors"
+            .any(|feature| query_anchors.iter().any(|anchor| anchor == feature))
     );
     assert_eq!(
         explain["sessions"].as_array().expect("sessions").len(),
@@ -488,19 +377,15 @@ fn large_windowed_file_stays_under_row_budget_and_explains() {
     let conn = Connection::open(repo.join(".home/.engram/index.sqlite")).expect("sqlite");
     let evidence_rows: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM evidence WHERE file_path = 'src/lib.rs'",
+            "SELECT COUNT(*) FROM evidence_windows WHERE file_path = 'src/lib.rs'",
             [],
             |row| row.get(0),
         )
         .expect("evidence count");
     assert!(evidence_rows > 0);
-    // Evidence is stored at individual-token granularity (one row per winnow
-    // hash token).  A 1914-line file with unique line numbers produces many
-    // unique k-gram hashes.  The bound below guards against storing at
-    // per-character or per-byte granularity.
     assert!(
-        evidence_rows < 100_000,
-        "expected token-scale evidence rows, got {evidence_rows}"
+        evidence_rows < 200,
+        "expected physical-window-scale evidence rows, got {evidence_rows}"
     );
 
     let explain = run_json(repo, &["explain", "src/lib.rs:900-930"], None);
@@ -516,29 +401,24 @@ fn explain_include_deleted_controls_tombstones() {
     let repo = temp.path();
     let _ = run_json(repo, &["init"], None);
 
-    let deleted_anchor = "winnow:00000000000000de";
+    let deleted_text = "fn deleted_item() { return removed_value + legacy_value; }";
+    let deleted_anchor =
+        expand_winnow_anchor(&fingerprint_text(deleted_text).fingerprint).remove(0);
     let transcript = format!(
         concat!(
             "{{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"code.edit\",\"file\":\"src/lib.rs\",",
-            "\"before_range\":[10,12],\"after_range\":[10,12],",
-            "\"before_anchor_hashes\":[\"{0}\"]}}\n"
+            "\"before_range\":[10,12],\"before_text\":{0}}}\n"
         ),
-        deleted_anchor
+        serde_json::to_string(deleted_text).unwrap()
     );
     let _ = run_json(repo, &["record", "--stdin"], Some(&transcript));
 
-    let without_deleted = run_json(repo, &["explain", deleted_anchor, "--anchor"], None);
-    assert_eq!(
-        without_deleted["tombstones"]
-            .as_array()
-            .expect("tombstones array")
-            .len(),
-        0
-    );
+    let without_deleted = run_cli(repo, &["explain", &deleted_anchor, "--anchor"], None);
+    assert!(!without_deleted.status.success());
 
     let with_deleted = run_json(
         repo,
-        &["explain", deleted_anchor, "--anchor", "--include-deleted"],
+        &["explain", &deleted_anchor, "--anchor", "--include-deleted"],
         None,
     );
     let tombstones = with_deleted["tombstones"].as_array().expect("tombstones");
@@ -553,22 +433,23 @@ fn explain_forensics_and_agent_links_behave_as_specified() {
     let repo = temp.path();
     let _ = run_json(repo, &["init"], None);
 
-    let from_anchor = "winnow:00000000000000ef";
-    let to_anchor = "winnow:00000000000000f0";
+    let before_text = "fn before_item() { return alpha_value + beta_value; }";
+    let after_text = "fn after_item() { return gamma_value + delta_value; }";
+    let to_anchor = fingerprint_text(after_text).fingerprint;
     let transcript = format!(
         concat!(
             "{{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"code.edit\",\"file\":\"src/lib.rs\",",
             "\"before_range\":[1,1],\"after_range\":[1,1],",
-            "\"before_anchor_hashes\":[\"{0}\"],\"after_anchor_hashes\":[\"{1}\"]}}\n",
-            "{{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"code.read\",\"file\":\"src/b.rs\",\"range\":[10,20],\"anchor_hashes\":[\"span:src/b.rs:10-20\"]}}\n",
+            "\"before_text\":{0},\"after_text\":{1},\"similarity\":0.1}}\n",
             "{{\"t\":\"2026-02-22T00:00:01Z\",\"k\":\"span.link\",\"from_file\":\"src/a.rs\",",
             "\"from_range\":[1,2],\"to_file\":\"src/b.rs\",\"to_range\":[10,20],\"note\":\"extract\"}}\n"
         ),
-        from_anchor, to_anchor
+        serde_json::to_string(before_text).unwrap(),
+        serde_json::to_string(after_text).unwrap()
     );
     let _ = run_json(repo, &["record", "--stdin"], Some(&transcript));
 
-    let default_explain = run_json(repo, &["explain", to_anchor, "--anchor"], None);
+    let default_explain = run_json(repo, &["explain", &to_anchor, "--anchor"], None);
     assert_eq!(
         default_explain["lineage"]
             .as_array()
@@ -579,7 +460,7 @@ fn explain_forensics_and_agent_links_behave_as_specified() {
 
     let forensics_explain = run_json(
         repo,
-        &["explain", to_anchor, "--anchor", "--forensics"],
+        &["explain", &to_anchor, "--anchor", "--forensics"],
         None,
     );
     assert_eq!(
@@ -644,36 +525,104 @@ fn explain_orders_sessions_by_touch_count_then_recency() {
     let repo = temp.path();
     let _ = run_json(repo, &["init"], None);
 
-    let anchor = "ordering-anchor";
-    let tape_one = format!(
-        concat!(
-            "{{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"meta\",\"label\":\"first\"}}\n",
-            "{{\"t\":\"2026-02-22T00:00:01Z\",\"k\":\"code.read\",\"file\":\"src/lib.rs\",\"range\":[1,1],\"anchor_hashes\":[\"{0}\"]}}\n"
-        ),
-        anchor
+    let query_text = "pub fn ordered_touch() {\n\
+        let alpha = normalize(source);\n\
+        let beta = transform(alpha);\n\
+        publish(alpha + beta);\n\
+    }\n";
+    let partial_text = "pub fn ordered_touch() {\n\
+        let alpha = normalize(source);\n\
+        legacy_publish(alpha);\n\
+    }\n";
+    let two_touch_tape = |file: &str, first: &str, second: &str| {
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "t": first,
+                "k": "code.read",
+                "file": file,
+                "range": [1, 4],
+                "text": partial_text,
+            }),
+            serde_json::json!({
+                "t": second,
+                "k": "code.read",
+                "file": file,
+                "range": [1, 4],
+                "text": partial_text,
+            })
+        )
+    };
+    let recent_two = run_json(
+        repo,
+        &["record", "--stdin"],
+        Some(&two_touch_tape(
+            "src/recent.rs",
+            "2026-02-22T00:00:04Z",
+            "2026-02-22T00:00:05Z",
+        )),
     );
-    let tape_two = format!(
-        concat!(
-            "{{\"t\":\"2026-02-22T00:00:10Z\",\"k\":\"meta\",\"label\":\"second\"}}\n",
-            "{{\"t\":\"2026-02-22T00:00:11Z\",\"k\":\"code.read\",\"file\":\"src/lib.rs\",\"range\":[1,1],\"anchor_hashes\":[\"{0}\"]}}\n",
-            "{{\"t\":\"2026-02-22T00:00:12Z\",\"k\":\"code.read\",\"file\":\"src/lib.rs\",\"range\":[2,2],\"anchor_hashes\":[\"{0}\"]}}\n"
-        ),
-        anchor
+    let tied_two_a = run_json(
+        repo,
+        &["record", "--stdin"],
+        Some(&two_touch_tape(
+            "src/tied-a.rs",
+            "2026-02-22T00:00:01Z",
+            "2026-02-22T00:00:02Z",
+        )),
     );
-    let _ = run_json(repo, &["record", "--stdin"], Some(&tape_one));
-    let second = run_json(repo, &["record", "--stdin"], Some(&tape_two));
+    let tied_two_b = run_json(
+        repo,
+        &["record", "--stdin"],
+        Some(&two_touch_tape(
+            "src/tied-b.rs",
+            "2026-02-22T00:00:01Z",
+            "2026-02-22T00:00:02Z",
+        )),
+    );
+    let newest_one_text = format!(
+        "{}\n",
+        serde_json::json!({
+            "t": "2026-02-22T00:00:10Z",
+            "k": "code.read",
+            "file": "src/newest.rs",
+            "range": [1, 5],
+            "text": query_text,
+        })
+    );
+    let newest_one = run_json(repo, &["record", "--stdin"], Some(&newest_one_text));
 
-    let explain = run_json(repo, &["explain", anchor, "--anchor"], None);
+    let explain = run_json(repo, &["explain", query_text], None);
     let sessions = explain["sessions"].as_array().expect("sessions");
-    assert_eq!(sessions.len(), 2);
-    assert_eq!(sessions[0]["session_id"], second["tape_id"]);
+    assert_eq!(sessions.len(), 4, "sessions={sessions:?}");
+    assert_eq!(sessions[0]["session_id"], recent_two["tape_id"]);
+    assert_eq!(sessions[0]["touches"].as_array().unwrap().len(), 2);
     assert_eq!(
         sessions[0]["timestamp"],
-        Value::String("2026-02-22T00:00:12Z".to_string())
+        Value::String("2026-02-22T00:00:05Z".to_string())
     );
+
+    let mut tied_ids = [
+        tied_two_a["tape_id"].as_str().unwrap().to_string(),
+        tied_two_b["tape_id"].as_str().unwrap().to_string(),
+    ];
+    tied_ids.sort();
+    assert_eq!(sessions[1]["session_id"], tied_ids[0]);
+    assert_eq!(sessions[2]["session_id"], tied_ids[1]);
     assert_eq!(
         sessions[1]["timestamp"],
-        Value::String("2026-02-22T00:00:01Z".to_string())
+        Value::String("2026-02-22T00:00:02Z".to_string())
+    );
+    assert_eq!(
+        sessions[2]["timestamp"],
+        Value::String("2026-02-22T00:00:02Z".to_string())
+    );
+
+    assert_eq!(sessions[3]["session_id"], newest_one["tape_id"]);
+    assert_eq!(sessions[3]["touches"].as_array().unwrap().len(), 1);
+    assert!(
+        sessions[3]["confidence"].as_f64().unwrap() > sessions[0]["confidence"].as_f64().unwrap(),
+        "higher feature score must not outrank an older session with more touches: {sessions:?}"
     );
 }
 
@@ -712,11 +661,13 @@ fn record_recovers_when_tape_file_exists_but_index_missing() {
     let repo = temp.path();
     let _ = run_json(repo, &["init"], None);
 
-    let transcript = concat!(
-        r#"{"t":"2026-02-22T00:00:00Z","k":"code.read","file":"src/lib.rs","range":[1,1],"anchor_hashes":["orphan-anchor"]}"#,
-        "\n"
+    let orphan_text = "fn orphan_touch() { return alpha_value + beta_value; }";
+    let orphan_anchor = expand_winnow_anchor(&fingerprint_text(orphan_text).fingerprint).remove(0);
+    let transcript = format!(
+        "{{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"code.read\",\"file\":\"src/lib.rs\",\"range\":[1,1],\"text\":{}}}\n",
+        serde_json::to_string(orphan_text).unwrap()
     );
-    let tape_id = tape_id_for_contents(transcript);
+    let tape_id = tape_id_for_contents(&transcript);
     let tape_path = repo
         .join(".engram")
         .join("tapes")
@@ -725,7 +676,7 @@ fn record_recovers_when_tape_file_exists_but_index_missing() {
     let compressed = zstd::stream::encode_all(transcript.as_bytes(), 0).expect("compress");
     fs::write(&tape_path, compressed).expect("write tape");
 
-    let explain_before = run_cli(repo, &["explain", "orphan-anchor", "--anchor"], None);
+    let explain_before = run_cli(repo, &["explain", &orphan_anchor, "--anchor"], None);
     assert!(!explain_before.status.success());
     let explain_before_stderr = String::from_utf8_lossy(&explain_before.stderr);
     let explain_before_json = explain_before_stderr
@@ -734,17 +685,14 @@ fn record_recovers_when_tape_file_exists_but_index_missing() {
         .expect("no_results stderr line");
     let explain_before_payload: Value =
         serde_json::from_str(explain_before_json).expect("no_results payload");
-    assert_eq!(
-        explain_before_payload["error"],
-        Value::String("no_results".to_string())
-    );
+    assert_eq!(explain_before_payload["error"]["code"], "sqlite_error");
 
-    let record = run_json(repo, &["record", "--stdin"], Some(transcript));
+    let record = run_json(repo, &["record", "--stdin"], Some(&transcript));
     assert_eq!(record["already_exists"], false);
     assert_eq!(record["already_indexed"], false);
     assert_eq!(record["tape_file_exists"], true);
 
-    let explain_after = run_json(repo, &["explain", "orphan-anchor", "--anchor"], None);
+    let explain_after = run_json(repo, &["explain", &orphan_anchor, "--anchor"], None);
     assert_eq!(
         explain_after["sessions"]
             .as_array()

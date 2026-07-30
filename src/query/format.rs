@@ -11,14 +11,12 @@ use crate::index::lineage::{
     Cardinality, EvidenceFragmentRef, EvidenceKind, LocationDelta, StoredEdgeClass,
 };
 use crate::index::{DispatchDirection, EdgeRow, SqliteIndex};
-use crate::ingest::sha256_hex;
 use crate::query::explain::{
-    ExplainResult, ExplainTraversal, PrettyConfidenceTier, explain_by_anchor, pretty_tier,
+    ExplainResult, ExplainTraversal, PrettyConfidenceTier, explain_across_indexes_by_anchor,
+    pretty_tier,
 };
 pub use crate::store::tapes::{TapeRow, parse_jsonl_rows, print_json};
-use crate::store::tapes::{
-    event_window, read_tape_content, resolve_tape_path, tape_id_from_path,
-};
+use crate::store::tapes::{event_window, read_tape_content, resolve_tape_path, tape_id_from_path};
 use crate::{CliError, RuntimeContext, path_string};
 
 pub const MAX_QUERY_WINDOW_ANCHORS: usize = 16;
@@ -36,11 +34,16 @@ pub enum ExplainTarget {
 
 pub fn open_query_indexes(context: &RuntimeContext) -> Result<Vec<SqliteIndex>, CliError> {
     let mut indexes = Vec::new();
-    indexes.push(SqliteIndex::open(&path_string(&context.db_path))?);
+    if context.db_path.exists() {
+        indexes.push(SqliteIndex::open_reader(&path_string(&context.db_path))?);
+    }
     for store in &context.additional_stores {
         if store.exists() {
-            indexes.push(SqliteIndex::open(&path_string(store))?);
+            indexes.push(SqliteIndex::open_reader(&path_string(store))?);
         }
+    }
+    if indexes.is_empty() {
+        return Err(rusqlite::Error::InvalidPath(context.db_path.clone()).into());
     }
     Ok(indexes)
 }
@@ -242,6 +245,36 @@ pub fn compare_grep_sessions(
         .then_with(|| a_session_id.cmp(b_session_id))
 }
 
+pub fn compare_explain_sessions(a: &Value, b: &Value) -> std::cmp::Ordering {
+    let a_touch_count = a
+        .get("touches")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let b_touch_count = b
+        .get("touches")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let a_ts = a.get("timestamp").and_then(Value::as_str).unwrap_or("");
+    let b_ts = b.get("timestamp").and_then(Value::as_str).unwrap_or("");
+    let a_depth = a.get("depth").and_then(Value::as_u64).unwrap_or(0);
+    let b_depth = b.get("depth").and_then(Value::as_u64).unwrap_or(0);
+    let a_score = a.get("confidence").and_then(Value::as_f64).unwrap_or(0.0);
+    let b_score = b.get("confidence").and_then(Value::as_f64).unwrap_or(0.0);
+    let a_session_id = a.get("session_id").and_then(Value::as_str).unwrap_or("");
+    let b_session_id = b.get("session_id").and_then(Value::as_str).unwrap_or("");
+
+    b_touch_count
+        .cmp(&a_touch_count)
+        .then_with(|| b_ts.cmp(a_ts))
+        .then_with(|| a_depth.cmp(&b_depth))
+        .then_with(|| {
+            b_score
+                .partial_cmp(&a_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .then_with(|| a_session_id.cmp(b_session_id))
+}
+
 pub(crate) fn is_provenance_row(value: &Value) -> bool {
     matches!(
         value.get("k").and_then(Value::as_str),
@@ -251,7 +284,7 @@ pub(crate) fn is_provenance_row(value: &Value) -> bool {
 
 pub fn format_sessions_for_agent(
     context: &RuntimeContext,
-    primary_index: &SqliteIndex,
+    indexes: &[SqliteIndex],
     raw_sessions: Vec<Value>,
     score_by_session: &HashMap<String, f32>,
     grep: Option<&str>,
@@ -330,7 +363,7 @@ pub fn format_sessions_for_agent(
         let mut files_touched = files_touched.into_iter().collect::<Vec<_>>();
         files_touched.sort();
 
-        let (refs_up, refs_down) = dispatch_ref_counts(primary_index, session_id)?;
+        let (refs_up, refs_down) = dispatch_ref_counts(indexes, session_id)?;
         let timestamp = raw
             .get("latest_touch_timestamp")
             .and_then(Value::as_str)
@@ -357,15 +390,23 @@ pub fn format_sessions_for_agent(
 }
 
 pub(crate) fn dispatch_ref_counts(
-    index: &SqliteIndex,
+    indexes: &[SqliteIndex],
     tape_id: &str,
 ) -> Result<(usize, usize), CliError> {
     let mut up = 0usize;
     let mut down = 0usize;
-    for link in index.dispatch_links_for_tape(tape_id)? {
-        match link.direction {
-            DispatchDirection::Received => up += 1,
-            DispatchDirection::Sent => down += 1,
+    let mut seen = HashSet::new();
+    for index in indexes {
+        for link in index.dispatch_links_for_tape(tape_id)? {
+            let received = matches!(link.direction, DispatchDirection::Received);
+            if !seen.insert((link.uuid, received)) {
+                continue;
+            }
+            if received {
+                up += 1;
+            } else {
+                down += 1;
+            }
         }
     }
     Ok((up, down))
@@ -630,13 +671,27 @@ pub fn build_chain_metadata(sessions: &[Value]) -> Vec<Value> {
     out
 }
 
-pub fn default_peek_anchor_line(index: &SqliteIndex, session_id: &str, rows: &[TapeRow]) -> usize {
-    if let Ok(links) = index.dispatch_links_for_tape(session_id)
-        && let Some(received) = links
-            .into_iter()
-            .filter(|link| matches!(link.direction, DispatchDirection::Received))
-            .min_by_key(|link| link.first_turn_index)
-    {
+pub fn default_peek_anchor_line(
+    indexes: &[SqliteIndex],
+    session_id: &str,
+    rows: &[TapeRow],
+) -> usize {
+    let mut received_links = Vec::new();
+    for index in indexes {
+        if let Ok(links) = index.dispatch_links_for_tape(session_id) {
+            received_links.extend(
+                links
+                    .into_iter()
+                    .filter(|link| matches!(link.direction, DispatchDirection::Received)),
+            );
+        }
+    }
+    received_links.sort_by(|left, right| {
+        left.first_turn_index
+            .cmp(&right.first_turn_index)
+            .then_with(|| left.uuid.cmp(&right.uuid))
+    });
+    if let Some(received) = received_links.into_iter().next() {
         if let Some(offset) = message_turn_to_event_offset(rows, received.first_turn_index)
             && let Some(pos) = rows.iter().position(|row| row.offset == offset)
         {
@@ -695,35 +750,30 @@ pub fn explain_across_indexes(
         }
     }
 
-    for index in indexes {
-        let result = explain_by_anchor(index, anchors, traversal, include_forensics)?;
-        for fragment in result.direct {
-            let key = touch_key(&fragment);
-            if seen_direct.insert(key) {
-                direct.push(fragment);
-            }
-        }
-        for edge in result.lineage {
-            let key = format!(
-                "{}:{}:{:.6}:{}:{}:{}:{}",
-                edge.from_anchor,
-                edge.to_anchor,
-                edge.confidence,
-                location_delta_name(edge.location_delta),
-                cardinality_name(edge.cardinality),
-                edge.agent_link,
-                edge.note.clone().unwrap_or_default()
-            );
-            if seen_lineage.insert(key) {
-                lineage.push(edge);
-            }
-        }
-        for anchor in result.touched_anchors {
-            if seen_anchors.insert(anchor.clone()) {
-                touched_anchors.push(anchor);
-            }
+    let result = explain_across_indexes_by_anchor(indexes, anchors, traversal, include_forensics)?;
+    for fragment in result.direct {
+        let key = touch_key(&fragment);
+        if seen_direct.insert(key) {
+            direct.push(fragment);
         }
     }
+    for edge in result.lineage {
+        let key = crate::index::semantic_edge_key(&edge);
+        if seen_lineage.insert(key) {
+            lineage.push(edge);
+        }
+    }
+    for anchor in result.touched_anchors {
+        if seen_anchors.insert(anchor.clone()) {
+            touched_anchors.push(anchor);
+        }
+    }
+    direct.sort_by(|a, b| {
+        a.timestamp
+            .cmp(&b.timestamp)
+            .then_with(|| a.tape_id.cmp(&b.tape_id))
+            .then_with(|| a.event_offset.cmp(&b.event_offset))
+    });
 
     Ok(ExplainResult {
         direct,
@@ -996,86 +1046,14 @@ pub fn edge_to_json(edge: &EdgeRow) -> Value {
     })
 }
 
-pub fn emit_query_result(
-    index: &SqliteIndex,
-    command: &str,
-    payload: Value,
-) -> Result<(), CliError> {
-    let payload_json = canonical_json_string(&payload)?;
-    let result_id = format!(
-        "result_{}",
-        sha256_hex(&format!("{command}:{payload_json}"))
-    );
-    let created_at = Utc::now().to_rfc3339();
-    index.record_query_result(&result_id, command, &payload_json, &created_at)?;
-
-    let mut object = match payload {
-        Value::Object(map) => map,
-        _ => {
-            return Err(CliError::new(
-                "invalid_query_payload",
-                format!("{command} payload must be a JSON object"),
-            ));
-        }
-    };
-    object.insert("result_id".to_string(), Value::String(result_id.clone()));
-    object.insert(
-        "rating_hint".to_string(),
-        Value::String(format!(
-            "Rate this result: engram rate {result_id} --outcome <found_answer|partially_helped|noise|misleading|not_used>"
-        )),
-    );
-    print_json(&Value::Object(object))
-}
-
-pub(crate) fn canonical_json_string(value: &Value) -> Result<String, CliError> {
-    let mut out = String::new();
-    write_canonical_json(value, &mut out)?;
-    Ok(out)
-}
-
-pub(crate) fn write_canonical_json(value: &Value, out: &mut String) -> Result<(), CliError> {
-    match value {
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
-            out.push_str(&serde_json::to_string(value)?);
-        }
-        Value::Array(items) => {
-            out.push('[');
-            for (idx, item) in items.iter().enumerate() {
-                if idx > 0 {
-                    out.push(',');
-                }
-                write_canonical_json(item, out)?;
-            }
-            out.push(']');
-        }
-        Value::Object(map) => {
-            out.push('{');
-            let mut keys = map.keys().collect::<Vec<_>>();
-            keys.sort_unstable();
-            for (idx, key) in keys.iter().enumerate() {
-                if idx > 0 {
-                    out.push(',');
-                }
-                out.push_str(&serde_json::to_string(key)?);
-                out.push(':');
-                let value = map
-                    .get(*key)
-                    .expect("canonical json key collected from same map");
-                write_canonical_json(value, out)?;
-            }
-            out.push('}');
-        }
-    }
-    Ok(())
+pub fn emit_query_result(_command: &str, payload: Value) -> Result<(), CliError> {
+    print_json(&payload)
 }
 
 pub(crate) fn evidence_kind_name(kind: EvidenceKind) -> &'static str {
     match kind {
         EvidenceKind::Edit => "edit",
         EvidenceKind::Read => "read",
-        EvidenceKind::Tool => "tool",
-        EvidenceKind::Message => "message",
     }
 }
 

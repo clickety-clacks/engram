@@ -3,6 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use engram::anchor::fingerprint_windows;
+use rusqlite::Connection;
 use serde_json::{Value, json};
 
 fn run_cli(repo: &Path, args: &[&str], home: &Path) -> Output {
@@ -128,16 +130,6 @@ fn session_has_touch(explain: &Value, session_id: &str, kind: &str) -> bool {
         })
 }
 
-fn query_anchors(explain: &Value) -> HashSet<String> {
-    explain["query"]["anchors"]
-        .as_array()
-        .expect("query anchors")
-        .iter()
-        .filter_map(Value::as_str)
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
 fn has_warranted_cross_state_edge(
     explain: &Value,
     source_anchors: &HashSet<String>,
@@ -160,7 +152,7 @@ fn has_warranted_cross_state_edge(
 }
 
 #[test]
-fn uj1_cross_tier_message_and_tool_output_provenance() {
+fn uj1_messages_and_tool_outputs_are_raw_context_not_direct_evidence() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (home, repo) = init_sandbox(&temp);
     fs::create_dir_all(repo.join("src")).expect("source directory");
@@ -268,15 +260,39 @@ fn uj1_cross_tier_message_and_tool_output_provenance() {
                 && !events.iter().any(|event| event["k"] == "code.edit")
         })
         .expect("discussion-only tape");
+    let implementation_tape = tape_ids(&repo, &home)
+        .into_iter()
+        .find(|tape_id| {
+            shown_events(&repo, &home, tape_id)
+                .iter()
+                .any(|event| event["k"] == "code.edit")
+        })
+        .expect("implementation tape");
 
     let widget = run_json(&repo, &["explain", "src/widget.rs:1-31"], &home);
     let gadget = run_json(&repo, &["explain", "src/gadget.rs:1-31"], &home);
-    let message_leg = session_has_touch(&widget, &discussion_tape, "message");
-    let tool_leg = session_has_touch(&gadget, &discussion_tape, "tool");
+    let widget_edit = session_has_touch(&widget, &implementation_tape, "edit");
+    let gadget_edit = session_has_touch(&gadget, &implementation_tape, "edit");
+    let discussion_is_direct = widget["sessions"]
+        .as_array()
+        .expect("widget sessions")
+        .iter()
+        .chain(gadget["sessions"].as_array().expect("gadget sessions"))
+        .any(|session| session["session_id"] == discussion_tape);
+    let discussion_events = shown_events(&repo, &home, &discussion_tape);
+    let raw_message_and_tool_are_preserved = discussion_events
+        .iter()
+        .any(|event| event["k"] == "msg.out")
+        && discussion_events
+            .iter()
+            .any(|event| event["k"] == "tool.result");
 
     assert!(
-        message_leg && tool_leg,
-        "product expectation: explain must return the discussion session with nonzero confidence and a message touch for snippet A, and with nonzero confidence and a tool touch for snippet B; message_leg={message_leg} tool_leg={tool_leg}"
+        widget_edit && gadget_edit && !discussion_is_direct && raw_message_and_tool_are_preserved,
+        "v4 expectation: text-backed edits are direct evidence while discussion message/tool rows \
+         remain raw context only; widget_edit={widget_edit} gadget_edit={gadget_edit} \
+         discussion_is_direct={discussion_is_direct} \
+         raw_message_and_tool_are_preserved={raw_message_and_tool_are_preserved}"
     );
 }
 
@@ -339,14 +355,54 @@ fn uj2_bidirectional_edit_lineage() {
         &["explain", "src/current.rs", "--min-confidence", "0.30"],
         &home,
     );
-    let before_anchors = query_anchors(&explain_before);
-    let after_anchors = query_anchors(&explain_after);
+    let before_windows = fingerprint_windows(&before);
+    let after_windows = fingerprint_windows(&after);
+    let before_anchors = before_windows
+        .iter()
+        .map(|window| window.anchor.clone())
+        .collect::<HashSet<_>>();
+    let after_anchors = after_windows
+        .iter()
+        .map(|window| window.anchor.clone())
+        .collect::<HashSet<_>>();
     let forward = has_warranted_cross_state_edge(&explain_before, &before_anchors, &after_anchors);
     let backward = has_warranted_cross_state_edge(&explain_after, &before_anchors, &after_anchors);
 
+    let conn = Connection::open(repo.join(".engram/index.sqlite")).expect("open v4 index");
+    let mut stmt = conn
+        .prepare(
+            "SELECT pair_ordinal, from_window_ordinal, to_window_ordinal
+             FROM edges
+             WHERE source_kind = 'edit'
+             ORDER BY pair_ordinal",
+        )
+        .expect("physical edge query");
+    let physical_pairs = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .expect("physical edge rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("physical pairs");
+    let expected_pairs = before_windows.len().max(after_windows.len());
+    let physical_identity_is_complete = physical_pairs.len() == expected_pairs
+        && physical_pairs.iter().enumerate().all(
+            |(expected_ordinal, (pair_ordinal, from_ordinal, to_ordinal))| {
+                *pair_ordinal == expected_ordinal as i64 && *from_ordinal >= 0 && *to_ordinal >= 0
+            },
+        );
+
     assert!(
-        forward && backward,
-        "product expectation: explain from both old and new text must expose a bidirectionally traversable lineage edge with warranted confidence in [0.30, 1.0); old_to_new={forward} new_to_old={backward}"
+        forward && backward && physical_identity_is_complete,
+        "v4 expectation: every proportional physical pair has stable identity and semantic lineage \
+         traverses in both directions with warranted confidence in [0.30, 1.0); \
+         old_to_new={forward} new_to_old={backward} \
+         physical_pairs={} expected_pairs={expected_pairs}",
+        physical_pairs.len()
     );
 }
 

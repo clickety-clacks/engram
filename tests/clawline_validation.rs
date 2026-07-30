@@ -3,6 +3,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
+use engram::anchor::{expand_winnow_anchor, fingerprint_text};
 use serde_json::Value;
 
 fn run_cli(repo: &Path, args: &[&str], stdin: Option<&str>) -> Output {
@@ -47,20 +48,14 @@ fn clawline_style_tape_yields_agent_useful_peek_content() {
     let _ = run_json(repo, &["init"], None);
     let _ = run_json(repo, &["record", "--stdin"], Some(&fixture));
 
-    let explain = run_json(
-        repo,
-        &["explain", "winnow:0000000000000301", "--anchor"],
-        None,
-    );
+    let touch = "fn invalidate_cache(key: &str) { cache.remove(key); }";
+    let feature = expand_winnow_anchor(&fingerprint_text(touch).fingerprint).remove(0);
+    let explain = run_json(repo, &["explain", &feature, "--anchor"], None);
     let sessions = explain["sessions"].as_array().expect("sessions");
     assert_eq!(sessions.len(), 1);
 
-    let session_id = sessions[0]["session_id"]
-        .as_str()
-        .expect("session_id");
-    let window_start = sessions[0]["window_start"]
-        .as_u64()
-        .expect("window_start") as usize;
+    let session_id = sessions[0]["session_id"].as_str().expect("session_id");
+    let window_start = sessions[0]["window_start"].as_u64().expect("window_start") as usize;
     let window_end = sessions[0]["window_end"].as_u64().expect("window_end") as usize;
     let window_lines = window_end.saturating_sub(window_start).saturating_add(1);
 
@@ -77,7 +72,10 @@ fn clawline_style_tape_yields_agent_useful_peek_content() {
         None,
     );
     let content = peek["session"]["content"].as_array().expect("content");
-    assert!(!content.is_empty(), "expected peek content around touch events");
+    assert!(
+        !content.is_empty(),
+        "expected peek content around touch events"
+    );
 
     let mut saw_contextual_event = false;
     for line in content {

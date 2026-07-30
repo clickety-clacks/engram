@@ -44,7 +44,7 @@ pub fn run_ingest(
     candidates.sort();
     candidates.dedup();
     ensure_db_parent(&context.db_path)?;
-    let index = SqliteIndex::open(&path_string(&context.db_path))?;
+    let index = SqliteIndex::open_writer(&path_string(&context.db_path))?;
 
     let mut scanned = 0usize;
     let mut imported = 0usize;
@@ -673,7 +673,7 @@ pub fn record_transcript(
     let tape_path = tape_path_for_id(paths, &tape_id);
     let tape_file_exists = tape_path.exists();
     ensure_db_parent(db_path)?;
-    let index = SqliteIndex::open(&path_string(db_path))?;
+    let index = SqliteIndex::open_writer(&path_string(db_path))?;
     let already_indexed = index.has_tape(&tape_id)?;
 
     if !already_indexed {

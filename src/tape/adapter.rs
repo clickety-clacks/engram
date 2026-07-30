@@ -1045,9 +1045,7 @@ impl HarnessAdapter for OpenClawAdapter {
                         .get("message")
                         .and_then(|message| message.get("role"))
                         .and_then(Value::as_str)
-                        .is_some_and(|role| {
-                            matches!(role, "user" | "assistant" | "toolResult")
-                        })
+                        .is_some_and(|role| matches!(role, "user" | "assistant" | "toolResult"))
                     && row
                         .get("message")
                         .and_then(|message| message.get("content"))
@@ -1353,8 +1351,8 @@ mod tests {
         );
         assert!(report.issues.is_empty(), "issues={:?}", report.issues);
         assert_eq!(report.coverage.tool, CoverageGrade::Full);
-        assert_eq!(report.coverage.read, CoverageGrade::Partial);
-        assert_eq!(report.coverage.edit, CoverageGrade::Partial);
+        assert_eq!(report.coverage.read, CoverageGrade::Full);
+        assert_eq!(report.coverage.edit, CoverageGrade::Full);
     }
 
     #[test]
@@ -1395,6 +1393,10 @@ mod tests {
                 "\"message\":{{\"role\":\"assistant\",\"content\":[{{",
                 "\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Write\",",
                 "\"input\":{{\"file_path\":\"/repo/src/lib.rs\",\"content\":{0}}}",
+                "}}]}}}}\n",
+                "{{\"type\":\"user\",\"timestamp\":\"2026-02-22T00:00:01Z\",",
+                "\"message\":{{\"role\":\"user\",\"content\":[{{",
+                "\"type\":\"tool_result\",\"tool_use_id\":\"toolu_1\",\"content\":\"done\"",
                 "}}]}}}}"
             ),
             content_json
@@ -1424,7 +1426,10 @@ mod tests {
         );
         // Evidence is stored at individual-token granularity; sample a few.
         let tokens = fingerprint_token_hashes(after_text);
-        assert!(tokens.len() >= 3, "expected token-level evidence, got {tokens:?}");
+        assert!(
+            tokens.len() >= 3,
+            "expected token-level evidence, got {tokens:?}"
+        );
 
         let index = SqliteIndex::open_in_memory().expect("sqlite");
         index
@@ -1522,8 +1527,8 @@ mod tests {
         assert!(report.event_count >= 3);
         assert!(report.issues.is_empty(), "issues={:?}", report.issues);
         assert_eq!(report.coverage.tool, CoverageGrade::Full);
-        assert_eq!(report.coverage.read, CoverageGrade::Partial);
-        assert_eq!(report.coverage.edit, CoverageGrade::Partial);
+        assert_eq!(report.coverage.read, CoverageGrade::Full);
+        assert_eq!(report.coverage.edit, CoverageGrade::Full);
     }
 
     #[test]
@@ -1534,8 +1539,8 @@ mod tests {
         assert!(report.event_count >= 7);
         assert!(report.issues.is_empty(), "issues={:?}", report.issues);
         assert_eq!(report.coverage.tool, CoverageGrade::Full);
-        assert_eq!(report.coverage.read, CoverageGrade::Partial);
-        assert_eq!(report.coverage.edit, CoverageGrade::Partial);
+        assert_eq!(report.coverage.read, CoverageGrade::Full);
+        assert_eq!(report.coverage.edit, CoverageGrade::Full);
     }
 
     #[test]
@@ -1636,7 +1641,7 @@ mod tests {
         let mut normalized =
             super::convert_with_adapter(AdapterId::CodexCli, input).expect("adapter should parse");
         normalized = normalized.replace(
-            "\"coverage.read\":\"partial\"",
+            "\"coverage.read\":\"full\"",
             "\"coverage.read\":\"PARTIAL\"",
         );
 

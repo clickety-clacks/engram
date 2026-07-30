@@ -16,18 +16,18 @@ fn parse_output_events(output: &str) -> Vec<Value> {
 }
 
 #[test]
-fn opencode_export_maps_to_deterministic_events_with_explicit_partial_read_edit() {
+fn opencode_export_maps_to_success_gated_events_with_full_coverage() {
     let input = load_fixture("tests/fixtures/opencode/session_export.json");
     let output = opencode_json_to_tape_jsonl(&input).expect("adapter should parse fixture");
     let events = parse_output_events(&output);
 
-    assert!(events.len() >= 11, "events={events:?}");
+    assert!(events.len() >= 9, "events={events:?}");
 
     let meta = &events[0];
     assert_eq!(meta["k"], "meta");
     assert_eq!(meta["coverage.tool"], "full");
-    assert_eq!(meta["coverage.read"], "partial");
-    assert_eq!(meta["coverage.edit"], "partial");
+    assert_eq!(meta["coverage.read"], "full");
+    assert_eq!(meta["coverage.edit"], "full");
     assert_eq!(meta["source"]["harness"], "opencode");
     assert_eq!(meta["source"]["session_id"], "ses_open_1");
 
@@ -55,7 +55,7 @@ fn opencode_export_maps_to_deterministic_events_with_explicit_partial_read_edit(
     assert!(
         events.iter().any(|event| event["k"] == "code.read"
             && event["file"] == "src/lib.rs"
-            && event["range"] == serde_json::json!([1, 3])),
+            && event["range"] == serde_json::json!([1, 1])),
         "events={events:?}"
     );
 
@@ -67,16 +67,10 @@ fn opencode_export_maps_to_deterministic_events_with_explicit_partial_read_edit(
     );
 
     assert!(
-        events
-            .iter()
-            .any(|event| event["k"] == "code.edit" && event["file"] == "src/main.rs"),
-        "events={events:?}"
-    );
-
-    assert!(
-        events
-            .iter()
-            .any(|event| event["k"] == "code.edit" && event["file"] == "src/new.rs"),
+        events.iter().all(|event| {
+            event["k"] != "code.edit"
+                || !matches!(event["file"].as_str(), Some("src/main.rs" | "src/new.rs"))
+        }),
         "events={events:?}"
     );
 

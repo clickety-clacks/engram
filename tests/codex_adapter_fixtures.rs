@@ -21,12 +21,12 @@ fn codex_supported_paths_emit_deterministic_events_and_partial_coverage_meta() {
     let output = codex_jsonl_to_tape_jsonl(&input).expect("adapter should parse fixture");
     let events = parse_output_events(&output);
 
-    assert_eq!(events.len(), 7, "events={events:?}");
+    assert_eq!(events.len(), 5, "events={events:?}");
 
     let meta = &events[0];
     assert_eq!(meta["k"], "meta");
     assert_eq!(meta["coverage.tool"], "full");
-    assert_eq!(meta["coverage.read"], "partial");
+    assert_eq!(meta["coverage.read"], "full");
     assert_eq!(meta["coverage.edit"], "partial");
     assert_eq!(meta["source"]["harness"], "codex-cli");
     assert_eq!(meta["source"]["session_id"], "sess_123");
@@ -44,15 +44,10 @@ fn codex_supported_paths_emit_deterministic_events_and_partial_coverage_meta() {
     assert_eq!(events[3]["tool"], "apply_patch");
     assert_eq!(events[3]["call_id"], "call_2");
 
-    assert_eq!(events[4]["k"], "code.edit");
-    assert_eq!(events[4]["file"], "src/main.rs");
-    assert_eq!(events[5]["k"], "code.edit");
-    assert_eq!(events[5]["file"], "src/new.rs");
-
-    assert_eq!(events[6]["k"], "tool.result");
-    assert_eq!(events[6]["tool"], "apply_patch");
-    assert_eq!(events[6]["call_id"], "call_2");
-    assert!(events[6].get("exit").is_none(), "events={events:?}");
+    assert_eq!(events[4]["k"], "tool.result");
+    assert_eq!(events[4]["tool"], "apply_patch");
+    assert_eq!(events[4]["call_id"], "call_2");
+    assert!(events[4].get("exit").is_none(), "events={events:?}");
 
     assert!(
         events

@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use serde_json::{Value, json};
 
+use super::structured::bounded_shell_read;
+
 const CURSOR_COVERAGE_TOOL: &str = "full";
 const CURSOR_COVERAGE_READ: &str = "partial";
 const CURSOR_COVERAGE_EDIT: &str = "partial";
@@ -12,6 +14,11 @@ pub fn cursor_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
     let mut first_timestamp: Option<String> = None;
     let mut emitted_meta = false;
     let mut tool_contexts = HashMap::<String, CursorToolContext>::new();
+    let mut read_total = 0u32;
+    let mut read_accounted = 0u32;
+    let mut edit_total = 0u32;
+    let mut edit_accounted = 0u32;
+    let mut session_cwd = None::<String>;
 
     for line in input.lines() {
         if line.trim().is_empty() {
@@ -44,6 +51,11 @@ pub fn cursor_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
         match row_type {
             "system" => {
                 if row.get("subtype").and_then(Value::as_str) == Some("init") {
+                    session_cwd = row
+                        .get("cwd")
+                        .or_else(|| row.get("workspace_path"))
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
                     out.push(json!({
                         "t": timestamp,
                         "k": "meta",
@@ -89,6 +101,14 @@ pub fn cursor_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
                 let subtype = row.get("subtype").and_then(Value::as_str).unwrap_or("");
                 match subtype {
                     "started" => {
+                        if tool == "readToolCall" || is_shell_tool(&tool) {
+                            read_total = read_total.saturating_add(1);
+                            if is_shell_tool(&tool) {
+                                edit_total = edit_total.saturating_add(1);
+                            }
+                        } else if tool == "writeToolCall" {
+                            edit_total = edit_total.saturating_add(1);
+                        }
                         let args = cursor_tool_args(&row);
                         let mut call = serde_json::Map::new();
                         call.insert("t".to_string(), json!(timestamp));
@@ -104,6 +124,7 @@ pub fn cursor_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
                     }
                     "completed" => {
                         let stdout = cursor_tool_stdout(&row).unwrap_or_default();
+                        let function_stdout = cursor_function_stdout(&row);
                         let context = call_id
                             .as_ref()
                             .and_then(|id| tool_contexts.remove(id))
@@ -120,27 +141,68 @@ pub fn cursor_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
                             result.insert("call_id".to_string(), json!(call_id));
                         }
                         out.push(Value::Object(result));
+                        if cursor_tool_failed(&row) {
+                            if tool == "readToolCall" || is_shell_tool(&tool) {
+                                read_accounted = read_accounted.saturating_add(1);
+                                if is_shell_tool(&tool) {
+                                    edit_accounted = edit_accounted.saturating_add(1);
+                                }
+                            } else if tool == "writeToolCall" {
+                                edit_accounted = edit_accounted.saturating_add(1);
+                            }
+                        }
 
-                        if let Some(file) = context.read_path {
+                        if cursor_tool_succeeded(&row)
+                            && !stdout.is_empty()
+                            && let Some(file) = context.read_path
+                        {
+                            let lines = stdout.lines().count() as u32;
                             out.push(json!({
                                 "t": timestamp,
                                 "k": "code.read",
                                 "source": cursor_source(session_id.as_deref()),
                                 "file": file,
-                                "range": [1, 1],
-                                "text": if stdout.is_empty() { Value::Null } else { json!(stdout) },
+                                "range": [1, lines],
+                                "text": stdout,
                                 "range_basis": "line"
                             }));
+                            read_accounted = read_accounted.saturating_add(1);
                         }
 
-                        if let Some(file) = context.write_path {
+                        if cursor_tool_succeeded(&row)
+                            && let (Some(file), Some(write_text)) =
+                                (context.write_path, context.write_text)
+                        {
                             out.push(json!({
                                 "t": timestamp,
                                 "k": "code.edit",
                                 "source": cursor_source(session_id.as_deref()),
                                 "file": file,
-                                "after_text": context.write_text
+                                "after_text": write_text
                             }));
+                            edit_accounted = edit_accounted.saturating_add(1);
+                        }
+                        if cursor_tool_succeeded(&row)
+                            && let Some(command) = context.command
+                            && let Some(function_stdout) = function_stdout.as_deref()
+                            && let Some(read) = bounded_shell_read(
+                                &command,
+                                function_stdout,
+                                context.workdir.as_deref(),
+                                session_cwd.as_deref(),
+                            )
+                        {
+                            let coverage_complete = read.coverage_complete;
+                            out.push(json!({
+                                "t": timestamp, "k": "code.read",
+                                "source": cursor_source(session_id.as_deref()),
+                                "file": read.file, "range": read.range, "text": read.text,
+                                "range_basis": "line"
+                            }));
+                            if coverage_complete {
+                                read_accounted = read_accounted.saturating_add(1);
+                                edit_accounted = edit_accounted.saturating_add(1);
+                            }
                         }
                     }
                     _ => {}
@@ -163,6 +225,24 @@ pub fn cursor_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
             }),
         );
     }
+    if let Some(meta) = out.first_mut().and_then(Value::as_object_mut) {
+        meta.insert(
+            "coverage.read".to_string(),
+            json!(if read_total == read_accounted {
+                "full"
+            } else {
+                "partial"
+            }),
+        );
+        meta.insert(
+            "coverage.edit".to_string(),
+            json!(if edit_total == edit_accounted {
+                "full"
+            } else {
+                "partial"
+            }),
+        );
+    }
 
     to_jsonl(&out)
 }
@@ -172,6 +252,8 @@ struct CursorToolContext {
     read_path: Option<String>,
     write_path: Option<String>,
     write_text: Option<String>,
+    command: Option<String>,
+    workdir: Option<String>,
 }
 
 fn content_text(value: &Value) -> String {
@@ -293,6 +375,25 @@ fn cursor_tool_stdout(row: &Value) -> Option<String> {
     None
 }
 
+fn cursor_function_stdout(row: &Value) -> Option<String> {
+    row.get("tool_call")?
+        .get("function")?
+        .get("result")?
+        .get("success")?
+        .as_object()?
+        .get("content")
+        .or_else(|| {
+            row.get("tool_call")?
+                .get("function")?
+                .get("result")?
+                .get("success")?
+                .as_object()?
+                .get("output")
+        })
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
 fn cursor_tool_stderr(row: &Value) -> String {
     let Some(tool_call) = row.get("tool_call").and_then(Value::as_object) else {
         return String::new();
@@ -301,6 +402,7 @@ fn cursor_tool_stderr(row: &Value) -> String {
         .get("readToolCall")
         .and_then(|read| read.get("result"))
         .and_then(|result| result.get("error"))
+        .filter(|error| !error.is_null())
     {
         return serde_json::to_string(error).unwrap_or_else(|_| String::new());
     }
@@ -308,6 +410,7 @@ fn cursor_tool_stderr(row: &Value) -> String {
         .get("writeToolCall")
         .and_then(|write| write.get("result"))
         .and_then(|result| result.get("error"))
+        .filter(|error| !error.is_null())
     {
         return serde_json::to_string(error).unwrap_or_else(|_| String::new());
     }
@@ -315,6 +418,7 @@ fn cursor_tool_stderr(row: &Value) -> String {
         .get("function")
         .and_then(|function| function.get("result"))
         .and_then(|result| result.get("error"))
+        .filter(|error| !error.is_null())
     {
         return serde_json::to_string(error).unwrap_or_else(|_| String::new());
     }
@@ -322,25 +426,42 @@ fn cursor_tool_stderr(row: &Value) -> String {
 }
 
 fn cursor_tool_exit_code(row: &Value) -> i64 {
+    i64::from(cursor_tool_failed(row))
+}
+
+fn cursor_tool_succeeded(row: &Value) -> bool {
+    if cursor_tool_failed(row) {
+        return false;
+    }
     let Some(tool_call) = row.get("tool_call").and_then(Value::as_object) else {
-        return 0;
+        return false;
     };
-    let has_error = tool_call
-        .get("readToolCall")
-        .and_then(|read| read.get("result"))
-        .and_then(|result| result.get("error"))
-        .is_some()
-        || tool_call
-            .get("writeToolCall")
-            .and_then(|write| write.get("result"))
-            .and_then(|result| result.get("error"))
-            .is_some()
-        || tool_call
-            .get("function")
-            .and_then(|function| function.get("result"))
-            .and_then(|result| result.get("error"))
-            .is_some();
-    if has_error { 1 } else { 0 }
+    ["readToolCall", "writeToolCall"].iter().any(|name| {
+        tool_call
+            .get(*name)
+            .and_then(|tool| tool.get("result"))
+            .and_then(|result| result.get("success"))
+            .is_some_and(Value::is_object)
+    }) || tool_call
+        .get("function")
+        .and_then(|tool| tool.get("result"))
+        .and_then(|result| result.get("success"))
+        .is_some_and(Value::is_object)
+}
+
+fn cursor_tool_failed(row: &Value) -> bool {
+    let Some(tool_call) = row.get("tool_call").and_then(Value::as_object) else {
+        return false;
+    };
+    ["readToolCall", "writeToolCall", "function"]
+        .iter()
+        .any(|name| {
+            tool_call
+                .get(*name)
+                .and_then(|tool| tool.get("result"))
+                .and_then(|result| result.get("error"))
+                .is_some_and(|error| !error.is_null())
+        })
 }
 
 fn cursor_tool_context(row: &Value) -> CursorToolContext {
@@ -348,7 +469,26 @@ fn cursor_tool_context(row: &Value) -> CursorToolContext {
         read_path: cursor_read_path(row),
         write_path: cursor_write_edit_path(row),
         write_text: cursor_write_text(row),
+        command: cursor_function_args(row)
+            .and_then(|args| args.get("command").or_else(|| args.get("cmd")))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        workdir: cursor_function_args(row)
+            .and_then(|args| args.get("workdir"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
     }
+}
+
+fn cursor_function_args(row: &Value) -> Option<&Value> {
+    row.get("tool_call")?.get("function")?.get("arguments")
+}
+
+fn is_shell_tool(tool: &str) -> bool {
+    matches!(
+        tool.to_ascii_lowercase().as_str(),
+        "bash" | "exec" | "shell" | "shell_command" | "process"
+    )
 }
 
 fn cursor_write_edit_path(row: &Value) -> Option<String> {
@@ -415,8 +555,8 @@ mod tests {
             "c6b62c6f-7ead-4fd6-9922-e952131177ff"
         );
         assert_eq!(meta["coverage.tool"], "full");
-        assert_eq!(meta["coverage.read"], "partial");
-        assert_eq!(meta["coverage.edit"], "partial");
+        assert_eq!(meta["coverage.read"], "full");
+        assert_eq!(meta["coverage.edit"], "full");
 
         let read_call = events
             .iter()

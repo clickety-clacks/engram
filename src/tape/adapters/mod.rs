@@ -4,6 +4,7 @@ pub mod cursor;
 pub mod gemini;
 pub mod openclaw;
 pub mod opencode;
+pub(crate) mod structured;
 
 pub use claude::claude_jsonl_to_tape_jsonl;
 pub use codex::codex_jsonl_to_tape_jsonl;

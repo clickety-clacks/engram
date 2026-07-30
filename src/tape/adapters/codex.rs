@@ -1,6 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use serde_json::{Value, json};
+
+use super::structured::{bounded_shell_read, parse_patch, patch_is_complete};
 
 const CODEX_COVERAGE_TOOL: &str = "full";
 const CODEX_COVERAGE_READ: &str = "partial";
@@ -8,10 +10,11 @@ const CODEX_COVERAGE_EDIT: &str = "partial";
 
 pub fn codex_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Error> {
     let mut out = Vec::new();
-    let mut call_tools: HashMap<String, String> = HashMap::new();
+    let mut calls: HashMap<String, CodexCall> = HashMap::new();
     let mut session_id: Option<String> = None;
     let mut first_timestamp: Option<String> = None;
     let mut emitted_meta = false;
+    let mut session_cwd = None::<String>;
 
     for line in input.lines() {
         if line.trim().is_empty() {
@@ -33,6 +36,10 @@ pub fn codex_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Erro
         match row_type {
             "session_meta" => {
                 let payload = row.get("payload").and_then(Value::as_object);
+                session_cwd = payload
+                    .and_then(|obj| obj.get("cwd"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
                 let model = payload
                     .and_then(|obj| obj.get("model"))
                     .and_then(Value::as_str)
@@ -90,6 +97,7 @@ pub fn codex_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Erro
                         let call_id = payload
                             .and_then(|obj| obj.get("call_id"))
                             .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty())
                             .map(ToOwned::to_owned);
                         let args = payload
                             .and_then(|obj| obj.get("arguments"))
@@ -98,7 +106,7 @@ pub fn codex_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Erro
                             .to_string();
                         emit_tool_call(
                             &mut out,
-                            &mut call_tools,
+                            &mut calls,
                             timestamp,
                             session_id.as_deref(),
                             tool,
@@ -114,6 +122,7 @@ pub fn codex_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Erro
                         let call_id = payload
                             .and_then(|obj| obj.get("call_id"))
                             .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty())
                             .map(ToOwned::to_owned);
                         let args = payload
                             .and_then(|obj| obj.get("input"))
@@ -121,7 +130,7 @@ pub fn codex_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Erro
                             .unwrap_or_default();
                         emit_tool_call(
                             &mut out,
-                            &mut call_tools,
+                            &mut calls,
                             timestamp,
                             session_id.as_deref(),
                             tool,
@@ -129,20 +138,21 @@ pub fn codex_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Erro
                             &args,
                         );
                     }
-                    "function_call_output" => {
+                    "function_call_output" | "custom_tool_call_output" => {
                         let call_id = payload
                             .and_then(|obj| obj.get("call_id"))
                             .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty())
                             .map(ToOwned::to_owned);
                         let output = payload
                             .and_then(|obj| obj.get("output"))
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_string();
-                        let tool = call_id
+                        let context = call_id.as_ref().and_then(|id| calls.remove(id));
+                        let tool = context
                             .as_ref()
-                            .and_then(|id| call_tools.get(id))
-                            .cloned()
+                            .map(|context| context.tool.clone())
                             .unwrap_or_else(|| "unknown".to_string());
                         let mut result_event = serde_json::Map::new();
                         result_event.insert("t".to_string(), json!(timestamp));
@@ -153,12 +163,33 @@ pub fn codex_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Erro
                         if let Some(call_id) = &call_id {
                             result_event.insert("call_id".to_string(), json!(call_id));
                         }
-                        if let Some(exit) = extract_exit_code(&output) {
+                        let exit = match context.as_ref().map(|context| context.tool.as_str()) {
+                            Some("apply_patch") if payload_type == "custom_tool_call_output" => {
+                                custom_tool_exit_code(&output)
+                            }
+                            Some("exec_command") if payload_type == "function_call_output" => {
+                                extract_exit_code(&output)
+                            }
+                            _ => None,
+                        };
+                        if let Some(exit) = exit {
                             result_event.insert("exit".to_string(), json!(exit));
                         }
                         result_event.insert("stdout".to_string(), json!(output));
                         result_event.insert("stderr".to_string(), json!(""));
                         out.push(Value::Object(result_event));
+                        if exit == Some(0)
+                            && let Some(context) = context
+                        {
+                            emit_structured_after_result(
+                                &mut out,
+                                timestamp,
+                                session_id.as_deref(),
+                                session_cwd.as_deref(),
+                                &context,
+                                &output,
+                            );
+                        }
                     }
                     _ => {}
                 }
@@ -178,8 +209,97 @@ pub fn codex_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Erro
             ),
         );
     }
+    let (read_coverage, edit_coverage) = codex_coverage(&out);
+    for meta in out
+        .iter_mut()
+        .filter_map(Value::as_object_mut)
+        .filter(|event| event.get("k").and_then(Value::as_str) == Some("meta"))
+    {
+        meta.insert("coverage.read".to_string(), json!(read_coverage));
+        meta.insert("coverage.edit".to_string(), json!(edit_coverage));
+    }
 
     to_jsonl(&out)
+}
+
+fn codex_coverage(events: &[Value]) -> (&'static str, &'static str) {
+    let mut read_partial = false;
+    let mut edit_partial = false;
+    for (index, call) in events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event["k"] == "tool.call")
+    {
+        let tool = call["tool"].as_str().unwrap_or("");
+        if !matches!(tool, "exec_command" | "apply_patch") {
+            continue;
+        }
+        let result = events
+            .iter()
+            .enumerate()
+            .skip(index + 1)
+            .find(|(_, event)| {
+                event["k"] == "tool.result" && event.get("call_id") == call.get("call_id")
+            });
+        let Some((result_index, result)) = result else {
+            if tool == "exec_command" {
+                read_partial = true;
+                edit_partial = true;
+            } else {
+                edit_partial = true
+            }
+            continue;
+        };
+        let Some(exit) = result.get("exit").and_then(Value::as_i64) else {
+            if tool == "exec_command" {
+                read_partial = true;
+                edit_partial = true;
+            } else {
+                edit_partial = true
+            }
+            continue;
+        };
+        if exit != 0 {
+            continue;
+        }
+        if tool == "apply_patch"
+            && !call["args"]
+                .as_str()
+                .is_some_and(|args| patch_is_complete(&patch_body(args)))
+        {
+            edit_partial = true;
+            continue;
+        }
+        let expected_kind = if tool == "exec_command" {
+            "code.read"
+        } else {
+            "code.edit"
+        };
+        let emitted = events
+            .iter()
+            .skip(result_index + 1)
+            .take_while(|event| !matches!(event["k"].as_str(), Some("tool.call" | "tool.result")))
+            .find(|event| event["k"] == expected_kind);
+        if emitted.is_none() {
+            if tool == "exec_command" {
+                read_partial = true;
+                edit_partial = true;
+            } else {
+                edit_partial = true;
+            }
+        } else if tool == "exec_command"
+            && emitted
+                .and_then(|event| event["file"].as_str())
+                .is_some_and(|file| !std::path::Path::new(file).is_absolute())
+        {
+            read_partial = true;
+            edit_partial = true;
+        }
+    }
+    (
+        if read_partial { "partial" } else { "full" },
+        if edit_partial { "partial" } else { "full" },
+    )
 }
 
 fn content_text(value: &Value) -> String {
@@ -268,7 +388,7 @@ fn codex_meta_event(
 
 fn emit_tool_call(
     out: &mut Vec<Value>,
-    call_tools: &mut HashMap<String, String>,
+    calls: &mut HashMap<String, CodexCall>,
     timestamp: &str,
     session_id: Option<&str>,
     tool: &str,
@@ -276,7 +396,13 @@ fn emit_tool_call(
     args: &str,
 ) {
     if let Some(call_id) = call_id {
-        call_tools.insert(call_id.to_string(), tool.to_string());
+        calls.insert(
+            call_id.to_string(),
+            CodexCall {
+                tool: tool.to_string(),
+                args: args.to_string(),
+            },
+        );
     }
 
     let mut call_event = serde_json::Map::new();
@@ -289,23 +415,6 @@ fn emit_tool_call(
         call_event.insert("call_id".to_string(), json!(call_id));
     }
     out.push(Value::Object(call_event));
-
-    if tool == "apply_patch" {
-        for edit in extract_apply_patch_edits(args) {
-            let mut event = serde_json::Map::new();
-            event.insert("t".to_string(), json!(timestamp));
-            event.insert("k".to_string(), json!("code.edit"));
-            event.insert("source".to_string(), codex_source(session_id));
-            event.insert("file".to_string(), json!(edit.file));
-            if let Some(before_text) = edit.before_text {
-                event.insert("before_text".to_string(), json!(before_text));
-            }
-            if let Some(after_text) = edit.after_text {
-                event.insert("after_text".to_string(), json!(after_text));
-            }
-            out.push(Value::Object(event));
-        }
-    }
 }
 
 fn value_to_argument_string(value: &Value) -> String {
@@ -315,13 +424,13 @@ fn value_to_argument_string(value: &Value) -> String {
     }
 }
 
-struct ApplyPatchEdit {
-    file: String,
-    before_text: Option<String>,
-    after_text: Option<String>,
+#[derive(Debug)]
+struct CodexCall {
+    tool: String,
+    args: String,
 }
 
-fn extract_apply_patch_edits(arguments: &str) -> Vec<ApplyPatchEdit> {
+fn patch_body(arguments: &str) -> String {
     let patch_body = serde_json::from_str::<Value>(arguments)
         .ok()
         .and_then(|value| {
@@ -331,67 +440,68 @@ fn extract_apply_patch_edits(arguments: &str) -> Vec<ApplyPatchEdit> {
                 .map(ToOwned::to_owned)
         })
         .unwrap_or_else(|| arguments.to_string());
+    patch_body
+}
 
-    let mut edits = Vec::new();
-    let mut seen = HashSet::new();
-    let mut current_file: Option<String> = None;
-    let mut before = String::new();
-    let mut after = String::new();
+fn custom_tool_exit_code(output: &str) -> Option<i64> {
+    serde_json::from_str::<Value>(output)
+        .ok()?
+        .get("metadata")?
+        .get("exit_code")?
+        .as_i64()
+}
 
-    let flush_current = |edits: &mut Vec<ApplyPatchEdit>,
-                         current_file: &mut Option<String>,
-                         before: &mut String,
-                         after: &mut String| {
-        if let Some(file) = current_file.take() {
-            edits.push(ApplyPatchEdit {
-                file,
-                before_text: (!before.is_empty()).then(|| before.clone()),
-                after_text: (!after.is_empty()).then(|| after.clone()),
-            });
-            before.clear();
-            after.clear();
-        }
-    };
+fn command_stdout(output: &str) -> &str {
+    output
+        .split_once("Final output:\n")
+        .map(|(_, stdout)| stdout)
+        .or_else(|| output.split_once("Output:\n").map(|(_, stdout)| stdout))
+        .unwrap_or("")
+}
 
-    for line in patch_body.lines() {
-        let file = line
-            .strip_prefix("*** Update File: ")
-            .or_else(|| line.strip_prefix("*** Add File: "))
-            .or_else(|| line.strip_prefix("*** Delete File: "));
-        if let Some(path) = file.map(str::trim) {
-            flush_current(&mut edits, &mut current_file, &mut before, &mut after);
-            if !path.is_empty() && seen.insert(path.to_string()) {
-                current_file = Some(path.to_string());
+fn emit_structured_after_result(
+    out: &mut Vec<Value>,
+    timestamp: &str,
+    session_id: Option<&str>,
+    cwd: Option<&str>,
+    context: &CodexCall,
+    output: &str,
+) {
+    if context.tool == "apply_patch" {
+        for edit in parse_patch(&patch_body(&context.args)) {
+            let mut event = serde_json::Map::new();
+            event.insert("t".to_string(), json!(timestamp));
+            event.insert("k".to_string(), json!("code.edit"));
+            event.insert("source".to_string(), codex_source(session_id));
+            event.insert("file".to_string(), json!(edit.file));
+            if let Some(before) = edit.before_text {
+                event.insert("before_text".to_string(), json!(before));
             }
-            continue;
+            if let Some(after) = edit.after_text {
+                event.insert("after_text".to_string(), json!(after));
+            }
+            out.push(Value::Object(event));
         }
-
-        if current_file.is_none()
-            || line == "*** Begin Patch"
-            || line == "*** End Patch"
-            || line.starts_with("*** Move to: ")
-            || line.starts_with("@@")
-            || line == "*** End of File"
-        {
-            continue;
-        }
-
-        if let Some(content) = line.strip_prefix('+') {
-            after.push_str(content);
-            after.push('\n');
-        } else if let Some(content) = line.strip_prefix('-') {
-            before.push_str(content);
-            before.push('\n');
-        } else if let Some(content) = line.strip_prefix(' ') {
-            before.push_str(content);
-            before.push('\n');
-            after.push_str(content);
-            after.push('\n');
-        }
+    } else if context.tool == "exec_command"
+        && let Ok(args) = serde_json::from_str::<Value>(&context.args)
+        && let Some(command) = args.get("cmd").and_then(Value::as_str)
+        && let Some(read) = bounded_shell_read(
+            command,
+            command_stdout(output),
+            args.get("workdir").and_then(Value::as_str),
+            cwd,
+        )
+    {
+        out.push(json!({
+            "t": timestamp,
+            "k": "code.read",
+            "source": codex_source(session_id),
+            "file": read.file,
+            "range": read.range,
+            "text": read.text,
+            "range_basis": "line"
+        }));
     }
-
-    flush_current(&mut edits, &mut current_file, &mut before, &mut after);
-    edits
 }
 
 fn to_jsonl(events: &[Value]) -> Result<String, serde_json::Error> {
@@ -422,8 +532,7 @@ mod tests {
         assert!(out.contains(r#""tool":"exec_command""#), "out={out}");
         assert!(out.contains(r#""k":"tool.result""#), "out={out}");
         assert!(out.contains(r#""exit":7"#), "out={out}");
-        assert!(out.contains(r#""k":"code.edit""#), "out={out}");
-        assert!(out.contains(r#""file":"src/main.rs""#), "out={out}");
+        assert!(!out.contains(r#""k":"code.edit""#), "out={out}");
     }
 
     #[test]
@@ -439,7 +548,7 @@ mod tests {
             .collect();
 
         assert_eq!(events[0]["k"], "meta");
-        assert_eq!(events[0]["coverage.read"], "partial");
+        assert_eq!(events[0]["coverage.read"], "full");
         assert_eq!(events[0]["coverage.edit"], "partial");
         assert!(
             events.iter().all(|event| event["k"] != "code.edit"),
@@ -448,7 +557,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_adapter_emits_textual_code_edit_for_custom_tool_call_apply_patch() {
+    fn codex_adapter_does_not_emit_custom_patch_without_paired_result() {
         let input = r#"{"timestamp":"2025-11-03T20:59:25.465Z","type":"session_meta","payload":{"id":"019a4b84-7c94-7783-a08b-fb4674e68b65","model_provider":"openai"}}
 {"timestamp":"2025-11-03T20:59:25.465Z","type":"response_item","payload":{"type":"custom_tool_call","status":"completed","call_id":"call_patch","name":"apply_patch","input":"*** Begin Patch\n*** Update File: Helm/Features/Chat/Components/ChatScrollContent.swift\n@@\n-import SwiftUI\n-import Foundation\n+import SwiftUI\n+import Foundation\n+import OSLog\n@@\n-struct ChatScrollContent: View {\n+struct ChatScrollContent: View {\n     let messageIDs: [UUID]\n     let screenGeometry: GeometryProxy\n     let screenHeight: CGFloat\n*** End Patch"}} "#;
 
@@ -458,19 +567,6 @@ mod tests {
             .map(|line| serde_json::from_str(line).expect("valid JSON event"))
             .collect();
 
-        let edit = events
-            .iter()
-            .find(|event| event["k"] == "code.edit")
-            .expect("code.edit event");
-        assert_eq!(
-            edit["file"],
-            "Helm/Features/Chat/Components/ChatScrollContent.swift"
-        );
-        assert!(
-            edit["after_text"]
-                .as_str()
-                .is_some_and(|text| text.contains("import OSLog")),
-            "events={events:?}"
-        );
+        assert!(events.iter().all(|event| event["k"] != "code.edit"));
     }
 }

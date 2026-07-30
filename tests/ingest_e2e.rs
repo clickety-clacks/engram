@@ -76,6 +76,89 @@ fn cursor_state_path(repo: &Path, transcript: &Path) -> PathBuf {
     repo.join(".engram/cursors").join(format!("{key}.json"))
 }
 
+fn ordered_index_snapshot(db_path: &Path) -> Vec<String> {
+    let conn = rusqlite::Connection::open(db_path).expect("open index snapshot");
+    let queries = [
+        (
+            "evidence_windows",
+            "SELECT evidence_id, anchor, tape_id, event_offset, kind, file_path,
+                    timestamp, window_ordinal
+             FROM evidence_windows
+             ORDER BY evidence_id",
+        ),
+        (
+            "evidence_features",
+            "SELECT feature_hash, evidence_id
+             FROM evidence_features
+             ORDER BY feature_hash, evidence_id",
+        ),
+        (
+            "edges",
+            "SELECT edge_id, source_kind, tape_id, event_offset, pair_ordinal,
+                    from_window_ordinal, to_window_ordinal, from_anchor, to_anchor,
+                    confidence, location_delta, cardinality, agent_link, note
+             FROM edges
+             ORDER BY edge_id",
+        ),
+        (
+            "tombstones",
+            "SELECT tombstone_id, anchor, tape_id, event_offset, file_path,
+                    range_start, range_end, timestamp, window_ordinal
+             FROM tombstones
+             ORDER BY tombstone_id",
+        ),
+        (
+            "tombstone_features",
+            "SELECT feature_hash, tombstone_id
+             FROM tombstone_features
+             ORDER BY feature_hash, tombstone_id",
+        ),
+        ("tapes", "SELECT tape_id FROM tapes ORDER BY tape_id"),
+        (
+            "dispatch_links",
+            "SELECT tape_id, uuid, first_turn_index, direction
+             FROM dispatch_links
+             ORDER BY tape_id, uuid",
+        ),
+    ];
+
+    let mut snapshot = Vec::new();
+    for (table, sql) in queries {
+        let mut stmt = conn.prepare(sql).expect("snapshot query");
+        let column_count = stmt.column_count();
+        let rows = stmt
+            .query_map([], |row| {
+                let mut values = Vec::with_capacity(column_count);
+                for column in 0..column_count {
+                    let value = match row.get_ref(column)? {
+                        rusqlite::types::ValueRef::Null => "null".to_string(),
+                        rusqlite::types::ValueRef::Integer(value) => format!("i:{value}"),
+                        rusqlite::types::ValueRef::Real(value) => {
+                            format!("r:{:016x}", value.to_bits())
+                        }
+                        rusqlite::types::ValueRef::Text(value) => {
+                            format!("t:{}", String::from_utf8_lossy(value))
+                        }
+                        rusqlite::types::ValueRef::Blob(value) => format!(
+                            "b:{}",
+                            value
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect::<String>()
+                        ),
+                    };
+                    values.push(value);
+                }
+                Ok(values.join("\u{1f}"))
+            })
+            .expect("snapshot rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("snapshot collect");
+        snapshot.extend(rows.into_iter().map(|row| format!("{table}\u{1e}{row}")));
+    }
+    snapshot
+}
+
 #[test]
 fn ingest_is_local_scoped_incremental_and_idempotent() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -418,7 +501,11 @@ fn ingest_emits_edit_winnow_evidence_that_explain_can_query() {
     fs::create_dir_all(&claude_root).expect("claude root");
     fs::write(
         claude_root.join("main.jsonl"),
-        include_str!("fixtures/claude_adapter_input.jsonl"),
+        format!(
+            "{}{}",
+            include_str!("fixtures/claude_adapter_input.jsonl"),
+            "{\"type\":\"user\",\"session_id\":\"session-claude-1\",\"timestamp\":\"2026-02-22T00:00:03Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_edit_1\",\"content\":\"ok\"}]}}\n"
+        ),
     )
     .expect("claude fixture");
 
@@ -707,6 +794,112 @@ fn fingerprint_indexes_only_local_tapes() {
 }
 
 #[test]
+fn fingerprint_rebuild_is_independent_of_filesystem_enumeration_order() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let first_repo = home.join("first");
+    let second_repo = home.join("second");
+    fs::create_dir_all(&first_repo).expect("first repo");
+    fs::create_dir_all(&second_repo).expect("second repo");
+    let _ = run_json(&first_repo, &["init"], None, &home);
+    let _ = run_json(&second_repo, &["init"], None, &home);
+
+    let read_text = (1..=30)
+        .map(|line| format!("fn rebuild_read_{line}() {{ value_{line}(); }}\n"))
+        .collect::<String>();
+    let before_text = (1..=30)
+        .map(|line| format!("fn rebuild_before_{line}() {{ old_{line}(); }}\n"))
+        .collect::<String>();
+    let after_text = (1..=30)
+        .map(|line| format!("fn rebuild_after_{line}() {{ new_{line}(); }}\n"))
+        .collect::<String>();
+    let deleted_text = (1..=30)
+        .map(|line| format!("fn rebuild_deleted_{line}() {{ gone_{line}(); }}\n"))
+        .collect::<String>();
+    let dispatch_uuid = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    let transcripts = [
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "t": "2026-03-21T00:00:00Z",
+                "k": "code.read",
+                "file": "src/read.rs",
+                "range": [1, 30],
+                "text": read_text,
+            })
+        ),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "t": "2026-03-21T00:01:00Z",
+                "k": "code.edit",
+                "file": "src/edit.rs",
+                "before_range": [1, 30],
+                "after_range": [1, 30],
+                "before_text": before_text,
+                "after_text": after_text,
+                "similarity": 0.75,
+            })
+        ),
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "t": "2026-03-21T00:02:00Z",
+                "k": "msg.in",
+                "role": "user",
+                "content": format!("<engram-src id=\"{dispatch_uuid}\"/> rebuild"),
+            }),
+            serde_json::json!({
+                "t": "2026-03-21T00:02:01Z",
+                "k": "code.edit",
+                "file": "src/deleted.rs",
+                "before_range": [1, 30],
+                "before_text": deleted_text,
+            })
+        ),
+    ];
+
+    for transcript in &transcripts {
+        write_tape(&first_repo.join(".engram/tapes"), transcript);
+    }
+    for transcript in transcripts.iter().rev() {
+        write_tape(&second_repo.join(".engram/tapes"), transcript);
+    }
+
+    let first = run_json(&first_repo, &["fingerprint"], None, &home);
+    let second = run_json(&second_repo, &["fingerprint"], None, &home);
+    assert_eq!(first["fingerprinted_tapes"], 3);
+    assert_eq!(second["fingerprinted_tapes"], 3);
+
+    let first_snapshot = ordered_index_snapshot(&first_repo.join(".engram/index.sqlite"));
+    let second_snapshot = ordered_index_snapshot(&second_repo.join(".engram/index.sqlite"));
+    assert_eq!(
+        first_snapshot, second_snapshot,
+        "ordered logical rows, including surrogate IDs, must be rebuild-stable"
+    );
+    assert_eq!(
+        sha256_hex(&first_snapshot.join("\n")),
+        sha256_hex(&second_snapshot.join("\n")),
+        "ordered logical digest must be rebuild-stable"
+    );
+
+    let first_again = run_json(&first_repo, &["fingerprint"], None, &home);
+    let second_again = run_json(&second_repo, &["fingerprint"], None, &home);
+    assert_eq!(first_again["fingerprinted_tapes"], 0);
+    assert_eq!(first_again["skipped_existing_tapes"], 3);
+    assert_eq!(second_again["fingerprinted_tapes"], 0);
+    assert_eq!(second_again["skipped_existing_tapes"], 3);
+    assert_eq!(
+        ordered_index_snapshot(&first_repo.join(".engram/index.sqlite")),
+        first_snapshot
+    );
+    assert_eq!(
+        ordered_index_snapshot(&second_repo.join(".engram/index.sqlite")),
+        second_snapshot
+    );
+}
+
+#[test]
 fn explain_fans_out_to_additional_stores_and_dedupes() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
@@ -724,18 +917,23 @@ fn explain_fans_out_to_additional_stores_and_dedupes() {
     )
     .expect("home config");
 
-    let anchor = "winnow:0000000000000201";
+    let touch_text = "fn shared_touch() {\n    let value = alpha + beta;\n    consume(value);\n}\n";
+    let anchor = fingerprint_text(touch_text).fingerprint;
     let transcript_a = format!(
-        "{{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"code.read\",\"file\":\"src/a.rs\",\"range\":[1,1],\"anchor_hashes\":[\"{anchor}\"]}}\n"
+        "{{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"code.read\",\"file\":\"src/a.rs\",\"range\":[1,4],\"text\":{}}}\n",
+        serde_json::to_string(touch_text).expect("read text")
     );
     let transcript_b = format!(
         concat!(
             "{{\"t\":\"2026-02-22T00:00:01Z\",\"k\":\"code.edit\",\"file\":\"src/b.rs\",",
-            "\"before_range\":[1,1],\"after_range\":[1,1],",
-            "\"before_anchor_hashes\":[\"winnow:0000000000000200\"],",
-            "\"after_anchor_hashes\":[\"{0}\"],\"similarity\":0.91}}\n"
+            "\"before_range\":[1,4],\"after_range\":[1,4],",
+            "\"before_text\":{},\"after_text\":{},\"similarity\":0.91}}\n"
         ),
-        anchor
+        serde_json::to_string(
+            "fn shared_touch() {\n    let value = alpha;\n    consume(value);\n}\n"
+        )
+        .expect("before text"),
+        serde_json::to_string(touch_text).expect("after text")
     );
     let tape_a = sha256_hex(&transcript_a);
     let tape_b = sha256_hex(&transcript_b);
@@ -776,7 +974,7 @@ fn explain_fans_out_to_additional_stores_and_dedupes() {
     )
     .expect("project a config");
 
-    let explain = run_json(&project_a, &["explain", anchor, "--anchor"], None, &home);
+    let explain = run_json(&project_a, &["explain", &anchor, "--anchor"], None, &home);
     assert_eq!(explain["stores_queried"], 2);
     let sessions = explain["sessions"].as_array().expect("sessions");
     assert!(
@@ -812,13 +1010,16 @@ fn show_and_explain_fall_back_to_home_tapes_when_repo_tapes_dir_is_empty() {
     )
     .expect("repo config");
 
-    let anchor = "winnow:0000000000000202";
+    let touch_text =
+        "fn home_store_touch() {\n    let provenance = available();\n    use_it(provenance);\n}\n";
+    let anchor = fingerprint_text(touch_text).fingerprint;
     let transcript = format!(
         concat!(
             "{{\"t\":\"2026-03-17T00:00:00Z\",\"k\":\"meta\",\"label\":\"home-store\"}}\n",
-            "{{\"t\":\"2026-03-17T00:00:01Z\",\"k\":\"code.read\",\"file\":\"src/lib.rs\",\"range\":[1,1],\"anchor_hashes\":[\"{anchor}\"]}}\n"
+            "{{\"t\":\"2026-03-17T00:00:01Z\",\"k\":\"code.read\",\"file\":\"src/lib.rs\",",
+            "\"range\":[1,4],\"text\":{}}}\n"
         ),
-        anchor = anchor
+        serde_json::to_string(touch_text).expect("read text")
     );
     let tape_id = write_tape(&home.join(".engram/tapes"), &transcript);
 
@@ -830,7 +1031,7 @@ fn show_and_explain_fall_back_to_home_tapes_when_repo_tapes_dir_is_empty() {
     assert_eq!(show["tape_id"], tape_id);
     assert_eq!(show["event_count"], 2);
 
-    let explain = run_json(&repo, &["explain", anchor, "--anchor"], None, &home);
+    let explain = run_json(&repo, &["explain", &anchor, "--anchor"], None, &home);
     let sessions = explain["sessions"].as_array().expect("sessions");
     assert_eq!(sessions.len(), 1, "sessions={sessions:?}");
     assert_eq!(sessions[0]["session_id"], Value::String(tape_id.clone()));
@@ -862,16 +1063,20 @@ fn show_and_explain_resolve_tapes_from_additional_store_directories() {
     )
     .expect("project a config");
 
-    let anchor = "winnow:0000000000000203";
+    let touch_text = "fn additional_store_touch() {\n    let provenance = remote();\n    use_it(provenance);\n}\n";
+    let anchor = fingerprint_text(touch_text).fingerprint;
     let transcript = format!(
         concat!(
             "{{\"t\":\"2026-03-17T00:05:00Z\",\"k\":\"meta\",\"label\":\"project-b\"}}\n",
             "{{\"t\":\"2026-03-17T00:05:01Z\",\"k\":\"code.edit\",\"file\":\"src/lib.rs\",",
-            "\"before_range\":[1,1],\"after_range\":[1,1],",
-            "\"before_anchor_hashes\":[\"winnow:0000000000000100\"],",
-            "\"after_anchor_hashes\":[\"{anchor}\"],\"similarity\":0.91}}\n"
+            "\"before_range\":[1,4],\"after_range\":[1,4],",
+            "\"before_text\":{},\"after_text\":{},\"similarity\":0.91}}\n"
         ),
-        anchor = anchor
+        serde_json::to_string(
+            "fn additional_store_touch() {\n    let provenance = local();\n    use_it(provenance);\n}\n"
+        )
+        .expect("before text"),
+        serde_json::to_string(touch_text).expect("after text")
     );
     let tape_id = write_tape(&project_b.join(".engram/tapes"), &transcript);
 
@@ -883,12 +1088,188 @@ fn show_and_explain_resolve_tapes_from_additional_store_directories() {
     assert_eq!(show["tape_id"], tape_id);
     assert_eq!(show["event_count"], 2);
 
-    let explain = run_json(&project_a, &["explain", anchor, "--anchor"], None, &home);
+    let primary_db = project_a.join(".engram/index.sqlite");
+    assert!(!primary_db.exists(), "primary must start absent");
+    let explain = run_json(&project_a, &["explain", &anchor, "--anchor"], None, &home);
+    assert!(
+        !primary_db.exists(),
+        "read-only query must not create the missing primary"
+    );
+    assert_eq!(explain["stores_queried"], 1);
     let sessions = explain["sessions"].as_array().expect("sessions");
     assert_eq!(sessions.len(), 1, "sessions={sessions:?}");
     assert_eq!(sessions[0]["session_id"], Value::String(tape_id));
     assert!(sessions[0]["window_end"].as_u64().unwrap_or(0) >= 1);
     assert!(sessions[0]["total_lines"].as_u64().unwrap_or(0) >= 1);
+}
+
+#[test]
+fn additional_store_preserves_dispatch_chain_refs_and_default_peek_anchor() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let producer = home.join("producer");
+    let consumer = home.join("consumer");
+    fs::create_dir_all(producer.join(".engram/tapes")).expect("producer tapes");
+    fs::create_dir_all(consumer.join(".engram")).expect("consumer .engram");
+
+    let primary_db = consumer.join(".engram/index.sqlite");
+    let additional_db = producer.join(".engram/index.sqlite");
+    fs::write(
+        consumer.join(".engram/config.yml"),
+        format!(
+            "db: {}\ntapes_dir: .engram/tapes\n",
+            primary_db.to_string_lossy()
+        ),
+    )
+    .expect("initial consumer config");
+    let primary_seed =
+        "{\"t\":\"2026-03-20T00:00:00Z\",\"k\":\"meta\",\"label\":\"empty-primary\"}\n";
+    let _ = run_json(&consumer, &["record", "--stdin"], Some(primary_seed), &home);
+
+    fs::write(
+        producer.join(".engram/config.yml"),
+        format!(
+            "db: {}\ntapes_dir: .engram/tapes\n",
+            additional_db.to_string_lossy()
+        ),
+    )
+    .expect("producer config");
+
+    let uuid_ab = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let uuid_bc = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let touch_text = "pub fn additional_dispatch_touch() {\n    let value = lineage();\n    preserve(value);\n}\n";
+    let touch_json = serde_json::to_string(touch_text).expect("touch json");
+    let tape_a_text = format!(
+        "{{\"t\":\"2026-03-20T00:01:00Z\",\"k\":\"msg.out\",\"role\":\"assistant\",\
+         \"content\":[{{\"type\":\"toolCall\",\"arguments\":{{\"payload\":\
+         \"<engram-src id=\\\"{uuid_ab}\\\"/> dispatch\"}}}}]}}\n"
+    );
+    let tape_b_text = format!(
+        concat!(
+            "{{\"t\":\"2026-03-20T00:02:00Z\",\"k\":\"msg.in\",\"role\":\"user\",",
+            "\"content\":\"<engram-src id=\\\"{uuid_ab}\\\"/> receive\"}}\n",
+            "{{\"t\":\"2026-03-20T00:02:01Z\",\"k\":\"msg.out\",\"role\":\"assistant\",",
+            "\"content\":[{{\"type\":\"toolCall\",\"arguments\":{{\"payload\":",
+            "\"<engram-src id=\\\"{uuid_bc}\\\"/> dispatch\"}}}}]}}\n"
+        ),
+        uuid_ab = uuid_ab,
+        uuid_bc = uuid_bc
+    );
+    let tape_c_text = format!(
+        concat!(
+            "{{\"t\":\"2026-03-20T00:03:00Z\",\"k\":\"msg.out\",\"role\":\"assistant\",",
+            "\"content\":\"prelude\"}}\n",
+            "{{\"t\":\"2026-03-20T00:03:01Z\",\"k\":\"msg.in\",\"role\":\"user\",",
+            "\"content\":\"<engram-src id=\\\"{uuid_bc}\\\"/> receive\"}}\n",
+            "{{\"t\":\"2026-03-20T00:03:02Z\",\"k\":\"code.edit\",\"file\":\"src/engine.rs\",",
+            "\"before_range\":[1,4],\"after_range\":[1,4],",
+            "\"before_text\":{touch_json},\"after_text\":{touch_json},\"similarity\":1.0}}\n"
+        ),
+        uuid_bc = uuid_bc,
+        touch_json = touch_json
+    );
+    let sibling_text = format!(
+        "{{\"t\":\"2026-03-20T00:02:30Z\",\"k\":\"msg.in\",\"role\":\"user\",\
+         \"content\":\"<engram-src id=\\\"{uuid_ab}\\\"/> sibling\"}}\n"
+    );
+
+    let tape_a = write_tape(&producer.join(".engram/tapes"), &tape_a_text);
+    let tape_b = write_tape(&producer.join(".engram/tapes"), &tape_b_text);
+    let tape_c = write_tape(&producer.join(".engram/tapes"), &tape_c_text);
+    let sibling = write_tape(&producer.join(".engram/tapes"), &sibling_text);
+    let fingerprint = run_json(&producer, &["fingerprint"], None, &home);
+    assert_eq!(fingerprint["fingerprinted_tapes"], 4);
+
+    {
+        let primary = rusqlite::Connection::open(&primary_db).expect("primary index");
+        primary
+            .execute(
+                "INSERT INTO dispatch_links
+                 (tape_id, uuid, first_turn_index, direction)
+                 VALUES (?1, ?2, 0, 'sent')",
+                rusqlite::params![tape_a, uuid_ab],
+            )
+            .expect("duplicate primary sent link");
+        primary
+            .execute(
+                "INSERT INTO dispatch_links
+                 (tape_id, uuid, first_turn_index, direction)
+                 VALUES (?1, ?2, 0, 'received')",
+                rusqlite::params![tape_b, uuid_ab],
+            )
+            .expect("duplicate primary received link");
+    }
+
+    fs::write(
+        consumer.join(".engram/config.yml"),
+        format!(
+            "db: {}\ntapes_dir: .engram/tapes\nadditional_stores:\n  - {}\n",
+            primary_db.to_string_lossy(),
+            additional_db.to_string_lossy()
+        ),
+    )
+    .expect("consumer additional-store config");
+
+    let anchor = fingerprint_text(touch_text).fingerprint;
+    let explain = run_json(
+        &consumer,
+        &["explain", &anchor, "--anchor", "--limit", "10"],
+        None,
+        &home,
+    );
+    let sessions = explain["sessions"].as_array().expect("sessions");
+    let session_ids = sessions
+        .iter()
+        .filter_map(|session| session["session_id"].as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        session_ids.contains(&tape_a.as_str()),
+        "sessions={sessions:?}"
+    );
+    assert!(
+        session_ids.contains(&tape_b.as_str()),
+        "sessions={sessions:?}"
+    );
+    assert!(
+        session_ids.contains(&tape_c.as_str()),
+        "sessions={sessions:?}"
+    );
+    assert!(
+        !session_ids.contains(&sibling.as_str()),
+        "sessions={sessions:?}"
+    );
+    assert_eq!(
+        explain["dispatch_lineage"]
+            .as_array()
+            .expect("dispatch lineage")
+            .len(),
+        2,
+        "dispatch_lineage={:?}",
+        explain["dispatch_lineage"]
+    );
+
+    let refs = sessions
+        .iter()
+        .map(|session| {
+            (
+                session["session_id"].as_str().unwrap_or_default(),
+                session["refs_up"].as_u64().unwrap_or_default(),
+                session["refs_down"].as_u64().unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(refs.contains(&(tape_a.as_str(), 0, 1)), "refs={refs:?}");
+    assert!(refs.contains(&(tape_b.as_str(), 1, 1)), "refs={refs:?}");
+    assert!(refs.contains(&(tape_c.as_str(), 1, 0)), "refs={refs:?}");
+
+    let peek = run_json(
+        &consumer,
+        &["peek", &tape_c, "--before", "0", "--after", "0"],
+        None,
+        &home,
+    );
+    assert_eq!(peek["session"]["window_start"], 2);
+    assert_eq!(peek["session"]["window_end"], 2);
 }
 
 #[test]

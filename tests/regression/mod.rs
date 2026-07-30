@@ -4,6 +4,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
+use engram::anchor::fingerprint_text;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use support::{run_cli, run_json, run_json_timed};
@@ -95,12 +96,24 @@ fn explain_scaled_fixture_meets_perf_budget() {
 
     let db_path = repo.join(".engram/index.sqlite");
     let conn = Connection::open(db_path).expect("open db");
-    let evidence_rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM evidence", [], |row| row.get(0))
-        .expect("count evidence");
+    let evidence_windows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM evidence_windows", [], |row| {
+            row.get(0)
+        })
+        .expect("count evidence windows");
+    let evidence_features: i64 = conn
+        .query_row("SELECT COUNT(*) FROM evidence_features", [], |row| {
+            row.get(0)
+        })
+        .expect("count evidence features");
     assert!(
-        evidence_rows >= 20_000,
-        "scaled fixture should have substantial evidence cardinality; rows={evidence_rows}"
+        evidence_windows >= 2_000,
+        "scaled fixture should have window-scale evidence cardinality; windows={evidence_windows}"
+    );
+    assert!(
+        evidence_features > evidence_windows,
+        "narrow postings should fan out from canonical windows; \
+         windows={evidence_windows} features={evidence_features}"
     );
 
     let (explain, elapsed) = run_json_timed(&repo, &["explain", "src/lib.rs:900-930"], None, &home);
@@ -137,7 +150,8 @@ fn config_walkup_uses_global_db_and_repo_tapes_dir() {
     fs::create_dir_all(home.join(".engram")).expect("home .engram");
     fs::create_dir_all(&repo).expect("repo");
 
-    write_repo_file(&repo, "src/lib.rs", "fn app() { run(); }\n");
+    let touch_text = "fn app() {\n    let state = load_state();\n    run(state);\n}\n";
+    write_repo_file(&repo, "src/lib.rs", touch_text);
     write_repo_file(
         &home,
         ".engram/config.yml",
@@ -149,8 +163,8 @@ fn config_walkup_uses_global_db_and_repo_tapes_dir() {
         "t": "2026-03-18T00:00:00Z",
         "k": "code.read",
         "file": "src/lib.rs",
-        "range": [1, 1],
-        "anchor_hashes": ["winnow:0000000000000a11"],
+        "range": [1, 4],
+        "text": touch_text,
     })
     .to_string()
         + "\n";
@@ -165,12 +179,8 @@ fn config_walkup_uses_global_db_and_repo_tapes_dir() {
         "repo should not create a local db when config only sets tapes_dir"
     );
 
-    let explain = run_json(
-        &repo,
-        &["explain", "winnow:0000000000000a11", "--anchor"],
-        None,
-        &home,
-    );
+    let anchor = fingerprint_text(touch_text).fingerprint;
+    let explain = run_json(&repo, &["explain", &anchor, "--anchor"], None, &home);
     let sessions = explain["sessions"].as_array().expect("sessions");
     assert_eq!(sessions.len(), 1, "expected session from global db lookup");
     assert_eq!(sessions[0]["window_start"], Value::from(1));
@@ -194,16 +204,17 @@ fn explain_additional_store_resolves_windows_from_store_tapes_path() {
         ".engram/config.yml",
         "db: .engram/index.sqlite\ntapes_dir: .engram/tapes\n",
     );
-    write_repo_file(&producer, "src/lib.rs", "fn shared() { v1(); }\n");
+    let after_text = "fn shared() {\n    let value = version_two();\n    publish(value);\n}\n";
+    write_repo_file(&producer, "src/lib.rs", after_text);
 
     let producer_tape = json!({
         "t": "2026-03-18T01:00:00Z",
         "k": "code.edit",
         "file": "src/lib.rs",
-        "before_range": [1, 1],
-        "after_range": [1, 1],
-        "before_anchor_hashes": ["winnow:0000000000000a20"],
-        "after_anchor_hashes": ["winnow:0000000000000a21"],
+        "before_range": [1, 4],
+        "after_range": [1, 4],
+        "before_text": "fn shared() {\n    let value = version_one();\n    publish(value);\n}\n",
+        "after_text": after_text,
         "similarity": 0.95,
     })
     .to_string()
@@ -227,14 +238,16 @@ fn explain_additional_store_resolves_windows_from_store_tapes_path() {
         ),
     );
 
-    let explain = run_json(
-        &consumer,
-        &["explain", "winnow:0000000000000a21", "--anchor"],
-        None,
-        &home,
+    let consumer_primary = consumer.join(".engram/index.sqlite");
+    assert!(!consumer_primary.exists(), "consumer primary starts absent");
+    let anchor = fingerprint_text(after_text).fingerprint;
+    let explain = run_json(&consumer, &["explain", &anchor, "--anchor"], None, &home);
+    assert!(
+        !consumer_primary.exists(),
+        "query must not create the missing consumer primary"
     );
 
-    assert_eq!(explain["stores_queried"].as_u64(), Some(2));
+    assert_eq!(explain["stores_queried"].as_u64(), Some(1));
     let sessions = explain["sessions"].as_array().expect("sessions");
     assert_eq!(sessions.len(), 1, "expected match from additional store");
     assert_eq!(sessions[0]["window_start"], Value::from(1));
@@ -359,7 +372,9 @@ fn explain_supports_grep_filter_offset_count_and_date_bounds() {
     let home = temp.path().join("home");
     let repo = home.join("repo");
     fs::create_dir_all(&repo).expect("repo");
-    write_repo_file(&repo, "src/lib.rs", "fn filters_case() {}\n");
+    let after_text =
+        "fn filters_case() {\n    let result = run_filter();\n    consume(result);\n}\n";
+    write_repo_file(&repo, "src/lib.rs", after_text);
     let _ = run_json(&repo, &["init"], None, &home);
 
     for i in 0..4 {
@@ -368,10 +383,12 @@ fn explain_supports_grep_filter_offset_count_and_date_bounds() {
             "t": ts,
             "k": "code.edit",
             "file": "src/lib.rs",
-            "before_range": [1, 1],
-            "after_range": [1, 1],
-            "before_text": "fn filters_case() {}\n",
-            "after_text": format!("fn filters_case_{i}() {{}}\n"),
+            "before_range": [1, 4],
+            "after_range": [1, 4],
+            "before_text": format!(
+                "fn filters_case() {{\n    let result = old_filter_{i}();\n    consume(result);\n}}\n"
+            ),
+            "after_text": after_text,
             "similarity": 0.9,
         })
         .to_string()
@@ -383,7 +400,7 @@ fn explain_supports_grep_filter_offset_count_and_date_bounds() {
         &repo,
         &[
             "explain",
-            "src/lib.rs:1-1",
+            "src/lib.rs:1-4",
             "--grep-filter",
             "filters_case",
             "--since",
@@ -422,8 +439,23 @@ fn api_surface_errors_are_json_objects() {
         .expect("invalid span stderr line")
         .as_bytes()
         .to_vec();
-    let invalid_payload: Value = serde_json::from_slice(&invalid_json).expect("invalid span json error");
-    assert_eq!(invalid_payload["error"], Value::String("invalid_span".to_string()));
+    let invalid_payload: Value =
+        serde_json::from_slice(&invalid_json).expect("invalid span json error");
+    assert_eq!(
+        invalid_payload["error"],
+        Value::String("invalid_span".to_string())
+    );
+
+    let seed_record = json!({
+        "t": "2026-03-18T00:00:00Z",
+        "k": "code.read",
+        "file": "src/lib.rs",
+        "range": [1, 1],
+        "text": "fn invalid_span() {}\n",
+    })
+    .to_string()
+        + "\n";
+    let _ = run_json(&repo, &["record", "--stdin"], Some(&seed_record), &home);
 
     let no_results = run_cli(&repo, &["grep", "definitely-missing-pattern"], None, &home);
     assert!(!no_results.status.success());
@@ -434,8 +466,12 @@ fn api_surface_errors_are_json_objects() {
         .expect("no_results stderr line")
         .as_bytes()
         .to_vec();
-    let no_results_payload: Value = serde_json::from_slice(&no_results_json).expect("no_results json error");
-    assert_eq!(no_results_payload["error"], Value::String("no_results".to_string()));
+    let no_results_payload: Value =
+        serde_json::from_slice(&no_results_json).expect("no_results json error");
+    assert_eq!(
+        no_results_payload["error"],
+        Value::String("no_results".to_string())
+    );
 
     let missing_session = run_cli(&repo, &["peek", "missing-session-id"], None, &home);
     assert!(!missing_session.status.success());
@@ -446,7 +482,8 @@ fn api_surface_errors_are_json_objects() {
         .expect("session_not_found stderr line")
         .as_bytes()
         .to_vec();
-    let session_payload: Value = serde_json::from_slice(&session_json).expect("session_not_found json error");
+    let session_payload: Value =
+        serde_json::from_slice(&session_json).expect("session_not_found json error");
     assert_eq!(
         session_payload["error"],
         Value::String("session_not_found".to_string())
@@ -506,7 +543,12 @@ fn grep_count_returns_metadata_only() {
         let _ = run_json(&repo, &["record", "--stdin"], Some(&record_line), &home);
     }
 
-    let grep = run_json(&repo, &["grep", "count-only needle", "--count"], None, &home);
+    let grep = run_json(
+        &repo,
+        &["grep", "count-only needle", "--count"],
+        None,
+        &home,
+    );
     assert_eq!(grep["returned"], Value::from(3));
     assert_eq!(grep["total"], Value::from(3));
     assert_eq!(grep["sessions"], json!([]));
@@ -571,7 +613,7 @@ fn grep_ranks_provenance_matches_before_recent_text_mentions() {
 }
 
 #[test]
-fn stderr_only_tool_result_is_fingerprinted_without_empty_file_touch() {
+fn stderr_only_tool_result_is_preserved_but_not_direct_evidence() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
     let repo = home.join("repo");
@@ -603,18 +645,37 @@ fn stderr_only_tool_result_is_fingerprinted_without_empty_file_touch() {
     ]
     .join("\n")
         + "\n";
-    let _ = run_json(&repo, &["record", "--stdin"], Some(&record), &home);
+    let recorded = run_json(&repo, &["record", "--stdin"], Some(&record), &home);
 
-    let stderr_explain = run_json(&repo, &["explain", stderr_text], None, &home);
-    let stderr_sessions = stderr_explain["sessions"].as_array().expect("sessions");
-    assert_eq!(stderr_sessions.len(), 1);
-    assert!(stderr_sessions[0]["touches"].as_array().is_some_and(|touches| {
-        touches.iter().any(|touch| touch["kind"] == "tool")
-    }));
-    assert_eq!(
-        stderr_sessions[0]["files_touched"],
-        json!(["src/stderr.rs"]),
-        "textual evidence should use transcript file fallback without an empty path"
+    let stderr_explain = run_cli(&repo, &["explain", stderr_text], None, &home);
+    assert!(
+        !stderr_explain.status.success(),
+        "tool text must not become direct evidence"
+    );
+    let stderr_payload: Value = serde_json::from_slice(
+        String::from_utf8_lossy(&stderr_explain.stderr)
+            .lines()
+            .last()
+            .expect("stderr payload")
+            .as_bytes(),
+    )
+    .expect("no-results json");
+    assert_eq!(stderr_payload["error"], Value::String("no_results".into()));
+
+    let tape_id = recorded["tape_id"].as_str().expect("tape id");
+    let raw_tape = zstd::stream::decode_all(
+        fs::File::open(
+            repo.join(".engram/tapes")
+                .join(format!("{tape_id}.jsonl.zst")),
+        )
+        .expect("raw tape"),
+    )
+    .expect("decode raw tape");
+    assert!(
+        String::from_utf8(raw_tape)
+            .expect("utf8 tape")
+            .contains(stderr_text),
+        "raw tool result must remain in the immutable tape"
     );
 
     let edit_explain = run_json(
@@ -631,7 +692,7 @@ fn stderr_only_tool_result_is_fingerprinted_without_empty_file_touch() {
 }
 
 #[test]
-fn metrics_logging_writes_expected_jsonl_row() {
+fn explain_does_not_create_query_metrics_log() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
     let repo = home.join("repo");
@@ -658,16 +719,13 @@ fn metrics_logging_writes_expected_jsonl_row() {
         + "\n";
     let _ = run_json(&repo, &["record", "--stdin"], Some(&record_line), &home);
 
-    let _ = run_json(&repo, &["explain", "src/lib.rs:1-1"], None, &home);
     let metrics_path = repo.join(".engram/metrics.jsonl");
-    assert!(metrics_path.exists(), "metrics log should be created");
-    let content = fs::read_to_string(metrics_path).expect("metrics content");
-    let last = content.lines().last().expect("metrics row");
-    let row: Value = serde_json::from_str(last).expect("metrics row json");
-    assert_eq!(row["command"], Value::String("explain".to_string()));
-    assert_eq!(row["target"], Value::String("src/lib.rs:1-1".to_string()));
-    assert!(!row["ts"].as_str().unwrap_or("").is_empty());
-    assert_eq!(row["window_lines"], Value::Null);
+    assert!(!metrics_path.exists(), "metrics log starts absent");
+    let _ = run_json(&repo, &["explain", "src/lib.rs:1-1"], None, &home);
+    assert!(
+        !metrics_path.exists(),
+        "read-only explain must not create a query metrics log"
+    );
 }
 
 #[test]
@@ -806,9 +864,10 @@ fn peek_grep_filter_returns_match_context_window() {
     let content = session["content"].as_array().expect("content");
     assert_eq!(content.len(), 3);
     assert!(
-        content
-            .iter()
-            .any(|line| line["text"].as_str().unwrap_or("").contains("needle-in-session")),
+        content.iter().any(|line| line["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("needle-in-session")),
         "grep-filter output should include the matching line"
     );
 }
@@ -833,8 +892,16 @@ fn explain_chain_metadata_populates_parent_children_and_depth() {
     })
     .to_string()
         + "\n";
-    let parent = run_json(&repo, &["record", "--stdin"], Some(&parent_transcript), &home);
-    let parent_id = parent["tape_id"].as_str().expect("parent tape id").to_string();
+    let parent = run_json(
+        &repo,
+        &["record", "--stdin"],
+        Some(&parent_transcript),
+        &home,
+    );
+    let parent_id = parent["tape_id"]
+        .as_str()
+        .expect("parent tape id")
+        .to_string();
 
     let child_transcript = format!(
         "{}\n{}\n",
@@ -855,10 +922,23 @@ fn explain_chain_metadata_populates_parent_children_and_depth() {
             "similarity": 0.96
         })
     );
-    let child = run_json(&repo, &["record", "--stdin"], Some(&child_transcript), &home);
-    let child_id = child["tape_id"].as_str().expect("child tape id").to_string();
+    let child = run_json(
+        &repo,
+        &["record", "--stdin"],
+        Some(&child_transcript),
+        &home,
+    );
+    let child_id = child["tape_id"]
+        .as_str()
+        .expect("child tape id")
+        .to_string();
 
-    let explain = run_json(&repo, &["explain", "src/lib.rs:1-1", "--limit", "10"], None, &home);
+    let explain = run_json(
+        &repo,
+        &["explain", "src/lib.rs:1-1", "--limit", "10"],
+        None,
+        &home,
+    );
     let sessions = explain["sessions"].as_array().expect("sessions");
 
     let parent_session = sessions
@@ -1017,7 +1097,10 @@ fn explain_direct_string_query_returns_fingerprint_matches() {
 
     let explain = run_json(&repo, &["explain", query], None, &home);
     let sessions = explain["sessions"].as_array().expect("sessions");
-    assert!(!sessions.is_empty(), "expected literal explain to return matches");
+    assert!(
+        !sessions.is_empty(),
+        "expected literal explain to return matches"
+    );
     assert!(
         sessions[0]["confidence"].as_f64().unwrap_or(0.0) > 0.0,
         "direct string explain should return a positive confidence match"

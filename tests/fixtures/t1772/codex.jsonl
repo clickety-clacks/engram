@@ -1,0 +1,36 @@
+{"timestamp":"2026-07-29T00:00:00Z","type":"session_meta","payload":{"id":"t1772-codex","cwd":"/repo"}}
+{"timestamp":"2026-07-29T00:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"cat","arguments":"{\"cmd\":\"cat -- 'src/a file.rs'\"}"}}
+{"timestamp":"2026-07-29T00:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"cat","output":"Process exited with code 0\nFinal output:\none\ntwo\n"}}
+{"timestamp":"2026-07-29T00:00:03Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"sed-one","arguments":"{\"cmd\":\"sed -n '2p' src/a.rs\"}"}}
+{"timestamp":"2026-07-29T00:00:04Z","type":"response_item","payload":{"type":"function_call_output","call_id":"sed-one","output":"Process exited with code 0\nFinal output:\ntwo\n"}}
+{"timestamp":"2026-07-29T00:00:05Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"sed-range","arguments":"{\"cmd\":\"sed -n '2,4p' -- 'src/a file.rs'\",\"workdir\":\"pkg\"}"}}
+{"timestamp":"2026-07-29T00:00:06Z","type":"response_item","payload":{"type":"function_call_output","call_id":"sed-range","output":"Process exited with code 0\nFinal output:\ntwo\nthree\n"}}
+{"timestamp":"2026-07-29T00:00:07Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"head-n","arguments":"{\"cmd\":\"head -n 2 -- src/a.rs\"}"}}
+{"timestamp":"2026-07-29T00:00:08Z","type":"response_item","payload":{"type":"function_call_output","call_id":"head-n","output":"Process exited with code 0\nFinal output:\none\ntwo\n"}}
+{"timestamp":"2026-07-29T00:00:09Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"head-short","arguments":"{\"cmd\":\"head -2 src/a.rs\"}"}}
+{"timestamp":"2026-07-29T00:00:10Z","type":"response_item","payload":{"type":"function_call_output","call_id":"head-short","output":"Process exited with code 0\nFinal output:\none\ntwo\n"}}
+{"timestamp":"2026-07-29T00:00:11Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"tail","arguments":"{\"cmd\":\"tail -n +3 -- src/a.rs\"}"}}
+{"timestamp":"2026-07-29T00:00:12Z","type":"response_item","payload":{"type":"function_call_output","call_id":"tail","output":"Process exited with code 0\nFinal output:\nthree\nfour\n"}}
+{"timestamp":"2026-07-29T00:00:13Z","type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","call_id":"patch-ok","input":"*** Begin Patch\n*** Add File: src/add.rs\n+added\n*** Delete File: src/delete.rs\n-deleted\n*** Update File: src/a.rs\n@@\n-old\n+new\n*** Update File: src/a.rs\n@@\n-before\n+after\n*** Move to: src/b.rs\n*** End Patch\n"}}
+{"timestamp":"2026-07-29T00:00:14Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"patch-ok","output":"{\"output\":\"Done!\",\"metadata\":{\"exit_code\":0}}"}}
+{"timestamp":"2026-07-29T00:00:15Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"pipeline","arguments":"{\"cmd\":\"cat src/a.rs | head\"}"}}
+{"timestamp":"2026-07-29T00:00:16Z","type":"response_item","payload":{"type":"function_call_output","call_id":"pipeline","output":"Process exited with code 0\nFinal output:\none\n"}}
+{"timestamp":"2026-07-29T00:00:17Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"redirect","arguments":"{\"cmd\":\"cat src/a.rs > out\"}"}}
+{"timestamp":"2026-07-29T00:00:18Z","type":"response_item","payload":{"type":"function_call_output","call_id":"redirect","output":"Process exited with code 0\nFinal output:\n"}}
+{"timestamp":"2026-07-29T00:00:19Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"inline","arguments":"{\"cmd\":\"python -c 'print(1)'\"}"}}
+{"timestamp":"2026-07-29T00:00:20Z","type":"response_item","payload":{"type":"function_call_output","call_id":"inline","output":"Process exited with code 0\nFinal output:\n1\n"}}
+{"timestamp":"2026-07-29T00:00:21Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"remote","arguments":"{\"cmd\":\"ssh host cat src/a.rs\"}"}}
+{"timestamp":"2026-07-29T00:00:22Z","type":"response_item","payload":{"type":"function_call_output","call_id":"remote","output":"Process exited with code 0\nFinal output:\none\n"}}
+{"timestamp":"2026-07-29T00:00:23Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"multi","arguments":"{\"cmd\":\"cat src/a.rs src/b.rs\"}"}}
+{"timestamp":"2026-07-29T00:00:24Z","type":"response_item","payload":{"type":"function_call_output","call_id":"multi","output":"Process exited with code 0\nFinal output:\none\n"}}
+{"timestamp":"2026-07-29T00:00:25Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"empty","arguments":"{\"cmd\":\"cat empty.rs\"}"}}
+{"timestamp":"2026-07-29T00:00:26Z","type":"response_item","payload":{"type":"function_call_output","call_id":"empty","output":"Process exited with code 0\nFinal output:\n"}}
+{"timestamp":"2026-07-29T00:00:27Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"failed","arguments":"{\"cmd\":\"cat missing.rs\"}"}}
+{"timestamp":"2026-07-29T00:00:28Z","type":"response_item","payload":{"type":"function_call_output","call_id":"failed","output":"Process exited with code 1\nFinal output:\n"}}
+{"timestamp":"2026-07-29T00:00:29Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"unknown-status","arguments":"{\"cmd\":\"cat src/a.rs\"}"}}
+{"timestamp":"2026-07-29T00:00:30Z","type":"response_item","payload":{"type":"function_call_output","call_id":"unknown-status","output":"one\n"}}
+{"timestamp":"2026-07-29T00:00:31Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"missing-result","arguments":"{\"cmd\":\"cat src/a.rs\"}"}}
+{"timestamp":"2026-07-29T00:00:32Z","type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","call_id":"patch-path-only","input":"*** Begin Patch\n*** Update File: src/path.rs\n*** End Patch\n"}}
+{"timestamp":"2026-07-29T00:00:33Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"patch-path-only","output":"{\"output\":\"Done!\",\"metadata\":{\"exit_code\":0}}"}}
+{"timestamp":"2026-07-29T00:00:34Z","type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","call_id":"patch-failed","input":"*** Begin Patch\n*** Add File: src/no.rs\n+no\n*** End Patch\n"}}
+{"timestamp":"2026-07-29T00:00:35Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"patch-failed","output":"{\"output\":\"Failed\",\"metadata\":{\"exit_code\":1}}"}}

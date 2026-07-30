@@ -200,7 +200,27 @@ pub fn load_effective_config_with_override(
     home: &Path,
     config_override: Option<&Path>,
 ) -> Result<EffectiveConfig, ConfigError> {
-    let user_config_path = ensure_user_config(home)?;
+    load_effective_config_with_override_mode(cwd, home, config_override, true)
+}
+
+pub fn load_effective_config_read_only(
+    cwd: &Path,
+    home: &Path,
+) -> Result<EffectiveConfig, ConfigError> {
+    load_effective_config_with_override_mode(cwd, home, None, false)
+}
+
+fn load_effective_config_with_override_mode(
+    cwd: &Path,
+    home: &Path,
+    config_override: Option<&Path>,
+    create_user_config: bool,
+) -> Result<EffectiveConfig, ConfigError> {
+    let user_config_path = if create_user_config {
+        ensure_user_config(home)?
+    } else {
+        home.join(".engram").join("config.yml")
+    };
     let config_chain = if let Some(path) = config_override {
         vec![normalize_path(path)]
     } else {
