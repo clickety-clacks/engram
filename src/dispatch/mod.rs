@@ -201,6 +201,7 @@ pub(crate) fn dispatch_direction_name(direction: DispatchDirection) -> &'static 
 
 pub fn extract_dispatch_links_from_transcript(transcript: &str) -> Vec<DispatchLink> {
     let mut turn_index = 0_i64;
+    let mut last_message_timestamp = None::<String>;
     let mut first_by_uuid = HashMap::<String, (i64, DispatchDirection)>::new();
 
     for line in transcript.lines() {
@@ -210,25 +211,40 @@ pub fn extract_dispatch_links_from_transcript(transcript: &str) -> Vec<DispatchL
         let Ok(row) = serde_json::from_str::<Value>(line) else {
             continue;
         };
+        if row.get("k").and_then(Value::as_str) == Some("tool.call") {
+            let mut dispatch_uuids = HashSet::new();
+            if let Some(args) = row.get("args") {
+                collect_dispatch_uuids_anywhere(args, &mut dispatch_uuids);
+            }
+            let timestamp = row.get("t").and_then(Value::as_str).unwrap_or("");
+            let dispatch_turn = if last_message_timestamp.as_deref() == Some(timestamp) {
+                turn_index.saturating_sub(1)
+            } else {
+                turn_index
+            };
+            for uuid in dispatch_uuids {
+                record_first_dispatch(
+                    &mut first_by_uuid,
+                    uuid,
+                    dispatch_turn,
+                    DispatchDirection::Sent,
+                );
+            }
+        }
         for message in extract_message_objects(&row) {
             let dispatch_in_message = extract_dispatch_direction_by_uuid(message);
             for (uuid, direction) in dispatch_in_message {
-                match first_by_uuid.get(&uuid).copied() {
-                    None => {
-                        first_by_uuid.insert(uuid, (turn_index, direction));
-                    }
-                    Some((seen_turn, seen_dir)) => {
-                        let should_replace = turn_index < seen_turn
-                            || (turn_index == seen_turn
-                                && seen_dir == DispatchDirection::Sent
-                                && direction == DispatchDirection::Received);
-                        if should_replace {
-                            first_by_uuid.insert(uuid, (turn_index, direction));
-                        }
-                    }
-                }
+                record_first_dispatch(&mut first_by_uuid, uuid, turn_index, direction);
             }
             turn_index += 1;
+        }
+        if is_message_row(&row) {
+            last_message_timestamp = Some(
+                row.get("t")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            );
         }
     }
 
@@ -246,6 +262,28 @@ pub fn extract_dispatch_links_from_transcript(transcript: &str) -> Vec<DispatchL
             .then_with(|| a.uuid.cmp(&b.uuid))
     });
     out
+}
+
+fn record_first_dispatch(
+    first_by_uuid: &mut HashMap<String, (i64, DispatchDirection)>,
+    uuid: String,
+    turn_index: i64,
+    direction: DispatchDirection,
+) {
+    match first_by_uuid.get(&uuid).copied() {
+        None => {
+            first_by_uuid.insert(uuid, (turn_index, direction));
+        }
+        Some((seen_turn, seen_dir)) => {
+            let should_replace = turn_index < seen_turn
+                || (turn_index == seen_turn
+                    && seen_dir == DispatchDirection::Sent
+                    && direction == DispatchDirection::Received);
+            if should_replace {
+                first_by_uuid.insert(uuid, (turn_index, direction));
+            }
+        }
+    }
 }
 
 pub(crate) fn extract_message_objects<'a>(row: &'a Value) -> Vec<&'a Value> {

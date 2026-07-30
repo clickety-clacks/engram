@@ -1566,6 +1566,147 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_extraction_records_normalized_tool_calls_at_current_message_turn() {
+        let before = "00000000-0000-4000-8000-000000000001";
+        let between = "00000000-0000-4000-8000-000000000002";
+        let after = "00000000-0000-4000-8000-000000000003";
+        let same_turn = "00000000-0000-4000-8000-000000000004";
+        let earliest = "00000000-0000-4000-8000-000000000005";
+        let ignored = "00000000-0000-4000-8000-000000000006";
+        let ignored_non_args = "00000000-0000-4000-8000-000000000007";
+        let transcript = [
+            json!({
+                "k": "tool.call",
+                "source": format!("<engram-src id=\"{ignored_non_args}\"/>"),
+                "args": {
+                    "nested": {
+                        "command": format!("<engram-src id=\"{before}\"/>"),
+                        "repeat": format!("<engram-src id=\"{earliest}\"/>")
+                    }
+                }
+            }),
+            json!({
+                "k": "msg.out",
+                "t": "2026-07-29T11:00:00Z",
+                "content": "first message"
+            }),
+            json!({
+                "k": "tool.call",
+                "t": "2026-07-29T11:00:01Z",
+                "args": [format!("<engram-src id=\"{between}\"/>")]
+            }),
+            json!({
+                "k": "msg.out",
+                "t": "2026-07-29T11:00:02Z",
+                "content": "second message"
+            }),
+            json!({
+                "k": "tool.call",
+                "t": "2026-07-29T11:00:03Z",
+                "args": {
+                    "command": format!("<engram-src id=\"{after}\"/>"),
+                    "same_turn": format!("<engram-src id=\"{same_turn}\"/>")
+                }
+            }),
+            json!({
+                "k": "msg.in",
+                "content": format!(
+                    "<engram-src id=\"{same_turn}\"/> received at the same turn"
+                )
+            }),
+            json!({
+                "k": "msg.in",
+                "content": format!("<engram-src id=\"{earliest}\"/> received later")
+            }),
+            json!({
+                "k": "tool.result",
+                "content": format!("<engram-src id=\"{ignored}\"/>")
+            }),
+        ]
+        .into_iter()
+        .map(|row| serde_json::to_string(&row).expect("serialize transcript row"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        let links = extract_dispatch_links_from_transcript(&transcript);
+        let link = |uuid: &str| {
+            links
+                .iter()
+                .find(|link| link.uuid == uuid)
+                .unwrap_or_else(|| panic!("missing dispatch link {uuid}"))
+        };
+
+        assert_eq!(
+            (link(before).first_turn_index, link(before).direction),
+            (0, DispatchDirection::Sent)
+        );
+        assert_eq!(
+            (link(between).first_turn_index, link(between).direction),
+            (1, DispatchDirection::Sent)
+        );
+        assert_eq!(
+            (link(after).first_turn_index, link(after).direction),
+            (2, DispatchDirection::Sent)
+        );
+        assert_eq!(
+            (link(same_turn).first_turn_index, link(same_turn).direction),
+            (2, DispatchDirection::Received)
+        );
+        assert_eq!(
+            (link(earliest).first_turn_index, link(earliest).direction),
+            (0, DispatchDirection::Sent)
+        );
+        assert!(!links.iter().any(|link| link.uuid == ignored));
+        assert!(!links.iter().any(|link| link.uuid == ignored_non_args));
+    }
+
+    #[test]
+    fn dispatch_extraction_associates_tool_calls_with_matching_message_timestamps() {
+        let initial = "10000000-0000-4000-8000-000000000001";
+        let matching = "10000000-0000-4000-8000-000000000002";
+        let differing = "10000000-0000-4000-8000-000000000003";
+        let transcript = [
+            json!({
+                "k": "tool.call",
+                "t": "2026-07-29T10:00:00Z",
+                "args": {"marker": format!("<engram-src id=\"{initial}\"/>")}
+            }),
+            json!({
+                "k": "msg.out",
+                "t": "2026-07-29T10:00:01Z",
+                "content": "first message"
+            }),
+            json!({
+                "k": "tool.call",
+                "t": "2026-07-29T10:00:01Z",
+                "args": {"marker": format!("<engram-src id=\"{matching}\"/>")}
+            }),
+            json!({
+                "k": "tool.call",
+                "t": "2026-07-29T10:00:02Z",
+                "args": {"marker": format!("<engram-src id=\"{differing}\"/>")}
+            }),
+        ]
+        .into_iter()
+        .map(|row| serde_json::to_string(&row).expect("serialize transcript row"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        let links = extract_dispatch_links_from_transcript(&transcript);
+        let turn = |uuid: &str| {
+            links
+                .iter()
+                .find(|link| link.uuid == uuid)
+                .unwrap_or_else(|| panic!("missing dispatch link {uuid}"))
+                .first_turn_index
+        };
+
+        assert_eq!(turn(initial), 0);
+        assert_eq!(turn(matching), 0);
+        assert_eq!(turn(differing), 1);
+    }
+
+    #[test]
     fn cmd_watch_errors_when_watch_config_missing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let home = dir.path().join("home");
