@@ -285,6 +285,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "glob",
+ "libc",
  "notify",
  "rusqlite",
  "serde",

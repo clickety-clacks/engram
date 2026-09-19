@@ -9,6 +9,7 @@ pub mod config;
 pub mod dispatch;
 pub mod index;
 pub mod ingest;
+pub mod proof;
 pub mod query;
 pub mod store;
 pub mod tape;
