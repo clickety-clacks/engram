@@ -436,6 +436,11 @@ fn git_output(root: &Path, args: &[&str]) -> ProofResult<String> {
 }
 
 fn validate_executables(args: &Args) -> ProofResult<()> {
+    require_exact_path(
+        &args.baseline_binary,
+        engram::proof::performance::BASELINE_BINARY_PATH,
+        "baseline binary",
+    )?;
     if args.baseline_database.canonicalize()? == args.live_index.canonicalize()? {
         return Err("baseline must be a frozen non-live database, not the live index".into());
     }

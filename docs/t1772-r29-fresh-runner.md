@@ -8,8 +8,10 @@ The frozen performance manifest pins baseline binary SHA-256
 `72821518037a9d896f0b4d784fee146800902e78`. That source has no statement-counter
 output. PDO has approved separate in-process SQL probes, explicitly excluded
 from product wall timing; the frozen baseline binary remains unchanged.
-Exact frozen baseline database/binary paths and database SHA remain a PDO custody
-dependency. Accepted PO amendment art_a24618f6, SHA-256
+The exact frozen baseline executable path/hash is now bound by receipt
+art_ebfcc161, SHA-256 `4178f5a1d9d3cfdda476708a3548985bdf850aefcb053715dcb04963784aa329`.
+The baseline snapshot and complete invocation remain pending PO asg_636cc02d;
+no snapshot substitution or rebuild is authorized. Accepted PO amendment art_a24618f6, SHA-256
 `3ce0623b7ebb575962be92bf1f9f3e94b2195682a4c8f8f5e96e88d24e95c85e`, now permits
 the unchanged baseline to write `query_results` only in disposable staging
 copies. Immutable masters and candidate read-only behavior remain protected.
@@ -87,17 +89,26 @@ reviewed 40-hex commit. No path or other argument is variable:
   --runner-sha256 FULL_RUNNER_SHA256 \
   --controller-sha256 FULL_CONTROLLER_SHA256 \
   --candidate-binary /Users/mike/.tightbeam/work/d009fb9f2357/engram-t1772-p0/target/release/engram \
-  --candidate-binary-sha256 FULL_CANDIDATE_SHA256
+  --candidate-binary-sha256 FULL_CANDIDATE_SHA256 \
+  --baseline-binary /Users/mike/src/worktrees/engram-t1772-index-repair/scratch/t1772/engram-baseline-7282151
 ```
 
-The corrected controller additionally requires `--baseline-binary`,
-`--baseline-database`, and `--baseline-database-sha256`. Their approved paths and
-snapshot SHA remain a PDO custody dependency; the invocation above is therefore
-historical shape only, not a complete corrected launch invocation. The baseline
-binary hash is fixed by the manifest, the snapshot must have exactly
+The baseline executable path above is the only verified pinned binary, with
+5,120,032 bytes and SHA-256
+`13088f949fa7920615ff8873c1040d4b7ec9180976a7121a63e0de726e47571d`.
+Controller preflight (before proof-root creation) and measurement entry reject
+any other path; full hash verification remains mandatory. Protocol evidence binds
+the exact path, hash and receipt identity. This is receipt consumption, not a new
+Eezo check or execution.
+
+The controller still requires `--baseline-database` and
+`--baseline-database-sha256`. Their exact custody and the complete invocation
+remain pending PO asg_636cc02d and PDO disposition; the command above is therefore
+incomplete and must not be launched. The snapshot must have exactly
 120,001,798,144 bytes, and neither may change across execution. They are explicit
 additional custody inputs, not changes to the eleven-entry manifest. No live
-index can be used as the baseline input.
+index, differently sized retained database or unapproved rebuilt snapshot can be
+substituted. Source/build evidence does not make this package frozen or review-ready.
 
 ## Measurement correction
 

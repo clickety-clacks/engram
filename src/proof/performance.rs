@@ -29,6 +29,10 @@ pub fn direct_projection(touches: &[crate::index::lineage::EvidenceFragmentRef])
 
 pub const BASELINE_BINARY_SHA256: &str =
     "13088f949fa7920615ff8873c1040d4b7ec9180976a7121a63e0de726e47571d";
+pub const BASELINE_BINARY_PATH: &str =
+    "/Users/mike/src/worktrees/engram-t1772-index-repair/scratch/t1772/engram-baseline-7282151";
+pub const BASELINE_EXECUTABLE_CUSTODY_SHA256: &str =
+    "4178f5a1d9d3cfdda476708a3548985bdf850aefcb053715dcb04963784aa329";
 pub const TELEMETRY_AMENDMENT_SHA256: &str =
     "376d581e12743643c5e5e4923355a530964e485d16437bd47298fb8ee23e9035";
 const TEMP_LIMITATION: &str = "named files in dedicated SQLite temp directory, sampled every 100ms; unlinked files and allocations created/deleted between samples may be missed; zero observed is not zero total allocation";
@@ -47,6 +51,11 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
     if !cfg!(target_os = "macos") {
         return Err("performance RSS collector requires Darwin /usr/bin/time -l".into());
     }
+    super::t1772::require_exact_path(
+        inputs.baseline_binary,
+        BASELINE_BINARY_PATH,
+        "baseline binary",
+    )?;
     if sha256_file(inputs.baseline_binary)? != BASELINE_BINARY_SHA256
         || sha256_file(inputs.baseline_database)? != inputs.baseline_database_sha256
         || fs::metadata(inputs.baseline_database)?.len() != BASELINE_BYTES
@@ -88,6 +97,8 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
         "telemetry_amendment_sha256":TELEMETRY_AMENDMENT_SHA256,
         "source_revision":source_revision,
         "baseline_binary_sha256":BASELINE_BINARY_SHA256,
+        "baseline_binary_path":BASELINE_BINARY_PATH,
+        "baseline_executable_custody":{"artifact":"art_ebfcc161","sha256":BASELINE_EXECUTABLE_CUSTODY_SHA256},
         "preparation_order":"create byte copy when required, hash copy, baseline read-only logical/schema custody or candidate file custody; invoke CLI; post-custody; validate output; SQL probes",
         "baseline_policy":"one writable copy per hot query series; fresh writable copy per cold slot; only query_results application content may change",
         "candidate_policy":"database and its directory read-only; exact hash and directory custody after every slot",
