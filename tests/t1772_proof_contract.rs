@@ -7,6 +7,49 @@ use engram::proof::t1772::{
 use serde_json::json;
 
 #[test]
+fn performance_order_alternates_by_query_and_iteration() {
+    use engram::proof::performance::alternating_order;
+    let mut launches = [0, 0];
+    for query in 0..12 {
+        for _mode in 0..2 {
+            for iteration in 0..33 {
+                let order = alternating_order(query, iteration);
+                assert_ne!(order, alternating_order(query, iteration + 1));
+                assert_ne!(order, alternating_order(query + 1, iteration));
+                for variant in order {
+                    launches[variant] += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(launches, [792, 792]);
+}
+
+#[test]
+fn thirty_sample_tail_percentiles_use_nearest_rank() {
+    use engram::proof::measurement::percentiles;
+    let samples = (1..=30).rev().collect::<Vec<u64>>();
+    let result = percentiles(&samples).unwrap();
+    assert_eq!(result["p50"], 15);
+    assert_eq!(result["p95"], 29);
+    assert_eq!(result["p99"], 30);
+    assert!(percentiles(&[]).is_err());
+}
+
+#[test]
+fn darwin_rss_requires_one_unambiguous_observation() {
+    use engram::proof::performance::parse_darwin_rss;
+    assert_eq!(
+        parse_darwin_rss("noise\n  4096  maximum resident set size\n").unwrap(),
+        4096
+    );
+    assert!(parse_darwin_rss("no observation").is_err());
+    assert!(
+        parse_darwin_rss("4 maximum resident set size\n8 maximum resident set size\n").is_err()
+    );
+}
+
+#[test]
 fn canonical_json_is_sorted_compact_utf8_with_one_lf() {
     let value = json!({
         "z": {"two": 2, "one": 1},

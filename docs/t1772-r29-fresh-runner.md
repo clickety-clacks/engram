@@ -1,5 +1,16 @@
 # T1772 R29 fresh proof runner
 
+**Measurement correction in progress; not frozen or review-ready.** The recovered
+historical implementation is `8820423184fe646e420c7a1613a6bf65bc13fd61`. The
+correction retains that ancestry and the original proof/input/oracle bindings.
+The frozen performance manifest pins baseline binary SHA-256
+`13088f949fa7920615ff8873c1040d4b7ec9180976a7121a63e0de726e47571d` at source
+`72821518037a9d896f0b4d784fee146800902e78`. That source has no statement-counter
+output. This correction must not replace it with a rebuilt binary or report
+replayed SQL counters as observations of the timed CLI. The PDO must resolve
+that measurement dependency and supply exact frozen baseline database/binary
+custody before a launch package can be completed. Missing counters fail closed.
+
 This source is the fresh R29 proof implementation. It is descended from Engram
 candidate `9f8afc65d0b365444446a473c04389adf80bd4b3`; it does not call, wrap, copy,
 or root-rebind any R4-3 or R18-R27 proof executable.
@@ -65,6 +76,64 @@ reviewed 40-hex commit. No path or other argument is variable:
   --candidate-binary /Users/mike/.tightbeam/work/d009fb9f2357/engram-t1772-p0/target/release/engram \
   --candidate-binary-sha256 FULL_CANDIDATE_SHA256
 ```
+
+The corrected controller additionally requires `--baseline-binary`,
+`--baseline-database`, and `--baseline-database-sha256`. Their approved paths and
+snapshot SHA remain a PDO custody dependency; the invocation above is therefore
+historical shape only, not a complete corrected launch invocation. The baseline
+binary hash is fixed by the manifest, the snapshot must have exactly
+120,001,798,144 bytes, and neither may change across execution. They are explicit
+additional custody inputs, not changes to the eleven-entry manifest. No live
+index can be used as the baseline input.
+
+## Measurement correction
+
+`proof/performance.rs` schedules all twelve frozen queries for both ordinary CLI
+binaries. Each hot/filesystem-cold class has three fresh-process warmups and
+thirty measured fresh-process iterations per binary/query. Order alternates by
+query and iteration. Hot runs share a staged immutable database; filesystem-cold
+runs copy the immutable database before every process, exclude copy time, hash it
+after measurement, then remove only that iteration's copy. No OS cache purge is
+claimed. Raw stdout/stderr, argv/environment, exit status, wall time, Darwin
+`/usr/bin/time -l` maximum RSS, dedicated SQLite-temp directory samples and actual
+per-statement SORT/AUTOINDEX/row/VM counters are retained. Counters are collected
+inside the candidate's executed statements with an opt-in SQLite trace hook;
+they are not a SQL replay. The hook is inactive in ordinary use. It does not
+provide the absent historical-baseline instrumentation. Percentiles use nearest
+rank with raw observations retained; candidate p95/p99, peak RSS and zero-temp/
+SORT/AUTOINDEX gates are checked, not merely printed.
+
+`proof/concurrency.rs` makes two independent disposable v4 copies. Before each
+pass it removes the first hundred frozen tape IDs and their derived records from
+the copy, then reingests those exact real tapes with the normal one-tape ingest
+API and writer WAL/FULL settings. No synthetic probe table or synthetic tape ID
+is used. A frozen-manifest query must exercise at least two populated posting
+lookups and return multiple provenance rows. Reader A uses `open_reader` and
+retains a transaction through writer completion and at least sixty seconds;
+the second pass uses short read transactions in a loop. Writes have a 600ms
+fixed schedule with actual start times retained; a third connection checkpoints
+passively on a 1s fixed schedule during each pass, then once after reader exit.
+The raw commit/reader/checkpoint observations, exact primary/extended errors,
+application retry counts (zero, with SQLite busy timeout explicitly zero),
+commit latency percentiles, maximum observed WAL bytes, stable retained results,
+new-reader visibility and final checkpoint completion are recorded. Transaction
+latency includes indexing and COMMIT but excludes reading/parsing source tapes.
+
+`proof/measurement.rs` samples all staged non-directory file sizes and allocated
+blocks from proof-root creation through operation and post-custody capture.
+The requested interval is 100ms; every sample, maximum actual gap, vanished-path
+count, and observed logical/allocated high-water mark is retained. Directory
+metadata is excluded and hard links are counted once. This is explicitly a
+sampled maximum, not a claim to see allocations that disappear between samples.
+The controller joins the sampler before hashing outputs or writing eligibility;
+errors forbid eligibility. Per-query SQLite temp sampling uses its own otherwise
+empty subtree; harness output is outside it. It cannot observe unlinked temp
+files, and that limitation must be assessed along with actual statement counters
+before claiming the zero-temp gate is proven on the target host.
+
+The new measurement test definitions are source only until executed on an
+authorized non-Gibson host. A Gibson compilation proves type/link consistency,
+not performance, concurrency correctness, macOS behavior, or proof completion.
 
 ## Static verification definitions
 

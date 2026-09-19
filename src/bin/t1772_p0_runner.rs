@@ -2,10 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Barrier};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use clap::Parser;
 use engram::dispatch::extract_dispatch_links_from_transcript;
@@ -17,9 +14,8 @@ use engram::proof::t1772::{
     EXPECTED_EVIDENCE_WINDOWS, EXPECTED_INPUTS, EXPECTED_LEGACY_TOMBSTONE_KEYS,
     EXPECTED_READ_WINDOWS, EXPECTED_SEMANTIC_EDGES, EXPECTED_TOMBSTONE_FEATURES,
     EXPECTED_TOMBSTONE_WINDOWS, INPUT_ROOT, MANIFEST_NAME, MANIFEST_SHA256, PROOF_ROOT,
-    ProofResult, RETAINED_READER_SECONDS, WATCHER_TRANSACTIONS, canonical_json_lf, hex_digest,
-    require_exact_path, sha256_file, suspend_for_controller, write_canonical_json,
-    write_canonical_jsonl,
+    ProofResult, canonical_json_lf, hex_digest, require_exact_path, sha256_file,
+    suspend_for_controller, write_canonical_json, write_canonical_jsonl,
 };
 use engram::query::format::derive_anchor_candidates;
 use engram::store::tapes::read_tape_content;
@@ -50,6 +46,12 @@ struct Args {
     manifest: PathBuf,
     #[arg(long)]
     candidate_binary: PathBuf,
+    #[arg(long)]
+    baseline_binary: PathBuf,
+    #[arg(long)]
+    baseline_database: PathBuf,
+    #[arg(long)]
+    baseline_database_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -170,20 +172,28 @@ fn run() -> ProofResult<()> {
             .join("p0-performance-expected-direct-touches.json"),
         &runner_root.join("queries/direct-touch-results.json"),
     )?;
-    verify_candidate_cli(
-        &args.candidate_binary,
-        &runner_root.join("rebuild-1/index.sqlite"),
-        &args.tape_root,
-        &args.input_root.join("p0-performance-query-manifest.json"),
-        &runner_root.join("queries/candidate-cli"),
-    )?;
     record_query_plan(
         &runner_root.join("rebuild-1/index.sqlite"),
         &runner_root.join("queries/query-plan.json"),
     )?;
-    run_concurrency_gate(
+    engram::proof::concurrency::run(
         &runner_root.join("rebuild-1/index.sqlite"),
+        &args.tape_root,
+        &tape_ids,
+        &args.input_root.join("p0-performance-query-manifest.json"),
         &runner_root.join("concurrency"),
+    )?;
+    engram::proof::performance::run(
+        &engram::proof::performance::Inputs {
+            baseline_binary: &args.baseline_binary,
+            baseline_database: &args.baseline_database,
+            baseline_database_sha256: &args.baseline_database_sha256,
+            candidate_binary: &args.candidate_binary,
+            candidate_database: &runner_root.join("rebuild-1/index.sqlite"),
+            tape_root: &args.tape_root,
+            manifest: &args.input_root.join("p0-performance-query-manifest.json"),
+        },
+        &runner_root.join("performance"),
     )?;
     write_test_definitions(&runner_root.join("test-definitions.json"))?;
 
@@ -587,92 +597,6 @@ fn verify_direct_touch_oracle(
     Ok(())
 }
 
-fn verify_candidate_cli(
-    binary: &Path,
-    db_path: &Path,
-    tape_root: &Path,
-    manifest_path: &Path,
-    output_root: &Path,
-) -> ProofResult<()> {
-    fs::create_dir_all(output_root)?;
-    let home = output_root.join("home");
-    let config_dir = home.join(".engram");
-    fs::create_dir_all(&config_dir)?;
-    let config = format!(
-        "db: {}\ntapes_dir: {}\n",
-        db_path.display(),
-        tape_root.display()
-    );
-    t1772::write_new_file(&config_dir.join("config.yml"), config.as_bytes())?;
-
-    let manifest: Value = serde_json::from_reader(File::open(manifest_path)?)?;
-    let mut results = Vec::new();
-    for query in manifest["queries"]
-        .as_array()
-        .ok_or("performance queries missing")?
-    {
-        let id = query["id"].as_str().ok_or("query id missing")?;
-        let target = query["target"].as_str().ok_or("query target missing")?;
-        let stdout_path = output_root.join(format!("{id}.stdout"));
-        let stderr_path = output_root.join(format!("{id}.stderr"));
-        let stdout = File::options()
-            .write(true)
-            .create_new(true)
-            .open(&stdout_path)?;
-        let stderr = File::options()
-            .write(true)
-            .create_new(true)
-            .open(&stderr_path)?;
-        let started = Instant::now();
-        let status = Command::new(binary)
-            .args([
-                "explain",
-                target,
-                "--limit",
-                "1000000",
-                "--depth",
-                "10",
-                "--max-fanout",
-                "50",
-                "--max-edges",
-                "500",
-                "--min-confidence",
-                "0.5",
-            ])
-            .env_clear()
-            .env("HOME", &home)
-            .env("LC_ALL", "C")
-            .env("LANG", "C")
-            .env("TZ", "UTC")
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
-            .status()?;
-        if !status.success() {
-            return Err(format!("candidate CLI query {id} failed with {status}").into());
-        }
-        results.push(json!({
-            "id": id,
-            "elapsed_microseconds": started.elapsed().as_micros(),
-            "exit_code": status.code(),
-            "stdout_path": stdout_path.strip_prefix(output_root)?.to_string_lossy(),
-            "stdout_sha256": sha256_file(&stdout_path)?,
-            "stderr_path": stderr_path.strip_prefix(output_root)?.to_string_lossy(),
-            "stderr_sha256": sha256_file(&stderr_path)?
-        }));
-    }
-    write_canonical_json(
-        &output_root.join("candidate-cli-results.json"),
-        &json!({
-            "candidate_binary": binary,
-            "candidate_binary_sha256": sha256_file(binary)?,
-            "fresh_process_per_query": true,
-            "queries": results
-        }),
-    )?;
-    Ok(())
-}
-
 fn record_query_plan(db_path: &Path, output: &Path) -> ProofResult<()> {
     let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let sample: String = conn.query_row(
@@ -697,71 +621,6 @@ fn record_query_plan(db_path: &Path, output: &Path) -> ProofResult<()> {
     Ok(())
 }
 
-fn run_concurrency_gate(source_db: &Path, output_root: &Path) -> ProofResult<()> {
-    fs::create_dir(output_root)?;
-    let db_path = output_root.join("concurrency.sqlite");
-    fs::copy(source_db, &db_path)?;
-    let barrier = Arc::new(Barrier::new(2));
-    let reader_db = db_path.clone();
-    let reader_barrier = barrier.clone();
-    let reader = thread::spawn(move || -> ProofResult<u64> {
-        let conn = Connection::open_with_flags(&reader_db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        conn.execute_batch("BEGIN DEFERRED")?;
-        let snapshot: u64 = conn.query_row("SELECT COUNT(*) FROM evidence_features WHERE feature_hash=(SELECT feature_hash FROM evidence_features ORDER BY feature_hash LIMIT 1)", [], |row| row.get(0))?;
-        reader_barrier.wait();
-        thread::sleep(Duration::from_secs(RETAINED_READER_SECONDS));
-        let stable: u64 = conn.query_row("SELECT COUNT(*) FROM evidence_features WHERE feature_hash=(SELECT feature_hash FROM evidence_features ORDER BY feature_hash LIMIT 1)", [], |row| row.get(0))?;
-        conn.execute_batch("COMMIT")?;
-        if stable != snapshot {
-            return Err("retained reader snapshot changed".into());
-        }
-        Ok(snapshot)
-    });
-    barrier.wait();
-    let conn = Connection::open(&db_path)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS t1772_concurrency_probe(id INTEGER PRIMARY KEY, payload TEXT NOT NULL);")?;
-    let mut commits = Vec::new();
-    for id in 0..WATCHER_TRANSACTIONS {
-        let started = Instant::now();
-        conn.execute(
-            "INSERT INTO t1772_concurrency_probe(id,payload) VALUES(?1,?2)",
-            params![id, format!("watcher-{id:03}")],
-        )?;
-        let wal_bytes = fs::metadata(format!("{}-wal", db_path.display()))
-            .map(|meta| meta.len())
-            .unwrap_or(0);
-        commits.push(json!({"transaction": id + 1, "elapsed_microseconds": started.elapsed().as_micros(), "wal_bytes": wal_bytes, "primary_code": 0, "extended_code": 0, "retries": 0}));
-        thread::sleep(Duration::from_millis(600));
-    }
-    let reader_snapshot = reader
-        .join()
-        .map_err(|_| "retained reader thread panicked")??;
-    let visible: u64 =
-        conn.query_row("SELECT COUNT(*) FROM t1772_concurrency_probe", [], |row| {
-            row.get(0)
-        })?;
-    let checkpoint: (i64, i64, i64) =
-        conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?;
-    if visible != WATCHER_TRANSACTIONS {
-        return Err("new reader did not observe all writer commits".into());
-    }
-    write_canonical_json(
-        &output_root.join("result.json"),
-        &json!({
-            "retained_reader_seconds": RETAINED_READER_SECONDS,
-            "reader_snapshot_rows": reader_snapshot,
-            "writer_transactions": commits,
-            "committed": visible,
-            "busy_locked_timeout_errors": 0,
-            "checkpoint_after_reader": [checkpoint.0, checkpoint.1, checkpoint.2],
-            "passed": true
-        }),
-    )?;
-    Ok(())
-}
-
 fn write_test_definitions(path: &Path) -> ProofResult<()> {
     write_canonical_json(
         path,
@@ -773,7 +632,9 @@ fn write_test_definitions(path: &Path) -> ProofResult<()> {
                 {"id":"exact-accounting", "assertion":"all frozen cardinalities, per-tape CSV rows, and 14,369 dispatch rows match"},
                 {"id":"query-equivalence", "assertion":"12 fixed direct-touch projections exactly equal the frozen oracle"},
                 {"id":"read-only-plan", "assertion":"feature lookup uses posting/window keys without full evidence scan or temporary B-tree"},
-                {"id":"concurrency", "assertion":"60-second retained reader overlaps 100 successful writer transactions with zero SQLite errors"},
+                {"id":"performance", "assertion":"12 identical manifest queries, both binaries, hot and filesystem-cold; 3 warmups and 30 measured fresh processes each, alternating order; raw RSS/temp/elapsed/actual-statement counters and p50/p95/p99; missing counters fail"},
+                {"id":"concurrency", "assertion":"real multi-posting open_reader snapshot held >=60s through 100 actual frozen-tape ingest commits at fixed cadence; interval passive checkpoints; repeat short-query loop; exact error histogram/no retries, commit percentiles, WAL maximum and final checkpoint"},
+                {"id":"peak-staging", "assertion":"controller continuously samples staged file sizes and allocated blocks every requested 100ms across operation; preserve raw samples, maximum gap and observed peaks; join sampler before output hashing"},
                 {"id":"custody", "assertion":"controller repeats full immutable input custody and admits publication only after comparison"},
                 {"id":"lifecycle", "assertion":"controller observes stopped post-exec runner, csops status, Darwin SIGCONT 19, stdout, stderr, and exit status"}
             ],

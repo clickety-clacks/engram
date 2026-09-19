@@ -91,6 +91,12 @@ enum AccessKind {
 }
 
 impl SqliteIndex {
+    /// Configure contention handling explicitly for callers that must observe every
+    /// attempt (the proof uses zero timeout and performs no retry).
+    pub fn set_busy_timeout(&self, timeout: std::time::Duration) -> rusqlite::Result<()> {
+        self.conn.busy_timeout(timeout)
+    }
+
     pub fn open_writer(path: &str) -> rusqlite::Result<Self> {
         let existed = Path::new(path).exists();
         let conn = Connection::open(path)?;
@@ -130,6 +136,7 @@ impl SqliteIndex {
             conn,
             access_kind: AccessKind::Reader,
         };
+        crate::proof::sqlite_observer::install(&index.conn)?;
         if index.user_version()? != SCHEMA_VERSION {
             return Err(rusqlite::Error::InvalidQuery);
         }

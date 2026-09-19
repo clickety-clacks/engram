@@ -48,6 +48,12 @@ struct Args {
     candidate_binary: PathBuf,
     #[arg(long)]
     candidate_binary_sha256: String,
+    #[arg(long)]
+    baseline_binary: PathBuf,
+    #[arg(long)]
+    baseline_database: PathBuf,
+    #[arg(long)]
+    baseline_database_sha256: String,
 }
 
 struct LifecycleWriter {
@@ -141,12 +147,22 @@ fn run() -> ProofResult<()> {
     validate_executables(&args)?;
 
     // Full immutable input custody is observed while PROOF_ROOT is still absent.
-    let custody_roots = vec![args.input_root.clone(), args.tape_root.clone()];
+    let custody_roots = vec![
+        args.input_root.clone(),
+        args.tape_root.clone(),
+        args.baseline_binary.clone(),
+        args.baseline_database.clone(),
+    ];
     let immutable_pre = collect_custody(&custody_roots)?;
     let live_pre = observe_live_paths(&args.live_index, &args.cursor_root)?;
     let capacity_before = capacity(&args.proof_root.parent().ok_or("proof root has no parent")?)?;
 
     fs::create_dir(&args.proof_root)?;
+    let disk_sampler = engram::proof::measurement::DiskSampler::start(
+        &args.proof_root,
+        &args.proof_root.join("staging-disk-samples.jsonl"),
+        &args.proof_root.join("staging-disk-peak.json"),
+    )?;
     for relative in ["logs", "manifests", "controller", "publication"] {
         fs::create_dir(args.proof_root.join(relative))?;
     }
@@ -326,6 +342,12 @@ fn run() -> ProofResult<()> {
         }),
     )?;
 
+    // Stop and join observation before hashing outputs; sampler failure forbids
+    // eligibility. Includes rebuilds, concurrency copies, temporary query copies,
+    // sidecars, child output and post-custody capture, all inside PROOF_ROOT.
+    let disk = disk_sampler.finish()?;
+    lifecycle.record("staging_disk_measurement_completed", disk)?;
+
     // This local eligibility record never publishes a Tightbeam condition or
     // wakes Eezo; an accepted independent review must precede any external
     // readiness effect. The full output manifest is written once, after it.
@@ -414,6 +436,14 @@ fn git_output(root: &Path, args: &[&str]) -> ProofResult<String> {
 }
 
 fn validate_executables(args: &Args) -> ProofResult<()> {
+    if args.baseline_database.canonicalize()? == args.live_index.canonicalize()? {
+        return Err("baseline must be a frozen non-live database, not the live index".into());
+    }
+    if sha256_file(&args.baseline_database)? != args.baseline_database_sha256
+        || fs::metadata(&args.baseline_database)?.len() != t1772::BASELINE_BYTES
+    {
+        return Err("baseline snapshot custody mismatch".into());
+    }
     let current = std::env::current_exe()?;
     for (name, path, expected) in [
         (
@@ -426,6 +456,11 @@ fn validate_executables(args: &Args) -> ProofResult<()> {
             "candidate",
             args.candidate_binary.as_path(),
             args.candidate_binary_sha256.as_str(),
+        ),
+        (
+            "baseline",
+            args.baseline_binary.as_path(),
+            engram::proof::performance::BASELINE_BINARY_SHA256,
         ),
     ] {
         let observed = sha256_file(path)?;
@@ -451,6 +486,12 @@ fn runner_argv(args: &Args) -> Vec<String> {
         args.manifest.to_string_lossy().into_owned(),
         "--candidate-binary".into(),
         args.candidate_binary.to_string_lossy().into_owned(),
+        "--baseline-binary".into(),
+        args.baseline_binary.to_string_lossy().into_owned(),
+        "--baseline-database".into(),
+        args.baseline_database.to_string_lossy().into_owned(),
+        "--baseline-database-sha256".into(),
+        args.baseline_database_sha256.clone(),
     ]
 }
 
