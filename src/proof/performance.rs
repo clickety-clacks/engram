@@ -5,7 +5,6 @@ use super::t1772::{
 };
 use serde_json::{Value, json};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Instant;
@@ -35,6 +34,8 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
     }
     let manifest: Value = serde_json::from_reader(File::open(inputs.manifest)?)?;
     validate_manifest(&manifest)?;
+    let manifest_hash = sha256_file(inputs.manifest)?;
+    let probe_binary_hash = sha256_file(&std::env::current_exe()?)?;
     fs::create_dir_all(root)?;
     let binaries = [inputs.baseline_binary, inputs.candidate_binary];
     let binary_hashes = [sha256_file(binaries[0])?, sha256_file(binaries[1])?];
@@ -68,7 +69,10 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
             let mut measured: [Vec<Value>; 2] = [Vec::new(), Vec::new()];
             for iteration in 0..33 {
                 let warmup = iteration < 3;
-                for variant in alternating_order(query_index, iteration) {
+                for (order, variant) in alternating_order(query_index, iteration)
+                    .into_iter()
+                    .enumerate()
+                {
                     let label = ["baseline", "candidate"][variant];
                     let run_root = query_root.join(format!("{iteration:02}-{label}"));
                     fs::create_dir(&run_root)?;
@@ -81,13 +85,24 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
                     } else {
                         &hot[variant]
                     };
+                    let target = query["target"].as_str().ok_or("target absent")?;
+                    let anchors =
+                        crate::query::format::derive_anchor_candidates(&[target.to_string()]);
+                    let binding = json!({"query_id":id,"variant":label,"cache_class":mode,
+                        "phase":if warmup {"warmup"} else {"measured"},
+                        "iteration":if warmup {iteration} else {iteration - 3},
+                        "schedule_iteration":iteration,"order_in_pair":order,
+                        "database_path":db,"database_sha256":database_hashes[variant],
+                        "manifest_sha256":manifest_hash,"target":target,"flags":query["flags"],
+                        "derived_anchors":anchors,"product_binary_sha256":binary_hashes[variant],
+                        "probe_binary_sha256":probe_binary_hash});
                     let observation = measure(
                         binaries[variant],
                         db,
                         inputs.tape_root,
                         query,
                         &run_root,
-                        &binary_hashes[variant],
+                        &binding,
                     );
                     let observation = match observation {
                         Ok(row) => row,
@@ -105,9 +120,7 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
                     write_canonical_json(
                         &run_root.join("observation.json"),
                         &json!({
-                        "query_id":id,"cache_mode":mode,"iteration":iteration,
-                        "phase":if warmup {"warmup"} else {"measured"},"variant":label,
-                        "binary_sha256":binary_hashes[variant],"observation":observation}),
+                        "binding":binding,"observation":observation}),
                     )?;
                     if !warmup {
                         measured[variant].push(observation);
@@ -147,7 +160,9 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
     write_canonical_json(
         &root.join("result.json"),
         &json!({
-        "passed":all_passed,"manifest_sha256":sha256_file(inputs.manifest)?,
+        "passed":all_passed,"manifest_sha256":manifest_hash,
+        "counter_scope":super::statement_probe::COUNTER_SCOPE,
+        "database_hash_custody":"source digests bound to copies; cold copies verified after each product/probe pair; hot copies verified after entire schedule",
         "warmups_per_query_variant_mode":3,"measured_iterations_per_query_variant_mode":30,
         "fresh_process_each_iteration":true,"rss_collector":"/usr/bin/time -l",
         "run_order":"query ID order, hot then filesystem-cold; alternate variant first by query index plus iteration index",
@@ -182,6 +197,7 @@ fn validate_manifest(value: &Value) -> ProofResult<()> {
         let id = query["id"].as_str().ok_or("id missing")?;
         if id <= previous
             || query["command"] != "explain"
+            || query["target_kind"] != "literal"
             || query["warmups"] != 3
             || query["measured_iterations"] != 30
             || query["cache_modes"] != json!(["hot", "filesystem-cold"])
@@ -213,7 +229,7 @@ fn measure(
     tapes: &Path,
     query: &Value,
     root: &Path,
-    binary_hash: &str,
+    binding: &Value,
 ) -> ProofResult<Value> {
     let home = root.join("home");
     let config = home.join(".engram");
@@ -234,7 +250,6 @@ fn measure(
     )?;
     let stdout_path = root.join("stdout.json");
     let stderr_path = root.join("stderr-and-time.txt");
-    let statements = root.join("sqlite-statements.jsonl");
     let target = query["target"].as_str().ok_or("query target missing")?;
     let argv = [
         "explain",
@@ -258,7 +273,6 @@ fn measure(
         .env("HOME", &home)
         .env("TMPDIR", &temp)
         .env("SQLITE_TMPDIR", &temp)
-        .env("T1772_SQLITE_STATEMENTS", &statements)
         .env("LC_ALL", "C")
         .env("LANG", "C")
         .env("TZ", "UTC")
@@ -280,24 +294,36 @@ fn measure(
     let disk = sampler.finish()?;
     let stderr = fs::read_to_string(&stderr_path)?;
     let rss = parse_darwin_rss(&stderr)?;
-    // Save process completion before requiring counters so failure is diagnosable.
+    // Product completion is persisted before the separate SQL probe starts.
     write_canonical_json(
         &root.join("process.json"),
-        &json!({"argv":argv,"binary":binary,
-        "binary_sha256":binary_hash,"exit_code":status.code(),"success":status.success(),
+        &json!({"binding":binding,"argv":argv,"collector_argv":["/usr/bin/time","-l"],"binary":binary,
+        "counter_scope":"none: product CLI is uninstrumented",
+        "exit_code":status.code(),"success":status.success(),
         "elapsed_microseconds":elapsed,"peak_rss_bytes":rss,
         "environment":{"HOME":home,"TMPDIR":temp,"SQLITE_TMPDIR":temp,
-            "T1772_SQLITE_STATEMENTS":statements,"LC_ALL":"C","LANG":"C","TZ":"UTC"},
+            "LC_ALL":"C","LANG":"C","TZ":"UTC"},
         "stdout_sha256":sha256_file(&stdout_path)?,"stderr_sha256":sha256_file(&stderr_path)?}),
     )?;
     if !status.success() {
         return Err("ordinary CLI measurement failed".into());
     }
-    let (sort, autoindex, all_statements) = statement_counters(&statements)?;
+    let canonical_output = root.join("canonical-output.json");
+    let output: Value = serde_json::from_reader(File::open(&stdout_path)?)?;
+    write_canonical_json(&canonical_output, &output)?;
+    if output["query"]["anchors"] != binding["derived_anchors"] {
+        return Err("product CLI anchors differ from bound SQL probe anchors".into());
+    }
+    let probe_path = root.join("statement-probe.json");
+    let probe = super::statement_probe::run(db, binding, &probe_path)?;
     Ok(json!({"elapsed_microseconds":elapsed,"peak_rss_bytes":rss,
+        "counter_scope":super::statement_probe::COUNTER_SCOPE,
+        "canonical_output_sha256":sha256_file(&canonical_output)?,
         "observed_sqlite_temp_bytes":disk["peak_observed_logical_bytes"],
-        "temp_collection":disk,"direct_touch_sort":sort,"direct_touch_autoindex":autoindex,
-        "measured_statements":all_statements,"statement_trace_sha256":sha256_file(&statements)?}))
+        "temp_collection":disk,"direct_touch_sort":probe["direct_touch_sort"],
+        "direct_touch_autoindex":probe["direct_touch_autoindex"],
+        "direct_rows_visited":probe["direct_rows_visited"],"posting_rows_visited":probe["posting_rows_visited"],
+        "statement_probe_sha256":sha256_file(&probe_path)?}))
 }
 
 pub fn parse_darwin_rss(text: &str) -> ProofResult<u64> {
@@ -315,45 +341,6 @@ pub fn parse_darwin_rss(text: &str) -> ProofResult<u64> {
         .parse()?)
 }
 
-fn statement_counters(path: &Path) -> ProofResult<(u64, u64, usize)> {
-    let file = File::open(path).map_err(|error| format!(
-        "actual CLI statement counters unavailable at {}: {error}; no replay or zero substitution permitted",path.display()))?;
-    let rows = BufReader::new(file)
-        .lines()
-        .map(|line| -> ProofResult<Value> { Ok(serde_json::from_str(&line?)?) })
-        .collect::<ProofResult<Vec<_>>>()?;
-    if rows.first().map(|r| &r["event"]) != Some(&json!("begin"))
-        || rows.last().map(|r| &r["event"]) != Some(&json!("end"))
-        || rows.last().map(|r| &r["complete"]) != Some(&json!(true))
-    {
-        return Err("statement observation lifecycle incomplete".into());
-    }
-    let (mut sort, mut autoindex, mut direct, mut count) = (0, 0, 0, 0);
-    for row in &rows[1..rows.len() - 1] {
-        if row["event"] != "statement" {
-            return Err("invalid statement trace".into());
-        }
-        let sql = row["sql"].as_str().ok_or("statement SQL absent")?;
-        let s = row["sort"].as_u64().ok_or("SORT observation missing")?;
-        let a = row["autoindex"]
-            .as_u64()
-            .ok_or("AUTOINDEX observation missing")?;
-        count += 1;
-        if sql.contains("evidence_windows")
-            || sql.contains("evidence_features")
-            || sql.contains("FROM evidence ")
-        {
-            direct += 1;
-            sort += s;
-            autoindex += a;
-        }
-    }
-    if direct == 0 {
-        return Err("no direct-touch statements observed".into());
-    }
-    Ok((sort, autoindex, count))
-}
-
 fn summarize(rows: &[Value]) -> ProofResult<Value> {
     if rows.len() != 30 {
         return Err("measurement count is not thirty".into());
@@ -363,6 +350,7 @@ fn summarize(rows: &[Value]) -> ProofResult<Value> {
         .map(|r| r["elapsed_microseconds"].as_u64().ok_or("elapsed missing"))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(json!({"elapsed_microseconds":percentiles(&times)?,
+        "counter_scope":super::statement_probe::COUNTER_SCOPE,
         "peak_rss_bytes":rows.iter().filter_map(|r|r["peak_rss_bytes"].as_u64()).max(),
         "observed_sqlite_temp_bytes":rows.iter().filter_map(|r|r["observed_sqlite_temp_bytes"].as_u64()).max(),
         "direct_touch_sort":rows.iter().filter_map(|r|r["direct_touch_sort"].as_u64()).sum::<u64>(),

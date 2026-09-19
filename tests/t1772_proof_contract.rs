@@ -7,6 +7,59 @@ use engram::proof::t1772::{
 use serde_json::json;
 
 #[test]
+fn separate_probes_report_real_sort_and_posting_counters_with_identical_binding() {
+    use engram::proof::statement_probe::{COUNTER_SCOPE, run};
+    use engram::proof::t1772::sha256_file;
+    let dir = tempfile::tempdir().unwrap();
+    for variant in ["baseline", "candidate"] {
+        let db = dir.path().join(format!("{variant}.sqlite"));
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE edges(edge_id INTEGER PRIMARY KEY, from_anchor TEXT, to_anchor TEXT, confidence REAL, location_delta TEXT, cardinality TEXT, agent_link INTEGER, note TEXT);").unwrap();
+        if variant == "baseline" {
+            conn.execute_batch("PRAGMA user_version=3;
+                CREATE TABLE evidence(anchor TEXT,tape_id TEXT,event_offset INTEGER,kind TEXT,file_path TEXT,timestamp TEXT);
+                CREATE INDEX evidence_anchor ON evidence(anchor);
+                INSERT INTO evidence VALUES('winnow:a','t',2,'read','/x','b'),('winnow:a','t',1,'read','/x','a');").unwrap();
+        } else {
+            conn.execute_batch("PRAGMA user_version=4;
+                CREATE TABLE evidence_windows(evidence_id INTEGER PRIMARY KEY,anchor TEXT,tape_id TEXT,event_offset INTEGER,kind TEXT,file_path TEXT,timestamp TEXT);
+                CREATE TABLE evidence_features(feature_hash TEXT,evidence_id INTEGER,PRIMARY KEY(feature_hash,evidence_id));
+                INSERT INTO evidence_windows VALUES(1,'winnow:a,b','t',1,'read','/x','a'),(2,'winnow:a,c','t',2,'read','/x','b');
+                INSERT INTO evidence_features VALUES('winnow:a',1),('winnow:a',2);").unwrap();
+        }
+        drop(conn);
+        let before = sha256_file(&db).unwrap();
+        let binding = json!({"query_id":"fixture", "variant":variant,"cache_class":"hot",
+            "phase":"measured","iteration":0,"order_in_pair":0,"database_sha256":before,
+            "derived_anchors":["winnow:a"],"flags":{"depth":10,"max_edges":500,"max_fanout":50,
+                "min_confidence":0.5,"forensics":false,"include_deleted":false,"pretty":false}});
+        let output = dir.path().join(format!("{variant}.json"));
+        let report = run(&db, &binding, &output).unwrap();
+        assert_eq!(report["binding"], binding);
+        assert_eq!(report["counter_scope"], COUNTER_SCOPE);
+        assert_eq!(report["direct_rows_visited"], 2);
+        assert_eq!(report["direct_touch_autoindex"], 0);
+        assert_eq!(
+            report["direct_touch_sort"],
+            if variant == "baseline" { 1 } else { 0 }
+        );
+        assert_eq!(
+            report["posting_rows_visited"],
+            if variant == "baseline" { 0 } else { 4 }
+        );
+        for row in report["statements"].as_array().unwrap() {
+            assert!(row["sort"].is_u64() && row["autoindex"].is_u64());
+            assert!(row["rows_visited"].is_u64() && row["vm_steps"].is_u64());
+        }
+        assert_eq!(sha256_file(&db).unwrap(), before);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(output).unwrap()).unwrap(),
+            report
+        );
+    }
+}
+
+#[test]
 fn performance_order_alternates_by_query_and_iteration() {
     use engram::proof::performance::alternating_order;
     let mut launches = [0, 0];

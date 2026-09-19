@@ -136,7 +136,6 @@ impl SqliteIndex {
             conn,
             access_kind: AccessKind::Reader,
         };
-        crate::proof::sqlite_observer::install(&index.conn)?;
         if index.user_version()? != SCHEMA_VERSION {
             return Err(rusqlite::Error::InvalidQuery);
         }

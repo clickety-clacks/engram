@@ -162,12 +162,7 @@ struct PeekArgs {
 }
 
 fn main() -> ExitCode {
-    let result = run();
-    if let Err(error) = engram::proof::sqlite_observer::finish() {
-        eprintln!("statement measurement failed: {error}");
-        return ExitCode::FAILURE;
-    }
-    match result {
+    match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             let payload = error_payload(&err);

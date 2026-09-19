@@ -6,10 +6,15 @@ correction retains that ancestry and the original proof/input/oracle bindings.
 The frozen performance manifest pins baseline binary SHA-256
 `13088f949fa7920615ff8873c1040d4b7ec9180976a7121a63e0de726e47571d` at source
 `72821518037a9d896f0b4d784fee146800902e78`. That source has no statement-counter
-output. This correction must not replace it with a rebuilt binary or report
-replayed SQL counters as observations of the timed CLI. The PDO must resolve
-that measurement dependency and supply exact frozen baseline database/binary
-custody before a launch package can be completed. Missing counters fail closed.
+output. PDO has approved separate in-process SQL probes, explicitly excluded
+from product wall timing; the frozen baseline binary remains unchanged.
+Exact frozen baseline database/binary paths and database SHA remain a PDO custody
+dependency. A further source conflict prevents launch: baseline `explain` calls
+`emit_query_result` (`src/query/format.rs:999` at the pinned baseline commit),
+which unconditionally calls `record_query_result` (`src/index/mod.rs:387`) to
+write `query_results`. The frozen manifest requires immutable copies. This
+implementation retains that contract and fails closed on product failure or
+changed clone hashes; no writable-clone exception has been assumed.
 
 This source is the fresh R29 proof implementation. It is descended from Engram
 candidate `9f8afc65d0b365444446a473c04389adf80bd4b3`; it does not call, wrap, copy,
@@ -95,13 +100,28 @@ query and iteration. Hot runs share a staged immutable database; filesystem-cold
 runs copy the immutable database before every process, exclude copy time, hash it
 after measurement, then remove only that iteration's copy. No OS cache purge is
 claimed. Raw stdout/stderr, argv/environment, exit status, wall time, Darwin
-`/usr/bin/time -l` maximum RSS, dedicated SQLite-temp directory samples and actual
-per-statement SORT/AUTOINDEX/row/VM counters are retained. Counters are collected
-inside the candidate's executed statements with an opt-in SQLite trace hook;
-they are not a SQL replay. The hook is inactive in ordinary use. It does not
-provide the absent historical-baseline instrumentation. Percentiles use nearest
-rank with raw observations retained; candidate p95/p99, peak RSS and zero-temp/
-SORT/AUTOINDEX gates are checked, not merely printed.
+`/usr/bin/time -l` maximum RSS and dedicated SQLite-temp directory samples are
+retained. Parsed product output is also saved under the canonical JSON/LF
+contract. Neither product CLI contains a measurement hook.
+
+After the product timer and temp sampler stop, `proof/statement_probe.rs` opens
+the same clone read-only and executes new instrumented SQL probes for direct
+evidence, candidate posting-seed expansion, and bounded provenance traversal.
+Each statement records SQL, bound anchor, SORT, AUTOINDEX, full-scan/VM steps,
+and rows returned before Rust filtering/deduplication. Candidate feature-join
+rows are additionally identified as posting rows; these counts do not claim
+unobservable SQLite internal page/index visits. Presentation, tape reads and
+baseline feedback writes are excluded. Query/cache class/phase/iteration/order,
+database path and source hash, manifest hash, target, flags, derived anchors,
+product binary hash and probe binary hash form a shared binding on the product
+and probe records. CLI output anchors must equal the bound probe anchors.
+Every summary labels `counter_scope` as `instrumented SQL probe excluded from
+product CLI wall timing`. A filesystem-cold slot's probe follows its product
+read and makes no independent cold-latency claim. Probe records and canonical
+CLI output have separate hashes. Percentiles use nearest rank with raw
+observations retained; candidate p95/p99, peak RSS and zero observed-temp/direct
+probe SORT/AUTOINDEX gates are checked. Probe counters are never attributed to
+the frozen CLI.
 
 `proof/concurrency.rs` makes two independent disposable v4 copies. Before each
 pass it removes the first hundred frozen tape IDs and their derived records from
