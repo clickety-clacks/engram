@@ -154,7 +154,6 @@ fn run() -> ProofResult<()> {
         args.baseline_database.clone(),
     ];
     let immutable_pre = collect_custody(&custody_roots)?;
-    let live_pre = observe_live_paths(&args.live_index, &args.cursor_root)?;
     let capacity_before = capacity(&args.proof_root.parent().ok_or("proof root has no parent")?)?;
 
     fs::create_dir(&args.proof_root)?;
@@ -166,6 +165,13 @@ fn run() -> ProofResult<()> {
     for relative in ["logs", "manifests", "controller", "publication"] {
         fs::create_dir(args.proof_root.join(relative))?;
     }
+    // Immutable/input checks still precede root creation. Live CoW captures need
+    // their staging directory and complete before any runner staging read.
+    let live_pre = observe_live_paths(
+        &args.live_index,
+        &args.cursor_root,
+        &args.proof_root.join("manifests/live-clones-pre"),
+    )?;
     write_canonical_jsonl(
         &args.proof_root.join("manifests/input-pre.jsonl"),
         manifest_result(&input_precheck),
@@ -299,7 +305,11 @@ fn run() -> ProofResult<()> {
     let input_postcheck = verify_input_manifest(&args.input_root, &args.manifest)?;
     let immutable_post = collect_custody(&custody_roots)?;
     let custody_comparison = compare_existing_immutable(&immutable_pre, &immutable_post)?;
-    let live_post = observe_live_paths(&args.live_index, &args.cursor_root)?;
+    let live_post = observe_live_paths(
+        &args.live_index,
+        &args.cursor_root,
+        &args.proof_root.join("manifests/live-clones-post"),
+    )?;
     let capacity_after = capacity(&args.proof_root)?;
     write_canonical_jsonl(
         &args.proof_root.join("manifests/input-post.jsonl"),
@@ -550,27 +560,140 @@ fn observe_csops(pid: libc::pid_t) -> Value {
     json!({"command":"csops(pid, CS_OPS_STATUS=0, &flags, sizeof(flags))", "pid":pid, "result":"unsupported-on-non-Darwin"})
 }
 
-fn observe_live_paths(index: &Path, cursor_root: &Path) -> ProofResult<Value> {
-    let mut paths = vec![
-        index.to_path_buf(),
-        PathBuf::from(format!("{}-wal", index.display())),
-        PathBuf::from(format!("{}-shm", index.display())),
-    ];
+fn observe_live_paths(index: &Path, cursor_root: &Path, clone_root: &Path) -> ProofResult<Value> {
+    let boundary_started = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let mut rows = clone_live_index_files(index, clone_root)?;
+    let mut paths = vec![cursor_root.to_path_buf()];
     if cursor_root.exists() {
         collect_paths(cursor_root, &mut paths)?;
     }
     paths.sort();
     paths.dedup();
-    let mut rows = Vec::new();
     for path in paths {
         match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_file() => rows.push(json!({"path":path,"state":"present","bytes":metadata.len(),"mtime_seconds":metadata.mtime(),"mtime_nanoseconds":metadata.mtime_nsec(),"inode":metadata.ino(),"device":metadata.dev(),"sha256":sha256_file(&path)?})),
-            Ok(metadata) => rows.push(json!({"path":path,"state":"present-non-file","bytes":metadata.len(),"mtime_seconds":metadata.mtime(),"inode":metadata.ino(),"device":metadata.dev()})),
+            Ok(metadata) if metadata.is_file() => rows.push(json!({"path":path,"state":"present","type":"file","bytes":metadata.len(),"mtime_seconds":metadata.mtime(),"mtime_nanoseconds":metadata.mtime_nsec(),"inode":metadata.ino(),"device":metadata.dev(),"sha256":sha256_file(&path)?})),
+            Ok(metadata) => rows.push(json!({"path":path,"state":"present-non-file","type":if metadata.is_dir(){"directory"}else if metadata.file_type().is_symlink(){"symlink"}else{"other"},"bytes":metadata.len(),"mtime_seconds":metadata.mtime(),"mtime_nanoseconds":metadata.mtime_nsec(),"inode":metadata.ino(),"device":metadata.dev()})),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => rows.push(json!({"path":path,"state":"absent"})),
             Err(error) => return Err(error.into()),
         }
     }
-    Ok(json!({"access":"read-only observation; never a write target", "rows":rows}))
+    Ok(
+        json!({"access":"live paths read-only; writes only to retained APFS staging clones",
+        "boundary_started_unix_nanoseconds":boundary_started,
+        "boundary_finished_unix_nanoseconds":SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+        "index_hash_scope":"retained per-file APFS CoW clones; no multi-file atomic SQLite snapshot claimed",
+        "clone_root":clone_root,"rows":rows}),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn clone_live_index_files(index: &Path, clone_root: &Path) -> ProofResult<Vec<Value>> {
+    use std::ffi::{CStr, CString};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    fn require_apfs(file: &File) -> ProofResult<()> {
+        let mut info = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        if unsafe { libc::fstatfs(file.as_raw_fd(), info.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let info = unsafe { info.assume_init() };
+        if unsafe { CStr::from_ptr(info.f_fstypename.as_ptr()) }.to_bytes() != b"apfs" {
+            return Err("live manifest clones require APFS; no copy fallback permitted".into());
+        }
+        Ok(())
+    }
+    let metadata_json = |m: &fs::Metadata| {
+        json!({"type":if m.is_file(){"file"}else if m.is_dir(){"directory"}else if m.file_type().is_symlink(){"symlink"}else{"other"},"bytes":m.len(),
+        "mtime_seconds":m.mtime(),"mtime_nanoseconds":m.mtime_nsec(),
+        "inode":m.ino(),"device":m.dev(),"mode":m.mode()})
+    };
+    fs::create_dir(clone_root)?;
+    let directory = File::open(clone_root)?;
+    require_apfs(&directory)?;
+    let mut rows = Vec::new();
+    let mut clones = Vec::new();
+    // Capture all three files before hashing any, keeping capture times close.
+    // The read-only descriptor pins each source inode across pathname rotation.
+    for (source_path, name) in [
+        (index.to_path_buf(), "index.sqlite"),
+        (
+            PathBuf::from(format!("{}-wal", index.display())),
+            "index.sqlite-wal",
+        ),
+        (
+            PathBuf::from(format!("{}-shm", index.display())),
+            "index.sqlite-shm",
+        ),
+    ] {
+        let started = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let source = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&source_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                rows.push(json!({"path":source_path,"state":"absent","observed_unix_nanoseconds":started}));
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let before = source.metadata()?;
+        if !before.is_file() || before.dev() != directory.metadata()?.dev() {
+            return Err(
+                "live manifest clone source must be a regular file on the staging filesystem"
+                    .into(),
+            );
+        }
+        require_apfs(&source)?;
+        let destination = CString::new(name)?;
+        if unsafe {
+            libc::fclonefileat(
+                source.as_raw_fd(),
+                directory.as_raw_fd(),
+                destination.as_ptr(),
+                0,
+            )
+        } != 0
+        {
+            return Err(format!(
+                "APFS clone failed for {}: {}",
+                source_path.display(),
+                std::io::Error::last_os_error()
+            )
+            .into());
+        }
+        let finished = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let clone_path = clone_root.join(name);
+        fs::set_permissions(&clone_path, fs::Permissions::from_mode(0o400))?;
+        let mut row = metadata_json(&before);
+        row["path"] = json!(source_path);
+        row["state"] = json!("present");
+        row["clone_method"] =
+            json!("APFS fclonefileat, read-only source descriptor, flags=0; no byte-copy fallback");
+        row["clone_started_unix_nanoseconds"] = json!(started);
+        row["clone_finished_unix_nanoseconds"] = json!(finished);
+        row["source_metadata_after_clone"] = metadata_json(&source.metadata()?);
+        row["source_path_after_clone"] = match fs::symlink_metadata(&source_path) {
+            Ok(m) => metadata_json(&m),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({"state":"absent"}),
+            Err(e) => return Err(e.into()),
+        };
+        row["clone_path"] = json!(clone_path);
+        row["hash_scope"] = json!("retained staging clone, not changing live path");
+        clones.push((row, clone_path));
+    }
+    for (mut row, clone_path) in clones {
+        row["clone_metadata"] = metadata_json(&fs::metadata(&clone_path)?);
+        row["sha256"] = json!(sha256_file(&clone_path)?);
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clone_live_index_files(_index: &Path, _clone_root: &Path) -> ProofResult<Vec<Value>> {
+    Err("APFS live manifest cloning is supported only on Darwin; no live hashing fallback".into())
 }
 
 fn collect_paths(root: &Path, paths: &mut Vec<PathBuf>) -> ProofResult<()> {
@@ -624,7 +747,41 @@ fn compare_existing_immutable(
 }
 
 fn diff_values(before: &Value, after: &Value) -> Value {
-    json!({"changed":before != after,"before":before,"after":after,"attribution":"differences are observed only; the controller never opens these paths for write"})
+    // Clone paths and observation clocks necessarily differ between boundaries.
+    // Compare source identity/metadata and captured bytes, retain complete rows.
+    let comparable = |value: &Value| {
+        value["rows"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|row| {
+                let fields = [
+                    "path",
+                    "state",
+                    "type",
+                    "bytes",
+                    "mtime_seconds",
+                    "mtime_nanoseconds",
+                    "inode",
+                    "device",
+                    "sha256",
+                    "source_metadata_after_clone",
+                    "source_path_after_clone",
+                ];
+                let entry = fields
+                    .into_iter()
+                    .map(|key| (key.to_string(), row[key].clone()))
+                    .collect::<serde_json::Map<_, _>>();
+                (
+                    row["path"].as_str().unwrap_or_default().to_string(),
+                    Value::Object(entry),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    json!({"changed":comparable(before) != comparable(after),"before":before,"after":after,
+        "comparison_scope":"source identity/metadata and clone byte hashes; observation clocks/clone destinations excluded",
+        "attribution":"differences are observed only; the controller never opens live paths for write; per-file clones are not a multi-file atomic database snapshot"})
 }
 
 fn capacity(path: &Path) -> ProofResult<Value> {
@@ -659,4 +816,50 @@ fn proof_output_manifest(root: &Path) -> ProofResult<Vec<Value>> {
 
 fn now_millis() -> ProofResult<u128> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())
+}
+
+#[cfg(test)]
+mod live_clone_tests {
+    use super::*;
+
+    #[test]
+    fn live_difference_ignores_capture_locations_but_keeps_byte_changes() {
+        let before = json!({"rows":[{"path":"/live/index.sqlite","state":"present",
+            "sha256":"a","clone_path":"/stage/pre/index.sqlite","clone_started_unix_nanoseconds":1}]});
+        let mut after = before.clone();
+        after["rows"][0]["clone_path"] = json!("/stage/post/index.sqlite");
+        after["rows"][0]["clone_started_unix_nanoseconds"] = json!(2);
+        assert_eq!(diff_values(&before, &after)["changed"], false);
+        after["rows"][0]["sha256"] = json!("b");
+        assert_eq!(diff_values(&before, &after)["changed"], true);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apfs_boundary_clones_survive_source_changes() {
+        let staging = tempfile::tempdir().unwrap();
+        let index = staging.path().join("source.sqlite");
+        let wal = staging.path().join("source.sqlite-wal");
+        fs::write(&index, b"original-index").unwrap();
+        fs::write(&wal, b"original-wal").unwrap();
+        let clone_root = staging.path().join("clones");
+        let rows = clone_live_index_files(&index, &clone_root).unwrap();
+        assert_eq!(rows.iter().filter(|r| r["state"] == "absent").count(), 1);
+        fs::write(&index, b"changed-index").unwrap();
+        fs::remove_file(&wal).unwrap();
+        assert_eq!(
+            fs::read(clone_root.join("index.sqlite")).unwrap(),
+            b"original-index"
+        );
+        assert_eq!(
+            fs::read(clone_root.join("index.sqlite-wal")).unwrap(),
+            b"original-wal"
+        );
+        for row in rows.iter().filter(|r| r["state"] == "present") {
+            assert_eq!(
+                row["sha256"],
+                sha256_file(Path::new(row["clone_path"].as_str().unwrap())).unwrap()
+            );
+        }
+    }
 }

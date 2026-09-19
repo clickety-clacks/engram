@@ -49,6 +49,32 @@ record. Neither executable calls Tightbeam, publishes readiness, wakes Eezo,
 installs Engram, or targets the live index, tapes, WAL/SHM, cursor, or raw source
 for write.
 
+For §9.2 the controller creates fresh `manifests/live-clones-pre` and
+`manifests/live-clones-post` staging directories at the two manifest boundaries.
+Input and immutable-custody checks still precede proof-root creation; pre-clones
+are captured after the root exists and before runner staging reads. Each existing
+live index/WAL/SHM is opened read-only without following a final symlink, checked
+to be on the same APFS filesystem as staging, and cloned with `fclonefileat`.
+All three capture attempts precede any clone hashing. The source descriptor pins
+its inode across pathname rotation. Hashes come only from retained read-only
+staging clones; unsupported filesystems, failed clones and non-Darwin execution
+fail without byte-copy or live-hash fallback. No SQLite connection/checkpoint is
+opened on these paths.
+
+Manifest rows retain source metadata before/after, source pathname state after
+capture, per-file capture times, clone metadata/path and clone hash. Missing
+files are recorded explicitly. These are per-file boundary observations, not a
+multi-file atomic SQLite snapshot. Differences compare source metadata and
+captured hashes, excluding clone destinations and observation clocks; complete
+rows remain retained. Clones remain under the proof root through the final
+manifest and are included by the existing staging sampler. APFS shared blocks
+are not deduplicated by that sampler's named-file allocated-byte sum.
+
+The API basis is Apple's [clonefile(2) manual](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/clonefile.2);
+the pinned libc 0.2.182 Darwin declarations were inspected. Gibson's Linux build
+does not compile or execute the Darwin-only syscall branch; target validation
+remains required on an authorized host.
+
 All new JSON and JSONL evidence follows one byte contract:
 
 > Recursively sort object keys by UTF-8 bytes; preserve array order and JSON
