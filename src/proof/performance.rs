@@ -29,6 +29,9 @@ pub fn direct_projection(touches: &[crate::index::lineage::EvidenceFragmentRef])
 
 pub const BASELINE_BINARY_SHA256: &str =
     "13088f949fa7920615ff8873c1040d4b7ec9180976a7121a63e0de726e47571d";
+pub const TELEMETRY_AMENDMENT_SHA256: &str =
+    "376d581e12743643c5e5e4923355a530964e485d16437bd47298fb8ee23e9035";
+const TEMP_LIMITATION: &str = "named files in dedicated SQLite temp directory, sampled every 100ms; unlinked files and allocations created/deleted between samples may be missed; zero observed is not zero total allocation";
 
 pub struct Inputs<'a> {
     pub baseline_binary: &'a Path,
@@ -64,6 +67,8 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
     }
     let expected: Value = serde_json::from_reader(File::open(&expected_path)?)?;
     let manifest_hash = sha256_file(inputs.manifest)?;
+    let source_revision =
+        option_env!("T1772_BUILD_REVISION").ok_or("proof build source revision absent")?;
     let probe_binary_hash = sha256_file(&std::env::current_exe()?)?;
     fs::create_dir_all(root)?;
     let binaries = [inputs.baseline_binary, inputs.candidate_binary];
@@ -74,20 +79,24 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
         sha256_file(databases[1])?,
     ];
     write_canonical_json(
-        &root.join("protocol-r2.json"),
+        &root.join("protocol-r3.json"),
         &json!({
-        "version":2,"parent_manifest_sha256":manifest_hash,
+        "version":3,"parent_manifest_sha256":manifest_hash,
         "parent_spec_sha256":"df43b6e63184d2e02803905b841dc46f5b6f3d0573c3b5a6ee68ca7d0ea81bea",
         "expected_projection_sha256":"417d3aeabaf80a2196b51c3f0b7dad5381903a06d4017b7960410203100d3b31",
         "amendment_sha256":baseline_custody::AMENDMENT_SHA256,
-        "source_revision":option_env!("T1772_BUILD_REVISION"),
+        "telemetry_amendment_sha256":TELEMETRY_AMENDMENT_SHA256,
+        "source_revision":source_revision,
         "baseline_binary_sha256":BASELINE_BINARY_SHA256,
         "preparation_order":"create byte copy when required, hash copy, baseline read-only logical/schema custody or candidate file custody; invoke CLI; post-custody; validate output; SQL probes",
         "baseline_policy":"one writable copy per hot query series; fresh writable copy per cold slot; only query_results application content may change",
         "candidate_policy":"database and its directory read-only; exact hash and directory custody after every slot",
         "cache_limit":"copy/hash/custody reads can warm filesystem cache; filesystem-cold means a fresh copy, never cache eviction",
-        "unresolved":["actual frozen CLI statement counters","complete temporary-file observation","frozen baseline pre-lineage output extraction"],
-        "eligible_for_full_performance_pass":false}),
+        "baseline_cli_counters":"unavailable / non-comparable; no counter improvement comparison permitted",
+        "baseline_projection":"raw historical output retained; separate direct projection unavailable; no result-equivalence claim",
+        "candidate_counter_requirement":"each bound direct-touch SQL probe statement SORT=0 and AUTOINDEX=0",
+        "temporary_byte_requirement":"candidate observed bytes=0; incomplete coverage accepted under telemetry amendment",
+        "temporary_byte_limitation":TEMP_LIMITATION}),
     )?;
     let mut comparisons = Vec::new();
     let mut all_passed = true;
@@ -177,8 +186,11 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
                         "database_path":db,"master_database_sha256":database_hashes[variant],
                         "database_sha256":before_database_sha256,
                         "amendment_sha256":baseline_custody::AMENDMENT_SHA256,
+                        "telemetry_amendment_sha256":TELEMETRY_AMENDMENT_SHA256,
                         "manifest_sha256":manifest_hash,"target":target,"flags":query["flags"],
                         "derived_anchors":anchors,"product_binary_sha256":binary_hashes[variant],
+                        "product_source_revision":if variant == 0 {"72821518037a9d896f0b4d784fee146800902e78"}else{source_revision},
+                        "probe_source_revision":source_revision,
                         "probe_binary_sha256":probe_binary_hash});
                     let observation = measure(
                         binaries[variant],
@@ -239,8 +251,8 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
                 && candidate["direct_touch_autoindex"] == 0;
             all_passed &= passed;
             comparisons.push(json!({"query_id":id,"mode":mode,"baseline":baseline,
-                "candidate":candidate,"observed_thresholds_passed":passed,"passed":false,
-                "reason":"actual CLI counters, complete temporary bytes and baseline semantic extraction remain unresolved"}));
+                "candidate":candidate,"passed":passed,
+                "acceptance_scope":"amended performance protocol; baseline counters non-comparable; zero observed temp only; no baseline result-equivalence claim"}));
             if mode == "hot" {
                 for db in &hot {
                     discard_own_copy(db)?;
@@ -258,8 +270,12 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
     write_canonical_json(
         &root.join("result.json"),
         &json!({
-        "passed":false,"observed_thresholds_passed":all_passed,"manifest_sha256":manifest_hash,
-        "unresolved":["actual frozen CLI statement counters","complete temporary-file observation","frozen baseline pre-lineage output extraction"],
+        "passed":all_passed,"manifest_sha256":manifest_hash,
+        "baseline_copy_amendment_sha256":baseline_custody::AMENDMENT_SHA256,
+        "telemetry_amendment_sha256":TELEMETRY_AMENDMENT_SHA256,
+        "acceptance_scope":"amended performance protocol; not an exhaustive telemetry or baseline result-equivalence claim",
+        "baseline_cli_counters":"unavailable / non-comparable",
+        "temporary_byte_limitation":TEMP_LIMITATION,
         "counter_scope":super::statement_probe::COUNTER_SCOPE,
         "database_hash_custody":"immutable masters verified before/after; candidate files and directory verified every slot; baseline schema/all non-query_results tables verified every slot with file custody",
         "warmups_per_query_variant_mode":3,"measured_iterations_per_query_variant_mode":30,
@@ -267,7 +283,10 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
         "run_order":"query ID order, hot then filesystem-cold; alternate variant first by query index plus iteration index",
         "cache_policy":manifest["os_cache_policy"],"comparisons":comparisons}),
     )?;
-    Err("full performance gate blocked: actual baseline CLI counters, complete temporary-file observation and baseline direct projection unavailable; no eligibility permitted".into())
+    if !all_passed {
+        return Err("amended performance thresholds failed".into());
+    }
+    Ok(())
 }
 
 pub fn alternating_order(query: usize, iteration: usize) -> [usize; 2] {
@@ -477,7 +496,7 @@ fn measure(
         &json!({
         "binding":binding,"expected":expected_touches,"actual":actual,
         "candidate_exact":if baseline {Value::Null}else{json!(exact)},
-        "status":if baseline {"unresolved: frozen CLI merges direct and lineage sessions and may truncate; no complete pre-lineage extractor"}else if exact{"exact"}else{"mismatch"},
+        "status":if baseline {"unavailable: frozen CLI merges direct and lineage sessions and may truncate; historical output retained, no direct-equivalence claim"}else if exact{"exact"}else{"mismatch"},
         "baseline_legacy_semantics":if baseline {json!("v3 feature fanout plus lineage/session formatting; raw result_id/rating_hint retained, write costs included; differences are not classified as correctness success")}else{Value::Null},
         "elapsed_microseconds":validation_started.elapsed().as_micros()}),
     )?;
@@ -486,13 +505,21 @@ fn measure(
     }
     let probe_path = root.join("statement-probe.json");
     let probe = super::statement_probe::run(db, binding, &probe_path)?;
+    // Warmups have the same zero-observed requirement as measured candidate slots.
+    if !baseline && (disk["status"] != "observed" || disk["peak_observed_logical_bytes"] != 0) {
+        return Err("candidate temporary-byte observation missing, failed or nonzero".into());
+    }
     Ok(json!({"elapsed_microseconds":elapsed,"peak_rss_bytes":rss,
         "collector_setup_postprocessing_probe_microseconds":measurement_started.elapsed().as_micros().saturating_sub(elapsed as u128),
         "counter_scope":super::statement_probe::COUNTER_SCOPE,
         "candidate_direct_touch_exact":if baseline {Value::Null}else{json!(exact)},
-        "baseline_projection_status":if baseline {json!("unresolved; comparison cannot be accepted")}else{Value::Null},
-        "actual_cli_statement_counters":Value::Null,
+        "baseline_projection_status":if baseline {json!("unavailable; historical output retained without direct-equivalence claim")}else{Value::Null},
+        "actual_cli_statement_counters":{"status":"unavailable / non-comparable","sort":null,"autoindex":null,
+            "source_revision":binding["product_source_revision"],"binary_sha256":binding["product_binary_sha256"]},
         "complete_temporary_bytes":Value::Null,
+        "temporary_byte_limitation":TEMP_LIMITATION,"zero_total_temporary_allocation_claimed":false,
+        "temp_collector_identity":{"module":"src/proof/measurement.rs::DiskSampler","source_revision":binding["probe_source_revision"],"binary_sha256":binding["probe_binary_sha256"]},
+        "temp_samples_path":root.join("temp-samples.jsonl"),"temp_collector_errors":[],
         "canonical_output_sha256":sha256_file(&canonical_output)?,
         "observed_sqlite_temp_bytes":disk["peak_observed_logical_bytes"],
         "temp_collection":disk,"direct_touch_sort":probe["direct_touch_sort"],
@@ -525,7 +552,14 @@ fn summarize(rows: &[Value]) -> ProofResult<Value> {
         .map(|r| r["elapsed_microseconds"].as_u64().ok_or("elapsed missing"))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(json!({"elapsed_microseconds":percentiles(&times)?,
+        "actual_cli_statement_counters":rows[0]["actual_cli_statement_counters"],
         "counter_scope":super::statement_probe::COUNTER_SCOPE,
+        "comparative_cli_counter_improvement_claimed":false,
+        "temporary_byte_limitation":TEMP_LIMITATION,"zero_total_temporary_allocation_claimed":false,
+        "temp_collector_identity":rows[0]["temp_collector_identity"],
+        "temp_requested_interval_milliseconds":100,"temp_collector_errors":[],
+        "temp_maximum_sample_gap_microseconds":rows.iter().filter_map(|r|r["temp_collection"]["maximum_sample_gap_microseconds"].as_u64()).max(),
+        "raw_temp_evidence":"each slot retains temp-samples.jsonl and temp-peak.json; observations identify dedicated paths",
         "peak_rss_bytes":rows.iter().filter_map(|r|r["peak_rss_bytes"].as_u64()).max(),
         "observed_sqlite_temp_bytes":rows.iter().filter_map(|r|r["observed_sqlite_temp_bytes"].as_u64()).max(),
         "direct_touch_sort":rows.iter().filter_map(|r|r["direct_touch_sort"].as_u64()).sum::<u64>(),

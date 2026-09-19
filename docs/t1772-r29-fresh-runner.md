@@ -13,10 +13,16 @@ dependency. Accepted PO amendment art_a24618f6, SHA-256
 `3ce0623b7ebb575962be92bf1f9f3e94b2195682a4c8f8f5e96e88d24e95c85e`, now permits
 the unchanged baseline to write `query_results` only in disposable staging
 copies. Immutable masters and candidate read-only behavior remain protected.
-Actual frozen CLI counters, complete temporary-file observation, and a complete
-baseline pre-lineage output extractor remain unavailable. The performance
-result explicitly emits `passed:false` and returns an error even if observed
-thresholds pass, so this implementation cannot publish review eligibility.
+Telemetry amendment art_73471b68, SHA-256
+`376d581e12743643c5e5e4923355a530964e485d16437bd47298fb8ee23e9035`, applies with
+that predecessor. Actual baseline CLI counters are explicitly unavailable /
+non-comparable; separate baseline probes remain diagnostic. Candidate per-statement
+direct-touch probes must cover each bound anchor with SORT=0 and AUTOINDEX=0,
+and candidate temp observations must be present and zero, including warmups.
+Acceptance is limited to observed named temporary files: unlinked/between-sample
+allocations may be missed, and zero total allocation is never claimed.
+The superseded telemetry hard failure is removed. Exact baseline input/executable
+custody and bound invocation remain missing; this source build is not review-ready.
 
 This source is the fresh R29 proof implementation. It is descended from Engram
 candidate `9f8afc65d0b365444446a473c04389adf80bd4b3`; it does not call, wrap, copy,
@@ -110,7 +116,7 @@ timed separately; they can warm the filesystem cache. No OS purge is claimed.
 Candidate database and containing directory are read-only, with exact file and
 directory custody after every product/probe slot. Completed disposable copies
 created by this run are removed only after custody is saved; failed copies remain.
-`protocol-r2.json` identifies the original manifest and accepted amendment hashes
+`protocol-r3.json` identifies the original manifest and both accepted amendment hashes
 without rewriting either. Raw stdout/stderr, argv/environment, exit status, wall time, Darwin
 `/usr/bin/time -l` maximum RSS and dedicated SQLite-temp directory samples are
 retained. Parsed product output is also saved under the canonical JSON/LF
@@ -124,7 +130,9 @@ projection exactly; discrepancy evidence retains actual and expected arrays.
 The pinned baseline is unchanged and gets this environment value set to zero.
 Its raw output/result metadata remains retained. Its merged/truncated session
 output cannot be honestly classified as a complete direct-touch projection;
-each slot explicitly reports that unresolved semantic comparison, not equality.
+each slot reports that unavailable projection and retains the historical output
+without claiming direct-touch equality. This limitation no longer independently
+fails the amended gate under PDO's current direction.
 
 After the product timer and temp sampler stop, `proof/statement_probe.rs` opens
 the same clone read-only and executes new instrumented SQL probes for direct
@@ -142,10 +150,17 @@ product CLI wall timing`. A filesystem-cold slot's probe follows its product
 read and makes no independent cold-latency claim. Probe records and canonical
 CLI output have separate hashes. Percentiles use nearest rank with raw
 observations retained; candidate p95/p99, peak RSS and zero observed-temp/direct
-probe SORT/AUTOINDEX thresholds are checked as diagnostic observations. Actual
-CLI counters and complete temp bytes remain null/unavailable. These observations
-cannot pass the complete performance gate. Probe counters are never attributed
-to the frozen CLI.
+probe SORT/AUTOINDEX thresholds must pass the amended performance gate. Every
+candidate probe slot checks raw statement coverage and zero counters before
+returning a successful observation. Missing, failed or nonzero observations fail;
+no missing value becomes zero. Actual CLI counters are explicit unavailable /
+non-comparable objects with null numeric fields in observations and summaries.
+No comparative CLI counter improvement is claimed. Temp observations/summaries
+retain collector identity, dedicated paths, requested interval, actual gaps,
+raw samples/errors and incomplete-coverage limitations. Probe counters are never
+attributed to the frozen CLI. Product/probe bindings include both source revisions
+and binary hashes. Threshold failure still returns an error; only the superseded
+unavailability failure is removed.
 
 `proof/concurrency.rs` makes two independent disposable v4 copies. Before each
 pass it removes the first hundred frozen tape IDs and their derived records from
@@ -172,8 +187,9 @@ sampled maximum, not a claim to see allocations that disappear between samples.
 The controller joins the sampler before hashing outputs or writing eligibility;
 errors forbid eligibility. Per-query SQLite temp sampling uses its own otherwise
 empty subtree; harness output is outside it. It cannot observe unlinked temp
-files, and that limitation must be assessed along with actual statement counters
-before claiming the zero-temp gate is proven on the target host.
+files or allocations entirely between samples. The telemetry amendment permits
+only a qualified zero-observed claim; even zero probe counters do not close those
+blind spots. Collector errors remain missing evidence and fail the gate.
 
 The new measurement test definitions are source only until executed on an
 authorized non-Gibson host. A Gibson compilation proves type/link consistency,

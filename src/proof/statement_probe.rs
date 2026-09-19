@@ -194,7 +194,54 @@ pub fn run(db: &Path, binding: &Value, output: &Path) -> ProofResult<Value> {
         "lineage_rows_visited":total("lineage", "rows_visited"),
         "lineage_edges_selected":selected_edges,"statements":statements});
     write_canonical_json(output, &result)?;
+    if !baseline {
+        validate_candidate_direct_statements(&result)?;
+    }
     Ok(result)
+}
+
+/// Validate raw statement coverage and zeros for each warmup/measured candidate
+/// slot. This is deliberately restricted to the existing exact/feature probes.
+pub fn validate_candidate_direct_statements(report: &Value) -> ProofResult<()> {
+    let anchors = report["binding"]["derived_anchors"]
+        .as_array()
+        .ok_or("probe anchors absent")?;
+    let statements = report["statements"]
+        .as_array()
+        .ok_or("raw probe statements absent")?;
+    let required = anchors
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|a| a.starts_with("winnow:"))
+        .collect::<Vec<_>>();
+    let direct = statements
+        .iter()
+        .filter(|s| s["kind"] == "direct")
+        .collect::<Vec<_>>();
+    if required.is_empty() || direct.len() != required.len() {
+        return Err("candidate direct-touch probe coverage incomplete".into());
+    }
+    for anchor in required {
+        let matching = direct
+            .iter()
+            .filter(|s| s["bound_anchor"] == anchor)
+            .collect::<Vec<_>>();
+        let expected_sql = if anchor.contains(',') {
+            CANDIDATE_EXACT
+        } else {
+            CANDIDATE_FEATURE
+        };
+        if matching.len() != 1
+            || matching[0]["sql"] != expected_sql
+            || matching[0]["sort"].as_u64() != Some(0)
+            || matching[0]["autoindex"].as_u64() != Some(0)
+        {
+            return Err(
+                "candidate direct-touch probe missing, mismatched or nonzero SORT/AUTOINDEX".into(),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn observe(

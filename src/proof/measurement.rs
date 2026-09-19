@@ -96,7 +96,7 @@ impl DiskSampler {
                 "peak_observed_logical_bytes":peak_logical,
                 "peak_observed_allocated_bytes":peak_allocated,
                 "samples":samples,"vanished_paths":vanished,
-                "limitation":"sampled high-water mark; allocations created and removed between samples may not be observed"});
+                "limitation":"sampled named-file high-water mark; unlinked files and allocations created and removed between samples may be missed; not total allocation evidence"});
             write_canonical_json(&summary, &result)?;
             Ok(result)
         });

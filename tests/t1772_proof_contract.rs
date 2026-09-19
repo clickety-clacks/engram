@@ -78,6 +78,35 @@ fn separate_probes_report_real_sort_and_posting_counters_with_identical_binding(
             assert!(row["rows_visited"].is_u64() && row["vm_steps"].is_u64());
         }
         assert_eq!(sha256_file(&db).unwrap(), before);
+        if variant == "candidate" {
+            use engram::proof::statement_probe::validate_candidate_direct_statements;
+            let mut nonzero = report.clone();
+            let direct = nonzero["statements"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|s| s["kind"] == "direct")
+                .unwrap();
+            direct["sort"] = json!(1);
+            assert!(validate_candidate_direct_statements(&nonzero).is_err());
+            let mut incomplete = report.clone();
+            incomplete["statements"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|s| s["kind"] != "direct");
+            assert!(validate_candidate_direct_statements(&incomplete).is_err());
+            let mut missing = report.clone();
+            missing["statements"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|s| s["kind"] == "direct")
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove("autoindex");
+            assert!(validate_candidate_direct_statements(&missing).is_err());
+        }
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&std::fs::read(output).unwrap()).unwrap(),
             report
