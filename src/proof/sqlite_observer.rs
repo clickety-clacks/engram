@@ -47,7 +47,7 @@ pub fn install(conn: &Connection) -> rusqlite::Result<()> {
     let code = unsafe {
         ffi::sqlite3_trace_v2(
             conn.handle(),
-            ffi::SQLITE_TRACE_PROFILE | ffi::SQLITE_TRACE_ROW,
+            (ffi::SQLITE_TRACE_PROFILE | ffi::SQLITE_TRACE_ROW) as u32,
             Some(profile),
             std::ptr::null_mut(),
         )
@@ -70,7 +70,7 @@ unsafe extern "C" fn profile(
             .get_or_init(|| Mutex::new(BTreeMap::new()))
             .lock()
             .map_err(|_| "row counter lock poisoned")?;
-        if mask == ffi::SQLITE_TRACE_ROW {
+        if mask == ffi::SQLITE_TRACE_ROW as u32 {
             *row_counts.entry(statement as usize).or_default() += 1;
             return Ok(());
         }
