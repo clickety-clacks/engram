@@ -7,6 +7,32 @@ use engram::proof::t1772::{
 use serde_json::json;
 
 #[test]
+fn same_invocation_direct_projection_keeps_extras_duplicates_and_canonical_order() {
+    use engram::index::lineage::{EvidenceFragmentRef, EvidenceKind};
+    use engram::proof::performance::direct_projection;
+    let row = |kind, path: &str| EvidenceFragmentRef {
+        tape_id: "t".into(),
+        event_offset: 4,
+        kind,
+        file_path: path.into(),
+        timestamp: "z".into(),
+    };
+    let rows = vec![
+        row(EvidenceKind::Read, "/z"),
+        row(EvidenceKind::Edit, "/b"),
+        row(EvidenceKind::Edit, "/a"),
+        row(EvidenceKind::Edit, "/a"),
+    ];
+    let projection = direct_projection(&rows);
+    let items = projection.as_array().unwrap();
+    assert_eq!(items.len(), 4);
+    assert_eq!(items[0], items[1]);
+    assert_eq!(items[0]["file_path"], "/a");
+    assert_eq!(items[2]["file_path"], "/b");
+    assert_eq!(items[3]["kind"], "read");
+}
+
+#[test]
 fn separate_probes_report_real_sort_and_posting_counters_with_identical_binding() {
     use engram::proof::statement_probe::{COUNTER_SCOPE, run};
     use engram::proof::t1772::sha256_file;

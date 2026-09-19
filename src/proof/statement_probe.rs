@@ -1,6 +1,6 @@
 //! Separate SQL observations: these are never counters from the product CLI.
 use super::t1772::{ProofResult, write_canonical_json};
-use rusqlite::{Connection, OpenFlags, Row, StatementStatus};
+use rusqlite::{Connection, Row, StatementStatus};
 use serde_json::{Value, json};
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
@@ -40,7 +40,7 @@ pub fn run(db: &Path, binding: &Value, output: &Path) -> ProofResult<Value> {
     {
         return Err("unsupported probe flags".into());
     }
-    let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let conn = super::baseline_custody::open_copy_reader(db)?;
     let mut statements = Vec::new();
     let mut version = 0;
     observe(
@@ -183,6 +183,7 @@ pub fn run(db: &Path, binding: &Value, output: &Path) -> ProofResult<Value> {
             .sum()
     };
     let result = json!({"binding":binding,"counter_scope":COUNTER_SCOPE,
+        "database_sha256_at_probe":super::t1772::sha256_file(db)?,
         "cache_observation":"same slot and clone, after product CLI; probe latency is not measured",
         "coverage":"direct evidence, posting seed expansion, bounded provenance edges; excludes presentation, tape I/O, feedback writes",
         "visited_rows_definition":"rows delivered by sqlite3_step to probe, before Rust filters/dedup; not all SQLite internal page or index visits",

@@ -1092,6 +1092,7 @@ fn cmd_explain(
     let mut tombstones = Vec::new();
     let touched_anchors;
     let score_by_session;
+    let mut proof_direct_touches = None;
     let date_filter = DateFilter::parse(args.since.as_deref(), args.until.as_deref())?;
 
     match target_kind {
@@ -1154,6 +1155,11 @@ fn cmd_explain(
             };
             let result =
                 explain_across_indexes(&indexes, &query_anchors, traversal, args.forensics)?;
+            if std::env::var("T1772_DIRECT_TOUCH_PROJECTION").as_deref() == Ok("1") {
+                proof_direct_touches = Some(engram::proof::performance::direct_projection(
+                    &result.direct,
+                ));
+            }
             touched_anchors = result.touched_anchors.clone();
             let touches =
                 collect_touch_evidence(&indexes, &result.direct, &result.touched_anchors)?;
@@ -1234,38 +1240,39 @@ fn cmd_explain(
         return Err(CliError::new("no_results", target));
     }
     let chain_metadata = build_chain_metadata(&sessions);
-    emit_query_result(
-        "explain",
-        json!({
-        "query": {
-            "command": "explain",
-            "target": target,
-            "anchors": query_anchors,
-            "grep_filter": args.grep_filter,
-            "limit": args.limit,
-            "offset": args.offset,
-            "min_confidence": args.min_confidence,
-            "since": args.since,
-            "until": args.until,
-            "count": args.count,
-            "max_fanout": args.max_fanout,
-            "max_edges": args.max_edges,
-            "depth": args.depth,
-            "forensics": args.forensics,
-            "include_deleted": args.include_deleted,
-        },
-        "sessions": sessions,
-        "chains": chain_metadata,
-        "lineage": lineage,
-        "dispatch_lineage": dispatch_lineage,
-        "tombstones": tombstones,
-        "stores_queried": indexes.len(),
-        "returned": returned,
-        "total": total,
-        "time_range": time_range,
-        "truncated": truncated,
-        }),
-    )
+    let mut payload = json!({
+    "query": {
+        "command": "explain",
+        "target": target,
+        "anchors": query_anchors,
+        "grep_filter": args.grep_filter,
+        "limit": args.limit,
+        "offset": args.offset,
+        "min_confidence": args.min_confidence,
+        "since": args.since,
+        "until": args.until,
+        "count": args.count,
+        "max_fanout": args.max_fanout,
+        "max_edges": args.max_edges,
+        "depth": args.depth,
+        "forensics": args.forensics,
+        "include_deleted": args.include_deleted,
+    },
+    "sessions": sessions,
+    "chains": chain_metadata,
+    "lineage": lineage,
+    "dispatch_lineage": dispatch_lineage,
+    "tombstones": tombstones,
+    "stores_queried": indexes.len(),
+    "returned": returned,
+    "total": total,
+    "time_range": time_range,
+    "truncated": truncated,
+    });
+    if let Some(touches) = proof_direct_touches {
+        payload["t1772_direct_touches"] = touches;
+    }
+    emit_query_result("explain", payload)
 }
 
 fn cmd_grep(_paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Result<(), CliError> {

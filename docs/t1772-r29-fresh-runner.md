@@ -9,12 +9,14 @@ The frozen performance manifest pins baseline binary SHA-256
 output. PDO has approved separate in-process SQL probes, explicitly excluded
 from product wall timing; the frozen baseline binary remains unchanged.
 Exact frozen baseline database/binary paths and database SHA remain a PDO custody
-dependency. A further source conflict prevents launch: baseline `explain` calls
-`emit_query_result` (`src/query/format.rs:999` at the pinned baseline commit),
-which unconditionally calls `record_query_result` (`src/index/mod.rs:387`) to
-write `query_results`. The frozen manifest requires immutable copies. This
-implementation retains that contract and fails closed on product failure or
-changed clone hashes; no writable-clone exception has been assumed.
+dependency. Accepted PO amendment art_a24618f6, SHA-256
+`3ce0623b7ebb575962be92bf1f9f3e94b2195682a4c8f8f5e96e88d24e95c85e`, now permits
+the unchanged baseline to write `query_results` only in disposable staging
+copies. Immutable masters and candidate read-only behavior remain protected.
+Actual frozen CLI counters, complete temporary-file observation, and a complete
+baseline pre-lineage output extractor remain unavailable. The performance
+result explicitly emits `passed:false` and returns an error even if observed
+thresholds pass, so this implementation cannot publish review eligibility.
 
 This source is the fresh R29 proof implementation. It is descended from Engram
 candidate `9f8afc65d0b365444446a473c04389adf80bd4b3`; it does not call, wrap, copy,
@@ -96,13 +98,33 @@ index can be used as the baseline input.
 `proof/performance.rs` schedules all twelve frozen queries for both ordinary CLI
 binaries. Each hot/filesystem-cold class has three fresh-process warmups and
 thirty measured fresh-process iterations per binary/query. Order alternates by
-query and iteration. Hot runs share a staged immutable database; filesystem-cold
-runs copy the immutable database before every process, exclude copy time, hash it
-after measurement, then remove only that iteration's copy. No OS cache purge is
-claimed. Raw stdout/stderr, argv/environment, exit status, wall time, Darwin
+query and iteration. Each hot query series has its own baseline working copy,
+shared through that series' three warmups and thirty measured processes. Cold
+slots receive fresh initially byte-identical copies. Only baseline copies are
+writable. `baseline_custody.rs` checks existing schema-v3 objects/columns, records
+schema and typed row digests for the seven fixed v3 tables, and rejects any
+schema/content change outside `query_results`. Pre/post file, WAL/SHM and
+directory custody is retained; unexpected entries fail. Whole-CLI timing includes
+baseline initialization and feedback writes. Preparation and custody reads are
+timed separately; they can warm the filesystem cache. No OS purge is claimed.
+Candidate database and containing directory are read-only, with exact file and
+directory custody after every product/probe slot. Completed disposable copies
+created by this run are removed only after custody is saved; failed copies remain.
+`protocol-r2.json` identifies the original manifest and accepted amendment hashes
+without rewriting either. Raw stdout/stderr, argv/environment, exit status, wall time, Darwin
 `/usr/bin/time -l` maximum RSS and dedicated SQLite-temp directory samples are
 retained. Parsed product output is also saved under the canonical JSON/LF
-contract. Neither product CLI contains a measurement hook.
+contract. Candidate literal `explain` with `T1772_DIRECT_TOUCH_PROJECTION=1`
+adds `t1772_direct_touches` from that invocation's already-computed direct rows,
+canonically ordered by timestamp/tape/event/kind/path, without discarding any
+duplicates or intersecting with the oracle. This single evidence field is the
+only new product observation seam; its serialization cost stays inside timing.
+Every warmup and measured candidate response must match the complete frozen
+projection exactly; discrepancy evidence retains actual and expected arrays.
+The pinned baseline is unchanged and gets this environment value set to zero.
+Its raw output/result metadata remains retained. Its merged/truncated session
+output cannot be honestly classified as a complete direct-touch projection;
+each slot explicitly reports that unresolved semantic comparison, not equality.
 
 After the product timer and temp sampler stop, `proof/statement_probe.rs` opens
 the same clone read-only and executes new instrumented SQL probes for direct
@@ -120,8 +142,10 @@ product CLI wall timing`. A filesystem-cold slot's probe follows its product
 read and makes no independent cold-latency claim. Probe records and canonical
 CLI output have separate hashes. Percentiles use nearest rank with raw
 observations retained; candidate p95/p99, peak RSS and zero observed-temp/direct
-probe SORT/AUTOINDEX gates are checked. Probe counters are never attributed to
-the frozen CLI.
+probe SORT/AUTOINDEX thresholds are checked as diagnostic observations. Actual
+CLI counters and complete temp bytes remain null/unavailable. These observations
+cannot pass the complete performance gate. Probe counters are never attributed
+to the frozen CLI.
 
 `proof/concurrency.rs` makes two independent disposable v4 copies. Before each
 pass it removes the first hundred frozen tape IDs and their derived records from
