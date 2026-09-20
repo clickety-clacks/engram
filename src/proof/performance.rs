@@ -425,7 +425,8 @@ fn prepare_baseline(inputs: &Inputs<'_>, db: &Path, root: &Path) -> ProofResult<
         "copy_bytes":fs::metadata(db)?.len(),"copy":db,
         "method":"Darwin clonefile; no byte-copy fallback",
         "preparation_excluded_from_cli_timing":true}),
-    )
+    )?;
+    Ok(())
 }
 
 fn finish_baseline(db: &Path, root: &Path, master: &Value) -> ProofResult<()> {
@@ -470,7 +471,8 @@ fn write_io_plan(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
         "other_costs":"master pre/post hashes, comparator preflight, corpus/config/output hashes, two rebuilds and two concurrency copies, live CoW clones, sidecars, raw artifacts and post-write growth remain additional; CoW allocated blocks can be shared and are not unique physical storage",
         "cache_policy":"baseline cold preparation before matrix; cold post scans after complete matrix; hot baseline post scan at series boundary; candidate per-slot custody/direct probes still condition cache; no OS eviction claim",
         "technical_review_status":"implementation choice, not PDO certification"}),
-    )
+    )?;
+    Ok(())
 }
 
 fn staging_copy(source: &Path, output: &Path, writable_baseline: bool) -> ProofResult<()> {
