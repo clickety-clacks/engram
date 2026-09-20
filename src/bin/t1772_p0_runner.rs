@@ -794,6 +794,7 @@ mod correction_tests {
         let output = dir.path().join("comparison.json");
         verify_rebuild_accounting(&first, &second, &output).unwrap();
         for case in 0..7 {
+            let output = dir.path().join(format!("comparison-{case}.json"));
             let mut changed = second.clone();
             let key = match case {
                 0 => {
