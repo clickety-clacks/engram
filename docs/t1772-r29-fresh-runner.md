@@ -360,19 +360,15 @@ not performance, concurrency correctness, macOS behavior, or proof completion.
 The runtime writes `runner/test-definitions.json` with the larger P0 checks and
 records every observed result in hash-bound canonical evidence. Repository gates
 remain `cargo fmt --check`, `cargo test --all-targets`, and the release build;
-they run only on an authorized non-Gibson test host.
+the task-specific authority now permits focused Gibson checks in isolation.
+The previously accepted full Racter suite is not repeated for host parity.
 
 ## Correction after independent b7a1aa5 review
 
-This section supersedes earlier claims of complete semantic acceptance. The
-source implements R29-1 through R29-4 comparisons and failure handling, but a
-full P0 passing result remains blocked: PDO confirmed no standalone frozen
-complete §9.3 journey expectations are available. The runner retains a blocked
-summary and returns failure even if its available gates pass. Twelve performance
-projections, the typed semantic oracle and tombstone event journeys are stated
-as bounded checks. They do not stand in for full session/raw-window/ordering/
-lineage/queried-store/dispatch-lineage journeys. No local eligibility is possible
-from this runner until that missing expectation contract is supplied and reviewed.
+At the accepted 5dc2b5c revision, full §9.3 was explicitly unavailable. The
+supplement below replaces only that unavailable-data gate with exact frozen
+product-case comparisons. The canonical oracle, compatibility and twelve direct
+projections remain distinct mandatory gates; none alone is full §9.3.
 
 R29-1 adds two separately SHA-bound inputs under exact
 `/Users/mike/shared-workspace/engram/proofs/t1772/oracle-inputs-r29`:
@@ -439,4 +435,100 @@ historical byte ceiling (C2). This consumes existing reports without additional
 SQL scans, hashes or collectors. Paths and timing are excluded. The replacement
 launch template must derive both revision and tree from that same committed
 source and verify them against its bundle/receipt (C3). All other proof gates,
-including the explicit unavailable full-§9.3 result, remain unchanged.
+remain unchanged; the separately authorized supplement below replaces only the
+unavailable full-§9.3 gate.
+
+
+## Section 9.3 fixed expectation supplement
+
+Contract `art_5eec55f4`, SHA
+`29fd50d40d56860b6c3619b53ba342c7afc6b06d0b0b3b005420d4efbe62db83`,
+requires full ordered product results from independently declared inputs. The
+new `journeys` proof module supplies one explicit manifest consumer; it does
+not change product query, adapter or index semantics. The controller binds
+`--journey-root /Users/mike/shared-workspace/engram/proofs/t1772/journey-inputs-r29`
+and `--journey-manifest-sha256 HASH`, verifies every ledger file, and includes
+that root in pre/post immutable custody. A missing manifest, required case,
+expected file, unexpected CLI failure/output/mutation or unequal field fails.
+Only complete comparisons on both rebuilds can replace the unavailable result.
+No supplied document, fixture-only test or Linux build is a full §9.3 pass.
+
+The case matrix is explicit:
+
+| Case IDs / groups | Required observation |
+| --- | --- |
+| `p0-q01` through `p0-q12`, each `full-explain` and ten `window-NN` cases | Full P0 product JSON including complete bounded ordered sessions, touches, lineage, chains, totals and exact raw windows; not just the performance projection |
+| `fixed-unaligned-edit`, `fixed-unaligned-read` | Unaligned 25–32 target across raw fingerprint windows; direct event keys and raw outputs |
+| `fixed-ordinary`, `fixed-forensics`, `fixed-span-link` | Before/after lineage, exact threshold membership and positive P1 agent link; P0 span links remain exactly zero |
+| `fixed-deleted-hidden`, `fixed-deleted-visible` | Exact tombstone omission/inclusion, alongside unchanged exhaustive 25,305-key compatibility |
+| `fixed-session-order` | Distinct repeated events, touch-count/recency/tie order, raw offsets |
+| `fixed-additional-dedupe` | Primary read tape duplicated in additional store; edit tape only in additional store; exact dedupe, two stores and additional-store raw resolution |
+| `fixed-dispatch-chain` | Full A→B→C ancestor/hop/window outputs, explicit sibling exclusion |
+| `fixed-restart-before`, `fixed-restart-reingest` | Base+worker query, repeat worker, identical pre-restart query, ingest distinct restart, complete new history query |
+| `p1-*`, `normalized-*-complete-raw` | Six adapters plus raw-only Gemini logs, structured event ranges/text/coverage/order and query outputs |
+| `repaired-root-session-*`, `repaired-implementer-session-*` | Two routed immutable Codex transcript copies and original fixed target/flags; no claim about unavailable historical sources |
+
+`examples/t1772_journey_reference.rs` reads only normalized tape bytes and frozen
+targets. It shares only SHA-pinned fingerprint primitives, never index/SQL/query
+code. Two sequential passes derive edits/tombstones and relevant raw windows;
+`scripts/derive-t1772-journeys.py` independently applies declared public rules to
+produce complete JSON. It requires the P0 census (3,250,068 events, 150,357 edits,
+zero span links) and all twelve independent direct projections to match frozen
+authority before emitting the supplemented results. Ambiguous relevant dispatch
+tie order fails derivation rather than choosing a convenient answer. Original
+frozen oracle bytes and the exact 45,758-tape ID manifest remain unchanged.
+
+`scripts/t1772-fixed-fixtures.py` recovers source-defined fixtures and field
+ordering. `t1772_freeze_normalized` converts the seven original P1 inputs and two
+routed historical copies twice, checks equality and source pre/post hashes, and
+freezes candidate-normalized inputs as §3 requires. Those inputs are not query
+oracles: the separate reference derives their query answers. The package retains
+raw sources, normalized bytes, source hashes, complete expected files, component
+derivation manifests, reference executable hashes and concrete commands.
+
+Reproduce in a fresh output directory using the clean source revision:
+
+```sh
+cargo build --locked --release --example t1772_journey_reference --example t1772_freeze_normalized
+python3 scripts/freeze-t1772-journeys.py CORPUS_CUSTODY ORACLES HISTORICAL_COPIES HISTORICAL_LOGS REFERENCE_EXECUTABLE NORMALIZER_EXECUTABLE NEW_OUTPUT
+```
+
+The exact absolute arguments, toolchain, environment and output hashes are frozen
+in the delivery receipt. This command performs independent tape derivation and
+fixture normalization only. It never runs a P0 product query, runner or controller.
+The frozen manifest binds config templates and every case argv; runtime records
+resolved paths, cleared environment, config hash, raw stdout/stderr, exit status,
+expected/actual JSON and precise JSON-pointer differences. Object key order is
+nonsemantic; no semantic field, array ordering, multiplicity or provenance is
+excluded. Only exact staging `config:`/`db:` stderr diagnostic lines sit outside
+product JSON; unexpected diagnostic text fails. The writer's symbolic output
+path is resolved to the exact isolated tape path, not erased.
+
+Each query protects all database files and their directories, retaining full
+pre/post hashes, sidecar presence and directory listings before equality checks.
+The explicit repeat/restart writer steps unprotect only their disposable store,
+then re-protect it before querying. P0 candidate masters remain read-only;
+§9.5's existing disposable copy explicitly receives mode 0600 before its writer
+opens it, because filesystem copy otherwise inherits the protected master mode.
+No baseline telemetry, slot custody, probe or accepted amendment changes.
+
+Incremental I/O: 132 P0 CLI observations per rebuild, 528 full candidate database
+hashes across both rebuilds, lower bound `528 * actual_candidate_database_bytes`
+plus any existing sidecar bytes. No extra P0 database copies. This is the exact
+§9.3 per-query pre/post requirement, outside performance timings. Seventeen
+fixture primary databases and one additional database per rebuild are small
+isolated inputs; the package receipt reports their actual input bytes and query
+counts. Derivation makes two read-only compressed corpus passes (at least
+2,341,224,286 compressed bytes), in addition to one 1,170,612,143-byte custody
+hash pass and selected raw-window decompression. Runtime disk sampling remains
+the existing whole-operation sampler. No estimated SQLite physical-read total
+is presented as a measurement.
+
+Focused verification selects `proof::journeys`, the runner/controller test bins,
+and the ignored `frozen_fixture_package_executes_without_p0` test with an explicit
+package and binary. That test verifies the entire package, removes the P0 group,
+asserts its absence and passes unusable P0 paths. It exercises only isolated
+fixed/P1/repaired cases. Full P0 results remain unexecuted/nonpassing in delivery;
+new native Darwin build custody, target placements and reconstructed-comparator
+custody remain separate failing preflight gates. Prior 5dc2b5c native hashes must
+never be rebound to a new source revision.

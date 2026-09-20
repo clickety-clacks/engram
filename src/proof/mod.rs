@@ -2,6 +2,7 @@ pub mod baseline_custody;
 pub mod canonical_oracle;
 pub mod compatibility;
 pub mod concurrency;
+pub mod journeys;
 pub mod measurement;
 pub mod performance;
 pub mod statement_probe;

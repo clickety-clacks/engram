@@ -31,6 +31,10 @@ struct Args {
     #[arg(long)]
     oracle_root: PathBuf,
     #[arg(long)]
+    journey_root: PathBuf,
+    #[arg(long)]
+    journey_manifest_sha256: String,
+    #[arg(long)]
     proof_root: PathBuf,
     #[arg(long)]
     tape_root: PathBuf,
@@ -164,6 +168,7 @@ fn run() -> ProofResult<()> {
     let custody_roots = vec![
         args.input_root.clone(),
         args.oracle_root.clone(),
+        args.journey_root.clone(),
         args.tape_root.clone(),
         args.baseline_binary.clone(),
         PathBuf::from(engram::proof::baseline_custody::COMPARATOR_ROOT),
@@ -509,6 +514,12 @@ fn validate_static_contract(args: &Args) -> ProofResult<()> {
         "ORACLE_ROOT",
     )?;
     engram::proof::canonical_oracle::verify_inputs(&args.oracle_root)?;
+    require_exact_path(
+        &args.journey_root,
+        engram::proof::journeys::ROOT,
+        "JOURNEY_ROOT",
+    )?;
+    engram::proof::journeys::verify_inputs(&args.journey_root, &args.journey_manifest_sha256)?;
     require_exact_path(&args.proof_root, PROOF_ROOT, "PROOF_ROOT")?;
     if args.manifest != args.input_root.join(MANIFEST_NAME) {
         return Err("manifest path is not exact".into());
@@ -610,6 +621,10 @@ fn runner_argv(args: &Args) -> Vec<String> {
         args.input_root.to_string_lossy().into_owned(),
         "--oracle-root".into(),
         args.oracle_root.to_string_lossy().into_owned(),
+        "--journey-root".into(),
+        args.journey_root.to_string_lossy().into_owned(),
+        "--journey-manifest-sha256".into(),
+        args.journey_manifest_sha256.clone(),
         "--proof-root".into(),
         args.proof_root.to_string_lossy().into_owned(),
         "--tape-root".into(),
@@ -953,6 +968,8 @@ mod live_clone_tests {
             source_revision: "fixture".into(),
             input_root: root.join("inputs"),
             oracle_root: root.join("oracle-inputs"),
+            journey_root: root.join("journey-inputs"),
+            journey_manifest_sha256: "0".repeat(64),
             proof_root: root.join("proof"),
             tape_root: root.join("tapes"),
             live_index: root.join("live.sqlite"),

@@ -57,6 +57,10 @@ pub fn run(
         fs::create_dir(&root)?;
         let db = root.join("index.sqlite");
         fs::copy(source, &db)?;
+        // §9.3 leaves its candidate master read-only; this separate §9.5
+        // disposable writer copy must not inherit that file mode.
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&db, fs::Permissions::from_mode(0o600))?;
         prepare(&db, &tapes)?;
         let result = pass(&db, &tapes, &manifest, mode, &root)?;
         let passed = result["passed"] == true;

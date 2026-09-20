@@ -41,6 +41,10 @@ struct Args {
     #[arg(long)]
     oracle_root: PathBuf,
     #[arg(long)]
+    journey_root: PathBuf,
+    #[arg(long)]
+    journey_manifest_sha256: String,
+    #[arg(long)]
     proof_root: PathBuf,
     #[arg(long)]
     tape_root: PathBuf,
@@ -175,6 +179,7 @@ fn run() -> ProofResult<()> {
         }
     }
 
+    let mut journey_hashes = Vec::new();
     let mut query_hashes = Vec::new();
     let mut compatibility_hashes = Vec::new();
     let mut accounting_hashes = Vec::new();
@@ -210,6 +215,15 @@ fn run() -> ProofResult<()> {
                 .join("p0-performance-expected-direct-touches.json"),
             &output.join("direct-touch-results.json"),
         )?;
+        engram::proof::journeys::run(
+            &args.journey_root,
+            &args.journey_manifest_sha256,
+            &args.candidate_binary,
+            &db,
+            &args.tape_root,
+            &output.join("journeys"),
+        )?;
+        journey_hashes.push(sha256_file(&output.join("journeys/result.json"))?);
         accounting_hashes.push(sha256_file(&output.join("per-tape-accounting.jsonl"))?);
         canonical_hashes.push(sha256_file(
             &output.join("canonical-oracle/global-comparison.json"),
@@ -219,10 +233,11 @@ fn run() -> ProofResult<()> {
     }
     write_canonical_json(
         &runner_root.join("queries/cross-rebuild-comparison.json"),
-        &json!({"direct_touch_sha256":query_hashes,"compatibility_sha256":compatibility_hashes,"accounting_sha256":accounting_hashes,"canonical_oracle_sha256":canonical_hashes,
+        &json!({"journey_result_sha256":journey_hashes,"direct_touch_sha256":query_hashes,"compatibility_sha256":compatibility_hashes,"accounting_sha256":accounting_hashes,"canonical_oracle_sha256":canonical_hashes,
             "per_tape_accounting_matches_frozen_csv_both_rebuilds":true}),
     )?;
-    if query_hashes[0] != query_hashes[1]
+    if journey_hashes[0] != journey_hashes[1]
+        || query_hashes[0] != query_hashes[1]
         || compatibility_hashes[0] != compatibility_hashes[1]
         || accounting_hashes[0] != accounting_hashes[1]
         || canonical_hashes[0] != canonical_hashes[1]
@@ -263,8 +278,8 @@ fn run() -> ProofResult<()> {
     )?;
     let summary = json!({
         "schema": "t1772-p0-runner-summary-v1",
-        "status": "blocked",
-        "full_p0_section_9_3_journeys": {"status":"unavailable","reason":"No standalone frozen complete P0 journey expectations supplied; the 12 performance projections and exhaustive tombstone journeys are bounded subsets, not the complete gate"},
+        "status": "passed",
+        "full_p0_section_9_3_journeys": {"status":"passed","manifest_sha256":args.journey_manifest_sha256,"both_rebuild_result_sha256":journey_hashes},
         "candidate_base": CANDIDATE_BASE,
         "build_revision": BUILD_REVISION,
         "manifest_sha256": MANIFEST_SHA256,
@@ -285,7 +300,7 @@ fn run() -> ProofResult<()> {
     });
     write_canonical_json(&runner_root.join("runner-summary.json"), &summary)?;
     println!("{}", serde_json::to_string(&summary)?);
-    Err("full P0 section 9.3 journey expectations unavailable; full proof cannot pass".into())
+    Ok(())
 }
 
 // Compare the already-recorded observations; no extra database scan or collector.
@@ -331,6 +346,12 @@ fn validate_args(args: &Args) -> ProofResult<()> {
         return Err(format!("candidate must be {CANDIDATE_BASE}").into());
     }
     require_exact_path(&args.input_root, INPUT_ROOT, "INPUT_ROOT")?;
+    require_exact_path(
+        &args.journey_root,
+        engram::proof::journeys::ROOT,
+        "JOURNEY_ROOT",
+    )?;
+    engram::proof::journeys::verify_inputs(&args.journey_root, &args.journey_manifest_sha256)?;
     require_exact_path(
         &args.oracle_root,
         engram::proof::canonical_oracle::SUPPLEMENT_ROOT,
@@ -732,7 +753,7 @@ fn write_test_definitions(path: &Path) -> ProofResult<()> {
                 {"id":"inputs-before-root", "assertion":"controller verifies manifest SHA and 11 entries while PROOF_ROOT is absent"},
                 {"id":"two-rebuilds", "assertion":"two independent databases have identical schema and canonical JSON/LF logical table digests, database bytes, page size/count/freelist and ordered per-B-tree dbstat; retain physical comparison before failing and apply historical ceiling to both"},
                 {"id":"exact-accounting", "assertion":"all frozen cardinalities, per-tape CSV rows, and 14,369 dispatch rows match"},
-                {"id":"query-equivalence", "assertion":"both rebuilds: exact global/per-tape typed digests, complete 25305 legacy tombstone-key journeys and 12 fixed canonical event-touch projections; full P0 section 9.3 journeys remain unavailable and block passing summary"},
+                {"id":"query-equivalence", "assertion":"both rebuilds: exact global/per-tape typed digests, complete 25305 legacy tombstone-key journeys and 12 fixed canonical event-touch projections; hash-bound complete product journey cases must pass on both rebuilds under per-query read-only mutation custody; missing cases/expectations prevent passing"},
                 {"id":"read-only-plan", "assertion":"feature lookup uses posting/window keys without full evidence scan or temporary B-tree"},
                 {"id":"performance", "assertion":"reconstructed pinned-baseline versus candidate: 12 identical manifest queries, both binaries, hot and filesystem-cold; 3 warmups and 30 measured fresh processes each, alternating order; raw RSS/elapsed and p50/p95/p99 thresholds retained; baseline CLI counters unavailable/non-comparable, never substituted; every candidate warmup/measured slot requires full ordered same-invocation oracle equality, bound per-statement direct-touch probe coverage with SORT=0/AUTOINDEX=0, and successful zero-observed-temp evidence; retain collector paths/interval/gaps/errors and unlinked/between-sample limitations, never claim zero total temp allocation", "telemetry_amendment_sha256":engram::proof::performance::TELEMETRY_AMENDMENT_SHA256},
                 {"id":"reconstructed-comparator-custody", "assertion":"before root creation reject missing/changed receipt, binary/source/manifest/blob identity, schema/table accounting, corpus registration, sidecars, mutable master, reordered/extra/missing transcript slots or non-single-tape fingerprint invocations; accept distinct actual comparator size without historical equality; candidate historical ceiling remains strict; signed actual difference permits savings only when positive; provenance attribution and effective invocation remain independent inspection requirements", "amendment_sha256":engram::proof::baseline_custody::RECONSTRUCTION_AMENDMENT_SHA256},
