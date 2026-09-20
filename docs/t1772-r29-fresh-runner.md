@@ -10,8 +10,12 @@ output. PDO has approved separate in-process SQL probes, explicitly excluded
 from product wall timing; the frozen baseline binary remains unchanged.
 The exact frozen baseline executable path/hash is now bound by receipt
 art_ebfcc161, SHA-256 `4178f5a1d9d3cfdda476708a3548985bdf850aefcb053715dcb04963784aa329`.
-The baseline snapshot and complete invocation remain pending PO asg_636cc02d;
-no snapshot substitution or rebuild is authorized. Accepted PO amendment art_a24618f6, SHA-256
+The original snapshot is unavailable in inspected custody. Accepted reconstruction
+amendment art_1ee9a1bc / att_6310f382, SHA-256
+`8c7223747f618b9253b6dd956309a2e49caf2f2ec6ba0169ca17dda4a362a63b`, permits a
+separately labeled reconstructed comparator as an alternative identity. Actual
+comparator custody and target invocation are still absent; the amendment does not
+authorize reconstruction or execution. Accepted PO amendment art_a24618f6, SHA-256
 `3ce0623b7ebb575962be92bf1f9f3e94b2195682a4c8f8f5e96e88d24e95c85e`, now permits
 the unchanged baseline to write `query_results` only in disposable staging
 copies. Immutable masters and candidate read-only behavior remain protected.
@@ -24,7 +28,7 @@ and candidate temp observations must be present and zero, including warmups.
 Acceptance is limited to observed named temporary files: unlinked/between-sample
 allocations may be missed, and zero total allocation is never claimed.
 The superseded telemetry hard failure is removed. Exact baseline input/executable
-custody and bound invocation remain missing; this source build is not review-ready.
+database custody and bound invocation remain missing; this source build is not review-ready.
 
 This source is the fresh R29 proof implementation. It is descended from Engram
 candidate `9f8afc65d0b365444446a473c04389adf80bd4b3`; it does not call, wrap, copy,
@@ -116,7 +120,11 @@ reviewed 40-hex commit. No path or other argument is variable:
   --controller-sha256 FULL_CONTROLLER_SHA256 \
   --candidate-binary /Users/mike/.tightbeam/work/d009fb9f2357/engram-t1772-p0/target/release/engram \
   --candidate-binary-sha256 FULL_CANDIDATE_SHA256 \
-  --baseline-binary /Users/mike/src/worktrees/engram-t1772-index-repair/scratch/t1772/engram-baseline-7282151
+  --baseline-binary /Users/mike/src/worktrees/engram-t1772-index-repair/scratch/t1772/engram-baseline-7282151 \
+  --baseline-database /Users/mike/shared-workspace/engram/proofs/t1772/reconstructed-comparator-asg-931d2f4b-r1/master/index.sqlite \
+  --baseline-database-sha256 FULL_COMPARATOR_SHA256 \
+  --comparator-receipt /Users/mike/shared-workspace/engram/proofs/t1772/reconstructed-comparator-asg-931d2f4b-r1/receipt.json \
+  --comparator-receipt-sha256 FULL_COMPARATOR_RECEIPT_SHA256
 ```
 
 The baseline executable path above is the only verified pinned binary, with
@@ -127,14 +135,66 @@ any other path; full hash verification remains mandatory. Protocol evidence bind
 the exact path, hash and receipt identity. This is receipt consumption, not a new
 Eezo check or execution.
 
-The controller still requires `--baseline-database` and
-`--baseline-database-sha256`. Their exact custody and the complete invocation
-remain pending PO asg_636cc02d and PDO disposition; the command above is therefore
-incomplete and must not be launched. The snapshot must have exactly
-120,001,798,144 bytes, and neither may change across execution. They are explicit
-additional custody inputs, not changes to the eleven-entry manifest. No live
-index, differently sized retained database or unapproved rebuilt snapshot can be
-substituted. Source/build evidence does not make this package frozen or review-ready.
+The comparator paths are prospective staging locations, not observed artifacts.
+The command remains unbound until actual target executable hashes, comparator
+hash and receipt hash replace the explicit placeholders. It must not be launched
+under current holds. These are additional custody inputs; the eleven-entry input
+manifest remains unchanged. The original snapshot has not been recovered, and
+bounded searches do not establish universal loss.
+
+### Reconstructed comparator receipt contract
+
+`baseline_custody::verify_comparator` consumes evidence only; it never rebuilds a
+comparator or executes the baseline. It runs before proof-root creation. The
+master must have its own exact actual bytes/hash, be at the canonical path above,
+have a read-only file and containing directory, and have no WAL/SHM/journal.
+Existing schema-v3 inspection verifies schema and typed, rowid-ordered digests
+for all seven tables. Registered tape IDs must exactly equal the frozen corpus.
+The receipt and its supporting artifacts are retained under the comparator root
+and covered by the controller's full immutable pre/post custody observations.
+
+The receipt uses the common canonical JSON/LF bytes and these required fields:
+
+* `identity`: `reconstructed-pinned-baseline-v1`; `amendment_sha256`: the accepted
+  reconstruction hash; `binary_path`, `binary_sha256`, `source_revision`: the
+  pinned baseline identities above; `tape_manifest_sha256`: unchanged
+  `29800d70e6812b446581c1f505ddd1b78c25effcd76a8c467c892553913f5757`.
+* `database_path`, `database_sha256`, `database_bytes`: actual master custody;
+  `snapshot_state`: `checkpointed-closed-master-no-sidecars`; `accounting`:
+  `schema`, `user_version`, `tables` in the existing `snapshot` representation.
+* `historical_snapshot_status`: `unavailable in inspected custody`;
+  `historical_tool_message_postings_replay_delta`: 87711;
+  `unexplained_corpus_or_semantic_differences`: empty array;
+  `size_shaping_performed`: false. A hash-bound nonempty `provenance` artifact
+  (`path`, `sha256`) must attribute the reconstruction and explain actual
+  differences, including the T1771 replay policy delta. Semantic adequacy of that
+  explanation remains an independent inspection requirement, not a parsed fact.
+* `build_transcript`: a `path`/`sha256` reference to canonical JSONL below the
+  comparator root, exactly 45,758 rows in frozen manifest order. Each row binds
+  zero-based `ordinal`, `tape_id`, `source_path`, `source_blob_sha256`,
+  `visible_tape_ids: [tape_id]`, exact `argv: [BASELINE_BINARY_PATH, "fingerprint"]`,
+  canonical staging `cwd`, `environment_cleared: true`, complete string-valued
+  `environment`, hash-bound `config: {path, sha256}`, `exit_code: 0`, parsed
+  `stdout` and string `stderr`. The parsed baseline stdout must report `ok`, one
+  scanned/fingerprinted tape, zero skipped/failures and an empty failures array.
+
+The pinned `fingerprint` CLI enumerates `cwd/.engram/tapes` without sorting, so
+each recorded invocation must expose exactly one tape in that staging directory,
+in manifest order, retaining one staging database across invocations. This is a
+receipt contract for later authorized construction, not construction tooling.
+Raw transcript capture/attribution and the effective config/environment must be
+independently inspected before execution permission. The verifier checks every
+compressed source blob hash and normalized content SHA against its tape ID,
+without re-normalization. It hashes and reads artifacts; it does not replay logs
+or infer that a declaration alone proves how a process ran.
+
+The candidate still must be smaller than the **historical ceiling of
+120,001,798,144 bytes**. No comparator equality with that number is required.
+The summary reports actual comparator bytes minus candidate bytes (signed), and
+permits a comparator savings claim only for a positive result. It never claims
+historical layout/latency identity or live reclamation. Each performance record
+binds receipt and amendment hashes and labels the comparison `reconstructed
+pinned-baseline versus candidate`; baseline/candidate slot names remain stable.
 
 ## Measurement correction
 
@@ -153,7 +213,7 @@ timed separately; they can warm the filesystem cache. No OS purge is claimed.
 Candidate database and containing directory are read-only, with exact file and
 directory custody after every product/probe slot. Completed disposable copies
 created by this run are removed only after custody is saved; failed copies remain.
-`protocol-r3.json` identifies the original manifest and both accepted amendment hashes
+`protocol-r4.json` identifies the original manifest and all three accepted amendment hashes
 without rewriting either. Raw stdout/stderr, argv/environment, exit status, wall time, Darwin
 `/usr/bin/time -l` maximum RSS and dedicated SQLite-temp directory samples are
 retained. Parsed product output is also saved under the canonical JSON/LF
@@ -167,7 +227,7 @@ projection exactly; discrepancy evidence retains actual and expected arrays.
 The pinned baseline is unchanged and gets this environment value set to zero.
 Its raw output/result metadata remains retained. Its merged/truncated session
 output cannot be honestly classified as a complete direct-touch projection;
-each slot reports that unavailable projection and retains the historical output
+each slot reports that unavailable projection and retains the reconstructed baseline output
 without claiming direct-touch equality. This limitation no longer independently
 fails the amended gate under PDO's current direction.
 

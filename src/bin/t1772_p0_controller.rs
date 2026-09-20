@@ -54,6 +54,10 @@ struct Args {
     baseline_database: PathBuf,
     #[arg(long)]
     baseline_database_sha256: String,
+    #[arg(long)]
+    comparator_receipt: PathBuf,
+    #[arg(long)]
+    comparator_receipt_sha256: String,
 }
 
 struct LifecycleWriter {
@@ -145,13 +149,21 @@ fn run() -> ProofResult<()> {
 
     validate_source_checkout(&args)?;
     validate_executables(&args)?;
+    let comparator = engram::proof::baseline_custody::verify_comparator(
+        &args.baseline_database,
+        &args.baseline_database_sha256,
+        &args.comparator_receipt,
+        &args.comparator_receipt_sha256,
+        &args.input_root,
+        &args.tape_root,
+    )?;
 
     // Full immutable input custody is observed while PROOF_ROOT is still absent.
     let custody_roots = vec![
         args.input_root.clone(),
         args.tape_root.clone(),
         args.baseline_binary.clone(),
-        args.baseline_database.clone(),
+        PathBuf::from(engram::proof::baseline_custody::COMPARATOR_ROOT),
     ];
     let immutable_pre = collect_custody(&custody_roots)?;
     let capacity_before = capacity(&args.proof_root.parent().ok_or("proof root has no parent")?)?;
@@ -165,6 +177,12 @@ fn run() -> ProofResult<()> {
     for relative in ["logs", "manifests", "controller", "publication"] {
         fs::create_dir(args.proof_root.join(relative))?;
     }
+    write_canonical_json(
+        &args
+            .proof_root
+            .join("manifests/reconstructed-comparator.json"),
+        &comparator,
+    )?;
     // Immutable/input checks still precede root creation. Live CoW captures need
     // their staging directory and complete before any runner staging read.
     let live_pre = observe_live_paths(
@@ -454,11 +472,6 @@ fn validate_executables(args: &Args) -> ProofResult<()> {
     if args.baseline_database.canonicalize()? == args.live_index.canonicalize()? {
         return Err("baseline must be a frozen non-live database, not the live index".into());
     }
-    if sha256_file(&args.baseline_database)? != args.baseline_database_sha256
-        || fs::metadata(&args.baseline_database)?.len() != t1772::BASELINE_BYTES
-    {
-        return Err("baseline snapshot custody mismatch".into());
-    }
     let current = std::env::current_exe()?;
     for (name, path, expected) in [
         (
@@ -507,6 +520,10 @@ fn runner_argv(args: &Args) -> Vec<String> {
         args.baseline_database.to_string_lossy().into_owned(),
         "--baseline-database-sha256".into(),
         args.baseline_database_sha256.clone(),
+        "--comparator-receipt".into(),
+        args.comparator_receipt.to_string_lossy().into_owned(),
+        "--comparator-receipt-sha256".into(),
+        args.comparator_receipt_sha256.clone(),
     ]
 }
 

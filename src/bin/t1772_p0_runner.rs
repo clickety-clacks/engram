@@ -52,6 +52,10 @@ struct Args {
     baseline_database: PathBuf,
     #[arg(long)]
     baseline_database_sha256: String,
+    #[arg(long)]
+    comparator_receipt: PathBuf,
+    #[arg(long)]
+    comparator_receipt_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -106,6 +110,12 @@ fn run() -> ProofResult<()> {
     // The reviewed controller observes this post-exec stop, records csops, and
     // resumes with Darwin SIGCONT 19. No proof output is opened before resume.
     suspend_for_controller()?;
+    let comparator = engram::proof::baseline_custody::read_comparator_receipt(
+        &args.baseline_database,
+        &args.baseline_database_sha256,
+        &args.comparator_receipt,
+        &args.comparator_receipt_sha256,
+    )?;
 
     let runner_root = args.proof_root.join("runner");
     fs::create_dir(&runner_root)?;
@@ -149,7 +159,7 @@ fn run() -> ProofResult<()> {
     validate_counts(&reports[0].counts)?;
     if reports[0].bytes >= BASELINE_BYTES {
         return Err(format!(
-            "candidate database {} is not below baseline {BASELINE_BYTES}",
+            "candidate database {} is not below historical ceiling {BASELINE_BYTES}",
             reports[0].bytes
         )
         .into());
@@ -188,6 +198,8 @@ fn run() -> ProofResult<()> {
             baseline_binary: &args.baseline_binary,
             baseline_database: &args.baseline_database,
             baseline_database_sha256: &args.baseline_database_sha256,
+            comparator_receipt: &comparator,
+            comparator_receipt_sha256: &args.comparator_receipt_sha256,
             candidate_binary: &args.candidate_binary,
             candidate_database: &runner_root.join("rebuild-1/index.sqlite"),
             tape_root: &args.tape_root,
@@ -213,7 +225,10 @@ fn run() -> ProofResult<()> {
         "canonical_bytes_contract": t1772::CANONICAL_BYTES_CONTRACT,
         "counts": reports[0].counts,
         "rebuilds_logically_identical": true,
-        "candidate_bytes_below_baseline": true,
+        "candidate_bytes_below_historical_ceiling": true,
+        "reconstruction_amendment_sha256":engram::proof::baseline_custody::RECONSTRUCTION_AMENDMENT_SHA256,
+        "comparator_receipt_sha256":args.comparator_receipt_sha256,
+        "size_comparison":engram::proof::baseline_custody::size_comparison(reports[0].bytes, comparator["database_bytes"].as_u64().ok_or("comparator bytes absent")?),
         "elapsed_milliseconds": started.elapsed().as_millis(),
         "no_live_write_targets": true,
         "publication_performed": false
@@ -632,7 +647,8 @@ fn write_test_definitions(path: &Path) -> ProofResult<()> {
                 {"id":"exact-accounting", "assertion":"all frozen cardinalities, per-tape CSV rows, and 14,369 dispatch rows match"},
                 {"id":"query-equivalence", "assertion":"12 fixed direct-touch projections exactly equal the frozen oracle"},
                 {"id":"read-only-plan", "assertion":"feature lookup uses posting/window keys without full evidence scan or temporary B-tree"},
-                {"id":"performance", "assertion":"12 identical manifest queries, both binaries, hot and filesystem-cold; 3 warmups and 30 measured fresh processes each, alternating order; raw RSS/elapsed and p50/p95/p99 thresholds retained; baseline CLI counters unavailable/non-comparable, never substituted; every candidate warmup/measured slot requires full ordered same-invocation oracle equality, bound per-statement direct-touch probe coverage with SORT=0/AUTOINDEX=0, and successful zero-observed-temp evidence; retain collector paths/interval/gaps/errors and unlinked/between-sample limitations, never claim zero total temp allocation", "telemetry_amendment_sha256":engram::proof::performance::TELEMETRY_AMENDMENT_SHA256},
+                {"id":"performance", "assertion":"reconstructed pinned-baseline versus candidate: 12 identical manifest queries, both binaries, hot and filesystem-cold; 3 warmups and 30 measured fresh processes each, alternating order; raw RSS/elapsed and p50/p95/p99 thresholds retained; baseline CLI counters unavailable/non-comparable, never substituted; every candidate warmup/measured slot requires full ordered same-invocation oracle equality, bound per-statement direct-touch probe coverage with SORT=0/AUTOINDEX=0, and successful zero-observed-temp evidence; retain collector paths/interval/gaps/errors and unlinked/between-sample limitations, never claim zero total temp allocation", "telemetry_amendment_sha256":engram::proof::performance::TELEMETRY_AMENDMENT_SHA256},
+                {"id":"reconstructed-comparator-custody", "assertion":"before root creation reject missing/changed receipt, binary/source/manifest/blob identity, schema/table accounting, corpus registration, sidecars, mutable master, reordered/extra/missing transcript slots or non-single-tape fingerprint invocations; accept distinct actual comparator size without historical equality; candidate historical ceiling remains strict; signed actual difference permits savings only when positive; provenance attribution and effective invocation remain independent inspection requirements", "amendment_sha256":engram::proof::baseline_custody::RECONSTRUCTION_AMENDMENT_SHA256},
                 {"id":"concurrency", "assertion":"real multi-posting open_reader snapshot held >=60s through 100 actual frozen-tape ingest commits at fixed cadence; interval passive checkpoints; repeat short-query loop; exact error histogram/no retries, commit percentiles, WAL maximum and final checkpoint"},
                 {"id":"peak-staging", "assertion":"controller continuously samples staged file sizes and allocated blocks every requested 100ms across operation; preserve raw samples, maximum gap and observed peaks; join sampler before output hashing"},
                 {"id":"custody", "assertion":"controller repeats full immutable input custody and admits publication only after comparison"},

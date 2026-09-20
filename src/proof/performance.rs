@@ -1,9 +1,7 @@
 //! Frozen-manifest ordinary CLI measurements. Missing observations fail closed.
 use super::baseline_custody;
 use super::measurement::{DiskSampler, percentiles};
-use super::t1772::{
-    BASELINE_BYTES, ProofResult, sha256_file, write_canonical_json, write_new_file,
-};
+use super::t1772::{ProofResult, sha256_file, write_canonical_json, write_new_file};
 use serde_json::{Value, json};
 use std::fs::{self, File};
 use std::path::Path;
@@ -41,6 +39,8 @@ pub struct Inputs<'a> {
     pub baseline_binary: &'a Path,
     pub baseline_database: &'a Path,
     pub baseline_database_sha256: &'a str,
+    pub comparator_receipt: &'a Value,
+    pub comparator_receipt_sha256: &'a str,
     pub candidate_binary: &'a Path,
     pub candidate_database: &'a Path,
     pub tape_root: &'a Path,
@@ -58,7 +58,8 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
     )?;
     if sha256_file(inputs.baseline_binary)? != BASELINE_BINARY_SHA256
         || sha256_file(inputs.baseline_database)? != inputs.baseline_database_sha256
-        || fs::metadata(inputs.baseline_database)?.len() != BASELINE_BYTES
+        || Some(fs::metadata(inputs.baseline_database)?.len())
+            != inputs.comparator_receipt["database_bytes"].as_u64()
     {
         return Err("baseline binary/database custody mismatch".into());
     }
@@ -88,9 +89,13 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
         sha256_file(databases[1])?,
     ];
     write_canonical_json(
-        &root.join("protocol-r3.json"),
+        &root.join("protocol-r4.json"),
         &json!({
-        "version":3,"parent_manifest_sha256":manifest_hash,
+        "version":4,"parent_manifest_sha256":manifest_hash,
+        "comparison_label":baseline_custody::COMPARISON_LABEL,
+        "reconstruction_amendment_sha256":baseline_custody::RECONSTRUCTION_AMENDMENT_SHA256,
+        "comparator_receipt_sha256":inputs.comparator_receipt_sha256,
+        "comparator":inputs.comparator_receipt,
         "parent_spec_sha256":"df43b6e63184d2e02803905b841dc46f5b6f3d0573c3b5a6ee68ca7d0ea81bea",
         "expected_projection_sha256":"417d3aeabaf80a2196b51c3f0b7dad5381903a06d4017b7960410203100d3b31",
         "amendment_sha256":baseline_custody::AMENDMENT_SHA256,
@@ -104,7 +109,7 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
         "candidate_policy":"database and its directory read-only; exact hash and directory custody after every slot",
         "cache_limit":"copy/hash/custody reads can warm filesystem cache; filesystem-cold means a fresh copy, never cache eviction",
         "baseline_cli_counters":"unavailable / non-comparable; no counter improvement comparison permitted",
-        "baseline_projection":"raw historical output retained; separate direct projection unavailable; no result-equivalence claim",
+        "baseline_projection":"raw reconstructed comparator output retained; legacy CLI semantics; separate direct projection unavailable; no result-equivalence claim",
         "candidate_counter_requirement":"each bound direct-touch SQL probe statement SORT=0 and AUTOINDEX=0",
         "temporary_byte_requirement":"candidate observed bytes=0; incomplete coverage accepted under telemetry amendment",
         "temporary_byte_limitation":TEMP_LIMITATION}),
@@ -191,6 +196,9 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
                     let anchors =
                         crate::query::format::derive_anchor_candidates(&[target.to_string()]);
                     let binding = json!({"query_id":id,"variant":label,"cache_class":mode,
+                        "comparison_label":baseline_custody::COMPARISON_LABEL,
+                        "reconstruction_amendment_sha256":baseline_custody::RECONSTRUCTION_AMENDMENT_SHA256,
+                        "comparator_receipt_sha256":inputs.comparator_receipt_sha256,
                         "phase":if warmup {"warmup"} else {"measured"},
                         "iteration":if warmup {iteration} else {iteration - 3},
                         "schedule_iteration":iteration,"order_in_pair":order,
@@ -282,6 +290,9 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
         &root.join("result.json"),
         &json!({
         "passed":all_passed,"manifest_sha256":manifest_hash,
+        "comparison_label":baseline_custody::COMPARISON_LABEL,
+        "reconstruction_amendment_sha256":baseline_custody::RECONSTRUCTION_AMENDMENT_SHA256,
+        "comparator_receipt_sha256":inputs.comparator_receipt_sha256,
         "baseline_copy_amendment_sha256":baseline_custody::AMENDMENT_SHA256,
         "telemetry_amendment_sha256":TELEMETRY_AMENDMENT_SHA256,
         "acceptance_scope":"amended performance protocol; not an exhaustive telemetry or baseline result-equivalence claim",
@@ -507,7 +518,7 @@ fn measure(
         &json!({
         "binding":binding,"expected":expected_touches,"actual":actual,
         "candidate_exact":if baseline {Value::Null}else{json!(exact)},
-        "status":if baseline {"unavailable: frozen CLI merges direct and lineage sessions and may truncate; historical output retained, no direct-equivalence claim"}else if exact{"exact"}else{"mismatch"},
+        "status":if baseline {"unavailable: frozen CLI merges direct and lineage sessions and may truncate; reconstructed comparator output retained, no direct-equivalence claim"}else if exact{"exact"}else{"mismatch"},
         "baseline_legacy_semantics":if baseline {json!("v3 feature fanout plus lineage/session formatting; raw result_id/rating_hint retained, write costs included; differences are not classified as correctness success")}else{Value::Null},
         "elapsed_microseconds":validation_started.elapsed().as_micros()}),
     )?;
@@ -524,7 +535,7 @@ fn measure(
         "collector_setup_postprocessing_probe_microseconds":measurement_started.elapsed().as_micros().saturating_sub(elapsed as u128),
         "counter_scope":super::statement_probe::COUNTER_SCOPE,
         "candidate_direct_touch_exact":if baseline {Value::Null}else{json!(exact)},
-        "baseline_projection_status":if baseline {json!("unavailable; historical output retained without direct-equivalence claim")}else{Value::Null},
+        "baseline_projection_status":if baseline {json!("unavailable; reconstructed comparator output retained without direct-equivalence claim")}else{Value::Null},
         "actual_cli_statement_counters":{"status":"unavailable / non-comparable","sort":null,"autoindex":null,
             "source_revision":binding["product_source_revision"],"binary_sha256":binding["product_binary_sha256"]},
         "complete_temporary_bytes":Value::Null,
