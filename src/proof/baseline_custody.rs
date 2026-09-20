@@ -1,4 +1,4 @@
-//! Only the frozen v3 baseline's disposable-copy exception (PO amendment r1).
+//! Frozen v3 baseline: reconstructed-master custody and disposable-copy exception.
 use super::t1772::{ProofResult, canonical_json_lf, collect_custody};
 use rusqlite::{Connection, OpenFlags, types::ValueRef};
 use serde_json::{Value, json};
@@ -139,12 +139,12 @@ pub fn verify_comparator(
     };
     artifact("provenance")?; // Attributable historical-difference explanation; review remains required.
     let log = artifact("build_transcript")?;
-    let mut lines = BufReader::new(std::fs::File::open(log)?).split(b'\n');
+    let mut transcript = BufReader::new(std::fs::File::open(log)?);
     for (ordinal, id) in ids.iter().enumerate() {
-        let mut bytes = lines
-            .next()
-            .ok_or("reconstruction transcript truncated")??;
-        bytes.push(b'\n');
+        let mut bytes = Vec::new();
+        if transcript.read_until(b'\n', &mut bytes)? == 0 || bytes.last() != Some(&b'\n') {
+            return Err("reconstruction transcript truncated or missing LF".into());
+        }
         let row: Value = serde_json::from_slice(&bytes)?;
         let cwd = Path::new(row["cwd"].as_str().ok_or("build cwd missing")?);
         let env = row["environment"]
@@ -195,7 +195,7 @@ pub fn verify_comparator(
             return Err("comparator build configuration custody invalid".into());
         }
     }
-    if lines.next().is_some() || t1772::sha256_file(db)? != db_sha {
+    if !transcript.fill_buf()?.is_empty() || t1772::sha256_file(db)? != db_sha {
         return Err("comparator transcript has extra slots or master changed".into());
     }
     Ok(value)
