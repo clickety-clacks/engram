@@ -203,37 +203,74 @@ binaries. Each hot/filesystem-cold class has three fresh-process warmups and
 thirty measured fresh-process iterations per binary/query. Order alternates by
 query and iteration. Each hot query series has its own baseline working copy,
 shared through that series' three warmups and thirty measured processes. Cold
-slots receive fresh initially byte-identical copies. Baseline copies use Darwin
-CoW cloning with no byte-copy fallback. All 396 cold baseline clones and their
-initial full hashes are prepared before any CLI timing; each remains unused until
-its assigned slot. Hot baseline clones are prepared at their query-series boundary.
-Only baseline copies are writable. Each full initial clone hash must equal the
-identified master. Schema and seven-table initial logical state are inherited
-from the controller's independently verified, hash-bound comparator receipt.
-No initial per-copy logical rescan is needed to establish byte-identical state.
+slots receive fresh initially identical copies of their identified master. Accepted
+cold-baseline amendment art_76f62142 / att_2fd6729a, SHA-256
+`afeac1430bdbbade5c46e27eff440972d61176fc920cd38ad84b5a5570d4cf9e`, changes only
+cold baseline evidence. It is composed with the three prior amendments.
 
-Hot baseline slots bind the series initial/post custody paths; intermediate mutable
-per-slot hashes are explicitly unobserved/null. After each hot series there is one
-full logical/schema and file-custody check. Cold baseline post hashes, WAL/SHM and
-logical/schema validation are deferred until **all** timed query/mode series have
-finished. Every cold copy still receives its own complete post check, and any
-unexplained schema/non-query_results change fails before performance acceptance.
-Copies are retained until validation succeeds. No required per-copy hash or
-post logical check was waived. Preparation, file hashing and logical-validation
-times are recorded separately; all staging storage stays under the existing sampler.
+Hot baseline clones retain complete pre/post file hashes and post-series
+schema/seven-table checks against the controller-verified master. Full initial
+hash equality supports inheritance of that verified master's initial logical
+state; intermediate mutable hot-slot hashes remain unobserved/null.
+
+Each cold baseline clone is created immediately before its assigned warmup or
+measured CLI. An actual APFS `fclonefileat` result is recorded from a read-only
+`O_NOFOLLOW` master descriptor. Master file/directory must be protected, source
+sidecars absent, source descriptor/path metadata stable across cloning, and both
+filesystems APFS. The new destination must be a distinct regular-file inode on
+that device, with one link and the master's size. There is no hard-link, stale-copy
+or byte-copy fallback. Failure/missing receipt fails the gate. Raw clone results,
+source/destination metadata, descriptor identity, elapsed time and the master
+receipt/hash are bound to the precise query/cache/phase/iteration/order and
+product/configuration identity. The clone receipt's configuration expectation
+links to the actual config file/hash retained in the completed process record.
+
+**Cold-copy initial identity is clone-derived; no independent per-copy full-file
+hash. Complete post-mutation byte identity and unchanged provenance tables/schema
+were not independently measured per copy.** Cold measured-copy hash and logical-
+validation fields are null; a master hash is never substituted. Every relevant
+protocol/binding/observation/summary and controller eligibility record carries the
+amendment and/or explicit limitation. A hot-series check does not validate a cold
+copy's post-state.
+
+After each cold invocation, retain metadata-only database/directory and explicit
+WAL/SHM/journal presence/absence, raw stdout/stderr/exit status, configuration,
+canonical output and projection evidence. Unexpected entries, file replacement,
+mode/link/device changes, unexplained truncation, unsupported sidecar identity,
+missing process/config binding or failed CLI remain failures. Other size/time and
+SQLite sidecar effects are explained by the pinned write contract, with the lack
+of exhaustive observation explicit. Post metadata is attempted even on product
+failure; failed copies remain. Successful owned copies are released after their
+records are saved, using the existing disposal authority and entry safety checks.
+
+The cited write contract is source
+`72821518037a9d896f0b4d784fee146800902e78`:
+`src/query/format.rs::emit_query_result` (file SHA-256
+`b127b370531f2d94af2d21e5937267d2d157af1491e3680979140977ec98fc48`) calls
+`src/index/mod.rs::record_query_result` (file SHA-256
+`ad18827f34e4f6e79ec75ca54e513a7afa379e74db79e3b000786de9b5afb0b9`), which checks
+existing feedback schema and performs `INSERT OR REPLACE` into `query_results`.
+Master preflight requires the existing full baseline-compatible schema; metrics
+are disabled in the isolated CLI config. This is source-backed allowed behavior,
+not observed proof that every cold copy preserved all application tables.
 
 Candidate copies still get full database/directory custody before and after every
-complete CLI/direct-probe slot. The initial hash is extracted from the existing
-file-custody record instead of independently rereading the database. The separate
-post-CLI hash was redundant with post-slot custody and is removed. Cleanup still
-rejects unexpected entries/symlinks, but no longer hashes a file again immediately
-before deleting an owned, successfully validated copy. Failed copies remain.
+complete CLI/direct-probe slot, exact oracle projection every warmup/measurement,
+and read-only permissions. Master hash checks remain at their required boundaries.
 Whole-CLI timing still includes baseline initialization and feedback writes.
-Candidate copy/hashing and its direct probe still condition the cache between
-slots. Baseline clone/hash preparation warms source pages; fresh CoW copies can
-share cached pages. No OS-cache eviction or cache-neutral timing is claimed.
+All clone preparation, metadata/hash/logical checks and validation stay outside
+CLI wall timing; staging storage remains covered by the existing sampler.
 
-`protocol-r5.json` identifies the original manifest and all three accepted amendment hashes
+The declared preparation order is now per-slot cold clone/metadata, CLI, then
+metadata/output validation; no content pre-read is added for cold baseline copies.
+Fresh CoW pages may share the master's cache. Candidate copy/hashes/direct probes
+and hot boundary scans still condition caches. “Filesystem-cold” remains only the
+manifest's fresh-copy fallback class; no OS-cache eviction, independently cold
+page cache or stronger cold-state claim is made by omitting baseline hashing.
+This changed preparation order and its asymmetric residual cache effects remain
+explicit choices for independent technical review.
+
+`protocol-r6.json` identifies the original manifest and all four accepted amendment hashes
 without rewriting either. Raw stdout/stderr, argv/environment, exit status, wall time, Darwin
 `/usr/bin/time -l` maximum RSS and dedicated SQLite-temp directory samples are
 retained. Parsed product output is also saved under the canonical JSON/LF
@@ -265,24 +302,23 @@ metrics/hashes are unavailable/null, including summaries; they are never empty
 sums reported as zero. Counters remain separate SQL-probe observations excluded
 from CLI timing, never observations inside the frozen CLI.
 
-`runner/performance/io-plan.json` quantifies the fixed successful-path counts
-using actual B (comparator master bytes) and C (candidate master bytes): 816B
-baseline working-file hash bytes before growth/sidecars, 1,584C candidate hash
-bytes, 408 baseline CoW clones, 408 candidate byte copies (408C read and 408C
-written), and 408 seven-table post logical passes plus the one verified master
-pass. Clause 4 still requires 792 cold baseline hashes. At the historical size
-reference that cold floor alone is 95.041424130048 TB; the implementation does
-not remove it or treat that historical size as actual reconstructed bytes.
+`runner/performance/io-plan.json` uses actual B (comparator bytes) and C
+(candidate bytes) to report the amended plan: 24B hot baseline working-file hash
+bytes before growth/sidecars; 1,584C candidate slot hash bytes; zero cold baseline
+full-file hashes and zero cold logical scans; 12 hot post seven-table passes plus
+one independently verified master pass; 408 baseline CoW clones; and 408 candidate
+byte copies (408C read and written each). Candidate and all master/corpus/output
+custody costs remain. These savings are observer overhead, not CLI speedups.
 
-Peak retained baseline working databases reach 397 (396 cold plus one hot),
-with an additional candidate working copy: at least 397B+C logical bytes before
-growth, sidecars, both rebuilds, concurrency copies, masters and raw artifacts.
-CoW blocks are shared, so logical size and the sampler's allocated-block sum do
-not establish unique physical allocation. This is a quantified cost tradeoff
-for independent technical review, not certification or a feasibility claim.
-The rejected alternatives are per-slot logical scans, which pollute later timings;
-per-query cold post scans, which affect later query series; and dropping cold
-hashes/post logical evidence, which would require a successor amendment.
+Before this amendment the 792 cold full hashes alone cost 792B logical reads,
+illustratively 95.041424130048 TB at the historical reference size. Actual B is
+not inferred from that reference. The cold clones no longer need batch retention:
+peak working databases return to one baseline plus one candidate (B+C logical
+bytes before growth), in addition to both rebuilds, two concurrency copies,
+masters, live clones and raw evidence. CoW sharing means named allocated-block
+sums are not unique physical storage; source arithmetic is not measured device I/O.
+The amendment accepts weaker cold baseline evidence; it does not certify this
+implementation, observed conformance, timing comparability or readiness.
 
 `proof/concurrency.rs` makes two independent disposable v4 copies. Before each
 pass it removes the first hundred frozen tape IDs and their derived records from

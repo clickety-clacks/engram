@@ -4,7 +4,7 @@ use super::measurement::{DiskSampler, percentiles};
 use super::t1772::{ProofResult, sha256_file, write_canonical_json, write_new_file};
 use serde_json::{Value, json};
 use std::fs::{self, File};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
@@ -89,11 +89,13 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
         sha256_file(databases[1])?,
     ];
     write_canonical_json(
-        &root.join("protocol-r5.json"),
+        &root.join("protocol-r6.json"),
         &json!({
-        "version":5,"parent_manifest_sha256":manifest_hash,
+        "version":6,"parent_manifest_sha256":manifest_hash,
         "comparison_label":baseline_custody::COMPARISON_LABEL,
         "reconstruction_amendment_sha256":baseline_custody::RECONSTRUCTION_AMENDMENT_SHA256,
+        "cold_custody_amendment_sha256":baseline_custody::COLD_AMENDMENT_SHA256,
+        "cold_copy_limitation":baseline_custody::COLD_LIMITATION,
         "comparator_receipt_sha256":inputs.comparator_receipt_sha256,
         "comparator":inputs.comparator_receipt,
         "parent_spec_sha256":"df43b6e63184d2e02803905b841dc46f5b6f3d0573c3b5a6ee68ca7d0ea81bea",
@@ -104,10 +106,10 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
         "baseline_binary_sha256":BASELINE_BINARY_SHA256,
         "baseline_binary_path":BASELINE_BINARY_PATH,
         "baseline_executable_custody":{"artifact":"art_ebfcc161","sha256":BASELINE_EXECUTABLE_CUSTODY_SHA256},
-        "preparation_order":"prepare/hash all 396 baseline cold clones before any timed CLI; hot baseline pre/post custody once per series; candidate pre/post custody each complete CLI/probe slot; cold baseline post-custody after entire timing matrix",
-        "baseline_policy":"one writable CoW clone per hot series and one per cold slot; full pre/post file hashes retained; byte-equal initial copies inherit verified master logical state; each completed copy receives full post logical validation; only query_results may change",
+        "preparation_order":"hot baseline pre/post full custody once per series; fresh cold baseline APFS clone and metadata immediately before its assigned CLI, metadata after it; candidate pre/post full custody each complete CLI/direct-probe slot",
+        "baseline_policy":"hot series retains full pre/post hashes and logical check; cold copies use recorded APFS clone-derived identity and post metadata/source contract only; only query_results may change",
         "candidate_policy":"database and its directory read-only; exact hash and directory custody after every slot",
-        "cache_limit":"all cold baseline clone/hash preparation precedes timing; baseline post scans occur at hot-series boundaries or after the entire cold matrix; candidate slot custody and direct probes still warm cache; fresh CoW copy is not OS cache eviction and may share cached source pages",
+        "cache_limit":"cold baseline clone/metadata preparation immediately precedes its own CLI with no content pre-read; candidate slot hashes/direct probes and hot boundary scans still condition cache; fresh CoW copy may share cached pages and does not prove OS/filesystem cache eviction",
         "baseline_cli_counters":"unavailable / non-comparable; no counter improvement comparison permitted",
         "baseline_projection":"raw reconstructed comparator output retained; legacy CLI semantics; separate direct projection unavailable; no result-equivalence claim",
         "candidate_counter_requirement":"each bound direct-touch SQL probe statement SORT=0 and AUTOINDEX=0",
@@ -122,20 +124,6 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
         &root.join("baseline-master-accounting.json"),
         master_accounting,
     )?;
-    let mut deferred_baseline: Vec<(PathBuf, PathBuf)> = Vec::new();
-    for query in manifest["queries"].as_array().ok_or("queries absent")? {
-        let id = query["id"].as_str().ok_or("query ID absent")?;
-        super::t1772::safe_relative_path(id)?;
-        let query_root = root.join(id).join("filesystem-cold");
-        fs::create_dir_all(&query_root)?;
-        for iteration in 0..33 {
-            let slot = query_root.join(format!("{iteration:02}-baseline"));
-            fs::create_dir(&slot)?;
-            let db = slot.join("copy/database.sqlite");
-            prepare_baseline(inputs, &db, &slot)?;
-            deferred_baseline.push((db, slot));
-        }
-    }
     let mut comparisons = Vec::new();
     let mut all_passed = true;
     for (query_index, query) in manifest["queries"]
@@ -181,9 +169,7 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
                 {
                     let label = ["baseline", "candidate"][variant];
                     let run_root = query_root.join(format!("{iteration:02}-{label}"));
-                    if mode != "filesystem-cold" || variant != 0 {
-                        fs::create_dir(&run_root)?;
-                    }
+                    fs::create_dir(&run_root)?;
                     let prepare_start = Instant::now();
                     let cold = run_root.join("copy/database.sqlite");
                     let db = if mode == "filesystem-cold" {
@@ -222,14 +208,16 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
                     let binding = json!({"query_id":id,"variant":label,"cache_class":mode,
                         "comparison_label":baseline_custody::COMPARISON_LABEL,
                         "reconstruction_amendment_sha256":baseline_custody::RECONSTRUCTION_AMENDMENT_SHA256,
+        "cold_custody_amendment_sha256":baseline_custody::COLD_AMENDMENT_SHA256,
+        "cold_copy_limitation":baseline_custody::COLD_LIMITATION,
                         "comparator_receipt_sha256":inputs.comparator_receipt_sha256,
                         "phase":if warmup {"warmup"} else {"measured"},
                         "iteration":if warmup {iteration} else {iteration - 3},
                         "schedule_iteration":iteration,"order_in_pair":order,
                         "database_path":db,"master_database_sha256":database_hashes[variant],
-                        "database_sha256":if variant == 0 && mode == "hot" {Value::Null}else{json!(database_hashes[variant])},
+                        "database_sha256":if variant == 0 {Value::Null}else{json!(database_hashes[variant])},
                         "initial_custody_path":initial_custody_path,
-                        "database_identity_scope":if variant == 0 && mode == "hot" {"series initial hash; mutable intermediate slot hash not observed"}else{"fresh or read-only copy pre-slot hash"},
+                        "database_identity_scope":if variant == 0 {if mode == "hot" {"series initial hash; mutable intermediate slot hash not observed"}else{"clone-derived initial identity; no independent per-copy full-file hash"}}else{"read-only copy observed pre-slot hash"},
                         "post_custody_path":if variant == 0 {if mode == "hot" {query_root.join("custody-after.json")}else{run_root.join("custody-after.json")}}else{run_root.join("custody-after-slot.json")},
                         "amendment_sha256":baseline_custody::AMENDMENT_SHA256,
                         "telemetry_amendment_sha256":TELEMETRY_AMENDMENT_SHA256,
@@ -239,6 +227,10 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
                         "probe_source_revision":if variant == 1 {json!(source_revision)}else{Value::Null},
                         "probe_binary_sha256":if variant == 1 {json!(probe_binary_hash)}else{Value::Null},
                         "collector_source_revision":source_revision,"collector_binary_sha256":probe_binary_hash});
+                    let cold_baseline = variant == 0 && mode == "filesystem-cold";
+                    if cold_baseline {
+                        prepare_cold_baseline(inputs, db, &run_root, &binding)?;
+                    }
                     let observation = measure(
                         binaries[variant],
                         db,
@@ -248,6 +240,19 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
                         &binding,
                         expected_touches,
                     );
+                    // Observe post-state even when the CLI/validation failed; retain the copy on any failure.
+                    let cold_custody = if cold_baseline {
+                        finish_cold_baseline(db, &run_root, &binding)
+                    } else {
+                        Ok(())
+                    };
+                    if let Err(error) = &cold_custody {
+                        write_canonical_json(
+                            &run_root.join("cold-custody-failure.json"),
+                            &json!({"binding":binding,"error":error.to_string(),
+                                "product_error":observation.as_ref().err().map(|e|e.to_string())}),
+                        )?;
+                    }
                     let observation = match observation {
                         Ok(row) => row,
                         Err(error) => {
@@ -261,6 +266,7 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
                             return Err(error);
                         }
                     };
+                    cold_custody?;
                     write_canonical_json(
                         &run_root.join("observation.json"),
                         &json!({
@@ -289,7 +295,7 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
                     if !warmup {
                         measured[variant].push(observation);
                     }
-                    if mode == "filesystem-cold" && variant == 1 {
+                    if mode == "filesystem-cold" {
                         discard_own_copy(db)?;
                     }
                 }
@@ -318,10 +324,6 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
             }
         }
     }
-    for (db, slot) in deferred_baseline {
-        finish_baseline(&db, &slot, master_accounting)?;
-        discard_own_copy(&db)?;
-    }
     for variant in 0..2 {
         if sha256_file(databases[variant])? != database_hashes[variant]
             || sha256_file(binaries[variant])? != binary_hashes[variant]
@@ -335,6 +337,8 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
         "passed":all_passed,"manifest_sha256":manifest_hash,
         "comparison_label":baseline_custody::COMPARISON_LABEL,
         "reconstruction_amendment_sha256":baseline_custody::RECONSTRUCTION_AMENDMENT_SHA256,
+        "cold_custody_amendment_sha256":baseline_custody::COLD_AMENDMENT_SHA256,
+        "cold_copy_limitation":baseline_custody::COLD_LIMITATION,
         "comparator_receipt_sha256":inputs.comparator_receipt_sha256,
         "baseline_copy_amendment_sha256":baseline_custody::AMENDMENT_SHA256,
         "telemetry_amendment_sha256":TELEMETRY_AMENDMENT_SHA256,
@@ -342,7 +346,7 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
         "baseline_cli_counters":"unavailable / non-comparable",
         "temporary_byte_limitation":TEMP_LIMITATION,
         "counter_scope":super::statement_probe::COUNTER_SCOPE,
-        "database_hash_custody":"immutable masters verified before/after; candidate files and directory verified every slot; baseline each hot series/cold copy verified with full pre/post file custody and post schema/logical comparison to byte-equal initial master; cold post validation deferred until complete matrix",
+        "database_hash_custody":"immutable masters verified before/after; candidate files and directory verified every slot; hot baseline series verified with full pre/post hashes and logical/schema check; cold baseline clone-derived identity and metadata/source-only post-state under accepted limitation",
         "warmups_per_query_variant_mode":3,"measured_iterations_per_query_variant_mode":30,
         "fresh_process_each_iteration":true,"rss_collector":"/usr/bin/time -l",
         "run_order":"query ID order, hot then filesystem-cold; alternate variant first by query index plus iteration index",
@@ -423,7 +427,7 @@ fn prepare_baseline(inputs: &Inputs<'_>, db: &Path, root: &Path) -> ProofResult<
         &json!({
         "clone_microseconds":clone_microseconds,"file_hash_microseconds":hash_microseconds,
         "copy_bytes":fs::metadata(db)?.len(),"copy":db,
-        "method":"Darwin clonefile; no byte-copy fallback",
+        "method":"APFS fclonefileat from protected master descriptor; no byte-copy fallback",
         "preparation_excluded_from_cli_timing":true}),
     )?;
     Ok(())
@@ -457,19 +461,22 @@ fn write_io_plan(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
         &json!({
         "scope":"static successful-path performance working-copy counts; logical bytes, not measured physical device I/O",
         "baseline_master_bytes":b,"candidate_master_bytes":c,
-        "baseline_working_hashes_before":3984,"baseline_working_hashes_after":816,
-        "candidate_working_hashes_before":5568,"candidate_working_hashes_after":1584,
-        "baseline_working_hash_bytes_lower_bound_decimal":(816*b).to_string(),
+        "baseline_working_hashes_before":816,"baseline_working_hashes_after":24,
+        "candidate_working_hashes_before":1584,"candidate_working_hashes_after":1584,
+        "baseline_working_hash_bytes_lower_bound_decimal":(24*b).to_string(),
         "candidate_working_hash_bytes_decimal":(1584*c).to_string(),
-        "baseline_cold_required_hashes":792,"baseline_cold_hash_bytes_lower_bound_decimal":(792*b).to_string(),
-        "baseline_working_logical_passes_before":1584,"baseline_working_logical_passes_after":408,
+        "baseline_cold_required_hashes":0,"baseline_cold_hash_bytes_decimal":"0",
+        "cold_clone_operation_receipts":396,"cold_post_metadata_receipts":396,
+        "cold_custody_amendment_sha256":baseline_custody::COLD_AMENDMENT_SHA256,
+        "cold_copy_limitation":baseline_custody::COLD_LIMITATION,
+        "baseline_working_logical_passes_before":408,"baseline_working_logical_passes_after":12,
         "tables_per_logical_pass":7,"verified_master_logical_pass_reused":true,
         "baseline_clones":408,"baseline_full_byte_copies":0,
         "candidate_full_byte_copies":408,"candidate_copy_bytes_read_and_written_each_decimal":(408*c).to_string(),
-        "peak_retained_baseline_working_databases":397,
-        "working_logical_disk_lower_bound_before_growth_decimal":(397*b+c).to_string(),
+        "peak_retained_baseline_working_databases":1,
+        "working_logical_disk_lower_bound_before_growth_decimal":(b+c).to_string(),
         "other_costs":"master pre/post hashes, comparator preflight, corpus/config/output hashes, two rebuilds and two concurrency copies, live CoW clones, sidecars, raw artifacts and post-write growth remain additional; CoW allocated blocks can be shared and are not unique physical storage",
-        "cache_policy":"baseline cold preparation before matrix; cold post scans after complete matrix; hot baseline post scan at series boundary; candidate per-slot custody/direct probes still condition cache; no OS eviction claim",
+        "cache_policy":"baseline cold clone/metadata immediately before its assigned CLI, metadata after; hot baseline full custody at series boundaries; candidate per-slot hashes/direct probes still condition cache; no OS eviction claim",
         "technical_review_status":"implementation choice, not PDO certification"}),
     )?;
     Ok(())
@@ -479,7 +486,11 @@ fn staging_copy(source: &Path, output: &Path, writable_baseline: bool) -> ProofR
     let directory = output.parent().ok_or("copy parent missing")?;
     fs::create_dir(directory)?;
     if writable_baseline {
-        return clone_baseline(source, output);
+        let receipt = clone_baseline(source, output)?;
+        if receipt["valid"] != true {
+            return Err(format!("baseline clone failed: {receipt}").into());
+        }
+        return Ok(());
     }
     // create_new reserves the candidate destination; no overwrite or resume.
     let mut destination = File::options().write(true).create_new(true).open(output)?;
@@ -497,22 +508,208 @@ fn staging_copy(source: &Path, output: &Path, writable_baseline: bool) -> ProofR
 }
 
 #[cfg(target_os = "macos")]
-fn clone_baseline(source: &Path, output: &Path) -> ProofResult<()> {
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::PermissionsExt;
-    let from = std::ffi::CString::new(source.as_os_str().as_bytes())?;
-    let to = std::ffi::CString::new(output.as_os_str().as_bytes())?;
-    // clonefile fails for an existing destination or unsupported filesystem.
-    if unsafe { libc::clonefile(from.as_ptr(), to.as_ptr(), 0) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
+fn clone_baseline(source: &Path, output: &Path) -> ProofResult<Value> {
+    use std::ffi::{CStr, CString};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    fn apfs(file: &File) -> ProofResult<()> {
+        let mut info = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        if unsafe { libc::fstatfs(file.as_raw_fd(), info.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let info = unsafe { info.assume_init() };
+        if unsafe { CStr::from_ptr(info.f_fstypename.as_ptr()) }.to_bytes() != b"apfs" {
+            return Err("baseline CoW clone requires APFS; no fallback".into());
+        }
+        Ok(())
     }
-    fs::set_permissions(output, fs::Permissions::from_mode(0o600))?;
-    Ok(())
+    let started = Instant::now();
+    let source_file = File::options()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(source)?;
+    let destination_dir = File::open(output.parent().ok_or("clone parent absent")?)?;
+    apfs(&source_file)?;
+    apfs(&destination_dir)?;
+    let before = baseline_custody::cold_metadata(source)?;
+    let fd_before = baseline_custody::metadata_value(&source_file.metadata()?);
+    let mut named_before = before["database"].clone();
+    named_before
+        .as_object_mut()
+        .ok_or("source metadata absent")?
+        .remove("path");
+    if named_before != fd_before
+        || fd_before["type"] != "file"
+        || fd_before["mode"].as_u64().ok_or("source mode absent")? & 0o222 != 0
+        || before["directory"]["mode"]
+            .as_u64()
+            .ok_or("source parent mode absent")?
+            & 0o222
+            != 0
+        || before["sidecars"]
+            .as_array()
+            .ok_or("master sidecar state absent")?
+            .iter()
+            .any(|r| r["state"] != "absent")
+    {
+        return Err(
+            "clone master must be protected, stable, and checkpointed without sidecars".into(),
+        );
+    }
+    baseline_custody::validate_copy_entries(source)?;
+    let name = CString::new(
+        output
+            .file_name()
+            .ok_or("clone name absent")?
+            .as_encoded_bytes(),
+    )?;
+    let rc = unsafe {
+        libc::fclonefileat(
+            source_file.as_raw_fd(),
+            destination_dir.as_raw_fd(),
+            name.as_ptr(),
+            0,
+        )
+    };
+    let error = if rc == 0 {
+        None
+    } else {
+        Some(std::io::Error::last_os_error().to_string())
+    };
+    if rc == 0 {
+        fs::set_permissions(output, fs::Permissions::from_mode(0o600))?;
+    }
+    let after = baseline_custody::cold_metadata(source)?;
+    let fd_after = baseline_custody::metadata_value(&source_file.metadata()?);
+    let destination = baseline_custody::cold_metadata(output)?;
+    let valid = rc == 0
+        && before == after
+        && fd_before == fd_after
+        && destination["database"]["type"] == "file"
+        && destination["database"]["links"] == 1
+        && destination["database"]["bytes"] == fd_before["bytes"]
+        && destination["database"]["device"] == fd_before["device"]
+        && destination["database"]["inode"] != fd_before["inode"];
+    Ok(
+        json!({"operation":"APFS fclonefileat","flags":0,"return_code":rc,"error":error,
+        "valid":valid,"elapsed_microseconds":started.elapsed().as_micros(),
+        "source_path":source,"destination_path":output,"source_descriptor_before":fd_before,
+        "source_descriptor_after":fd_after,"master_before":before,"master_after":after,
+        "destination":destination,"source_open":"read-only O_NOFOLLOW; descriptor pins inode",
+        "fallback":null,"copy_sha256":null}),
+    )
 }
 
 #[cfg(not(target_os = "macos"))]
-fn clone_baseline(_: &Path, _: &Path) -> ProofResult<()> {
+fn clone_baseline(_: &Path, _: &Path) -> ProofResult<Value> {
     Err("baseline staging CoW clones require Darwin".into())
+}
+
+fn prepare_cold_baseline(
+    inputs: &Inputs<'_>,
+    db: &Path,
+    root: &Path,
+    binding: &Value,
+) -> ProofResult<()> {
+    fs::create_dir(db.parent().ok_or("cold copy parent absent")?)?;
+    let result = clone_baseline(inputs.baseline_database, db);
+    let operation = match result {
+        Ok(value) => value,
+        Err(error) => {
+            write_canonical_json(
+                &root.join("clone-operation.json"),
+                &json!({"binding":binding,
+                "valid":false,"error":error.to_string(),"successful_clone_observed":false}),
+            )?;
+            return Err(error);
+        }
+    };
+    write_canonical_json(
+        &root.join("clone-operation.json"),
+        &json!({
+        "binding":binding,"operation":operation,"master_receipt_sha256":inputs.comparator_receipt_sha256,
+        "verified_master_sha256":inputs.baseline_database_sha256,"copy_sha256":null,
+        "configuration":{"path":root.join("home/.engram/config.yml"),
+            "expected":{"db":db,"tapes_dir":inputs.tape_root,"metrics":{"enabled":false}}},
+        "limitation":baseline_custody::COLD_LIMITATION}),
+    )?;
+    if operation["valid"] != true {
+        return Err(
+            "cold clone operation failed or master/destination metadata contradicted identity"
+                .into(),
+        );
+    }
+    write_canonical_json(&root.join("custody-before.json"), &operation["destination"])?;
+    baseline_custody::validate_copy_entries(db)
+}
+
+fn finish_cold_baseline(db: &Path, root: &Path, binding: &Value) -> ProofResult<()> {
+    let started = Instant::now();
+    let before: Value = serde_json::from_reader(File::open(root.join("custody-before.json"))?)?;
+    let after = baseline_custody::cold_metadata(db)?;
+    write_canonical_json(&root.join("custody-after.json"), &after)?;
+    let mut anomalies = Vec::new();
+    let process_path = root.join("process.json");
+    let process: Value = serde_json::from_reader(File::open(&process_path)?)?;
+    if process["binding"] != *binding
+        || process["binary"] != BASELINE_BINARY_PATH
+        || process["configuration"]["path"]
+            != root
+                .join("home/.engram/config.yml")
+                .to_string_lossy()
+                .as_ref()
+        || process["configuration"]["sha256"] != sha256_file(&root.join("home/.engram/config.yml"))?
+    {
+        anomalies.push("CLI binding or configuration custody mismatch".into());
+    }
+
+    if let Err(error) = baseline_custody::validate_copy_entries(db) {
+        anomalies.push(error.to_string());
+    }
+    for kind in ["database", "directory"] {
+        for field in ["type", "inode", "device", "mode", "links"] {
+            if before[kind][field] != after[kind][field] {
+                anomalies.push(format!("{kind} {field} changed"));
+            }
+        }
+    }
+    if after["database"]["bytes"].as_u64() < before["database"]["bytes"].as_u64() {
+        anomalies.push("database shortened; not explained by pinned result persistence".into());
+    }
+    for row in after["sidecars"]
+        .as_array()
+        .ok_or("post sidecar metadata absent")?
+    {
+        if row["state"] != "absent"
+            && (row["type"] != "file"
+                || row["links"] != 1
+                || row["device"] != before["database"]["device"])
+        {
+            anomalies.push("unexpected sidecar identity/type".into());
+        }
+    }
+    write_canonical_json(
+        &root.join("custody-comparison.json"),
+        &json!({
+        "binding":binding,"passed_metadata_checks":anomalies.is_empty(),"anomalies":anomalies,
+        "elapsed_microseconds":started.elapsed().as_micros(),"copy_sha256":null,"logical_validation":null,
+        "clone_receipt_sha256":sha256_file(&root.join("clone-operation.json"))?,
+        "process_record":process_path,"process_sha256":sha256_file(&process_path)?,
+        "exit_code":process["exit_code"],"configuration":process["configuration"],"stdout":root.join("stdout.json"),
+        "stderr":root.join("stderr-and-time.txt"),"projection_evidence":root.join("direct-touch-comparison.json"),
+        "source_write_contract":{"source_revision":baseline_custody::BASELINE_SOURCE,
+            "binary_sha256":BASELINE_BINARY_SHA256,
+            "emit":"src/query/format.rs::emit_query_result; sha256 b127b370531f2d94af2d21e5937267d2d157af1491e3680979140977ec98fc48",
+            "write":"src/index/mod.rs::record_query_result; sha256 ad18827f34e4f6e79ec75ca54e513a7afa379e74db79e3b000786de9b5afb0b9",
+            "allowed":"existing schema only; INSERT OR REPLACE query_results and associated SQLite physical effects; metrics disabled",
+            "scope":"source inspection, not observed per-copy application-table preservation"},
+        "physical_changes":"database bytes/mtime/ctime and regular WAL/SHM/journal plus directory times may change from pinned CLI persistence; complete contents/schema not audited",
+        "limitation":baseline_custody::COLD_LIMITATION}),
+    )?;
+    if !anomalies.is_empty() {
+        return Err("cold baseline metadata has unexplained changes".into());
+    }
+    Ok(())
 }
 
 fn discard_own_copy(db: &Path) -> ProofResult<()> {
@@ -548,6 +745,7 @@ fn measure(
         "db":db,"tapes_dir":tapes,"metrics":{"enabled":false}}))?
         .as_bytes(),
     )?;
+    let config_sha256 = sha256_file(&config.join("config.yml"))?;
     let temp = root.join("sqlite-temp");
     fs::create_dir(&temp)?;
     let sampler = DiskSampler::start(
@@ -604,25 +802,29 @@ fn measure(
         ))
         .status()?;
     let elapsed = start.elapsed().as_micros() as u64;
-    let disk = sampler.finish()?;
+    let disk = sampler.finish();
     let baseline = binding["variant"] == "baseline";
     let stderr = fs::read_to_string(&stderr_path)?;
-    let rss = parse_darwin_rss(&stderr)?;
+    let rss = parse_darwin_rss(&stderr);
     // Product completion is persisted before the separate SQL probe starts.
     write_canonical_json(
         &root.join("process.json"),
         &json!({"binding":binding,"argv":argv,"collector_argv":["/usr/bin/time","-l"],"binary":binary,
         "counter_scope":"none: product CLI is uninstrumented",
         "exit_code":status.code(),"success":status.success(),
-        "elapsed_microseconds":elapsed,"peak_rss_bytes":rss,
+        "elapsed_microseconds":elapsed,"peak_rss_bytes":rss.as_ref().ok(),
+        "temp_collector_error":disk.as_ref().err().map(|e|e.to_string()),
+        "configuration":{"path":config.join("config.yml"),"sha256":config_sha256},
         "environment":{"HOME":home,"TMPDIR":temp,"SQLITE_TMPDIR":temp,
             "T1772_DIRECT_TOUCH_PROJECTION":projection_env,
             "LC_ALL":"C","LANG":"C","TZ":"UTC"},
         "stdout_sha256":sha256_file(&stdout_path)?,"stderr_sha256":sha256_file(&stderr_path)?}),
     )?;
+    let disk = disk?;
     if !status.success() {
         return Err("ordinary CLI measurement failed".into());
     }
+    let rss = rss?;
     let validation_started = Instant::now();
     let canonical_output = root.join("canonical-output.json");
     let output: Value = serde_json::from_reader(File::open(&stdout_path)?)?;
@@ -655,6 +857,8 @@ fn measure(
         return Err("candidate temporary-byte observation missing, failed or nonzero".into());
     }
     Ok(json!({"elapsed_microseconds":elapsed,"peak_rss_bytes":rss,
+        "cold_custody_amendment_sha256":baseline_custody::COLD_AMENDMENT_SHA256,
+        "cold_copy_limitation":if baseline && binding["cache_class"] == "filesystem-cold" {json!(baseline_custody::COLD_LIMITATION)}else{Value::Null},
         "collector_setup_postprocessing_probe_microseconds":measurement_started.elapsed().as_micros().saturating_sub(elapsed as u128),
         "counter_scope":if baseline {"unavailable / non-comparable; no baseline probe"}else{super::statement_probe::COUNTER_SCOPE},
         "candidate_direct_touch_exact":if baseline {Value::Null}else{json!(exact)},
@@ -708,6 +912,8 @@ fn summarize(rows: &[Value]) -> ProofResult<Value> {
         Ok(percentiles(&values)?)
     };
     Ok(json!({"elapsed_microseconds":percentiles(&times)?,
+        "cold_custody_amendment_sha256":baseline_custody::COLD_AMENDMENT_SHA256,
+        "cold_copy_limitation":rows[0]["cold_copy_limitation"],
         "actual_cli_statement_counters":rows[0]["actual_cli_statement_counters"],
         "counter_scope":rows[0]["counter_scope"],
         "direct_rows_visited":metrics("direct_rows_visited")?,

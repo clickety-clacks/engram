@@ -388,6 +388,8 @@ fn run() -> ProofResult<()> {
         "reason":"independent review has not yet accepted this exact source, binary custody, invocation, and frozen output manifest",
         "required_order":["proof_passed","post_custody_passed","output_frozen","independent_review_accepted","readiness_published","eezo_launch_authorized"],
         "runner_output_manifest_sha256":runner_manifest_hash,
+        "cold_custody_amendment_sha256":engram::proof::baseline_custody::COLD_AMENDMENT_SHA256,
+        "cold_copy_limitation":engram::proof::baseline_custody::COLD_LIMITATION,
         "no_external_publication_performed":true,
         "no_live_state_targeted_for_write":true
     });

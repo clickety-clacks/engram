@@ -13,6 +13,43 @@ pub const COMPARATOR_ROOT: &str =
 pub const COMPARATOR_DATABASE: &str = "/Users/mike/shared-workspace/engram/proofs/t1772/reconstructed-comparator-asg-931d2f4b-r1/master/index.sqlite";
 pub const COMPARATOR_RECEIPT: &str = "/Users/mike/shared-workspace/engram/proofs/t1772/reconstructed-comparator-asg-931d2f4b-r1/receipt.json";
 pub const COMPARISON_LABEL: &str = "reconstructed pinned-baseline versus candidate";
+pub const COLD_AMENDMENT_SHA256: &str =
+    "afeac1430bdbbade5c46e27eff440972d61176fc920cd38ad84b5a5570d4cf9e";
+pub const COLD_LIMITATION: &str = "cold-copy initial identity is clone-derived; no independent per-copy full-file hash; complete post-mutation byte identity and unchanged provenance tables/schema were not independently measured per copy";
+
+/// Only the cold-baseline amendment's metadata evidence; never read file bytes.
+pub(crate) fn metadata_value(m: &std::fs::Metadata) -> Value {
+    use std::os::unix::fs::MetadataExt;
+    json!({"state":"present","type":if m.is_file(){"file"}else if m.is_dir(){"directory"}else if m.file_type().is_symlink(){"symlink"}else{"other"},
+        "bytes":m.len(),"inode":m.ino(),"device":m.dev(),"links":m.nlink(),"mode":m.mode(),
+        "mtime_seconds":m.mtime(),"mtime_nanoseconds":m.mtime_nsec(),
+        "ctime_seconds":m.ctime(),"ctime_nanoseconds":m.ctime_nsec(),"sha256":null})
+}
+
+pub(crate) fn cold_metadata(db: &Path) -> ProofResult<Value> {
+    let row = |path: &Path| -> ProofResult<Value> {
+        let mut value = match std::fs::symlink_metadata(path) {
+            Ok(m) => metadata_value(&m),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                json!({"state":"absent","sha256":null})
+            }
+            Err(e) => return Err(e.into()),
+        };
+        value["path"] = json!(path);
+        Ok(value)
+    };
+    let parent = db.parent().ok_or("cold copy parent missing")?;
+    let mut entries = std::fs::read_dir(parent)?
+        .map(|entry| entry.map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.sort();
+    Ok(
+        json!({"scope":"metadata only; no file digests or logical scans","cold_copy_limitation":COLD_LIMITATION,
+        "database":row(db)?,"directory":row(parent)?,"entries":entries,
+        "sidecars":[row(Path::new(&format!("{}-wal",db.display())))?,
+            row(Path::new(&format!("{}-shm",db.display())))?,row(Path::new(&format!("{}-journal",db.display())))?]}),
+    )
+}
 
 /// Receipt consumption only. This module never constructs a comparator or
 /// invokes its binary. All paths below are prospective, not recovered custody.
