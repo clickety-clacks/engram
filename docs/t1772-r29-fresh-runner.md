@@ -203,17 +203,37 @@ binaries. Each hot/filesystem-cold class has three fresh-process warmups and
 thirty measured fresh-process iterations per binary/query. Order alternates by
 query and iteration. Each hot query series has its own baseline working copy,
 shared through that series' three warmups and thirty measured processes. Cold
-slots receive fresh initially byte-identical copies. Only baseline copies are
-writable. `baseline_custody.rs` checks existing schema-v3 objects/columns, records
-schema and typed row digests for the seven fixed v3 tables, and rejects any
-schema/content change outside `query_results`. Pre/post file, WAL/SHM and
-directory custody is retained; unexpected entries fail. Whole-CLI timing includes
-baseline initialization and feedback writes. Preparation and custody reads are
-timed separately; they can warm the filesystem cache. No OS purge is claimed.
-Candidate database and containing directory are read-only, with exact file and
-directory custody after every product/probe slot. Completed disposable copies
-created by this run are removed only after custody is saved; failed copies remain.
-`protocol-r4.json` identifies the original manifest and all three accepted amendment hashes
+slots receive fresh initially byte-identical copies. Baseline copies use Darwin
+CoW cloning with no byte-copy fallback. All 396 cold baseline clones and their
+initial full hashes are prepared before any CLI timing; each remains unused until
+its assigned slot. Hot baseline clones are prepared at their query-series boundary.
+Only baseline copies are writable. Each full initial clone hash must equal the
+identified master. Schema and seven-table initial logical state are inherited
+from the controller's independently verified, hash-bound comparator receipt.
+No initial per-copy logical rescan is needed to establish byte-identical state.
+
+Hot baseline slots bind the series initial/post custody paths; intermediate mutable
+per-slot hashes are explicitly unobserved/null. After each hot series there is one
+full logical/schema and file-custody check. Cold baseline post hashes, WAL/SHM and
+logical/schema validation are deferred until **all** timed query/mode series have
+finished. Every cold copy still receives its own complete post check, and any
+unexplained schema/non-query_results change fails before performance acceptance.
+Copies are retained until validation succeeds. No required per-copy hash or
+post logical check was waived. Preparation, file hashing and logical-validation
+times are recorded separately; all staging storage stays under the existing sampler.
+
+Candidate copies still get full database/directory custody before and after every
+complete CLI/direct-probe slot. The initial hash is extracted from the existing
+file-custody record instead of independently rereading the database. The separate
+post-CLI hash was redundant with post-slot custody and is removed. Cleanup still
+rejects unexpected entries/symlinks, but no longer hashes a file again immediately
+before deleting an owned, successfully validated copy. Failed copies remain.
+Whole-CLI timing still includes baseline initialization and feedback writes.
+Candidate copy/hashing and its direct probe still condition the cache between
+slots. Baseline clone/hash preparation warms source pages; fresh CoW copies can
+share cached pages. No OS-cache eviction or cache-neutral timing is claimed.
+
+`protocol-r5.json` identifies the original manifest and all three accepted amendment hashes
 without rewriting either. Raw stdout/stderr, argv/environment, exit status, wall time, Darwin
 `/usr/bin/time -l` maximum RSS and dedicated SQLite-temp directory samples are
 retained. Parsed product output is also saved under the canonical JSON/LF
@@ -231,33 +251,38 @@ each slot reports that unavailable projection and retains the reconstructed base
 without claiming direct-touch equality. This limitation no longer independently
 fails the amended gate under PDO's current direction.
 
-After the product timer and temp sampler stop, `proof/statement_probe.rs` opens
-the same clone read-only and executes new instrumented SQL probes for direct
-evidence, candidate posting-seed expansion, and bounded provenance traversal.
-Each statement records SQL, bound anchor, SORT, AUTOINDEX, full-scan/VM steps,
-and rows returned before Rust filtering/deduplication. Candidate feature-join
-rows are additionally identified as posting rows; these counts do not claim
-unobservable SQLite internal page/index visits. Presentation, tape reads and
-baseline feedback writes are excluded. Query/cache class/phase/iteration/order,
-database path and source hash, manifest hash, target, flags, derived anchors,
-product binary hash and probe binary hash form a shared binding on the product
-and probe records. CLI output anchors must equal the bound probe anchors.
-Every summary labels `counter_scope` as `instrumented SQL probe excluded from
-product CLI wall timing`. A filesystem-cold slot's probe follows its product
-read and makes no independent cold-latency claim. Probe records and canonical
-CLI output have separate hashes. Percentiles use nearest rank with raw
-observations retained; candidate p95/p99, peak RSS and zero observed-temp/direct
-probe SORT/AUTOINDEX thresholds must pass the amended performance gate. Every
-candidate probe slot checks raw statement coverage and zero counters before
-returning a successful observation. Missing, failed or nonzero observations fail;
-no missing value becomes zero. Actual CLI counters are explicit unavailable /
-non-comparable objects with null numeric fields in observations and summaries.
-No comparative CLI counter improvement is claimed. Temp observations/summaries
-retain collector identity, dedicated paths, requested interval, actual gaps,
-raw samples/errors and incomplete-coverage limitations. Probe counters are never
-attributed to the frozen CLI. Product/probe bindings include both source revisions
-and binary hashes. Threshold failure still returns an error; only the superseded
-unavailability failure is removed.
+After the product timer and temp sampler stop, `proof/statement_probe.rs` runs
+only candidate exact-anchor and feature-posting direct lookups, binding the same
+query, flags, anchors, database/custody paths, cache/phase/iteration/order, and
+product/probe identities. It retains raw per-statement SQL, SORT, AUTOINDEX,
+rows delivered and posting rows, with complete coverage/zero-counter validation.
+Feature-posting rows are counted once; the duplicate seed lookup, lineage BFS,
+baseline diagnostics, VM/fullscan counters and probe-only full-file hash are gone.
+These removals follow the required direct-touch scope of art_73471b68 and the
+named §9.4 rows/postings evidence. No retained gate uses the removed lineage
+traversal. Candidate rows/postings have p50/p95/p99 summaries. Baseline probe
+metrics/hashes are unavailable/null, including summaries; they are never empty
+sums reported as zero. Counters remain separate SQL-probe observations excluded
+from CLI timing, never observations inside the frozen CLI.
+
+`runner/performance/io-plan.json` quantifies the fixed successful-path counts
+using actual B (comparator master bytes) and C (candidate master bytes): 816B
+baseline working-file hash bytes before growth/sidecars, 1,584C candidate hash
+bytes, 408 baseline CoW clones, 408 candidate byte copies (408C read and 408C
+written), and 408 seven-table post logical passes plus the one verified master
+pass. Clause 4 still requires 792 cold baseline hashes. At the historical size
+reference that cold floor alone is 95.041424130048 TB; the implementation does
+not remove it or treat that historical size as actual reconstructed bytes.
+
+Peak retained baseline working databases reach 397 (396 cold plus one hot),
+with an additional candidate working copy: at least 397B+C logical bytes before
+growth, sidecars, both rebuilds, concurrency copies, masters and raw artifacts.
+CoW blocks are shared, so logical size and the sampler's allocated-block sum do
+not establish unique physical allocation. This is a quantified cost tradeoff
+for independent technical review, not certification or a feasibility claim.
+The rejected alternatives are per-slot logical scans, which pollute later timings;
+per-query cold post scans, which affect later query series; and dropping cold
+hashes/post logical evidence, which would require a successor amendment.
 
 `proof/concurrency.rs` makes two independent disposable v4 copies. Before each
 pass it removes the first hundred frozen tape IDs and their derived records from

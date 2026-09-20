@@ -256,6 +256,12 @@ pub(crate) fn open_copy_reader(db: &Path) -> ProofResult<Connection> {
 }
 
 pub fn snapshot(db: &Path) -> ProofResult<Value> {
+    let mut value = logical_snapshot(db)?;
+    value["files"] = copy_files(db)?;
+    Ok(value)
+}
+
+pub(crate) fn logical_snapshot(db: &Path) -> ProofResult<Value> {
     let conn = open_copy_reader(db)?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version != 3 {
@@ -334,9 +340,8 @@ pub fn snapshot(db: &Path) -> ProofResult<Value> {
     }
     drop(stmt);
     drop(conn);
-    let files = copy_files(db)?;
     Ok(
-        json!({"schema":schema,"user_version":version,"tables":tables,"files":files,
+        json!({"schema":schema,"user_version":version,"tables":tables,
         "observer":"read-only SQL; existing WAL read when present; typed rows in rowid order; file custody after observer closes"}),
     )
 }
@@ -354,6 +359,14 @@ pub fn compare(before: &Value, after: &Value) -> ProofResult<()> {
 }
 
 pub fn copy_files(db: &Path) -> ProofResult<Value> {
+    validate_copy_entries(db)?;
+    Ok(serde_json::to_value(collect_custody(&[db
+        .parent()
+        .ok_or("copy directory absent")?
+        .to_path_buf()])?)?)
+}
+
+pub(crate) fn validate_copy_entries(db: &Path) -> ProofResult<()> {
     let directory = db.parent().ok_or("copy directory absent")?;
     let name = db
         .file_name()
@@ -375,7 +388,5 @@ pub fn copy_files(db: &Path) -> ProofResult<Value> {
             return Err(format!("unexplained baseline copy entry {filename}").into());
         }
     }
-    Ok(serde_json::to_value(collect_custody(&[
-        directory.to_path_buf()
-    ])?)?)
+    Ok(())
 }

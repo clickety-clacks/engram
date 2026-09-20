@@ -4,7 +4,7 @@ use super::measurement::{DiskSampler, percentiles};
 use super::t1772::{ProofResult, sha256_file, write_canonical_json, write_new_file};
 use serde_json::{Value, json};
 use std::fs::{self, File};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
@@ -89,9 +89,9 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
         sha256_file(databases[1])?,
     ];
     write_canonical_json(
-        &root.join("protocol-r4.json"),
+        &root.join("protocol-r5.json"),
         &json!({
-        "version":4,"parent_manifest_sha256":manifest_hash,
+        "version":5,"parent_manifest_sha256":manifest_hash,
         "comparison_label":baseline_custody::COMPARISON_LABEL,
         "reconstruction_amendment_sha256":baseline_custody::RECONSTRUCTION_AMENDMENT_SHA256,
         "comparator_receipt_sha256":inputs.comparator_receipt_sha256,
@@ -104,16 +104,38 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
         "baseline_binary_sha256":BASELINE_BINARY_SHA256,
         "baseline_binary_path":BASELINE_BINARY_PATH,
         "baseline_executable_custody":{"artifact":"art_ebfcc161","sha256":BASELINE_EXECUTABLE_CUSTODY_SHA256},
-        "preparation_order":"create byte copy when required, hash copy, baseline read-only logical/schema custody or candidate file custody; invoke CLI; post-custody; validate output; SQL probes",
-        "baseline_policy":"one writable copy per hot query series; fresh writable copy per cold slot; only query_results application content may change",
+        "preparation_order":"prepare/hash all 396 baseline cold clones before any timed CLI; hot baseline pre/post custody once per series; candidate pre/post custody each complete CLI/probe slot; cold baseline post-custody after entire timing matrix",
+        "baseline_policy":"one writable CoW clone per hot series and one per cold slot; full pre/post file hashes retained; byte-equal initial copies inherit verified master logical state; each completed copy receives full post logical validation; only query_results may change",
         "candidate_policy":"database and its directory read-only; exact hash and directory custody after every slot",
-        "cache_limit":"copy/hash/custody reads can warm filesystem cache; filesystem-cold means a fresh copy, never cache eviction",
+        "cache_limit":"all cold baseline clone/hash preparation precedes timing; baseline post scans occur at hot-series boundaries or after the entire cold matrix; candidate slot custody and direct probes still warm cache; fresh CoW copy is not OS cache eviction and may share cached source pages",
         "baseline_cli_counters":"unavailable / non-comparable; no counter improvement comparison permitted",
         "baseline_projection":"raw reconstructed comparator output retained; legacy CLI semantics; separate direct projection unavailable; no result-equivalence claim",
         "candidate_counter_requirement":"each bound direct-touch SQL probe statement SORT=0 and AUTOINDEX=0",
         "temporary_byte_requirement":"candidate observed bytes=0; incomplete coverage accepted under telemetry amendment",
         "temporary_byte_limitation":TEMP_LIMITATION}),
     )?;
+    write_io_plan(inputs, root)?;
+    // Full controller preflight verified this accounting against the immutable
+    // master. A full file hash of each fresh clone establishes its initial state.
+    let master_accounting = &inputs.comparator_receipt["accounting"];
+    write_canonical_json(
+        &root.join("baseline-master-accounting.json"),
+        master_accounting,
+    )?;
+    let mut deferred_baseline: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for query in manifest["queries"].as_array().ok_or("queries absent")? {
+        let id = query["id"].as_str().ok_or("query ID absent")?;
+        super::t1772::safe_relative_path(id)?;
+        let query_root = root.join(id).join("filesystem-cold");
+        fs::create_dir_all(&query_root)?;
+        for iteration in 0..33 {
+            let slot = query_root.join(format!("{iteration:02}-baseline"));
+            fs::create_dir(&slot)?;
+            let db = slot.join("copy/database.sqlite");
+            prepare_baseline(inputs, &db, &slot)?;
+            deferred_baseline.push((db, slot));
+        }
+    }
     let mut comparisons = Vec::new();
     let mut all_passed = true;
     for (query_index, query) in manifest["queries"]
@@ -141,21 +163,14 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
                 query_root.join("candidate-copy/database.sqlite"),
             ];
             if mode == "hot" {
-                for variant in 0..2 {
-                    let started = Instant::now();
-                    staging_copy(databases[variant], &hot[variant], variant == 0)?;
-                    if sha256_file(&hot[variant])? != database_hashes[variant] {
-                        return Err("hot copy mismatch".into());
-                    }
-                    write_canonical_json(
-                        &query_root.join(format!(
-                            "{}-preparation.json",
-                            ["baseline", "candidate"][variant]
-                        )),
-                        &json!({"elapsed_microseconds":started.elapsed().as_micros(),"copy":hot[variant],
-                            "initial_sha256":database_hashes[variant],"bytes":fs::metadata(&hot[variant])?.len()}),
-                    )?;
-                }
+                prepare_baseline(inputs, &hot[0], &query_root)?;
+                let started = Instant::now();
+                staging_copy(databases[1], &hot[1], false)?;
+                write_canonical_json(
+                    &query_root.join("candidate-preparation.json"),
+                    &json!({"elapsed_microseconds":started.elapsed().as_micros(),
+                        "copy":hot[1],"hash_check":"first slot pre-custody before launch"}),
+                )?;
             }
             let mut measured: [Vec<Value>; 2] = [Vec::new(), Vec::new()];
             for iteration in 0..33 {
@@ -166,32 +181,41 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
                 {
                     let label = ["baseline", "candidate"][variant];
                     let run_root = query_root.join(format!("{iteration:02}-{label}"));
-                    fs::create_dir(&run_root)?;
+                    if mode != "filesystem-cold" || variant != 0 {
+                        fs::create_dir(&run_root)?;
+                    }
                     let prepare_start = Instant::now();
                     let cold = run_root.join("copy/database.sqlite");
                     let db = if mode == "filesystem-cold" {
-                        staging_copy(databases[variant], &cold, variant == 0)?;
-                        if sha256_file(&cold)? != database_hashes[variant] {
-                            return Err("cold copy mismatch".into());
+                        if variant == 1 {
+                            staging_copy(databases[1], &cold, false)?;
                         }
                         &cold
                     } else {
                         &hot[variant]
                     };
-                    let before = if variant == 0 {
-                        baseline_custody::snapshot(db)?
+                    let initial_custody_path = if variant == 0 && mode == "hot" {
+                        query_root.join("custody-before.json")
                     } else {
-                        baseline_custody::copy_files(db)?
+                        run_root.join("custody-before.json")
                     };
-                    let before_database_sha256 = sha256_file(db)?;
-                    write_canonical_json(&run_root.join("custody-before.json"), &before)?;
-                    write_canonical_json(
-                        &run_root.join("preparation.json"),
-                        &json!({
-                        "elapsed_microseconds":prepare_start.elapsed().as_micros(),
-                        "copy_bytes":fs::metadata(db)?.len(),"master_sha256":database_hashes[variant],
-                        "preparation_excluded_from_cli_timing":true}),
-                    )?;
+                    let before = if variant == 1 {
+                        let files = baseline_custody::copy_files(db)?;
+                        if database_hash(&files, db)? != database_hashes[1] {
+                            return Err("candidate pre-slot master hash mismatch".into());
+                        }
+                        write_canonical_json(&initial_custody_path, &files)?;
+                        write_canonical_json(
+                            &run_root.join("preparation.json"),
+                            &json!({
+                            "elapsed_microseconds":prepare_start.elapsed().as_micros(),
+                            "copy_bytes":fs::metadata(db)?.len(),"master_sha256":database_hashes[1],
+                            "preparation_excluded_from_cli_timing":true}),
+                        )?;
+                        files
+                    } else {
+                        Value::Null
+                    };
                     let target = query["target"].as_str().ok_or("target absent")?;
                     let anchors =
                         crate::query::format::derive_anchor_candidates(&[target.to_string()]);
@@ -203,14 +227,18 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
                         "iteration":if warmup {iteration} else {iteration - 3},
                         "schedule_iteration":iteration,"order_in_pair":order,
                         "database_path":db,"master_database_sha256":database_hashes[variant],
-                        "database_sha256":before_database_sha256,
+                        "database_sha256":if variant == 0 && mode == "hot" {Value::Null}else{json!(database_hashes[variant])},
+                        "initial_custody_path":initial_custody_path,
+                        "database_identity_scope":if variant == 0 && mode == "hot" {"series initial hash; mutable intermediate slot hash not observed"}else{"fresh or read-only copy pre-slot hash"},
+                        "post_custody_path":if variant == 0 {if mode == "hot" {query_root.join("custody-after.json")}else{run_root.join("custody-after.json")}}else{run_root.join("custody-after-slot.json")},
                         "amendment_sha256":baseline_custody::AMENDMENT_SHA256,
                         "telemetry_amendment_sha256":TELEMETRY_AMENDMENT_SHA256,
                         "manifest_sha256":manifest_hash,"target":target,"flags":query["flags"],
                         "derived_anchors":anchors,"product_binary_sha256":binary_hashes[variant],
                         "product_source_revision":if variant == 0 {"72821518037a9d896f0b4d784fee146800902e78"}else{source_revision},
-                        "probe_source_revision":source_revision,
-                        "probe_binary_sha256":probe_binary_hash});
+                        "probe_source_revision":if variant == 1 {json!(source_revision)}else{Value::Null},
+                        "probe_binary_sha256":if variant == 1 {json!(probe_binary_hash)}else{Value::Null},
+                        "collector_source_revision":source_revision,"collector_binary_sha256":probe_binary_hash});
                     let observation = measure(
                         binaries[variant],
                         db,
@@ -239,10 +267,18 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
                         "binding":binding,"observation":observation}),
                     )?;
                     if variant == 1 {
+                        let post_started = Instant::now();
                         let post_slot = baseline_custody::copy_files(db)?;
+                        let post_microseconds = post_started.elapsed().as_micros();
                         write_canonical_json(
                             &run_root.join("custody-after-slot.json"),
                             &post_slot,
+                        )?;
+                        write_canonical_json(
+                            &run_root.join("custody-comparison.json"),
+                            &json!({
+                            "passed":post_slot == before,"file_hash_microseconds":post_microseconds,
+                            "scope":"complete candidate CLI/direct-probe slot; no mutation allowed"}),
                         )?;
                         if post_slot != before {
                             return Err(
@@ -253,10 +289,13 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
                     if !warmup {
                         measured[variant].push(observation);
                     }
-                    if mode == "filesystem-cold" {
+                    if mode == "filesystem-cold" && variant == 1 {
                         discard_own_copy(db)?;
                     }
                 }
+            }
+            if mode == "hot" {
+                finish_baseline(&hot[0], &query_root, master_accounting)?;
             }
             let baseline = summarize(&measured[0])?;
             let candidate = summarize(&measured[1])?;
@@ -279,6 +318,10 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
             }
         }
     }
+    for (db, slot) in deferred_baseline {
+        finish_baseline(&db, &slot, master_accounting)?;
+        discard_own_copy(&db)?;
+    }
     for variant in 0..2 {
         if sha256_file(databases[variant])? != database_hashes[variant]
             || sha256_file(binaries[variant])? != binary_hashes[variant]
@@ -299,7 +342,7 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
         "baseline_cli_counters":"unavailable / non-comparable",
         "temporary_byte_limitation":TEMP_LIMITATION,
         "counter_scope":super::statement_probe::COUNTER_SCOPE,
-        "database_hash_custody":"immutable masters verified before/after; candidate files and directory verified every slot; baseline schema/all non-query_results tables verified every slot with file custody",
+        "database_hash_custody":"immutable masters verified before/after; candidate files and directory verified every slot; baseline each hot series/cold copy verified with full pre/post file custody and post schema/logical comparison to byte-equal initial master; cold post validation deferred until complete matrix",
         "warmups_per_query_variant_mode":3,"measured_iterations_per_query_variant_mode":30,
         "fresh_process_each_iteration":true,"rss_collector":"/usr/bin/time -l",
         "run_order":"query ID order, hot then filesystem-cold; alternate variant first by query index plus iteration index",
@@ -349,10 +392,94 @@ fn validate_manifest(value: &Value) -> ProofResult<()> {
     Ok(())
 }
 
+fn database_hash<'a>(files: &'a Value, db: &Path) -> ProofResult<&'a str> {
+    files
+        .as_array()
+        .ok_or("file custody absent")?
+        .iter()
+        .find(|r| r["path"] == db.to_string_lossy().as_ref() && r["file_type"] == "file")
+        .and_then(|r| r["sha256"].as_str())
+        .ok_or_else(|| "database hash missing from custody".into())
+}
+
+fn prepare_baseline(inputs: &Inputs<'_>, db: &Path, root: &Path) -> ProofResult<()> {
+    let started = Instant::now();
+    staging_copy(inputs.baseline_database, db, true)?;
+    let clone_microseconds = started.elapsed().as_micros();
+    let hashing = Instant::now();
+    let files = baseline_custody::copy_files(db)?;
+    if database_hash(&files, db)? != inputs.baseline_database_sha256 {
+        return Err("baseline clone differs from verified master".into());
+    }
+    let hash_microseconds = hashing.elapsed().as_micros();
+    let mut before = inputs.comparator_receipt["accounting"].clone();
+    before["files"] = files;
+    before["logical_state_source"] = json!({"scope":"inherited from independently verified master via observed complete clone hash equality",
+        "comparator_receipt_sha256":inputs.comparator_receipt_sha256,
+        "master_sha256":inputs.baseline_database_sha256});
+    write_canonical_json(&root.join("custody-before.json"), &before)?;
+    write_canonical_json(
+        &root.join("baseline-preparation.json"),
+        &json!({
+        "clone_microseconds":clone_microseconds,"file_hash_microseconds":hash_microseconds,
+        "copy_bytes":fs::metadata(db)?.len(),"copy":db,
+        "method":"Darwin clonefile; no byte-copy fallback",
+        "preparation_excluded_from_cli_timing":true}),
+    )
+}
+
+fn finish_baseline(db: &Path, root: &Path, master: &Value) -> ProofResult<()> {
+    let started = Instant::now();
+    let mut after = baseline_custody::logical_snapshot(db)?;
+    let logical_microseconds = started.elapsed().as_micros();
+    let hashing = Instant::now();
+    after["files"] = baseline_custody::copy_files(db)?;
+    let hash_microseconds = hashing.elapsed().as_micros();
+    write_canonical_json(&root.join("custody-after.json"), &after)?;
+    let comparison = baseline_custody::compare(master, &after);
+    write_canonical_json(
+        &root.join("custody-comparison.json"),
+        &json!({
+        "passed":comparison.is_ok(),"error":comparison.as_ref().err().map(|e| e.to_string()),
+        "logical_microseconds":logical_microseconds,"file_hash_microseconds":hash_microseconds,
+        "allowed_query_results_changed":master["tables"]["query_results"] != after["tables"]["query_results"],
+        "file_change_explanation":"baseline initialization/query_results persistence and associated pages/WAL/SHM only; unchanged schema and all other logical tables required"}),
+    )?;
+    comparison
+}
+
+fn write_io_plan(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
+    let b = fs::metadata(inputs.baseline_database)?.len() as u128;
+    let c = fs::metadata(inputs.candidate_database)?.len() as u128;
+    write_canonical_json(
+        &root.join("io-plan.json"),
+        &json!({
+        "scope":"static successful-path performance working-copy counts; logical bytes, not measured physical device I/O",
+        "baseline_master_bytes":b,"candidate_master_bytes":c,
+        "baseline_working_hashes_before":3984,"baseline_working_hashes_after":816,
+        "candidate_working_hashes_before":5568,"candidate_working_hashes_after":1584,
+        "baseline_working_hash_bytes_lower_bound_decimal":(816*b).to_string(),
+        "candidate_working_hash_bytes_decimal":(1584*c).to_string(),
+        "baseline_cold_required_hashes":792,"baseline_cold_hash_bytes_lower_bound_decimal":(792*b).to_string(),
+        "baseline_working_logical_passes_before":1584,"baseline_working_logical_passes_after":408,
+        "tables_per_logical_pass":7,"verified_master_logical_pass_reused":true,
+        "baseline_clones":408,"baseline_full_byte_copies":0,
+        "candidate_full_byte_copies":408,"candidate_copy_bytes_read_and_written_each_decimal":(408*c).to_string(),
+        "peak_retained_baseline_working_databases":397,
+        "working_logical_disk_lower_bound_before_growth_decimal":(397*b+c).to_string(),
+        "other_costs":"master pre/post hashes, comparator preflight, corpus/config/output hashes, two rebuilds and two concurrency copies, live CoW clones, sidecars, raw artifacts and post-write growth remain additional; CoW allocated blocks can be shared and are not unique physical storage",
+        "cache_policy":"baseline cold preparation before matrix; cold post scans after complete matrix; hot baseline post scan at series boundary; candidate per-slot custody/direct probes still condition cache; no OS eviction claim",
+        "technical_review_status":"implementation choice, not PDO certification"}),
+    )
+}
+
 fn staging_copy(source: &Path, output: &Path, writable_baseline: bool) -> ProofResult<()> {
     let directory = output.parent().ok_or("copy parent missing")?;
     fs::create_dir(directory)?;
-    // create_new reserves the destination; never overwrite or resume a copy.
+    if writable_baseline {
+        return clone_baseline(source, output);
+    }
+    // create_new reserves the candidate destination; no overwrite or resume.
     let mut destination = File::options().write(true).create_new(true).open(output)?;
     std::io::copy(&mut File::open(source)?, &mut destination)?;
     destination.sync_all()?;
@@ -367,10 +494,29 @@ fn staging_copy(source: &Path, output: &Path, writable_baseline: bool) -> ProofR
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn clone_baseline(source: &Path, output: &Path) -> ProofResult<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    let from = std::ffi::CString::new(source.as_os_str().as_bytes())?;
+    let to = std::ffi::CString::new(output.as_os_str().as_bytes())?;
+    // clonefile fails for an existing destination or unsupported filesystem.
+    if unsafe { libc::clonefile(from.as_ptr(), to.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    fs::set_permissions(output, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clone_baseline(_: &Path, _: &Path) -> ProofResult<()> {
+    Err("baseline staging CoW clones require Darwin".into())
+}
+
 fn discard_own_copy(db: &Path) -> ProofResult<()> {
     use std::os::unix::fs::PermissionsExt;
     // Only a directory created_new by this run, after all custody is retained.
-    baseline_custody::copy_files(db)?;
+    baseline_custody::validate_copy_entries(db)?;
     let directory = db.parent().ok_or("copy parent missing")?;
     fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
     for entry in fs::read_dir(directory)? {
@@ -457,35 +603,7 @@ fn measure(
         .status()?;
     let elapsed = start.elapsed().as_micros() as u64;
     let disk = sampler.finish()?;
-    let post_started = Instant::now();
-    let before: Value = serde_json::from_reader(File::open(root.join("custody-before.json"))?)?;
     let baseline = binding["variant"] == "baseline";
-    let after = if baseline {
-        baseline_custody::snapshot(db)?
-    } else {
-        baseline_custody::copy_files(db)?
-    };
-    write_canonical_json(&root.join("custody-after.json"), &after)?;
-    let custody = if baseline {
-        baseline_custody::compare(&before, &after)
-    } else if before != after
-        || sha256_file(db)?
-            != binding["database_sha256"]
-                .as_str()
-                .ok_or("bound database hash missing")?
-    {
-        Err("candidate copy/directory changed".into())
-    } else {
-        Ok(())
-    };
-    write_canonical_json(
-        &root.join("custody-comparison.json"),
-        &json!({
-        "passed":custody.is_ok(),"error":custody.as_ref().err().map(|e|e.to_string()),
-        "elapsed_microseconds":post_started.elapsed().as_micros(),
-        "allowed_query_results_changed":baseline && before["tables"]["query_results"] != after["tables"]["query_results"],
-        "file_change_explanation":if baseline {"pinned baseline initialization/query_results persistence and associated SQLite page/WAL/SHM effects; all other table content and schema must remain identical"}else{"no database or directory mutation permitted"}}),
-    )?;
     let stderr = fs::read_to_string(&stderr_path)?;
     let rss = parse_darwin_rss(&stderr)?;
     // Product completion is persisted before the separate SQL probe starts.
@@ -500,7 +618,6 @@ fn measure(
             "LC_ALL":"C","LANG":"C","TZ":"UTC"},
         "stdout_sha256":sha256_file(&stdout_path)?,"stderr_sha256":sha256_file(&stderr_path)?}),
     )?;
-    custody?;
     if !status.success() {
         return Err("ordinary CLI measurement failed".into());
     }
@@ -526,28 +643,32 @@ fn measure(
         return Err("candidate invocation direct-touch projection differs from complete ordered frozen oracle".into());
     }
     let probe_path = root.join("statement-probe.json");
-    let probe = super::statement_probe::run(db, binding, &probe_path)?;
+    let probe = if baseline {
+        Value::Null
+    } else {
+        super::statement_probe::run(db, binding, &probe_path)?
+    };
     // Warmups have the same zero-observed requirement as measured candidate slots.
     if !baseline && (disk["status"] != "observed" || disk["peak_observed_logical_bytes"] != 0) {
         return Err("candidate temporary-byte observation missing, failed or nonzero".into());
     }
     Ok(json!({"elapsed_microseconds":elapsed,"peak_rss_bytes":rss,
         "collector_setup_postprocessing_probe_microseconds":measurement_started.elapsed().as_micros().saturating_sub(elapsed as u128),
-        "counter_scope":super::statement_probe::COUNTER_SCOPE,
+        "counter_scope":if baseline {"unavailable / non-comparable; no baseline probe"}else{super::statement_probe::COUNTER_SCOPE},
         "candidate_direct_touch_exact":if baseline {Value::Null}else{json!(exact)},
         "baseline_projection_status":if baseline {json!("unavailable; reconstructed comparator output retained without direct-equivalence claim")}else{Value::Null},
         "actual_cli_statement_counters":{"status":"unavailable / non-comparable","sort":null,"autoindex":null,
             "source_revision":binding["product_source_revision"],"binary_sha256":binding["product_binary_sha256"]},
         "complete_temporary_bytes":Value::Null,
         "temporary_byte_limitation":TEMP_LIMITATION,"zero_total_temporary_allocation_claimed":false,
-        "temp_collector_identity":{"module":"src/proof/measurement.rs::DiskSampler","source_revision":binding["probe_source_revision"],"binary_sha256":binding["probe_binary_sha256"]},
+        "temp_collector_identity":{"module":"src/proof/measurement.rs::DiskSampler","source_revision":binding["collector_source_revision"],"binary_sha256":binding["collector_binary_sha256"]},
         "temp_samples_path":root.join("temp-samples.jsonl"),"temp_collector_errors":[],
         "canonical_output_sha256":sha256_file(&canonical_output)?,
         "observed_sqlite_temp_bytes":disk["peak_observed_logical_bytes"],
         "temp_collection":disk,"direct_touch_sort":probe["direct_touch_sort"],
         "direct_touch_autoindex":probe["direct_touch_autoindex"],
         "direct_rows_visited":probe["direct_rows_visited"],"posting_rows_visited":probe["posting_rows_visited"],
-        "statement_probe_sha256":sha256_file(&probe_path)?}))
+        "statement_probe_sha256":if baseline {Value::Null}else{json!(sha256_file(&probe_path)?)}}))
 }
 
 pub fn parse_darwin_rss(text: &str) -> ProofResult<u64> {
@@ -573,9 +694,23 @@ fn summarize(rows: &[Value]) -> ProofResult<Value> {
         .iter()
         .map(|r| r["elapsed_microseconds"].as_u64().ok_or("elapsed missing"))
         .collect::<Result<Vec<_>, _>>()?;
+    let candidate = rows[0]["statement_probe_sha256"].is_string();
+    let metrics = |field: &str| -> ProofResult<Value> {
+        if !candidate {
+            return Ok(Value::Null);
+        }
+        let values = rows
+            .iter()
+            .map(|r| r[field].as_u64().ok_or("candidate direct metric absent"))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(percentiles(&values)?)
+    };
     Ok(json!({"elapsed_microseconds":percentiles(&times)?,
         "actual_cli_statement_counters":rows[0]["actual_cli_statement_counters"],
-        "counter_scope":super::statement_probe::COUNTER_SCOPE,
+        "counter_scope":rows[0]["counter_scope"],
+        "direct_rows_visited":metrics("direct_rows_visited")?,
+        "posting_rows_visited":metrics("posting_rows_visited")?,
+        "row_metric_scope":"candidate direct-probe rows delivered before dedup; baseline unavailable; not timed CLI/internal page visits",
         "comparative_cli_counter_improvement_claimed":false,
         "temporary_byte_limitation":TEMP_LIMITATION,"zero_total_temporary_allocation_claimed":false,
         "temp_collector_identity":rows[0]["temp_collector_identity"],
@@ -584,6 +719,6 @@ fn summarize(rows: &[Value]) -> ProofResult<Value> {
         "raw_temp_evidence":"each slot retains temp-samples.jsonl and temp-peak.json; observations identify dedicated paths",
         "peak_rss_bytes":rows.iter().filter_map(|r|r["peak_rss_bytes"].as_u64()).max(),
         "observed_sqlite_temp_bytes":rows.iter().filter_map(|r|r["observed_sqlite_temp_bytes"].as_u64()).max(),
-        "direct_touch_sort":rows.iter().filter_map(|r|r["direct_touch_sort"].as_u64()).sum::<u64>(),
-        "direct_touch_autoindex":rows.iter().filter_map(|r|r["direct_touch_autoindex"].as_u64()).sum::<u64>()}))
+        "direct_touch_sort":if candidate {json!(rows.iter().filter_map(|r|r["direct_touch_sort"].as_u64()).sum::<u64>())}else{Value::Null},
+        "direct_touch_autoindex":if candidate {json!(rows.iter().filter_map(|r|r["direct_touch_autoindex"].as_u64()).sum::<u64>())}else{Value::Null}}))
 }
