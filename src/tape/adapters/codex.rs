@@ -200,7 +200,7 @@ pub fn codex_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Erro
                                             session_id.as_deref(),
                                             session_cwd.as_deref(),
                                             call,
-                                            &format!("Output:\n{stdout}"),
+                                            stdout,
                                         );
                                     }
                                 }
@@ -211,7 +211,7 @@ pub fn codex_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Erro
                                     session_id.as_deref(),
                                     session_cwd.as_deref(),
                                     &context,
-                                    &output,
+                                    command_stdout(&output),
                                 );
                             }
                         }
@@ -615,8 +615,9 @@ fn emit_structured_after_result(
     session_id: Option<&str>,
     cwd: Option<&str>,
     context: &CodexCall,
-    output: &str,
+    stdout: &str,
 ) {
+    // Callers decode transport envelopes once; nested JSON output is already text.
     if context.tool == "apply_patch" {
         for edit in parse_patch(&patch_body(&context.args)) {
             let mut event = serde_json::Map::new();
@@ -637,7 +638,7 @@ fn emit_structured_after_result(
         && let Some(command) = args.get("cmd").and_then(Value::as_str)
         && let Some(read) = bounded_shell_read(
             command,
-            command_stdout(output),
+            stdout,
             args.get("workdir").and_then(Value::as_str),
             cwd,
         )

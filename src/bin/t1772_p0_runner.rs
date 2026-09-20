@@ -152,6 +152,11 @@ fn run() -> ProofResult<()> {
         reports.push(report);
     }
 
+    verify_rebuild_accounting(
+        &reports[0],
+        &reports[1],
+        &runner_root.join("physical-accounting-comparison.json"),
+    )?;
     if reports[0].counts != reports[1].counts
         || reports[0].schema_sha256 != reports[1].schema_sha256
         || reports[0].logical_sha256 != reports[1].logical_sha256
@@ -159,12 +164,15 @@ fn run() -> ProofResult<()> {
         return Err("the two independent rebuilds differ logically".into());
     }
     validate_counts(&reports[0].counts)?;
-    if reports[0].bytes >= BASELINE_BYTES {
-        return Err(format!(
-            "candidate database {} is not below historical ceiling {BASELINE_BYTES}",
-            reports[0].bytes
-        )
-        .into());
+    for (ordinal, report) in reports.iter().enumerate() {
+        if report.bytes >= BASELINE_BYTES {
+            return Err(format!(
+                "candidate rebuild {} database {} is not below historical ceiling {BASELINE_BYTES}",
+                ordinal + 1,
+                report.bytes
+            )
+            .into());
+        }
     }
 
     let mut query_hashes = Vec::new();
@@ -278,6 +286,44 @@ fn run() -> ProofResult<()> {
     write_canonical_json(&runner_root.join("runner-summary.json"), &summary)?;
     println!("{}", serde_json::to_string(&summary)?);
     Err("full P0 section 9.3 journey expectations unavailable; full proof cannot pass".into())
+}
+
+// Compare the already-recorded observations; no extra database scan or collector.
+fn verify_rebuild_accounting(
+    first: &DbReport,
+    second: &DbReport,
+    output: &Path,
+) -> ProofResult<()> {
+    let accounting = |report: &DbReport| {
+        json!({
+            "bytes": report.bytes, "page_size": report.page_size,
+            "page_count": report.page_count, "freelist_count": report.freelist_count,
+            "dbstat": report.dbstat
+        })
+    };
+    let first = accounting(first);
+    let second = accounting(second);
+    let mismatched_fields = [
+        "bytes",
+        "page_size",
+        "page_count",
+        "freelist_count",
+        "dbstat",
+    ]
+    .into_iter()
+    .filter(|key| first[*key] != second[*key])
+    .collect::<Vec<_>>();
+    let equal = mismatched_fields.is_empty();
+    write_canonical_json(
+        output,
+        &json!({"equal":equal,"rebuild_1":first,"rebuild_2":second,"mismatched_fields":mismatched_fields}),
+    )?;
+    if !equal {
+        return Err(
+            "cross-rebuild physical table/page/byte accounting differs; comparison retained".into(),
+        );
+    }
+    Ok(())
 }
 
 fn validate_args(args: &Args) -> ProofResult<()> {
@@ -684,7 +730,7 @@ fn write_test_definitions(path: &Path) -> ProofResult<()> {
             "schema": "t1772-static-test-definitions-v1",
             "definitions": [
                 {"id":"inputs-before-root", "assertion":"controller verifies manifest SHA and 11 entries while PROOF_ROOT is absent"},
-                {"id":"two-rebuilds", "assertion":"two independent databases have identical schema and canonical JSON/LF logical table digests"},
+                {"id":"two-rebuilds", "assertion":"two independent databases have identical schema and canonical JSON/LF logical table digests, database bytes, page size/count/freelist and ordered per-B-tree dbstat; retain physical comparison before failing and apply historical ceiling to both"},
                 {"id":"exact-accounting", "assertion":"all frozen cardinalities, per-tape CSV rows, and 14,369 dispatch rows match"},
                 {"id":"query-equivalence", "assertion":"both rebuilds: exact global/per-tape typed digests, complete 25305 legacy tombstone-key journeys and 12 fixed canonical event-touch projections; full P0 section 9.3 journeys remain unavailable and block passing summary"},
                 {"id":"read-only-plan", "assertion":"feature lookup uses posting/window keys without full evidence scan or temporary B-tree"},
@@ -737,6 +783,59 @@ fn collect_files(path: &Path, output: &mut Vec<PathBuf>) -> ProofResult<()> {
 #[cfg(test)]
 mod correction_tests {
     use super::*;
+    #[test]
+    fn equal_logical_reports_reject_and_retain_each_physical_difference() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        drop(SqliteIndex::open_writer(db.to_str().unwrap()).unwrap());
+        let first = inspect_database(&db, &[], 0).unwrap();
+        let mut second = first.clone();
+        second.path = "different-rebuild-path".into();
+        let output = dir.path().join("comparison.json");
+        verify_rebuild_accounting(&first, &second, &output).unwrap();
+        for case in 0..7 {
+            let mut changed = second.clone();
+            let key = match case {
+                0 => {
+                    changed.bytes += 1;
+                    "bytes"
+                }
+                1 => {
+                    changed.page_size *= 2;
+                    "page_size"
+                }
+                2 => {
+                    changed.page_count += 1;
+                    "page_count"
+                }
+                3 => {
+                    changed.freelist_count += 1;
+                    "freelist_count"
+                }
+                4 => {
+                    changed.dbstat[0].pages += 1;
+                    "dbstat"
+                }
+                5 => {
+                    changed.dbstat[0].bytes += 1;
+                    "dbstat"
+                }
+                _ => {
+                    changed.dbstat[0].name.push_str("-wrong");
+                    "dbstat"
+                }
+            };
+            assert_eq!(first.counts, changed.counts);
+            assert_eq!(first.logical_sha256, changed.logical_sha256);
+            assert_eq!(first.schema_sha256, changed.schema_sha256);
+            assert!(verify_rebuild_accounting(&first, &changed, &output).is_err());
+            let retained: Value = serde_json::from_reader(File::open(&output).unwrap()).unwrap();
+            assert_eq!(retained["equal"], false);
+            assert_eq!(retained["mismatched_fields"], json!([key]));
+            assert_ne!(retained["rebuild_1"][key], retained["rebuild_2"][key]);
+        }
+    }
+
     #[test]
     fn dispatch_retains_frozen_ordinal_shape_and_turn_before_uuid_order() {
         let dir = tempfile::tempdir().unwrap();

@@ -578,3 +578,28 @@ fn codex_nested_read_preserves_output_and_rejects_shell_or_javascript_expression
     let failed = json!([output[0],{"type":"input_text","text":"{\"exit_code\":1,\"output\":\"not a successful read\"}"}]);
     assert!(structured(&run(code, failed)).is_empty());
 }
+
+#[test]
+fn codex_nested_read_keeps_embedded_output_markers_and_original_range() {
+    use serde_json::json;
+    let expected = "let before = actual_prefix;\nFinal output:\nlet after = actual_suffix;\n";
+    let output = json!([
+        {"type":"input_text","text":"Script completed\nWall time 0.1 seconds\nOutput:\n"},
+        {"type":"input_text","text":json!({"exit_code":0,"output":expected}).to_string()}
+    ]);
+    let raw=[
+        json!({"type":"session_meta","payload":{"session_id":"review-fixture","cwd":"/isolated"}}),
+        json!({"timestamp":"2026-09-20T00:00:00Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"read","input":"text(await tools.exec_command({cmd:\"cat /fixture/source.rs\",max_output_tokens:1000}));"}}),
+        json!({"timestamp":"2026-09-20T00:00:01Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"read","output":output}})
+    ].iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+    let rows = events(&codex_jsonl_to_tape_jsonl(&raw).unwrap());
+    let reads = structured(&rows);
+    assert_eq!(reads.len(), 1);
+    assert_eq!(reads[0]["file"], "/fixture/source.rs");
+    assert_eq!(reads[0]["text"], expected);
+    assert_eq!(reads[0]["range"], json!([1, 3]));
+    assert_eq!(
+        rows.iter().find(|row| row["k"] == "tool.result").unwrap()["raw_output"],
+        output
+    );
+}

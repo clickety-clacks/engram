@@ -425,3 +425,18 @@ scripts remain searchable raw events with partial evidence coverage. This resolv
 the demonstrated nested-tool seam without promising full provenance for arbitrary
 exec scripts. Focused fixtures include rejected decoys, missing/failed/ambiguous
 results, multiple calls, ordering ties and post-custody/finalization failures.
+
+## Bounded corrections after a02d3ff review
+
+Nested JSON command output now reaches bounded-read extraction directly; only
+legacy display envelopes pass through `command_stdout`. Literal `Final output:`
+inside file text remains content, including its original line range (C1).
+Before other rebuild comparisons, the runner writes
+`runner/physical-accounting-comparison.json` with both observed database byte,
+page-size/count/freelist and ordered per-B-tree `dbstat` records, named differences
+and equality. Any mismatch fails after retention; both rebuilds also face the
+historical byte ceiling (C2). This consumes existing reports without additional
+SQL scans, hashes or collectors. Paths and timing are excluded. The replacement
+launch template must derive both revision and tree from that same committed
+source and verify them against its bundle/receipt (C3). All other proof gates,
+including the explicit unavailable full-§9.3 result, remain unchanged.
