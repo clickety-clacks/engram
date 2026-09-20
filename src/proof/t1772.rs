@@ -70,6 +70,60 @@ pub struct CustodyEntry {
     pub symlink_target: Option<String>,
 }
 
+/// Physical windows can match the same event more than once. Only the early
+/// index gate collapses them; the same-invocation CLI seam must preserve extras.
+pub fn canonical_event_touches(touches: &[crate::index::lineage::EvidenceFragmentRef]) -> Value {
+    let mut value = super::performance::direct_projection(touches);
+    value
+        .as_array_mut()
+        .expect("projection is an array")
+        .dedup();
+    value
+}
+
+/// Post-run custody retains readable entries even when another path fails.
+pub fn collect_post_custody(roots: &[PathBuf]) -> (Vec<CustodyEntry>, Vec<Value>) {
+    fn visit(
+        path: &Path,
+        seen: &mut BTreeSet<PathBuf>,
+        entries: &mut Vec<CustodyEntry>,
+        errors: &mut Vec<Value>,
+    ) {
+        if !seen.insert(path.to_path_buf()) {
+            return;
+        }
+        match custody_entry(path) {
+            Ok(entry) => {
+                let directory = entry.file_type == "directory";
+                entries.push(entry);
+                if directory {
+                    match fs::read_dir(path) {
+                        Ok(children) => {
+                            for child in children {
+                                match child {
+                                    Ok(child) => visit(&child.path(), seen, entries, errors),
+                                    Err(error) => {
+                                        errors.push(json!({"path":path,"error":error.to_string()}))
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => errors.push(json!({"path":path,"error":error.to_string()})),
+                    }
+                }
+            }
+            Err(error) => errors.push(json!({"path":path,"error":error.to_string()})),
+        }
+    }
+    let (mut entries, mut errors, mut seen) = (Vec::new(), Vec::new(), BTreeSet::new());
+    for root in roots {
+        visit(root, &mut seen, &mut entries, &mut errors);
+    }
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    errors.sort_by_key(|row| row["path"].as_str().unwrap_or_default().to_string());
+    (entries, errors)
+}
+
 pub fn sha256_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);

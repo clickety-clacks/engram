@@ -39,6 +39,8 @@ struct Args {
     #[arg(long)]
     input_root: PathBuf,
     #[arg(long)]
+    oracle_root: PathBuf,
+    #[arg(long)]
     proof_root: PathBuf,
     #[arg(long)]
     tape_root: PathBuf,
@@ -165,23 +167,60 @@ fn run() -> ProofResult<()> {
         .into());
     }
 
-    verify_per_tape_accounting(
-        &runner_root.join("rebuild-1/index.sqlite"),
-        &args.input_root.join("p0-window-accounting.csv"),
-        &args.input_root.join("p0-lineage-accounting.csv"),
+    let mut query_hashes = Vec::new();
+    let mut compatibility_hashes = Vec::new();
+    let mut accounting_hashes = Vec::new();
+    let mut canonical_hashes = Vec::new();
+    for ordinal in 1..=2 {
+        let db = runner_root.join(format!("rebuild-{ordinal}/index.sqlite"));
+        let output = runner_root.join(format!("queries/rebuild-{ordinal}"));
+        verify_per_tape_accounting(
+            &db,
+            &args.input_root.join("p0-window-accounting.csv"),
+            &args.input_root.join("p0-lineage-accounting.csv"),
+            &output.join("per-tape-accounting.jsonl"),
+        )?;
+        verify_dispatch_oracle(&db, &tape_ids, &output.join("dispatch-oracle.jsonl"))?;
+        engram::proof::canonical_oracle::verify(
+            &db,
+            &args.tape_root,
+            &tape_ids,
+            &args.oracle_root,
+            &output.join("canonical-oracle"),
+        )?;
+        engram::proof::compatibility::verify(
+            &db,
+            &tape_ids,
+            &args.input_root.join("p0-tombstone-key-to-window.jsonl"),
+            &output.join("compatibility"),
+        )?;
+        verify_direct_touch_oracle(
+            &db,
+            &args.input_root.join("p0-performance-query-manifest.json"),
+            &args
+                .input_root
+                .join("p0-performance-expected-direct-touches.json"),
+            &output.join("direct-touch-results.json"),
+        )?;
+        accounting_hashes.push(sha256_file(&output.join("per-tape-accounting.jsonl"))?);
+        canonical_hashes.push(sha256_file(
+            &output.join("canonical-oracle/global-comparison.json"),
+        )?);
+        query_hashes.push(sha256_file(&output.join("direct-touch-results.json"))?);
+        compatibility_hashes.push(sha256_file(&output.join("compatibility/result.json"))?);
+    }
+    write_canonical_json(
+        &runner_root.join("queries/cross-rebuild-comparison.json"),
+        &json!({"direct_touch_sha256":query_hashes,"compatibility_sha256":compatibility_hashes,"accounting_sha256":accounting_hashes,"canonical_oracle_sha256":canonical_hashes,
+            "per_tape_accounting_matches_frozen_csv_both_rebuilds":true}),
     )?;
-    verify_dispatch_oracle(
-        &runner_root.join("rebuild-1/index.sqlite"),
-        &runner_root.join("dispatch-oracle.jsonl"),
-    )?;
-    verify_direct_touch_oracle(
-        &runner_root.join("rebuild-1/index.sqlite"),
-        &args.input_root.join("p0-performance-query-manifest.json"),
-        &args
-            .input_root
-            .join("p0-performance-expected-direct-touches.json"),
-        &runner_root.join("queries/direct-touch-results.json"),
-    )?;
+    if query_hashes[0] != query_hashes[1]
+        || compatibility_hashes[0] != compatibility_hashes[1]
+        || accounting_hashes[0] != accounting_hashes[1]
+        || canonical_hashes[0] != canonical_hashes[1]
+    {
+        return Err("cross-rebuild query or compatibility results differ".into());
+    }
     record_query_plan(
         &runner_root.join("rebuild-1/index.sqlite"),
         &runner_root.join("queries/query-plan.json"),
@@ -216,7 +255,8 @@ fn run() -> ProofResult<()> {
     )?;
     let summary = json!({
         "schema": "t1772-p0-runner-summary-v1",
-        "status": "passed",
+        "status": "blocked",
+        "full_p0_section_9_3_journeys": {"status":"unavailable","reason":"No standalone frozen complete P0 journey expectations supplied; the 12 performance projections and exhaustive tombstone journeys are bounded subsets, not the complete gate"},
         "candidate_base": CANDIDATE_BASE,
         "build_revision": BUILD_REVISION,
         "manifest_sha256": MANIFEST_SHA256,
@@ -237,7 +277,7 @@ fn run() -> ProofResult<()> {
     });
     write_canonical_json(&runner_root.join("runner-summary.json"), &summary)?;
     println!("{}", serde_json::to_string(&summary)?);
-    Ok(())
+    Err("full P0 section 9.3 journey expectations unavailable; full proof cannot pass".into())
 }
 
 fn validate_args(args: &Args) -> ProofResult<()> {
@@ -245,6 +285,12 @@ fn validate_args(args: &Args) -> ProofResult<()> {
         return Err(format!("candidate must be {CANDIDATE_BASE}").into());
     }
     require_exact_path(&args.input_root, INPUT_ROOT, "INPUT_ROOT")?;
+    require_exact_path(
+        &args.oracle_root,
+        engram::proof::canonical_oracle::SUPPLEMENT_ROOT,
+        "ORACLE_ROOT",
+    )?;
+    engram::proof::canonical_oracle::verify_inputs(&args.oracle_root)?;
     require_exact_path(&args.proof_root, PROOF_ROOT, "PROOF_ROOT")?;
     if args.manifest != args.input_root.join(MANIFEST_NAME) {
         return Err("manifest path is not the reviewed R29 manifest".into());
@@ -495,6 +541,7 @@ fn verify_per_tape_accounting(
     db_path: &Path,
     window_csv: &Path,
     lineage_csv: &Path,
+    output: &Path,
 ) -> ProofResult<()> {
     let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let mut actual = HashMap::<String, [u64; 9]>::new();
@@ -513,6 +560,9 @@ fn verify_per_tape_accounting(
             actual.entry(tape).or_insert([0; 9])[slot] = count;
         }
     }
+    let mut records = actual.iter().collect::<Vec<_>>();
+    records.sort_by_key(|(tape, _)| *tape);
+    write_canonical_jsonl(output,records.into_iter().map(|(tape,counts)|json!({"tape_id":tape,"counts_read_edit_features_tombstones_tombstone_features_edit_edges_span_links":&counts[..7]})))?;
     compare_csv(window_csv, &actual, &[0, 1, 2, 3, 4, 5])?;
     compare_csv(lineage_csv, &actual, &[5, 6, 3, 4])?;
     Ok(())
@@ -528,6 +578,9 @@ fn compare_csv(
     for line in lines {
         let line = line?;
         let fields = line.split(',').collect::<Vec<_>>();
+        if fields.len() != slots.len() + 1 {
+            return Err("accounting CSV width mismatch".into());
+        }
         let observed = actual.get(fields[0]).copied().unwrap_or([0; 9]);
         for (field, slot) in fields.iter().skip(1).zip(slots) {
             if field.parse::<u64>()? != observed[*slot] {
@@ -543,25 +596,17 @@ fn compare_csv(
     Ok(())
 }
 
-fn verify_dispatch_oracle(db_path: &Path, output: &Path) -> ProofResult<()> {
+fn verify_dispatch_oracle(db_path: &Path, tapes: &[String], output: &Path) -> ProofResult<()> {
     let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let mut stmt = conn.prepare("SELECT tape_id,uuid,first_turn_index,direction FROM dispatch_links ORDER BY tape_id,first_turn_index,uuid")?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok(json!({
-                "direction": row.get::<_, String>(3)?,
-                "first_turn_index": row.get::<_, i64>(2)?,
-                "tape_id": row.get::<_, String>(0)?,
-                "uuid": row.get::<_, String>(1)?
-            }))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    if rows.len() as u64 != DISPATCH_ROWS {
-        return Err("dispatch row count mismatch".into());
+    let mut stmt = conn.prepare("SELECT uuid,first_turn_index,direction FROM dispatch_links WHERE tape_id=?1 ORDER BY first_turn_index,uuid")?;
+    let mut rows = Vec::new();
+    for (ordinal, tape) in tapes.iter().enumerate() {
+        for row in stmt.query_map([tape], |r| Ok(json!({"direction":r.get::<_,String>(2)?,"first_turn_index":r.get::<_,i64>(1)?,"tape_id":tape,"tape_ordinal":ordinal,"uuid":r.get::<_,String>(0)?})))? {rows.push(row?);}
     }
+    let count = rows.len() as u64;
     let digest = write_canonical_jsonl(output, rows)?;
-    if digest != DISPATCH_JSONL_SHA256 {
-        return Err(format!("dispatch oracle digest mismatch: {digest}").into());
+    if count != DISPATCH_ROWS || digest != DISPATCH_JSONL_SHA256 {
+        return Err(format!("dispatch oracle mismatch: {count} rows / {digest}").into());
     }
     Ok(())
 }
@@ -594,18 +639,12 @@ fn verify_direct_touch_oracle(
         let id = query["id"].as_str().ok_or("query id missing")?;
         let target = query["target"].as_str().ok_or("query target missing")?;
         let anchors = derive_anchor_candidates(&[target.to_string()]);
-        let touches = index.evidence_for_anchors(&anchors)?.into_iter().map(|touch| json!({
-            "event_offset": touch.event_offset,
-            "file_path": touch.file_path,
-            "kind": match touch.kind { engram::index::lineage::EvidenceKind::Read => "read", engram::index::lineage::EvidenceKind::Edit => "edit" },
-            "tape_id": touch.tape_id,
-            "timestamp": touch.timestamp
-        })).collect::<Vec<_>>();
+        let touches = t1772::canonical_event_touches(&index.evidence_for_anchors(&anchors)?);
         let expected_touches = expected_by_id
             .get(id)
             .ok_or_else(|| format!("missing expected query {id}"))?["touches"]
             .clone();
-        if Value::Array(touches.clone()) != expected_touches {
+        if touches != expected_touches {
             return Err(format!("direct-touch oracle mismatch for {id}").into());
         }
         results.push(json!({"id": id, "touches": touches}));
@@ -647,7 +686,7 @@ fn write_test_definitions(path: &Path) -> ProofResult<()> {
                 {"id":"inputs-before-root", "assertion":"controller verifies manifest SHA and 11 entries while PROOF_ROOT is absent"},
                 {"id":"two-rebuilds", "assertion":"two independent databases have identical schema and canonical JSON/LF logical table digests"},
                 {"id":"exact-accounting", "assertion":"all frozen cardinalities, per-tape CSV rows, and 14,369 dispatch rows match"},
-                {"id":"query-equivalence", "assertion":"12 fixed direct-touch projections exactly equal the frozen oracle"},
+                {"id":"query-equivalence", "assertion":"both rebuilds: exact global/per-tape typed digests, complete 25305 legacy tombstone-key journeys and 12 fixed canonical event-touch projections; full P0 section 9.3 journeys remain unavailable and block passing summary"},
                 {"id":"read-only-plan", "assertion":"feature lookup uses posting/window keys without full evidence scan or temporary B-tree"},
                 {"id":"performance", "assertion":"reconstructed pinned-baseline versus candidate: 12 identical manifest queries, both binaries, hot and filesystem-cold; 3 warmups and 30 measured fresh processes each, alternating order; raw RSS/elapsed and p50/p95/p99 thresholds retained; baseline CLI counters unavailable/non-comparable, never substituted; every candidate warmup/measured slot requires full ordered same-invocation oracle equality, bound per-statement direct-touch probe coverage with SORT=0/AUTOINDEX=0, and successful zero-observed-temp evidence; retain collector paths/interval/gaps/errors and unlinked/between-sample limitations, never claim zero total temp allocation", "telemetry_amendment_sha256":engram::proof::performance::TELEMETRY_AMENDMENT_SHA256},
                 {"id":"reconstructed-comparator-custody", "assertion":"before root creation reject missing/changed receipt, binary/source/manifest/blob identity, schema/table accounting, corpus registration, sidecars, mutable master, reordered/extra/missing transcript slots or non-single-tape fingerprint invocations; accept distinct actual comparator size without historical equality; candidate historical ceiling remains strict; signed actual difference permits savings only when positive; provenance attribution and effective invocation remain independent inspection requirements", "amendment_sha256":engram::proof::baseline_custody::RECONSTRUCTION_AMENDMENT_SHA256},
@@ -693,4 +732,29 @@ fn collect_files(path: &Path, output: &mut Vec<PathBuf>) -> ProofResult<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod correction_tests {
+    use super::*;
+    #[test]
+    fn dispatch_retains_frozen_ordinal_shape_and_turn_before_uuid_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        drop(SqliteIndex::open_writer(db.to_str().unwrap()).unwrap());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("INSERT INTO dispatch_links VALUES('b','a',9,'sent'),('b','z',1,'received'),('a','q',2,'received');").unwrap();
+        let output = dir.path().join("dispatch.jsonl");
+        assert!(verify_dispatch_oracle(&db, &["b".into(), "a".into()], &output).is_err());
+        let rows = BufReader::new(File::open(output).unwrap())
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(&line.unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows[0],
+            json!({"direction":"received","first_turn_index":1,"tape_id":"b","tape_ordinal":0,"uuid":"z"})
+        );
+        assert_eq!(rows[1]["uuid"], "a");
+        assert_eq!(rows[2]["tape_ordinal"], 1);
+    }
 }

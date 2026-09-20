@@ -179,3 +179,37 @@ fn reviewed_r29_bindings_are_compile_time_constants() {
 fn darwin_sigcont_is_19() {
     assert_eq!(engram::proof::t1772::SIGCONT_NUMBER, 19);
 }
+
+#[test]
+fn early_projection_collapses_matching_windows_but_keeps_distinct_events_and_ties() {
+    use engram::index::SqliteIndex;
+    use engram::proof::t1772::canonical_event_touches;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("physical.sqlite");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("PRAGMA user_version=4;
+      CREATE TABLE evidence_windows(evidence_id INTEGER PRIMARY KEY,anchor TEXT,tape_id TEXT,event_offset INTEGER,kind TEXT,file_path TEXT,timestamp TEXT,window_ordinal INTEGER);
+      CREATE TABLE evidence_features(feature_hash TEXT,evidence_id INTEGER,PRIMARY KEY(feature_hash,evidence_id));
+      INSERT INTO evidence_windows VALUES
+      (1,'winnow:a,b','t',7,'read','/z','now',0),
+      (2,'winnow:a,c','t',7,'read','/z','now',1),
+      (3,'winnow:a,b','t',8,'read','/z','now',0),
+      (4,'winnow:a,b','t',7,'edit','/b','now',0),
+      (5,'winnow:a,b','t',7,'edit','/a','now',0);
+      INSERT INTO evidence_features VALUES('winnow:a',1),('winnow:a',2),('winnow:a',3),('winnow:a',4),('winnow:a',5);").unwrap();
+    drop(conn);
+    let index = SqliteIndex::open_reader(path.to_str().unwrap()).unwrap();
+    let physical = index.evidence_for_anchors(&["winnow:a".into()]).unwrap();
+    assert_eq!(physical.len(), 5);
+    let projected = canonical_event_touches(&physical);
+    let rows = projected.as_array().unwrap();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(
+        rows.iter()
+            .map(|r| r["file_path"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["/a", "/b", "/z", "/z"]
+    );
+    assert_eq!(rows[2]["event_offset"], 7);
+    assert_eq!(rows[3]["event_offset"], 8);
+}

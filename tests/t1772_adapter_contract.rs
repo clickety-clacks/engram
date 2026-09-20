@@ -470,3 +470,111 @@ fn openclaw_successful_empty_read_is_raw_only_and_partial() {
     assert!(structured(&rows).is_empty(), "{rows:?}");
     assert_eq!(rows[0]["coverage.read"], "partial");
 }
+
+#[test]
+fn codex_nested_patch_requires_literal_unconditional_call_and_paired_results() {
+    use serde_json::json;
+    let patch = "*** Begin Patch\n*** Update File: /fixture/source.rs\n@@\n-let before = old_value;\n+let after = new_value;\n*** End Patch\n";
+    let call = format!(
+        "text(await tools.apply_patch({}));",
+        serde_json::to_string(patch).unwrap()
+    );
+    let output = json!([
+        {"type":"input_text","text":"Script completed\nWall time 0.1 seconds\nOutput:\n"},
+        {"type":"input_text","text":"{}"}
+    ]);
+    let convert = |code: &str, result: Option<Value>| {
+        let mut raw = vec![
+            json!({"type":"session_meta","payload":{"session_id":"fixture","cwd":"/fixture"}}),
+            json!({"timestamp":"2026-09-20T00:00:00Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"p","input":code}}),
+        ];
+        if let Some(output) = result {
+            raw.push(json!({"timestamp":"2026-09-20T00:00:01Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"p","output":output}}));
+        }
+        let raw = raw
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let converted = codex_jsonl_to_tape_jsonl(&raw).unwrap();
+        assert_eq!(converted, codex_jsonl_to_tape_jsonl(&raw).unwrap());
+        events(&converted)
+    };
+    let rows = convert(&call, Some(output.clone()));
+    let edit = structured(&rows);
+    assert_eq!(edit.len(), 1);
+    assert_eq!(edit[0]["before_text"], "let before = old_value;\n");
+    assert_eq!(edit[0]["after_text"], "let after = new_value;\n");
+    assert_eq!(rows[1]["args"], call);
+    assert_eq!(rows[2]["raw_output"], output);
+    assert_eq!(rows[2]["k"], "tool.result");
+    assert_eq!(rows[3]["k"], "code.edit");
+    assert_eq!(rows[0]["coverage.read"], "partial");
+    assert_eq!(rows[0]["coverage.edit"], "full");
+    for code in [
+        format!("if(false){{{call}}}"),
+        format!("const quoted = {};", serde_json::to_string(&call).unwrap()),
+        format!("{call}text(await tools.exec_command({{cmd:'cat /x'}}));"),
+        "text(await tools.apply_patch(patch));".into(),
+    ] {
+        let rows = convert(&code, Some(output.clone()));
+        assert!(structured(&rows).is_empty());
+        assert_eq!(rows[0]["coverage.edit"], "partial");
+    }
+    for result in [
+        None,
+        Some(json!([])),
+        Some(json!([{"type":"input_text","text":"Script error: patch failed"}])),
+        Some(json!([output[0].clone(),{"type":"input_text","text":"{\"error\":\"failed\"}"}])),
+    ] {
+        let rows = convert(&call, result);
+        assert!(structured(&rows).is_empty());
+        assert_eq!(rows[0]["coverage.edit"], "partial");
+    }
+    let doubled = format!("{call}\n{call}");
+    assert!(structured(&convert(&doubled, Some(output.clone()))).is_empty());
+    assert_eq!(
+        structured(&convert(
+            &doubled,
+            Some(json!([output[0], output[1], output[1]]))
+        ))
+        .len(),
+        2
+    );
+}
+
+#[test]
+fn codex_nested_read_preserves_output_and_rejects_shell_or_javascript_expressions() {
+    use serde_json::json;
+    let code = "text(await tools.exec_command({cmd:\"cat source.rs\",workdir:\"/fixture\",max_output_tokens:1000}));";
+    let output = json!([
+        {"type":"input_text","text":"Script completed\nWall time 0.1 seconds\nOutput:\n"},
+        {"type":"input_text","text":json!({"exit_code":0,"output":"let observed = actual_file_contents;\n"}).to_string()}
+    ]);
+    let run = |code: &str, output: Value| {
+        let raw=[json!({"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"read","input":code}}),
+            json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"read","output":output}})]
+            .iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+        events(&codex_jsonl_to_tape_jsonl(&raw).unwrap())
+    };
+    let rows = run(code, output.clone());
+    let read = structured(&rows);
+    assert_eq!(read.len(), 1);
+    assert_eq!(read[0]["k"], "code.read");
+    assert_eq!(read[0]["file"], "/fixture/source.rs");
+    assert_eq!(read[0]["text"], "let observed = actual_file_contents;\n");
+    assert_eq!(read[0]["range"], json!([1, 1]));
+    assert_eq!(rows[2]["raw_output"], output);
+    for bad in [
+        code.replace("cat source.rs", "cat source.rs | sed x"),
+        code.replace("1000", "1000+functionCall()"),
+        format!("if (false) {{{code}}}"),
+    ] {
+        let rejected = run(&bad, output.clone());
+        assert!(structured(&rejected).is_empty());
+        assert_eq!(rejected[0]["coverage.read"], "partial");
+        assert_eq!(rejected[0]["coverage.edit"], "partial");
+    }
+    let failed = json!([output[0],{"type":"input_text","text":"{\"exit_code\":1,\"output\":\"not a successful read\"}"}]);
+    assert!(structured(&run(code, failed)).is_empty());
+}

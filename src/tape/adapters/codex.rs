@@ -144,11 +144,11 @@ pub fn codex_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Erro
                             .and_then(Value::as_str)
                             .filter(|id| !id.is_empty())
                             .map(ToOwned::to_owned);
-                        let output = payload
+                        let raw_output = payload
                             .and_then(|obj| obj.get("output"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        let output = content_text(&raw_output);
                         let context = call_id.as_ref().and_then(|id| calls.remove(id));
                         let tool = context
                             .as_ref()
@@ -163,7 +163,14 @@ pub fn codex_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Erro
                         if let Some(call_id) = &call_id {
                             result_event.insert("call_id".to_string(), json!(call_id));
                         }
+                        if !raw_output.is_string() {
+                            result_event.insert("raw_output".to_string(), raw_output.clone());
+                        }
                         let exit = match context.as_ref().map(|context| context.tool.as_str()) {
+                            Some("exec") => context.as_ref().and_then(|call| {
+                                let calls = nested_calls(&call.args)?;
+                                nested_results(&raw_output, &calls).map(|_| 0)
+                            }),
                             Some("apply_patch") if payload_type == "custom_tool_call_output" => {
                                 custom_tool_exit_code(&output)
                             }
@@ -181,14 +188,32 @@ pub fn codex_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Erro
                         if exit == Some(0)
                             && let Some(context) = context
                         {
-                            emit_structured_after_result(
-                                &mut out,
-                                timestamp,
-                                session_id.as_deref(),
-                                session_cwd.as_deref(),
-                                &context,
-                                &output,
-                            );
+                            if context.tool == "exec" {
+                                if let Some(nested) = nested_calls(&context.args)
+                                    && let Some(results) = nested_results(&raw_output, &nested)
+                                {
+                                    for (call, result) in nested.iter().zip(results) {
+                                        let stdout = result["output"].as_str().unwrap_or_default();
+                                        emit_structured_after_result(
+                                            &mut out,
+                                            timestamp,
+                                            session_id.as_deref(),
+                                            session_cwd.as_deref(),
+                                            call,
+                                            &format!("Output:\n{stdout}"),
+                                        );
+                                    }
+                                }
+                            } else {
+                                emit_structured_after_result(
+                                    &mut out,
+                                    timestamp,
+                                    session_id.as_deref(),
+                                    session_cwd.as_deref(),
+                                    &context,
+                                    &output,
+                                );
+                            }
                         }
                     }
                     _ => {}
@@ -231,6 +256,21 @@ fn codex_coverage(events: &[Value]) -> (&'static str, &'static str) {
         .filter(|(_, event)| event["k"] == "tool.call")
     {
         let tool = call["tool"].as_str().unwrap_or("");
+        if tool == "exec" {
+            // No generalized JS interpretation: unknown nested operations cannot
+            // justify full read/edit coverage, even when the outer script exits.
+            read_partial = true;
+            let paired = events.iter().skip(index + 1).find(|event| {
+                event["k"] == "tool.result" && event.get("call_id") == call.get("call_id")
+            });
+            if nested_calls(call["args"].as_str().unwrap_or_default())
+                .is_none_or(|calls| calls.iter().any(|call| call.tool == "exec_command"))
+                || !paired.is_some_and(|event| event["exit"] == 0)
+            {
+                edit_partial = true;
+            }
+            continue;
+        }
         if !matches!(tool, "exec_command" | "apply_patch") {
             continue;
         }
@@ -441,6 +481,116 @@ fn patch_body(arguments: &str) -> String {
         })
         .unwrap_or_else(|| arguments.to_string());
     patch_body
+}
+
+/// Exact straight-line wrapper only. Never evaluate JavaScript, infer execution
+/// from mentioned source, or associate ambiguous result blocks with operations.
+fn nested_calls(code: &str) -> Option<Vec<CodexCall>> {
+    let mut rest = code.trim();
+    if rest.starts_with("// @exec:") {
+        rest = rest.split_once('\n')?.1.trim_start();
+    }
+    let mut calls = Vec::new();
+    while !rest.is_empty() {
+        rest = rest.strip_prefix("text(await tools.")?;
+        let (tool, arguments) = rest.split_once('(')?;
+        let (args, consumed) = match tool {
+            "apply_patch" => {
+                let mut values =
+                    serde_json::Deserializer::from_str(arguments).into_iter::<String>();
+                let patch = values.next()?.ok()?;
+                if !patch_is_complete(&patch) || parse_patch(&patch).is_empty() {
+                    return None;
+                }
+                (patch, values.byte_offset())
+            }
+            "exec_command" => literal_command_arguments(arguments)?,
+            _ => return None,
+        };
+        rest = arguments[consumed..]
+            .trim_start()
+            .strip_prefix("));")?
+            .trim_start();
+        calls.push(CodexCall {
+            tool: tool.into(),
+            args,
+        });
+    }
+    (!calls.is_empty()).then_some(calls)
+}
+
+// JSON literal values and literal property names only; handles the recorded
+// {cmd:"...",workdir:"..."} spelling, not expressions, spreads or JS strings.
+fn literal_command_arguments(input: &str) -> Option<(String, usize)> {
+    let mut rest = input.trim_start().strip_prefix('{')?.trim_start();
+    let mut object = serde_json::Map::new();
+    loop {
+        if let Some(tail) = rest.strip_prefix('}') {
+            if !object.get("cmd")?.is_string() {
+                return None;
+            }
+            return Some((Value::Object(object).to_string(), input.len() - tail.len()));
+        }
+        let (key, tail) = if rest.starts_with('"') {
+            let mut values = serde_json::Deserializer::from_str(rest).into_iter::<String>();
+            let key = values.next()?.ok()?;
+            (key, &rest[values.byte_offset()..])
+        } else {
+            let end = rest.find(|c: char| !c.is_ascii_alphanumeric() && c != '_')?;
+            (rest[..end].to_string(), &rest[end..])
+        };
+        if !matches!(
+            key.as_str(),
+            "cmd"
+                | "workdir"
+                | "max_output_tokens"
+                | "yield_time_ms"
+                | "tty"
+                | "login"
+                | "sandbox_permissions"
+                | "justification"
+                | "prefix_rule"
+        ) {
+            return None;
+        }
+        rest = tail.trim_start().strip_prefix(':')?.trim_start();
+        let mut values = serde_json::Deserializer::from_str(rest).into_iter::<Value>();
+        let value = values.next()?.ok()?;
+        if object.insert(key, value).is_some() {
+            return None;
+        }
+        rest = rest[values.byte_offset()..].trim_start();
+        if let Some(tail) = rest.strip_prefix(',') {
+            rest = tail.trim_start();
+        } else if !rest.starts_with('}') {
+            return None;
+        }
+    }
+}
+
+fn nested_results(output: &Value, calls: &[CodexCall]) -> Option<Vec<Value>> {
+    let blocks = output.as_array()?;
+    if blocks.len() != calls.len() + 1 || !blocks.iter().all(|b| b["type"] == "input_text") {
+        return None;
+    }
+    let header = blocks[0]["text"].as_str()?;
+    if !header.starts_with("Script completed\nWall time ") || !header.ends_with("\nOutput:\n") {
+        return None;
+    }
+    calls
+        .iter()
+        .zip(&blocks[1..])
+        .map(|(call, block)| {
+            let value: Value = serde_json::from_str(block["text"].as_str()?).ok()?;
+            match call.tool.as_str() {
+                "apply_patch" if value == json!({}) => Some(value),
+                "exec_command" if value["exit_code"] == 0 && value["output"].is_string() => {
+                    Some(value)
+                }
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 fn custom_tool_exit_code(output: &str) -> Option<i64> {

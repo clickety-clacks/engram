@@ -361,3 +361,67 @@ The runtime writes `runner/test-definitions.json` with the larger P0 checks and
 records every observed result in hash-bound canonical evidence. Repository gates
 remain `cargo fmt --check`, `cargo test --all-targets`, and the release build;
 they run only on an authorized non-Gibson test host.
+
+## Correction after independent b7a1aa5 review
+
+This section supersedes earlier claims of complete semantic acceptance. The
+source implements R29-1 through R29-4 comparisons and failure handling, but a
+full P0 passing result remains blocked: PDO confirmed no standalone frozen
+complete §9.3 journey expectations are available. The runner retains a blocked
+summary and returns failure even if its available gates pass. Twelve performance
+projections, the typed semantic oracle and tombstone event journeys are stated
+as bounded checks. They do not stand in for full session/raw-window/ordering/
+lineage/queried-store/dispatch-lineage journeys. No local eligibility is possible
+from this runner until that missing expectation contract is supplied and reviewed.
+
+R29-1 adds two separately SHA-bound inputs under exact
+`/Users/mike/shared-workspace/engram/proofs/t1772/oracle-inputs-r29`:
+`global-oracle.json` (eaaf582c89dd8437825ff2fae8829a93c98e3fa42e0eec367d80ac0f956e48ca)
+and `per-tape-oracle.jsonl` (216389baba02cae5e722118b8cdee9cc5dc128cd222a8a44d34f70610374c2a7).
+The controller/runner require `--oracle-root`; the original eleven-file manifest
+is unchanged. Pre/post custody includes these supplemental bytes. Their eventual
+Darwin placement is an outstanding custody step, not claimed by a Linux build.
+The fresh comparator reads candidate tables, checks actual postings by full
+primary key, reproduces the frozen typed framing and ordered categories, and
+retains actual/expected per-tape and global results for both rebuilds. The frozen
+reference source is format evidence only and is neither wrapped nor executed.
+Tape compressed and decoded identities are checked against each frozen row.
+Dispatch JSON retains its frozen tape ordinal and first-turn/UUID ordering.
+Legacy edge and tombstone digests use the separately disclosed legacy census
+preimage. All 25,305 legacy tombstone keys exercise the actual product reader;
+complete canonical event sets and physical window associations are retained.
+Both rebuilds retain per-tape counts, query outputs and comparison hashes.
+
+Additional canonical-check I/O, beyond the previous b7a1aa5 manifest: per rebuild,
+one compressed hash read and one compressed decode read per tape (45,758 each),
+one ordered pass over 529,162 evidence windows, 150,357 edges, 1,114 tombstones and
+14,369 dispatch rows, 43,856,633 evidence-posting primary-key membership lookups
+and 41,964 tombstone-posting lookups, plus one count scan per posting table.
+For compressed corpus bytes T, the two rebuild comparisons add at least 4*T
+compressed bytes read. SQLite physical reads depend on its page cache, so no
+fabricated byte total is assigned to the lookups. Legacy compatibility separately
+reads 150,357 edges, checks 41,964 mapping rows and calls the product tombstone
+reader for 25,305 keys per rebuild. No baseline slot hash, collector or logical
+scan was added. Per-tape actual/expected artifacts add roughly twice the frozen
+73 MB JSONL per rebuild; exact emitted size is a runtime observation. These are
+canonical correctness gates outside all timed product samples.
+
+R29-2 sorts/deduplicates only the early physical-window projection by complete
+event identity. The same-invocation candidate CLI projection continues to retain
+extras and duplicates for strict comparison. R29-3 persists the complete payload
+manifest before its eligibility receipt; the receipt binds that manifest hash
+and is excluded from its payload to avoid a hash cycle. R29-4 always attempts
+available post-custody after a launched runner terminates, persists observations
+before comparing, and retains observation errors without replacing the runner's
+primary failure. Failure leaves eligibility absent.
+
+The Codex adapter correction is limited to literal, unconditional, straight-line
+`text(await tools.apply_patch(JSON_STRING));` and `tools.exec_command` wrappers
+with literal argument objects and matching successful result blocks. It preserves
+the raw output array; known bounded reads reuse the existing shell-read parser.
+It does not evaluate JavaScript, infer dynamic arguments, accept a mere outer
+completion as a successful nested call, or extract from conditionals. Unsupported
+scripts remain searchable raw events with partial evidence coverage. This resolves
+the demonstrated nested-tool seam without promising full provenance for arbitrary
+exec scripts. Focused fixtures include rejected decoys, missing/failed/ambiguous
+results, multiple calls, ordering ties and post-custody/finalization failures.

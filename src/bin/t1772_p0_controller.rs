@@ -29,6 +29,8 @@ struct Args {
     #[arg(long)]
     input_root: PathBuf,
     #[arg(long)]
+    oracle_root: PathBuf,
+    #[arg(long)]
     proof_root: PathBuf,
     #[arg(long)]
     tape_root: PathBuf,
@@ -161,6 +163,7 @@ fn run() -> ProofResult<()> {
     // Full immutable input custody is observed while PROOF_ROOT is still absent.
     let custody_roots = vec![
         args.input_root.clone(),
+        args.oracle_root.clone(),
         args.tape_root.clone(),
         args.baseline_binary.clone(),
         PathBuf::from(engram::proof::baseline_custody::COMPARATOR_ROOT),
@@ -182,6 +185,10 @@ fn run() -> ProofResult<()> {
             .proof_root
             .join("manifests/reconstructed-comparator.json"),
         &comparator,
+    )?;
+    write_canonical_json(
+        &args.proof_root.join("manifests/oracle-inputs-pre.json"),
+        &engram::proof::canonical_oracle::verify_inputs(&args.oracle_root)?,
     )?;
     // Immutable/input checks still precede root creation. Live CoW captures need
     // their staging directory and complete before any runner staging read.
@@ -252,163 +259,256 @@ fn run() -> ProofResult<()> {
         .stderr(Stdio::from(stderr));
     let mut child = ManagedChild::new(command.spawn()?);
     let child_pid = child.id() as libc::pid_t;
-    lifecycle.record(
-        "runner_spawned",
-        json!({
-            "pid": child_pid,
-            "argv": argv,
-            "environment": {"T1772_START_SUSPENDED":"1", "LC_ALL":"C", "LANG":"C", "TZ":"UTC"},
-            "stdout_path": stdout_path,
-            "stderr_path": stderr_path
-        }),
-    )?;
+    let runner_result = (|| -> ProofResult<()> {
+        lifecycle.record(
+            "runner_spawned",
+            json!({
+                "pid": child_pid,
+                "argv": argv,
+                "environment": {"T1772_START_SUSPENDED":"1", "LC_ALL":"C", "LANG":"C", "TZ":"UTC"},
+                "stdout_path": stdout_path,
+                "stderr_path": stderr_path
+            }),
+        )?;
 
-    let mut wait_status = 0i32;
-    let waited = unsafe { libc::waitpid(child_pid, &mut wait_status, libc::WUNTRACED) };
-    if waited != child_pid || !libc::WIFSTOPPED(wait_status) {
-        return Err(format!("runner did not enter the reviewed post-exec stopped state: waitpid={waited} status={wait_status}").into());
-    }
-    lifecycle.record(
-        "runner_stopped_observed",
-        json!({
-            "pid": child_pid,
-            "stop_signal": libc::WSTOPSIG(wait_status),
-            "csops": observe_csops(child_pid)
-        }),
-    )?;
+        let mut wait_status = 0i32;
+        let waited = unsafe { libc::waitpid(child_pid, &mut wait_status, libc::WUNTRACED) };
+        if waited != child_pid || !libc::WIFSTOPPED(wait_status) {
+            return Err(format!("runner did not enter the reviewed post-exec stopped state: waitpid={waited} status={wait_status}").into());
+        }
+        lifecycle.record(
+            "runner_stopped_observed",
+            json!({
+                "pid": child_pid,
+                "stop_signal": libc::WSTOPSIG(wait_status),
+                "csops": observe_csops(child_pid)
+            }),
+        )?;
 
-    if SIGCONT_NUMBER != 19 {
-        return Err(
-            format!("Darwin SIGCONT must be 19, compiled value is {SIGCONT_NUMBER}").into(),
-        );
-    }
-    let kill_result = unsafe { libc::kill(child_pid, SIGCONT_NUMBER) };
-    if kill_result != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    lifecycle.record(
-        "sigcont_sent",
-        json!({
-            "pid": child_pid,
-            "signal_name":"SIGCONT",
-            "signal_number":19,
-            "csops_after_resume": observe_csops(child_pid)
-        }),
-    )?;
+        if SIGCONT_NUMBER != 19 {
+            return Err(
+                format!("Darwin SIGCONT must be 19, compiled value is {SIGCONT_NUMBER}").into(),
+            );
+        }
+        let kill_result = unsafe { libc::kill(child_pid, SIGCONT_NUMBER) };
+        if kill_result != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        lifecycle.record(
+            "sigcont_sent",
+            json!({
+                "pid": child_pid,
+                "signal_name":"SIGCONT",
+                "signal_number":19,
+                "csops_after_resume": observe_csops(child_pid)
+            }),
+        )?;
 
-    let status = child.wait()?;
-    lifecycle.record(
-        "runner_completed",
-        json!({
-            "pid": child_pid,
-            "success": status.success(),
-            "exit_code": status.code(),
-            "elapsed_milliseconds": started.elapsed().as_millis(),
-            "stdout_path": stdout_path,
-            "stdout_sha256": sha256_file(&stdout_path)?,
-            "stderr_path": stderr_path,
-            "stderr_sha256": sha256_file(&stderr_path)?
-        }),
-    )?;
-    if !status.success() {
-        return Err(format!("runner exited unsuccessfully: {status}").into());
-    }
+        let status = child.wait()?;
+        lifecycle.record(
+            "runner_completed",
+            json!({
+                "pid": child_pid,
+                "success": status.success(),
+                "exit_code": status.code(),
+                "elapsed_milliseconds": started.elapsed().as_millis(),
+                "stdout_path": stdout_path,
+                "stdout_sha256": sha256_file(&stdout_path)?,
+                "stderr_path": stderr_path,
+                "stderr_sha256": sha256_file(&stderr_path)?
+            }),
+        )?;
+        if !status.success() {
+            return Err(format!("runner exited unsuccessfully: {status}").into());
+        }
 
-    let summary_path = args.proof_root.join("runner/runner-summary.json");
-    let summary: Value = serde_json::from_reader(File::open(&summary_path)?)?;
-    if summary["status"] != "passed" || summary["publication_performed"] != false {
-        return Err("runner summary is not a passing non-publication result".into());
-    }
+        let summary_path = args.proof_root.join("runner/runner-summary.json");
+        let summary: Value = serde_json::from_reader(File::open(&summary_path)?)?;
+        if summary["status"] != "passed" || summary["publication_performed"] != false {
+            return Err("runner summary is not a passing non-publication result".into());
+        }
 
-    let input_postcheck = verify_input_manifest(&args.input_root, &args.manifest)?;
-    let immutable_post = collect_custody(&custody_roots)?;
-    let custody_comparison = compare_existing_immutable(&immutable_pre, &immutable_post)?;
-    let live_post = observe_live_paths(
-        &args.live_index,
-        &args.cursor_root,
-        &args.proof_root.join("manifests/live-clones-post"),
-    )?;
-    let capacity_after = capacity(&args.proof_root)?;
-    write_canonical_jsonl(
-        &args.proof_root.join("manifests/input-post.jsonl"),
-        manifest_result(&input_postcheck),
-    )?;
-    write_canonical_jsonl(
-        &args
-            .proof_root
-            .join("manifests/immutable-custody-post.jsonl"),
-        immutable_post
-            .iter()
-            .map(|entry| serde_json::to_value(entry).unwrap()),
-    )?;
-    write_canonical_json(
-        &args
-            .proof_root
-            .join("manifests/immutable-custody-comparison.json"),
-        &custody_comparison,
-    )?;
-    write_canonical_json(
-        &args.proof_root.join("manifests/live-observation-post.json"),
-        &live_post,
-    )?;
-    write_canonical_json(
-        &args.proof_root.join("manifests/live-observation-diff.json"),
-        &diff_values(&live_pre, &live_post),
-    )?;
-    write_canonical_json(
-        &args.proof_root.join("manifests/capacity-after.json"),
-        &capacity_after,
+        Ok(())
+    })();
+    // Reap/terminate a child even after a stop/resume/observation error, then
+    // attempt every post boundary independently of the primary runner result.
+    drop(child);
+    let disk = retain_after_runner(
+        &args,
+        &custody_roots,
+        &immutable_pre,
+        &live_pre,
+        runner_result,
+        disk_sampler,
     )?;
     lifecycle.record(
         "post_custody_passed",
-        json!({
-            "manifest_entries": input_postcheck.len(),
-            "existing_immutable_paths_unchanged": true,
-            "new_immutable_paths": custody_comparison["new_paths"],
-            "live_differences_recorded": diff_values(&live_pre, &live_post),
-            "capacity": capacity_after
-        }),
+        json!({"all_observations_retained":true}),
     )?;
-
-    // Stop and join observation before hashing outputs; sampler failure forbids
-    // eligibility. Includes rebuilds, concurrency copies, temporary query copies,
-    // sidecars, child output and post-custody capture, all inside PROOF_ROOT.
-    let disk = disk_sampler.finish()?;
     lifecycle.record("staging_disk_measurement_completed", disk)?;
-
-    // This local eligibility record never publishes a Tightbeam condition or
-    // wakes Eezo; an accepted independent review must precede any external
-    // readiness effect. The full output manifest is written once, after it.
-    let runner_manifest_hash =
-        sha256_file(&args.proof_root.join("runner/runner-output-manifest.jsonl"))?;
-    let eligibility = json!({
-        "schema":"t1772-publication-eligibility-v1",
-        "eligible_for_independent_review":true,
-        "eligible_for_readiness_publication":false,
-        "reason":"independent review has not yet accepted this exact source, binary custody, invocation, and frozen output manifest",
-        "required_order":["proof_passed","post_custody_passed","output_frozen","independent_review_accepted","readiness_published","eezo_launch_authorized"],
-        "runner_output_manifest_sha256":runner_manifest_hash,
-        "cold_custody_amendment_sha256":engram::proof::baseline_custody::COLD_AMENDMENT_SHA256,
-        "cold_copy_limitation":engram::proof::baseline_custody::COLD_LIMITATION,
-        "no_external_publication_performed":true,
-        "no_live_state_targeted_for_write":true
-    });
-    lifecycle.record("review_package_eligible", eligibility.clone())?;
-    drop(lifecycle);
-    write_canonical_json(
-        &args.proof_root.join("publication/review-eligibility.json"),
-        &eligibility,
+    lifecycle.record(
+        "payload_finalization_started",
+        json!({"eligibility_receipt_outside_payload":true}),
     )?;
-    let output_manifest = proof_output_manifest(&args.proof_root)?;
-    write_canonical_jsonl(
-        &args.proof_root.join("manifests/full-proof-output.jsonl"),
+    drop(lifecycle); // No lifecycle writes after its bytes enter the payload.
+    finalize_eligibility(&args.proof_root)?;
+    Ok(())
+}
+
+fn retain_after_runner(
+    args: &Args,
+    custody_roots: &[PathBuf],
+    immutable_pre: &[t1772::CustodyEntry],
+    live_pre: &Value,
+    runner_result: ProofResult<()>,
+    disk_sampler: engram::proof::measurement::DiskSampler,
+) -> ProofResult<Value> {
+    let post_result = retain_post_custody(args, custody_roots, immutable_pre, live_pre);
+    let disk_result = disk_sampler.finish();
+    let primary = runner_result.as_ref().err().map(ToString::to_string);
+    let outcome = json!({"runner_error":primary,
+        "post_custody_error":post_result.as_ref().err().map(ToString::to_string),
+        "disk_error":disk_result.as_ref().err().map(ToString::to_string),
+        "eligible_for_independent_review":false});
+    let outcome_result = write_canonical_json(
+        &args.proof_root.join("controller/post-run-outcome.json"),
+        &outcome,
+    );
+    // Preserve the primary failure; secondary capture errors are retained above.
+    runner_result?;
+    post_result?;
+    let disk = disk_result?;
+    outcome_result?;
+    Ok(disk)
+}
+
+// The final receipt is outside the payload it binds; neither manifest nor
+// eligibility exists as a positive completion signal before payload persistence.
+fn finalize_eligibility(root: &Path) -> ProofResult<()> {
+    let runner_hash = sha256_file(&root.join("runner/runner-output-manifest.jsonl"))?;
+    let output_manifest = proof_output_manifest(root)?;
+    let payload_hash = write_canonical_jsonl(
+        &root.join("manifests/full-proof-output.jsonl"),
         output_manifest,
     )?;
+    write_canonical_json(
+        &root.join("publication/review-eligibility.json"),
+        &json!({
+            "schema":"t1772-publication-eligibility-v2",
+            "eligible_for_independent_review":true,
+            "eligible_for_readiness_publication":false,
+            "reason":"independent review and exact authorized native execution custody remain required",
+            "required_order":["proof_passed","post_custody_passed","output_frozen","independent_review_accepted","readiness_published","eezo_launch_authorized"],
+            "runner_output_manifest_sha256":runner_hash,
+            "full_proof_output_manifest_sha256":payload_hash,
+            "payload_exclusions":["manifests/full-proof-output.jsonl","publication/review-eligibility.json"],
+            "cold_custody_amendment_sha256":engram::proof::baseline_custody::COLD_AMENDMENT_SHA256,
+            "cold_copy_limitation":engram::proof::baseline_custody::COLD_LIMITATION,
+            "no_external_publication_performed":true,"no_live_state_targeted_for_write":true
+        }),
+    )?;
+    Ok(())
+}
+
+fn retain_post_custody(
+    args: &Args,
+    roots: &[PathBuf],
+    before: &[t1772::CustodyEntry],
+    live_pre: &Value,
+) -> ProofResult<()> {
+    // Only this post boundary collects errors instead of returning on first failure.
+    fn save(
+        root: &Path,
+        name: &str,
+        result: ProofResult<Value>,
+        errors: &mut Vec<Value>,
+    ) -> Option<Value> {
+        match result {
+            Ok(value) => {
+                if let Err(error) = write_canonical_json(&root.join(name), &value) {
+                    errors.push(json!({"observation":name,"error":error.to_string()}));
+                }
+                Some(value)
+            }
+            Err(error) => {
+                errors.push(json!({"observation":name,"error":error.to_string()}));
+                None
+            }
+        }
+    }
+    let root = &args.proof_root;
+    let (after, mut errors) = t1772::collect_post_custody(roots);
+    // Persist all available entries before comparing, including mutations.
+    if let Err(error) = write_canonical_jsonl(
+        &root.join("manifests/immutable-custody-post.jsonl"),
+        after
+            .iter()
+            .map(|entry| serde_json::to_value(entry).expect("custody serializes")),
+    ) {
+        errors.push(json!({"observation":"immutable-custody-post","error":error.to_string()}));
+    }
+    let comparison = compare_existing_immutable(before, &after);
+    let equal = comparison["existing_paths_unchanged"] == true;
+    save(
+        root,
+        "manifests/immutable-custody-comparison.json",
+        Ok(comparison),
+        &mut errors,
+    );
+    save(
+        root,
+        "manifests/input-post.json",
+        verify_input_manifest(&args.input_root, &args.manifest)
+            .map(|entries| json!(manifest_result(&entries))),
+        &mut errors,
+    );
+    save(
+        root,
+        "manifests/oracle-inputs-post.json",
+        engram::proof::canonical_oracle::verify_inputs(&args.oracle_root),
+        &mut errors,
+    );
+    if let Some(live) = save(
+        root,
+        "manifests/live-observation-post.json",
+        observe_live_paths(
+            &args.live_index,
+            &args.cursor_root,
+            &root.join("manifests/live-clones-post"),
+        ),
+        &mut errors,
+    ) {
+        save(
+            root,
+            "manifests/live-observation-diff.json",
+            Ok(diff_values(live_pre, &live)),
+            &mut errors,
+        );
+    }
+    save(
+        root,
+        "manifests/capacity-after.json",
+        capacity(root),
+        &mut errors,
+    );
+    write_canonical_json(
+        &root.join("manifests/post-observation-errors.json"),
+        &json!({"errors":errors}),
+    )?;
+    if !equal || !errors.is_empty() {
+        return Err("post-custody mismatch or observation error; retained manifests describe available evidence".into());
+    }
     Ok(())
 }
 
 fn validate_static_contract(args: &Args) -> ProofResult<()> {
     require_exact_path(&args.input_root, INPUT_ROOT, "INPUT_ROOT")?;
+    require_exact_path(
+        &args.oracle_root,
+        engram::proof::canonical_oracle::SUPPLEMENT_ROOT,
+        "ORACLE_ROOT",
+    )?;
+    engram::proof::canonical_oracle::verify_inputs(&args.oracle_root)?;
     require_exact_path(&args.proof_root, PROOF_ROOT, "PROOF_ROOT")?;
     if args.manifest != args.input_root.join(MANIFEST_NAME) {
         return Err("manifest path is not exact".into());
@@ -508,6 +608,8 @@ fn runner_argv(args: &Args) -> Vec<String> {
         CANDIDATE_BASE.into(),
         "--input-root".into(),
         args.input_root.to_string_lossy().into_owned(),
+        "--oracle-root".into(),
+        args.oracle_root.to_string_lossy().into_owned(),
         "--proof-root".into(),
         args.proof_root.to_string_lossy().into_owned(),
         "--tape-root".into(),
@@ -732,23 +834,25 @@ fn collect_paths(root: &Path, paths: &mut Vec<PathBuf>) -> ProofResult<()> {
 fn compare_existing_immutable(
     before: &[t1772::CustodyEntry],
     after: &[t1772::CustodyEntry],
-) -> ProofResult<Value> {
+) -> Value {
     let after_map = after
         .iter()
         .map(|entry| (&entry.path, entry))
         .collect::<BTreeMap<_, _>>();
+    let mut differences = Vec::new();
     for entry in before {
-        let Some(observed) = after_map.get(&entry.path) else {
-            return Err(format!("immutable input disappeared: {}", entry.path).into());
-        };
-        if entry.file_type == "file" || entry.file_type == "symlink" {
-            if entry.file_type != observed.file_type
-                || entry.bytes != observed.bytes
-                || entry.sha256 != observed.sha256
-                || entry.symlink_target != observed.symlink_target
+        match after_map.get(&entry.path) {
+            None => differences.push(json!({"path":entry.path,"before":entry,"after":null})),
+            Some(observed)
+                if (entry.file_type == "file" || entry.file_type == "symlink")
+                    && (entry.file_type != observed.file_type
+                        || entry.bytes != observed.bytes
+                        || entry.sha256 != observed.sha256
+                        || entry.symlink_target != observed.symlink_target) =>
             {
-                return Err(format!("immutable input bytes changed: {}", entry.path).into());
+                differences.push(json!({"path":entry.path,"before":entry,"after":observed}))
             }
+            _ => {}
         }
     }
     let before_paths = before
@@ -760,9 +864,8 @@ fn compare_existing_immutable(
         .filter(|entry| !before_paths.contains(&entry.path))
         .map(|entry| &entry.path)
         .collect::<Vec<_>>();
-    Ok(
-        json!({"existing_paths_unchanged":true,"before_count":before.len(),"after_count":after.len(),"new_paths":new_paths}),
-    )
+    json!({"existing_paths_unchanged":differences.is_empty(),"differences":differences,
+        "before_count":before.len(),"after_count":after.len(),"new_paths":new_paths})
 }
 
 fn diff_values(before: &Value, after: &Value) -> Value {
@@ -825,7 +928,10 @@ fn proof_output_manifest(root: &Path) -> ProofResult<Vec<Value>> {
     let manifest_path = root.join("manifests/full-proof-output.jsonl");
     let mut values = Vec::new();
     for path in paths {
-        if !path.is_file() || path == manifest_path {
+        if !path.is_file()
+            || path == manifest_path
+            || path == root.join("publication/review-eligibility.json")
+        {
             continue;
         }
         values.push(json!({"path":path.strip_prefix(root)?.to_string_lossy(),"bytes":fs::metadata(&path)?.len(),"sha256":sha256_file(&path)?}));
@@ -840,6 +946,128 @@ fn now_millis() -> ProofResult<u128> {
 #[cfg(test)]
 mod live_clone_tests {
     use super::*;
+
+    fn post_fixture(root: &Path) -> Args {
+        Args {
+            source_root: root.into(),
+            source_revision: "fixture".into(),
+            input_root: root.join("inputs"),
+            oracle_root: root.join("oracle-inputs"),
+            proof_root: root.join("proof"),
+            tape_root: root.join("tapes"),
+            live_index: root.join("live.sqlite"),
+            cursor_root: root.join("cursors"),
+            manifest: root.join("inputs/manifest"),
+            runner: root.join("runner"),
+            runner_sha256: "0".repeat(64),
+            controller_sha256: "0".repeat(64),
+            candidate_binary: root.join("candidate"),
+            candidate_binary_sha256: "0".repeat(64),
+            baseline_binary: root.join("baseline"),
+            baseline_database: root.join("baseline.sqlite"),
+            baseline_database_sha256: "0".repeat(64),
+            comparator_receipt: root.join("receipt.json"),
+            comparator_receipt_sha256: "0".repeat(64),
+        }
+    }
+
+    #[test]
+    fn failed_runner_and_immutable_mismatch_preserve_post_evidence() {
+        for runner_failed in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let args = post_fixture(temp.path());
+            fs::create_dir(&args.proof_root).unwrap();
+            fs::create_dir(&args.input_root).unwrap();
+            let input = args.input_root.join("blob");
+            fs::write(&input, b"before").unwrap();
+            let roots = vec![args.input_root.clone()];
+            let pre = collect_custody(&roots).unwrap();
+            fs::write(&input, b"changed").unwrap();
+            let sampler = engram::proof::measurement::DiskSampler::start(
+                &args.proof_root,
+                &args.proof_root.join("samples.jsonl"),
+                &args.proof_root.join("disk.json"),
+            )
+            .unwrap();
+            let primary = if runner_failed {
+                Err("runner failed fixture".into())
+            } else {
+                Ok(())
+            };
+            let error = retain_after_runner(&args, &roots, &pre, &json!({}), primary, sampler)
+                .unwrap_err()
+                .to_string();
+            if runner_failed {
+                assert_eq!(error, "runner failed fixture");
+            } else {
+                assert!(error.contains("post-custody"));
+            }
+            let post = fs::read_to_string(
+                args.proof_root
+                    .join("manifests/immutable-custody-post.jsonl"),
+            )
+            .unwrap();
+            assert!(post.contains(&sha256_file(&input).unwrap()));
+            let comparison: Value = serde_json::from_reader(
+                File::open(
+                    args.proof_root
+                        .join("manifests/immutable-custody-comparison.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(comparison["existing_paths_unchanged"], false);
+            assert_eq!(comparison["differences"].as_array().unwrap().len(), 1);
+            assert!(
+                args.proof_root
+                    .join("manifests/post-observation-errors.json")
+                    .is_file()
+            );
+            assert!(
+                args.proof_root
+                    .join("manifests/capacity-after.json")
+                    .is_file()
+            );
+            assert!(
+                !args
+                    .proof_root
+                    .join("publication/review-eligibility.json")
+                    .exists()
+            );
+        }
+    }
+
+    #[test]
+    fn eligibility_requires_persisted_payload_and_binds_its_hash() {
+        for fail in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            fs::create_dir(root.join("runner")).unwrap();
+            fs::create_dir(root.join("manifests")).unwrap();
+            fs::write(root.join("runner/runner-output-manifest.jsonl"), b"{}\n").unwrap();
+            if fail {
+                fs::create_dir(root.join("manifests/full-proof-output.jsonl")).unwrap();
+            }
+            let result = finalize_eligibility(root);
+            if fail {
+                assert!(result.is_err());
+                assert!(!root.join("publication/review-eligibility.json").exists());
+            } else {
+                result.unwrap();
+                let value: Value = serde_json::from_reader(
+                    File::open(root.join("publication/review-eligibility.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    value["full_proof_output_manifest_sha256"],
+                    sha256_file(&root.join("manifests/full-proof-output.jsonl")).unwrap()
+                );
+                let payload =
+                    fs::read_to_string(root.join("manifests/full-proof-output.jsonl")).unwrap();
+                assert!(!payload.contains("review-eligibility.json"));
+            }
+        }
+    }
 
     #[test]
     fn live_difference_ignores_capture_locations_but_keeps_byte_changes() {

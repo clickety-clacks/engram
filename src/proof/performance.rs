@@ -18,7 +18,7 @@ pub fn direct_projection(touches: &[crate::index::lineage::EvidenceFragmentRef])
             .as_str()
             .cmp(&b["timestamp"].as_str())
             .then_with(|| a["tape_id"].as_str().cmp(&b["tape_id"].as_str()))
-            .then_with(|| a["event_offset"].as_i64().cmp(&b["event_offset"].as_i64()))
+            .then_with(|| a["event_offset"].as_u64().cmp(&b["event_offset"].as_u64()))
             .then_with(|| a["kind"].as_str().cmp(&b["kind"].as_str()))
             .then_with(|| a["file_path"].as_str().cmp(&b["file_path"].as_str()))
     });
