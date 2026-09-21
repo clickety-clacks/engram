@@ -1,0 +1,122 @@
+{
+  "old_binary_sha256": "65c3f982ee470da93f6a3cde2211899c72bf36af53181cee2db6205970ac3db8",
+  "old_commit": "8c0286bdd9abc8986964396d996be0e5b778e6a7",
+  "files": {
+    "sender.codex.jsonl": "{\"type\":\"response_item\",\"timestamp\":\"2026-09-21T00:00:00Z\",\"payload\":{\"type\":\"custom_tool_call\",\"call_id\":\"send\",\"name\":\"exec\",\"input\":\"tightbeam wake <engram-src id=\\\"788de2da-5970-4814-a2aa-217c5f484d8a\\\"/> work\"}}\n",
+    "receiver.codex.jsonl": "{\"type\":\"session_meta\",\"timestamp\":\"2026-09-21T00:00:00Z\",\"payload\":{\"id\":\"worker\",\"cwd\":\"/tmp\"}}\n{\"type\":\"response_item\",\"timestamp\":\"2026-09-21T00:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"<engram-src id=\\\"788de2da-5970-4814-a2aa-217c5f484d8a\\\"/> work\"}]}}\n{\"type\":\"response_item\",\"timestamp\":\"2026-09-21T00:00:02Z\",\"payload\":{\"type\":\"custom_tool_call\",\"call_id\":\"edit\",\"name\":\"apply_patch\",\"input\":\"*** Begin Patch\\n*** Add File: /tmp/probe.rs\\n+pub fn isolated_handoff_probe() -> u64 { 73849127 }\\n*** End Patch\"}}\n{\"type\":\"response_item\",\"timestamp\":\"2026-09-21T00:00:03Z\",\"payload\":{\"type\":\"custom_tool_call_output\",\"call_id\":\"edit\",\"output\":\"{\\\"metadata\\\": {\\\"exit_code\\\": 0}, \\\"output\\\": \\\"Success. Updated the following files:\\\\nA /tmp/probe.rs\\\\n\\\"}\"}}\n"
+  },
+  "tapes": {
+    "820dc054bc4caf8183a725623d6fe514c511c4ddb9ae7a39b5687958007a6800": "{\"coverage.edit\":\"full\",\"coverage.read\":\"full\",\"coverage.tool\":\"full\",\"k\":\"meta\",\"source\":{\"harness\":\"codex-cli\"},\"t\":\"2026-09-21T00:00:00Z\"}\n{\"content\":\"<engram-src id=\\\"788de2da-5970-4814-a2aa-217c5f484d8a\\\"/> work\",\"k\":\"msg.in\",\"role\":\"user\",\"source\":{\"harness\":\"codex-cli\"},\"t\":\"2026-09-21T00:00:01Z\"}\n{\"args\":\"*** Begin Patch\\n*** Add File: /tmp/probe.rs\\n+pub fn isolated_handoff_probe() -> u64 { 73849127 }\\n*** End Patch\",\"call_id\":\"edit\",\"k\":\"tool.call\",\"source\":{\"harness\":\"codex-cli\"},\"t\":\"2026-09-21T00:00:02Z\",\"tool\":\"apply_patch\"}\n{\"call_id\":\"edit\",\"exit\":0,\"k\":\"tool.result\",\"source\":{\"harness\":\"codex-cli\"},\"stderr\":\"\",\"stdout\":\"{\\\"metadata\\\": {\\\"exit_code\\\": 0}, \\\"output\\\": \\\"Success. Updated the following files:\\\\nA /tmp/probe.rs\\\\n\\\"}\",\"t\":\"2026-09-21T00:00:03Z\",\"tool\":\"apply_patch\"}\n{\"after_text\":\"pub fn isolated_handoff_probe() -> u64 { 73849127 }\\n\",\"file\":\"/tmp/probe.rs\",\"k\":\"code.edit\",\"source\":{\"harness\":\"codex-cli\"},\"t\":\"2026-09-21T00:00:03Z\"}\n",
+    "2ca9df632084c0f77c3d393bbb5d052a7cd9672355d3f2369253e0231704b0a4": "{\"coverage.edit\":\"partial\",\"coverage.read\":\"partial\",\"coverage.tool\":\"full\",\"k\":\"meta\",\"source\":{\"harness\":\"codex-cli\"},\"t\":\"2026-09-21T00:00:00Z\"}\n{\"args\":\"tightbeam wake <engram-src id=\\\"788de2da-5970-4814-a2aa-217c5f484d8a\\\"/> work\",\"call_id\":\"send\",\"k\":\"tool.call\",\"source\":{\"harness\":\"codex-cli\"},\"t\":\"2026-09-21T00:00:00Z\",\"tool\":\"exec\"}\n"
+  },
+  "cursors": {
+    "sender.codex.jsonl": {
+      "byte_cursor": 217,
+      "cursor_guard": {
+        "offset": 0,
+        "len": 217,
+        "hash": "e1133f42ca66fba88f1ba0536f88573116b37522528bec5f06550a6277925c6f"
+      },
+      "adapter": "codex-cli",
+      "tape_id": "2ca9df632084c0f77c3d393bbb5d052a7cd9672355d3f2369253e0231704b0a4"
+    },
+    "receiver.codex.jsonl": {
+      "byte_cursor": 811,
+      "cursor_guard": {
+        "offset": 299,
+        "len": 512,
+        "hash": "09cc64fd53e8b4d45c20e76c7eb0b5b9e412977bf3dc573e2aa9923d4f7cfa79"
+      },
+      "adapter": "codex-cli",
+      "tape_id": "820dc054bc4caf8183a725623d6fe514c511c4ddb9ae7a39b5687958007a6800"
+    }
+  },
+  "dispatch_links": [
+    [
+      "820dc054bc4caf8183a725623d6fe514c511c4ddb9ae7a39b5687958007a6800",
+      "788de2da-5970-4814-a2aa-217c5f484d8a",
+      0,
+      "received"
+    ]
+  ],
+  "counts": {
+    "evidence_windows": 1,
+    "evidence_features": 3,
+    "edges": 0,
+    "tombstones": 0
+  },
+  "before_query": {
+    "chains": [
+      {
+        "descendants": [
+          {
+            "children": [],
+            "depth": 0,
+            "parent": null,
+            "session_id": "820dc054bc4caf8183a725623d6fe514c511c4ddb9ae7a39b5687958007a6800"
+          }
+        ],
+        "root_session_id": "820dc054bc4caf8183a725623d6fe514c511c4ddb9ae7a39b5687958007a6800"
+      }
+    ],
+    "dispatch_lineage": [],
+    "lineage": [],
+    "query": {
+      "anchors": [
+        "winnow:0753660fe8b09af7",
+        "winnow:08a35376192da71d",
+        "winnow:04b4a7d510b8b8d9"
+      ],
+      "command": "explain",
+      "count": false,
+      "depth": 10,
+      "forensics": false,
+      "grep_filter": null,
+      "include_deleted": false,
+      "limit": null,
+      "max_edges": 500,
+      "max_fanout": 50,
+      "min_confidence": 0.5,
+      "offset": 0,
+      "since": null,
+      "target": "pub fn isolated_handoff_probe() -> u64 { 73849127 }",
+      "until": null
+    },
+    "returned": 1,
+    "sessions": [
+      {
+        "chain_length": 1,
+        "children": [],
+        "confidence": 1.0,
+        "depth": 0,
+        "files_touched": [
+          "/tmp/probe.rs"
+        ],
+        "parent": null,
+        "refs_down": 0,
+        "refs_up": 1,
+        "session_id": "820dc054bc4caf8183a725623d6fe514c511c4ddb9ae7a39b5687958007a6800",
+        "timestamp": "2026-09-21T00:00:03Z",
+        "total_lines": 5,
+        "touches": [
+          {
+            "event_offset": 4,
+            "file_path": "/tmp/probe.rs",
+            "kind": "edit",
+            "timestamp": "2026-09-21T00:00:03Z"
+          }
+        ],
+        "window_end": 5,
+        "window_start": 1
+      }
+    ],
+    "stores_queried": 1,
+    "time_range": {
+      "end": "2026-09-21T00:00:03Z",
+      "start": "2026-09-21T00:00:03Z"
+    },
+    "tombstones": [],
+    "total": 1,
+    "truncated": false
+  }
+}

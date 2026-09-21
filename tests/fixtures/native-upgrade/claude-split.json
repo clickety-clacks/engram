@@ -1,0 +1,116 @@
+{
+  "old_binary_sha256": "65c3f982ee470da93f6a3cde2211899c72bf36af53181cee2db6205970ac3db8",
+  "old_commit": "8c0286bdd9abc8986964396d996be0e5b778e6a7",
+  "files": {
+    "sender.claude.jsonl": "{\"type\":\"assistant\",\"sessionId\":\"parent\",\"cwd\":\"/tmp\",\"timestamp\":\"2026-09-21T00:00:00Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"send\",\"name\":\"Bash\",\"input\":{\"command\":\"tightbeam wake <engram-src id=\\\"788de2da-5970-4814-a2aa-217c5f484d8a\\\"/> work\"}}]}}\n",
+    "receiver.claude.jsonl": "{\"type\":\"user\",\"sessionId\":\"worker\",\"cwd\":\"/tmp\",\"timestamp\":\"2026-09-21T00:00:01Z\",\"message\":{\"role\":\"user\",\"content\":\"<engram-src id=\\\"788de2da-5970-4814-a2aa-217c5f484d8a\\\"/> work\"}}\n{\"type\":\"assistant\",\"sessionId\":\"worker\",\"cwd\":\"/tmp\",\"timestamp\":\"2026-09-21T00:00:02Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"edit\",\"name\":\"Write\",\"input\":{\"file_path\":\"/tmp/probe.rs\",\"content\":\"pub fn isolated_handoff_probe() -> u64 { 73849127 }\"}}]}}\n{\"type\":\"user\",\"sessionId\":\"worker\",\"cwd\":\"/tmp\",\"timestamp\":\"2026-09-21T00:00:03Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"edit\",\"content\":\"written\"}]}}\n"
+  },
+  "tapes": {
+    "c8592ae3ca52e7ffb902fbb30e4a16b0ea2d2e4acfb393f8d6222416003d181f": "{\"coverage.edit\":\"partial\",\"coverage.read\":\"partial\",\"coverage.tool\":\"full\",\"k\":\"meta\",\"model\":null,\"source\":{\"harness\":\"claude-code\",\"session_id\":\"parent\"},\"t\":\"2026-09-21T00:00:00Z\"}\n{\"args\":\"{\\\"command\\\":\\\"tightbeam wake <engram-src id=\\\\\\\"788de2da-5970-4814-a2aa-217c5f484d8a\\\\\\\"/> work\\\"}\",\"call_id\":\"send\",\"k\":\"tool.call\",\"source\":{\"harness\":\"claude-code\",\"session_id\":\"parent\"},\"t\":\"2026-09-21T00:00:00Z\",\"tool\":\"Bash\"}\n",
+    "92554407682147e60e43aa5f51b3e470ecdebdfeff01363ff9d6b9e49d41f4f5": "{\"coverage.edit\":\"full\",\"coverage.read\":\"full\",\"coverage.tool\":\"full\",\"k\":\"meta\",\"model\":null,\"source\":{\"harness\":\"claude-code\",\"session_id\":\"worker\"},\"t\":\"2026-09-21T00:00:01Z\"}\n{\"content\":\"<engram-src id=\\\"788de2da-5970-4814-a2aa-217c5f484d8a\\\"/> work\",\"k\":\"msg.in\",\"role\":\"user\",\"source\":{\"harness\":\"claude-code\",\"session_id\":\"worker\"},\"t\":\"2026-09-21T00:00:01Z\"}\n",
+    "4c1d57e10390df9c73c5b8e2e5acd1d068f12193a3ebf1bf2a138348a3b26a59": "{\"coverage.edit\":\"full\",\"coverage.read\":\"full\",\"coverage.tool\":\"full\",\"k\":\"meta\",\"model\":null,\"source\":{\"harness\":\"claude-code\",\"session_id\":\"worker\"},\"t\":\"2026-09-21T00:00:02Z\"}\n{\"args\":\"{\\\"content\\\":\\\"pub fn isolated_handoff_probe() -> u64 { 73849127 }\\\",\\\"file_path\\\":\\\"/tmp/probe.rs\\\"}\",\"call_id\":\"edit\",\"k\":\"tool.call\",\"source\":{\"harness\":\"claude-code\",\"session_id\":\"worker\"},\"t\":\"2026-09-21T00:00:02Z\",\"tool\":\"Write\"}\n{\"call_id\":\"edit\",\"exit\":0,\"k\":\"tool.result\",\"source\":{\"harness\":\"claude-code\",\"session_id\":\"worker\"},\"stderr\":\"\",\"stdout\":\"written\",\"t\":\"2026-09-21T00:00:03Z\",\"tool\":\"Write\"}\n{\"after_text\":\"pub fn isolated_handoff_probe() -> u64 { 73849127 }\",\"file\":\"/tmp/probe.rs\",\"k\":\"code.edit\",\"source\":{\"harness\":\"claude-code\",\"session_id\":\"worker\"},\"t\":\"2026-09-21T00:00:03Z\"}\n"
+  },
+  "cursors": {
+    "sender.claude.jsonl": {
+      "byte_cursor": 279,
+      "cursor_guard": {
+        "offset": 0,
+        "len": 279,
+        "hash": "aeb1967daacaed6cd5ccec5824471118242cfae252a607499404e7934ab26eb3"
+      },
+      "adapter": "claude-code",
+      "tape_id": "c8592ae3ca52e7ffb902fbb30e4a16b0ea2d2e4acfb393f8d6222416003d181f"
+    },
+    "receiver.claude.jsonl": {
+      "byte_cursor": 655,
+      "cursor_guard": {
+        "offset": 143,
+        "len": 512,
+        "hash": "f101bed56165a3f7e7bd28a2dd6c4f9822b257f6ec28af7f1c446420c0de6744"
+      },
+      "adapter": "claude-code",
+      "tape_id": "4c1d57e10390df9c73c5b8e2e5acd1d068f12193a3ebf1bf2a138348a3b26a59"
+    }
+  },
+  "dispatch_links": [],
+  "counts": {
+    "evidence_windows": 1,
+    "evidence_features": 3,
+    "edges": 0,
+    "tombstones": 0
+  },
+  "before_query": {
+    "chains": [
+      {
+        "descendants": [
+          {
+            "children": [],
+            "depth": 0,
+            "parent": null,
+            "session_id": "4c1d57e10390df9c73c5b8e2e5acd1d068f12193a3ebf1bf2a138348a3b26a59"
+          }
+        ],
+        "root_session_id": "4c1d57e10390df9c73c5b8e2e5acd1d068f12193a3ebf1bf2a138348a3b26a59"
+      }
+    ],
+    "dispatch_lineage": [],
+    "lineage": [],
+    "query": {
+      "anchors": [
+        "winnow:0753660fe8b09af7",
+        "winnow:08a35376192da71d",
+        "winnow:04b4a7d510b8b8d9"
+      ],
+      "command": "explain",
+      "count": false,
+      "depth": 10,
+      "forensics": false,
+      "grep_filter": null,
+      "include_deleted": false,
+      "limit": null,
+      "max_edges": 500,
+      "max_fanout": 50,
+      "min_confidence": 0.5,
+      "offset": 0,
+      "since": null,
+      "target": "pub fn isolated_handoff_probe() -> u64 { 73849127 }",
+      "until": null
+    },
+    "returned": 1,
+    "sessions": [
+      {
+        "chain_length": 1,
+        "children": [],
+        "confidence": 1.0,
+        "depth": 0,
+        "files_touched": [
+          "/tmp/probe.rs"
+        ],
+        "parent": null,
+        "refs_down": 0,
+        "refs_up": 0,
+        "session_id": "4c1d57e10390df9c73c5b8e2e5acd1d068f12193a3ebf1bf2a138348a3b26a59",
+        "timestamp": "2026-09-21T00:00:03Z",
+        "total_lines": 4,
+        "touches": [
+          {
+            "event_offset": 3,
+            "file_path": "/tmp/probe.rs",
+            "kind": "edit",
+            "timestamp": "2026-09-21T00:00:03Z"
+          }
+        ],
+        "window_end": 4,
+        "window_start": 1
+      }
+    ],
+    "stores_queried": 1,
+    "time_range": {
+      "end": "2026-09-21T00:00:03Z",
+      "start": "2026-09-21T00:00:03Z"
+    },
+    "tombstones": [],
+    "total": 1,
+    "truncated": false
+  }
+}

@@ -22,6 +22,7 @@ pub fn collect_dispatch_upstream_sessions(
         .collect::<HashSet<_>>();
     let mut rows_cache = HashMap::<String, Vec<TapeRow>>::new();
     let mut seen_hops = HashSet::new();
+    let mut recovery = crate::ingest::recovery::QueryRecovery::default();
 
     for session in sessions {
         let Some(tape_id) = session.get("tape_id").and_then(Value::as_str) else {
@@ -43,8 +44,21 @@ pub fn collect_dispatch_upstream_sessions(
             let edit_turn =
                 message_turn_before_offset(context, &mut rows_cache, tape_id, edit_offset)?;
 
-            let mut current_tape = tape_id.to_string();
-            let mut current_turn = edit_turn;
+            let recovered = recovery.lookup(context, tape_id)?;
+            let mut first_hop = true;
+            let (mut current_tape, mut current_turn) = if let Some(recovered) = recovered {
+                let point = recovered
+                    .recovered
+                    .points
+                    .iter()
+                    .find(|p| p.old_offset == edit_offset)
+                    .ok_or_else(|| {
+                        CliError::new("native_recovery_error", "edit offset missing from recovery")
+                    })?;
+                (recovered.context_tape.clone(), point.turn)
+            } else {
+                (tape_id.to_string(), edit_turn)
+            };
             let mut visited = HashSet::new();
             while let Some((received, received_tape, received_start)) = latest_received_in_history(
                 context,
@@ -53,9 +67,33 @@ pub fn collect_dispatch_upstream_sessions(
                 &current_tape,
                 current_turn,
             )? {
-                let Some(parent) = sent_dispatch_for_uuid(indexes, &received.uuid)? else {
+                let Some(mut parent) = sent_dispatch_for_uuid(indexes, &received.uuid)? else {
                     break;
                 };
+                if let Some(recovered) = recovery.lookup(context, &parent.tape_id)? {
+                    let mut replacement = None;
+                    for index in indexes {
+                        if let Some(link) = index
+                            .dispatch_links_for_tape(&recovered.context_tape)?
+                            .into_iter()
+                            .find(|link| {
+                                link.uuid == received.uuid
+                                    && link.direction == DispatchDirection::Sent
+                            })
+                        {
+                            replacement = Some(DispatchLinkRow {
+                                tape_id: recovered.context_tape.clone(),
+                                uuid: link.uuid,
+                                first_turn_index: link.first_turn_index,
+                                direction: link.direction,
+                            });
+                            break;
+                        }
+                    }
+                    parent = replacement.ok_or_else(|| {
+                        CliError::new("native_recovery_error", "recovered sender metadata missing")
+                    })?;
+                }
                 let hop_key = (
                     current_tape.clone(),
                     current_turn,
@@ -87,6 +125,10 @@ pub fn collect_dispatch_upstream_sessions(
                         "parent_session": parent.tape_id,
                         "parent_sent_turn_index": parent_start + parent.first_turn_index,
                     });
+                    if first_hop && current_tape != tape_id {
+                        hop["edit_session"] = json!(tape_id);
+                        hop["edit_event_offset"] = json!(edit_offset);
+                    }
                     if received_tape != current_tape {
                         hop["received_session"] = json!(received_tape);
                     }
@@ -99,6 +141,7 @@ pub fn collect_dispatch_upstream_sessions(
                     extras.push(extra);
                 }
 
+                first_hop = false;
                 current_tape = parent.tape_id;
                 current_turn = parent.first_turn_index;
             }

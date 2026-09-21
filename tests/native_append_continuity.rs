@@ -134,8 +134,9 @@ fn tape_rows(root: &Path, id: &str) -> Vec<Value> {
 fn snapshots(root: &Path) -> Vec<(String, Vec<u8>)> {
     fs::read_dir(root.join("home/.engram/tapes"))
         .unwrap()
+        .map(|p| p.unwrap().path())
+        .filter(|p| p.is_file())
         .map(|p| {
-            let p = p.unwrap().path();
             (
                 p.file_name().unwrap().to_str().unwrap().into(),
                 fs::read(p).unwrap(),
@@ -531,4 +532,227 @@ fn sender_call_split_from_same_timestamp_message_keeps_full_ingest_turn() {
         assert_eq!(chain[1]["edit_turn_index"], 1);
         assert_eq!(chain[1]["received_turn_index"], 0);
     }
+}
+
+fn install_legacy_fixture(root: &Path, fixture: &Value) {
+    use engram::index::{DispatchLink, SqliteIndex};
+    use engram::tape::event::parse_jsonl_events;
+    fs::create_dir_all(root.join("home/.engram/tapes")).unwrap();
+    fs::create_dir_all(root.join(".engram/cursors")).unwrap();
+    fs::write(
+        root.join("home/.engram/config.yml"),
+        "db: ~/.engram/index.sqlite\ntapes_dir: ~/.engram/tapes\n",
+    )
+    .unwrap();
+    let index =
+        SqliteIndex::open_writer(root.join("home/.engram/index.sqlite").to_str().unwrap()).unwrap();
+    for (id, raw) in fixture["tapes"].as_object().unwrap() {
+        let raw = raw.as_str().unwrap();
+        assert_eq!(format!("{:x}", Sha256::digest(raw.as_bytes())), *id);
+        fs::write(
+            root.join("home/.engram/tapes")
+                .join(format!("{id}.jsonl.zst")),
+            zstd::stream::encode_all(raw.as_bytes(), 0).unwrap(),
+        )
+        .unwrap();
+        let links: Vec<_> = fixture["dispatch_links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r[0] == *id)
+            .map(|r| DispatchLink {
+                uuid: r[1].as_str().unwrap().into(),
+                first_turn_index: r[2].as_i64().unwrap(),
+                direction: if r[3] == "sent" {
+                    DispatchDirection::Sent
+                } else {
+                    DispatchDirection::Received
+                },
+            })
+            .collect();
+        index
+            .ingest_tape_events_with_dispatch(
+                id,
+                &parse_jsonl_events(raw).unwrap(),
+                &links,
+                engram::index::lineage::LINK_THRESHOLD_DEFAULT,
+            )
+            .unwrap();
+    }
+    for (name, raw) in fixture["files"].as_object().unwrap() {
+        let input = root.join(name);
+        fs::write(&input, raw.as_str().unwrap()).unwrap();
+        fs::write(cursor(root, &input), line(fixture["cursors"][name].clone())).unwrap();
+    }
+}
+fn stored_counts(root: &Path) -> Value {
+    let db = rusqlite::Connection::open(root.join("home/.engram/index.sqlite")).unwrap();
+    let mut out = serde_json::Map::new();
+    for table in [
+        "evidence_windows",
+        "evidence_features",
+        "edges",
+        "tombstones",
+    ] {
+        let count: i64 = db
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        out.insert(table.into(), json!(count));
+    }
+    Value::Object(out)
+}
+#[test]
+fn old_binary_full_and_split_stores_recover_historical_lineage_once() {
+    for raw in [
+        include_str!("fixtures/native-upgrade/codex-full.json"),
+        include_str!("fixtures/native-upgrade/codex-split.json"),
+        include_str!("fixtures/native-upgrade/claude-full.json"),
+        include_str!("fixtures/native-upgrade/claude-split.json"),
+    ] {
+        let fixture: Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            fixture["old_binary_sha256"],
+            "65c3f982ee470da93f6a3cde2211899c72bf36af53181cee2db6205970ac3db8"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        install_legacy_fixture(root, &fixture);
+        let immutable = snapshots(root);
+        assert_eq!(stored_counts(root), fixture["counts"]);
+        assert!(
+            cli(root, &["explain", "--", TEXT], None)["dispatch_lineage"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let files: Vec<_> = fixture["files"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|name| root.join(name))
+            .collect();
+        for file in &files {
+            cli(root, &["ingest", file.to_str().unwrap()], None);
+        }
+        assert_eq!(logical_result(root)["edit_turn"], 1);
+        assert_eq!(stored_counts(root), fixture["counts"]);
+        let repaired = cli(root, &["explain", "--", TEXT], None);
+        let historical = &repaired["dispatch_lineage"][0];
+        assert!(
+            fixture["tapes"]
+                .get(historical["edit_session"].as_str().unwrap())
+                .is_some()
+        );
+        for (name, bytes) in &immutable {
+            assert_eq!(
+                *bytes,
+                fs::read(root.join("home/.engram/tapes").join(name)).unwrap()
+            );
+        }
+        let count = snapshots(root).len();
+        let catalog =
+            fs::read(root.join("home/.engram/tapes/native-upgrade-v1/catalog.json")).unwrap();
+        for file in &files {
+            let prior = fs::read(cursor(root, file)).unwrap();
+            let repeat = cli(root, &["ingest", file.to_str().unwrap()], None);
+            assert_eq!(repeat["imported_tapes"], 0);
+            assert_eq!(repeat["skipped_unchanged"], 1);
+            assert_eq!(prior, fs::read(cursor(root, file)).unwrap());
+        }
+        assert_eq!(
+            catalog,
+            fs::read(root.join("home/.engram/tapes/native-upgrade-v1/catalog.json")).unwrap()
+        );
+        assert_eq!(count, snapshots(root).len());
+        assert_eq!(stored_counts(root), fixture["counts"]);
+        // Rebuild only SQLite from unchanged archives. Recovery remains usable.
+        fs::create_dir_all(root.join(".engram/tapes")).unwrap();
+        for (name, bytes) in snapshots(root) {
+            fs::write(root.join(".engram/tapes").join(name), bytes).unwrap();
+        }
+        fs::remove_file(root.join("home/.engram/index.sqlite")).unwrap();
+        cli(root, &["fingerprint"], None);
+        assert_eq!(logical_result(root)["edit_turn"], 1);
+        assert_eq!(stored_counts(root), fixture["counts"]);
+    }
+}
+
+#[test]
+fn legacy_recovery_uses_committed_prefix_and_rejects_unbound_locator() {
+    let fixture: Value =
+        serde_json::from_str(include_str!("fixtures/native-upgrade/codex-split.json")).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    install_legacy_fixture(root, &fixture);
+    let receiver = root.join("receiver.codex.jsonl");
+    let later = codex(
+        "message",
+        json!({"role":"user","content":[{"type":"input_text","text":format!("<engram-src id=\"{LATER}\"/> later") }]}),
+        4,
+    );
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&receiver)
+        .unwrap()
+        .write_all(later.as_bytes())
+        .unwrap();
+    cli(root, &["ingest", receiver.to_str().unwrap()], None);
+    cli(
+        root,
+        &["ingest", root.join("sender.codex.jsonl").to_str().unwrap()],
+        None,
+    );
+    let result = cli(root, &["explain", "--", TEXT], None);
+    assert_eq!(result["dispatch_lineage"][0]["received_uuid"], UUID);
+    let old = result["dispatch_lineage"][0]["edit_session"]
+        .as_str()
+        .unwrap();
+    let locator = root
+        .join("home/.engram/tapes/native-upgrade-v1")
+        .join(format!("{old}.json"));
+    let mut value: Value = serde_json::from_slice(&fs::read(&locator).unwrap()).unwrap();
+    value["recovered"]["points"][0]["turn"] = json!(999);
+    fs::write(&locator, line(value)).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_engram"))
+        .current_dir(root)
+        .env("HOME", root.join("home"))
+        .args(["explain", "--", TEXT])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("recovery locator not bound by context"));
+}
+
+#[test]
+fn ambiguous_legacy_events_fail_without_advancing_cursor_or_publishing_context() {
+    let mut fixture: Value =
+        serde_json::from_str(include_str!("fixtures/native-upgrade/codex-split.json")).unwrap();
+    let name = "receiver.codex.jsonl";
+    let raw = fixture["files"][name].as_str().unwrap();
+    let mut rows: Vec<_> = raw.lines().map(|s| s.to_string() + "\n").collect();
+    rows.insert(2, rows[1].clone());
+    let changed = rows.concat();
+    fixture["files"][name] = json!(changed);
+    // This models an old cursor after duplicate native frames: it has no source
+    // segment ledger with which to disambiguate the identical earlier records.
+    let guard_start = changed.len().saturating_sub(512);
+    fixture["cursors"][name]["byte_cursor"] = json!(changed.len());
+    fixture["cursors"][name]["cursor_guard"] = json!({"offset":guard_start,"len":changed.len()-guard_start,"hash":format!("{:x}", Sha256::digest(&changed.as_bytes()[guard_start..]))});
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    install_legacy_fixture(root, &fixture);
+    let input = root.join(name);
+    let state_before = fs::read(cursor(root, &input)).unwrap();
+    let tapes_before = snapshots(root);
+    let out = Command::new(env!("CARGO_BIN_EXE_engram"))
+        .current_dir(root)
+        .env("HOME", root.join("home"))
+        .args(["ingest", input.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("ambiguous legacy event"));
+    assert_eq!(state_before, fs::read(cursor(root, &input)).unwrap());
+    assert_eq!(tapes_before.len(), snapshots(root).len());
+    assert_eq!(stored_counts(root), fixture["counts"]);
 }

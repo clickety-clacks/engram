@@ -1,4 +1,5 @@
 mod continuity;
+pub(crate) mod recovery;
 use continuity::{Continuity, NativeState};
 
 use std::fs::{self, File};
@@ -54,6 +55,8 @@ pub fn run_ingest(
     let mut skipped_unchanged = 0usize;
     let mut skipped_existing_tape = 0usize;
     let mut skipped_non_transcript = 0usize;
+    let mut recovered_sources = 0usize;
+    let mut recovered_tapes = 0usize;
 
     for path in candidates {
         scanned += 1;
@@ -147,8 +150,8 @@ pub fn run_ingest(
                 File::open(&abs_path)
                     .and_then(|file| file.take(prev.byte_cursor).read_to_string(&mut prefix))
                     .map_err(|err| CliError::io("cursor_context_error", err))?;
-                let normalized = native.convert(&prefix)?;
-                let (normalized, turns) = continuity::annotate(&normalized, None, true)?;
+                let full_normalized = native.convert(&prefix)?;
+                let (normalized, turns) = continuity::annotate(&full_normalized, None, true)?;
                 let mut rows: Vec<Value> = normalized
                     .lines()
                     .map(serde_json::from_str)
@@ -157,6 +160,8 @@ pub fn run_ingest(
                     meta["context_raw_prefix_bytes"] = json!(prev.byte_cursor);
                     meta["context_raw_prefix_sha256"] = json!(tape_id_for_contents(&prefix));
                 }
+                let recovered =
+                    recovery::plan(context, &prev.tape_id, &full_normalized, &mut rows)?;
                 let normalized = rows
                     .iter()
                     .map(serde_json::to_string)
@@ -167,6 +172,7 @@ pub fn run_ingest(
                 store_normalized(context, &id, &normalized)?;
                 let links = extract_dispatch_links_from_transcript(&normalized);
                 index.ingest_tape_events_with_dispatch(&id, &[], &links, LINK_THRESHOLD_DEFAULT)?;
+                recovery::publish(context, &id, &recovered)?;
                 prev.continuity = Some(Continuity {
                     native,
                     message_turns: turns,
@@ -174,6 +180,8 @@ pub fn run_ingest(
                     last_message_timestamp: continuity::last_message_timestamp(&normalized),
                 });
                 save_ingest_state_for_path(paths, &abs_path, prev)?;
+                recovered_sources += 1;
+                recovered_tapes += recovered.len();
             }
             if metadata.len() == prev.byte_cursor {
                 skipped_unchanged += 1;
@@ -442,7 +450,7 @@ pub fn run_ingest(
         }
     }
 
-    print_json(&json!({
+    let mut result = json!({
         "status": if failures.is_empty() { "ok" } else { "partial" },
         "scanned_inputs": scanned,
         "imported_tapes": imported,
@@ -451,7 +459,11 @@ pub fn run_ingest(
         "skipped_non_transcript": skipped_non_transcript,
         "failure_count": failures.len(),
         "failures": failures,
-    }))
+    });
+    if recovered_sources > 0 {
+        result["native_recovery"] = json!({"mode":"one_time_legacy_context_v1", "sources":recovered_sources, "tapes":recovered_tapes});
+    }
+    print_json(&result)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
