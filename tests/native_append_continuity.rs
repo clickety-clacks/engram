@@ -1362,3 +1362,167 @@ fn n1_repeated_sender_and_received_direction_preserve_parent_identity() {
         }
     }
 }
+
+#[test]
+fn legacy_recovery_binds_repeated_events_by_unique_whole_sequence() {
+    let mut fixture: Value =
+        serde_json::from_str(include_str!("fixtures/native-upgrade/codex-full.json")).unwrap();
+    let name = "receiver.codex.jsonl";
+    let mut raw: Vec<String> = fixture["files"][name]
+        .as_str()
+        .unwrap()
+        .lines()
+        .map(|l| l.to_string() + "\n")
+        .collect();
+    raw.insert(2, raw[1].clone());
+    let raw = raw.concat();
+    fixture["files"][name] = json!(raw);
+    let old_id = fixture["cursors"][name]["tape_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut normalized: Vec<String> = fixture["tapes"][&old_id]
+        .as_str()
+        .unwrap()
+        .lines()
+        .map(|l| l.to_string() + "\n")
+        .collect();
+    normalized.insert(2, normalized[1].clone());
+    let normalized = normalized.concat();
+    let new_id = format!("{:x}", Sha256::digest(normalized.as_bytes()));
+    fixture["tapes"].as_object_mut().unwrap().remove(&old_id);
+    fixture["tapes"][&new_id] = json!(normalized);
+    fixture["cursors"][name]["tape_id"] = json!(new_id);
+    let guard = raw.len().saturating_sub(512);
+    fixture["cursors"][name]["byte_cursor"] = json!(raw.len());
+    fixture["cursors"][name]["cursor_guard"] = json!({"offset":guard,"len":raw.len()-guard,"hash":format!("{:x}",Sha256::digest(&raw.as_bytes()[guard..]))});
+    for link in fixture["dispatch_links"].as_array_mut().unwrap() {
+        if link[0] == old_id {
+            link[0] = json!(new_id);
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    install_legacy_fixture(root, &fixture);
+    let immutable = snapshots(root);
+    let counts = stored_counts(root);
+    for file in [name, "sender.codex.jsonl"] {
+        let path = root.join(file);
+        let result = cli(root, &["ingest", path.to_str().unwrap()], None);
+        assert_eq!(result["failure_count"], 0);
+        assert_eq!(result["native_recovery"]["sources"], 1);
+    }
+    let locator: Value = serde_json::from_slice(
+        &fs::read(
+            root.join("home/.engram/tapes/native-upgrade-v1")
+                .join(format!("{new_id}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        locator["recovered"]["points"],
+        json!([{"old_offset":5,"source_offset":5,"turn":2}])
+    );
+    let query = cli(root, &["explain", "--", TEXT], None);
+    let hop = &query["dispatch_lineage"][0];
+    assert_eq!(hop["received_turn_index"], 0);
+    assert_eq!(hop["edit_turn_index"], 2);
+    assert_eq!(hop["edit_event_offset"], 5);
+    assert_public_chain(
+        &query,
+        &[new_id, hop["parent_session"].as_str().unwrap().into()],
+    );
+    assert_eq!(stored_counts(root), counts);
+    for (name, bytes) in immutable {
+        assert_eq!(
+            bytes,
+            fs::read(root.join("home/.engram/tapes").join(name)).unwrap()
+        );
+    }
+    let path = root.join(name);
+    let before = fs::read(cursor(root, &path)).unwrap();
+    let repeat = cli(root, &["ingest", path.to_str().unwrap()], None);
+    assert_eq!(repeat["skipped_unchanged"], 1);
+    assert!(repeat.get("native_recovery").is_none());
+    assert_eq!(before, fs::read(cursor(root, &path)).unwrap());
+}
+
+#[test]
+fn legacy_recovery_excludes_foreign_session_candidates_but_rejects_current_mismatch() {
+    for mismatched_current in [false, true] {
+        let mut fixture: Value =
+            serde_json::from_str(include_str!("fixtures/native-upgrade/claude-full.json")).unwrap();
+        let name = "receiver.claude.jsonl";
+        let current = fixture["cursors"][name]["tape_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let other: String = fixture["tapes"][&current]
+            .as_str()
+            .unwrap()
+            .lines()
+            .map(|l| {
+                let mut row: Value = serde_json::from_str(l).unwrap();
+                row["source"]["session_id"] = json!("unrelated-session");
+                line(row)
+            })
+            .collect();
+        let foreign = format!("{:x}", Sha256::digest(other.as_bytes()));
+        fixture["tapes"][&foreign] = json!(other);
+        if mismatched_current {
+            fixture["cursors"][name]["tape_id"] = json!(foreign);
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        install_legacy_fixture(root, &fixture);
+        let path = root.join(name);
+        let immutable = snapshots(root);
+        let counts = stored_counts(root);
+        let before = fs::read(cursor(root, &path)).unwrap();
+        let result = Command::new(env!("CARGO_BIN_EXE_engram"))
+            .current_dir(root)
+            .env("HOME", root.join("home"))
+            .args(["ingest", path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        if mismatched_current {
+            assert!(!result.status.success());
+            assert!(
+                String::from_utf8_lossy(&result.stderr)
+                    .contains("legacy session/tool mismatch in current segment")
+            );
+            assert_eq!(before, fs::read(cursor(root, &path)).unwrap());
+            assert_eq!(snapshots(root).len(), immutable.len());
+        } else {
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let result: Value = serde_json::from_slice(&result.stdout).unwrap();
+            assert_eq!(result["failure_count"], 0);
+            assert_eq!(result["native_recovery"]["tapes"], 1);
+            let dir = root.join("home/.engram/tapes/native-upgrade-v1");
+            assert!(dir.join(format!("{current}.json")).exists());
+            assert!(!dir.join(format!("{foreign}.json")).exists());
+            let locator: Value =
+                serde_json::from_slice(&fs::read(dir.join(format!("{current}.json"))).unwrap())
+                    .unwrap();
+            assert_eq!(
+                locator["recovered"]["points"],
+                json!([{"old_offset":4,"source_offset":4,"turn":1}])
+            );
+            let repeat = cli(root, &["ingest", path.to_str().unwrap()], None);
+            assert_eq!(repeat["skipped_unchanged"], 1);
+            assert!(repeat.get("native_recovery").is_none());
+        }
+        assert_eq!(stored_counts(root), counts);
+        for (name, bytes) in immutable {
+            assert_eq!(
+                bytes,
+                fs::read(root.join("home/.engram/tapes").join(name)).unwrap()
+            );
+        }
+    }
+}

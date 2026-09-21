@@ -54,6 +54,21 @@ fn key(row: &Value) -> String {
     }
     tape_id_for_contents(&row.to_string())
 }
+// Omitted legacy identity/tool metadata may be filled by full-prefix conversion;
+// explicitly recorded values must agree before an event is a matching candidate.
+fn compatible(old: &Value, full: &Value) -> bool {
+    if let (Some(a), Some(b)) = (
+        old["source"]["session_id"].as_str(),
+        full["source"]["session_id"].as_str(),
+    ) && a != b
+    {
+        return false;
+    }
+    !(old["k"] == "tool.result"
+        && old["tool"].as_str().is_some_and(|tool| tool != "unknown")
+        && old["tool"] != full["tool"])
+}
+
 fn verified_rows(context: &RuntimeContext, id: &str) -> Result<Vec<Value>, CliError> {
     let text = read_tape_content(&tape_path_for_tapes_dir(&context.tapes_dir, id))?;
     if tape_id_for_contents(&text) != id {
@@ -104,8 +119,8 @@ fn catalog(context: &RuntimeContext) -> Result<BTreeMap<String, Vec<String>>, Cl
     Ok(catalog)
 }
 
-/// Match only exact, uniquely located normalized events in the retained raw
-/// prefix. A missing/ambiguous current segment is a visible error, never a guess.
+/// Bind the entire legacy event sequence uniquely within the retained raw prefix.
+/// A missing/ambiguous current segment is a visible error, never a guess.
 pub(super) fn plan(
     context: &RuntimeContext,
     current: &str,
@@ -134,7 +149,7 @@ pub(super) fn plan(
         }
     }
     let mut recovered = Vec::new();
-    for id in candidates {
+    'candidate: for id in candidates {
         let old = verified_rows(context, &id)?;
         let events: Vec<_> = old
             .iter()
@@ -149,43 +164,72 @@ pub(super) fn plan(
             }
             continue;
         }
-        let mut points = Vec::new();
-        let mut previous = None;
-        for (offset, row) in events {
-            let matches = &positions[&key(row)];
-            if matches.len() != 1 {
+        let matches: Vec<_> = events
+            .iter()
+            .map(|(_, row)| positions[&key(row)].as_slice())
+            .collect();
+        for ((_, row), matches) in events.iter().zip(&matches) {
+            if !matches
+                .iter()
+                .any(|(offset, _)| compatible(row, &full[*offset as usize]))
+            {
+                // The catalog's first-event key intentionally omits session/tool
+                // metadata; an unrelated catalog tape is not this source's history.
+                // The cursor's own tape, however, must never be skipped.
+                if id != current {
+                    continue 'candidate;
+                }
                 return Err(error(format!(
-                    "ambiguous legacy event in {id} at offset {offset}"
+                    "legacy session/tool mismatch in current segment {id}"
                 )));
             }
-            let (source_offset, turn) = matches[0];
-            if previous.is_some_and(|p| p >= source_offset) {
-                return Err(error(format!("legacy chronology mismatch in {id}")));
-            }
-            // An explicitly recorded, different session identity is never erased.
-            if let (Some(a), Some(b)) = (
-                row["source"]["session_id"].as_str(),
-                full[source_offset as usize]["source"]["session_id"].as_str(),
-            ) {
-                if a != b {
-                    return Err(error(format!("legacy session mismatch in {id}")));
-                }
-            }
-            if row["k"] == "tool.result"
-                && row["tool"].as_str().is_some_and(|tool| tool != "unknown")
-                && row["tool"] != full[source_offset as usize]["tool"]
-            {
-                return Err(error(format!("legacy result tool mismatch in {id}")));
-            }
-            if row["k"] == "code.edit" {
-                points.push(Point {
-                    old_offset: offset as u64,
-                    source_offset,
-                    turn,
-                });
-            }
-            previous = Some(source_offset);
         }
+        // Earliest and latest monotone embeddings bound every valid alignment.
+        // They agree at every event iff the complete sequence binds uniquely.
+        // Repeated rows are valid when their surrounding chronology fixes them;
+        // choosing the first duplicate alone would silently invent offsets.
+        let mut earliest = Vec::with_capacity(events.len());
+        let mut previous = None;
+        for ((_, row), matches) in events.iter().zip(&matches) {
+            let begin =
+                matches.partition_point(|(offset, _)| previous.is_some_and(|p| *offset <= p));
+            let Some(&(offset, turn)) = matches[begin..]
+                .iter()
+                .find(|(offset, _)| compatible(row, &full[*offset as usize]))
+            else {
+                return Err(error(format!("legacy chronology mismatch in {id}")));
+            };
+            earliest.push((offset, turn));
+            previous = Some(offset);
+        }
+        let mut next = full.len() as u64;
+        for (((old_offset, row), matches), &(earliest_offset, _)) in
+            events.iter().zip(&matches).zip(&earliest).rev()
+        {
+            let end = matches.partition_point(|(offset, _)| *offset < next);
+            let Some(&(offset, _)) = matches[..end]
+                .iter()
+                .rfind(|(offset, _)| compatible(row, &full[*offset as usize]))
+            else {
+                return Err(error(format!("legacy chronology mismatch in {id}")));
+            };
+            if offset != earliest_offset {
+                return Err(error(format!(
+                    "ambiguous legacy event in {id} at offset {old_offset}"
+                )));
+            }
+            next = offset;
+        }
+        let points = events
+            .iter()
+            .zip(earliest)
+            .filter(|((_, row), _)| row["k"] == "code.edit")
+            .map(|((old_offset, _), (source_offset, turn))| Point {
+                old_offset: *old_offset as u64,
+                source_offset,
+                turn,
+            })
+            .collect();
         recovered.push(RecoveredTape {
             tape_id: id,
             points,
