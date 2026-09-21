@@ -6,3 +6,5 @@
 
 
 Native append lineage: dispatch rows retain first occurrences only within each tape. Query selection must fold immutable predecessor segments before choosing a UUID/direction; a repeated marker must not renew its turn. Recovered hops retain context in `session` and the original evidence child in `edit_session`; public chain formatting must use the latter when present.
+
+Legacy Codex suffixes can record an exec result as unknown with no derived exit when the call was in an earlier segment. Recovery must bind the unchanged raw result and unique chronology before filling that annotation; a recorded exit or known tool must never be discarded.

@@ -57,6 +57,18 @@ fn key(row: &Value) -> String {
 // Omitted legacy identity/tool metadata may be filled by full-prefix conversion;
 // explicitly recorded values must agree before an event is a matching candidate.
 fn compatible(old: &Value, full: &Value) -> bool {
+    if old["k"] == "tool.result" && old.get("exit") != full.get("exit") {
+        // A stateless Codex suffix cannot derive exec success without its call.
+        // Only this absent annotation may be filled; recorded exits still bind.
+        if !(old.get("exit").is_none()
+            && old["tool"] == "unknown"
+            && full["source"]["harness"] == "codex-cli"
+            && full["tool"] == "exec"
+            && full["exit"] == 0)
+        {
+            return false;
+        }
+    }
     if let (Some(a), Some(b)) = (
         old["source"]["session_id"].as_str(),
         full["source"]["session_id"].as_str(),
@@ -138,6 +150,21 @@ pub(super) fn plan(
             .entry(key(row))
             .or_default()
             .push((offset as u64, turn));
+        if row["k"] == "tool.result"
+            && row["source"]["harness"] == "codex-cli"
+            && row["tool"] == "exec"
+            && row["exit"] == 0
+        {
+            // Preserve existing catalog keys. Add the exact legacy stateless
+            // form only: raw output, timestamp, call ID and chronology still bind.
+            // compatible() requires unknown tool + absent exit for this alias.
+            let mut legacy = row.clone();
+            legacy.as_object_mut().unwrap().remove("exit");
+            positions
+                .entry(key(&legacy))
+                .or_default()
+                .push((offset as u64, turn));
+        }
         if crate::dispatch::is_message_row(row) {
             turn += 1;
         }

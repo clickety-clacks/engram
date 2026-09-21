@@ -1526,3 +1526,123 @@ fn legacy_recovery_excludes_foreign_session_candidates_but_rejects_current_misma
         }
     }
 }
+
+#[test]
+fn legacy_unknown_exec_result_recovers_only_missing_derived_success() {
+    use engram::tape::adapters::codex::codex_jsonl_to_tape_jsonl;
+    let result = codex(
+        "custom_tool_call_output",
+        json!({"call_id":"outer","output":[
+            {"type":"input_text","text":"Script completed\nWall time 0.1 seconds\nOutput:\n"},
+            {"type":"input_text","text":json!({"exit_code":0,"output":"bounded output"}).to_string()}
+        ]}),
+        0,
+    );
+    let suffix = result + &rows(false)[1..].concat();
+    let raw = rows(false)[0].clone()
+        + &codex(
+            "custom_tool_call",
+            json!({"call_id":"outer","name":"exec","input":"text(await tools.exec_command({\"cmd\":\"true\"}));"}),
+            0,
+        )
+        + &suffix;
+    let old = codex_jsonl_to_tape_jsonl(&suffix).unwrap();
+    let full = codex_jsonl_to_tape_jsonl(&raw).unwrap();
+    let full_rows: Vec<Value> = full
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(full_rows[2]["exit"], 0);
+    assert_eq!(full_rows[2]["tool"], "exec");
+    for mode in [
+        "valid",
+        "recorded_success",
+        "exit",
+        "null_exit",
+        "known_tool_without_exit",
+        "wrong_tool",
+        "stdout",
+        "raw_output",
+        "timestamp",
+        "call_id",
+        "stderr",
+    ] {
+        let mut old_rows: Vec<Value> = old
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(old_rows[1]["tool"], "unknown");
+        assert!(old_rows[1].get("exit").is_none());
+        match mode {
+            "valid" => (),
+            "recorded_success" => old_rows[1]["exit"] = json!(0),
+            "exit" => old_rows[1]["exit"] = json!(1),
+            "null_exit" => old_rows[1]["exit"] = Value::Null,
+            "known_tool_without_exit" => old_rows[1]["tool"] = json!("exec"),
+            "wrong_tool" => old_rows[1]["tool"] = json!("apply_patch"),
+            "stdout" => old_rows[1]["stdout"] = json!("altered"),
+            "raw_output" => old_rows[1]["raw_output"][1]["text"] = json!("altered"),
+            "timestamp" => old_rows[1]["t"] = json!("2026-09-20T00:00:00Z"),
+            "call_id" => old_rows[1]["call_id"] = json!("other-call"),
+            "stderr" => old_rows[1]["stderr"] = json!("altered"),
+            _ => unreachable!(),
+        }
+        let normalized: String = old_rows.into_iter().map(line).collect();
+        let id = format!("{:x}", Sha256::digest(normalized.as_bytes()));
+        let name = "receiver.codex.jsonl";
+        let guard = raw.len().saturating_sub(512);
+        let fixture = json!({"tapes":{&id:normalized},"dispatch_links":[],"files":{name:raw},"cursors":{name:{
+            "adapter":"codex-cli","tape_id":id,"byte_cursor":raw.len(),
+            "cursor_guard":{"offset":guard,"len":raw.len()-guard,"hash":format!("{:x}", Sha256::digest(&raw.as_bytes()[guard..]))}
+        }}});
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        install_legacy_fixture(root, &fixture);
+        let input = root.join(name);
+        let before = fs::read(cursor(root, &input)).unwrap();
+        let immutable = snapshots(root);
+        let counts = stored_counts(root);
+        let out = Command::new(env!("CARGO_BIN_EXE_engram"))
+            .current_dir(root)
+            .env("HOME", root.join("home"))
+            .args(["ingest", input.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let success = matches!(mode, "valid" | "recorded_success");
+        assert_eq!(
+            out.status.success(),
+            success,
+            "{mode}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let locator = root
+            .join("home/.engram/tapes/native-upgrade-v1")
+            .join(format!("{id}.json"));
+        if success {
+            let locator: Value = serde_json::from_slice(&fs::read(locator).unwrap()).unwrap();
+            assert_eq!(
+                locator["recovered"]["points"],
+                json!([{"old_offset":5,"source_offset":6,"turn":1}])
+            );
+            let after = fs::read(cursor(root, &input)).unwrap();
+            let repeat = cli(root, &["ingest", input.to_str().unwrap()], None);
+            assert_eq!(repeat["skipped_unchanged"], 1);
+            assert!(repeat.get("native_recovery").is_none());
+            assert_eq!(after, fs::read(cursor(root, &input)).unwrap());
+        } else {
+            assert!(String::from_utf8_lossy(&out.stderr).contains("native_recovery_error"));
+            assert_eq!(before, fs::read(cursor(root, &input)).unwrap());
+            assert_eq!(snapshots(root).len(), immutable.len());
+            assert!(!locator.exists());
+        }
+        assert_eq!(stored_counts(root), counts);
+        assert_eq!(fs::read_to_string(&input).unwrap(), raw);
+        for (name, bytes) in immutable {
+            assert_eq!(
+                bytes,
+                fs::read(root.join("home/.engram/tapes").join(name)).unwrap()
+            );
+        }
+        println!("legacy exec result: {mode}, recovery_success={success}, custody retained");
+    }
+}
