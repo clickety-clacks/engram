@@ -67,33 +67,16 @@ pub fn collect_dispatch_upstream_sessions(
                 &current_tape,
                 current_turn,
             )? {
-                let Some(mut parent) = sent_dispatch_for_uuid(indexes, &received.uuid)? else {
+                let Some(parent) = sent_dispatch_for_uuid(
+                    context,
+                    &mut rows_cache,
+                    indexes,
+                    &mut recovery,
+                    &received.uuid,
+                )?
+                else {
                     break;
                 };
-                if let Some(recovered) = recovery.lookup(context, &parent.tape_id)? {
-                    let mut replacement = None;
-                    for index in indexes {
-                        if let Some(link) = index
-                            .dispatch_links_for_tape(&recovered.context_tape)?
-                            .into_iter()
-                            .find(|link| {
-                                link.uuid == received.uuid
-                                    && link.direction == DispatchDirection::Sent
-                            })
-                        {
-                            replacement = Some(DispatchLinkRow {
-                                tape_id: recovered.context_tape.clone(),
-                                uuid: link.uuid,
-                                first_turn_index: link.first_turn_index,
-                                direction: link.direction,
-                            });
-                            break;
-                        }
-                    }
-                    parent = replacement.ok_or_else(|| {
-                        CliError::new("native_recovery_error", "recovered sender metadata missing")
-                    })?;
-                }
                 let hop_key = (
                     current_tape.clone(),
                     current_turn,
@@ -158,23 +141,44 @@ fn message_turn_start(rows: &[TapeRow]) -> i64 {
         .unwrap_or(0)
 }
 
-/// Follow immutable append segments only backwards. Never borrow markers from
-/// a later segment or another session (including siblings sharing a UUID).
-fn latest_received_in_history(
+/// Merge the first occurrence of each UUID across the immutable predecessor
+/// chain before selecting a parent. A later append must not renew a marker.
+/// Keep both directions: an earlier sent occurrence suppresses a later receive.
+fn first_dispatches_in_history(
     context: &RuntimeContext,
     cache: &mut HashMap<String, Vec<TapeRow>>,
     indexes: &[SqliteIndex],
     tape_id: &str,
-    turn: i64,
-) -> Result<Option<(DispatchLink, String, i64)>, CliError> {
+) -> Result<
+    (
+        HashMap<String, (DispatchLink, String, i64)>,
+        HashSet<String>,
+    ),
+    CliError,
+> {
     let mut tape = tape_id.to_string();
-    let cutoff = message_turn_start(load_tape_rows_cached(context, cache, tape_id)?) + turn;
+    let mut first = HashMap::<String, (DispatchLink, String, i64)>::new();
     let mut visited = HashSet::new();
     while visited.insert(tape.clone()) {
         let rows = load_tape_rows_cached(context, cache, &tape)?;
         let start = message_turn_start(rows);
-        if let Some(link) = latest_received_dispatch_before_turn(indexes, &tape, cutoff - start)? {
-            return Ok(Some((link, tape, start)));
+        for index in indexes {
+            for link in index.dispatch_links_for_tape(&tape)? {
+                let replace = match first.get(&link.uuid) {
+                    None => true,
+                    Some((seen, _, seen_start)) => {
+                        let turn = start + link.first_turn_index;
+                        let seen_turn = seen_start + seen.first_turn_index;
+                        turn < seen_turn
+                            || (turn == seen_turn
+                                && (link.direction == DispatchDirection::Received
+                                    || seen.direction == DispatchDirection::Sent))
+                    }
+                };
+                if replace {
+                    first.insert(link.uuid.clone(), (link, tape.clone(), start));
+                }
+            }
         }
         let previous = rows
             .iter()
@@ -184,46 +188,87 @@ fn latest_received_in_history(
         let Some(previous) = previous else { break };
         tape = previous;
     }
-    Ok(None)
+    Ok((first, visited))
 }
 
-fn latest_received_dispatch_before_turn(
+fn latest_received_in_history(
+    context: &RuntimeContext,
+    cache: &mut HashMap<String, Vec<TapeRow>>,
     indexes: &[SqliteIndex],
     tape_id: &str,
-    turn_index: i64,
-) -> Result<Option<DispatchLink>, CliError> {
-    let mut candidates = Vec::new();
-    for index in indexes {
-        if let Some(link) = index.latest_received_dispatch_before_turn(tape_id, turn_index)? {
-            candidates.push(link);
-        }
-    }
-    candidates.sort_by(|left, right| {
-        right
-            .first_turn_index
-            .cmp(&left.first_turn_index)
+    turn: i64,
+) -> Result<Option<(DispatchLink, String, i64)>, CliError> {
+    let cutoff = message_turn_start(load_tape_rows_cached(context, cache, tape_id)?) + turn;
+    let mut candidates: Vec<_> = first_dispatches_in_history(context, cache, indexes, tape_id)?
+        .0
+        .into_values()
+        .filter(|(link, _, start)| {
+            link.direction == DispatchDirection::Received && start + link.first_turn_index < cutoff
+        })
+        .collect();
+    candidates.sort_by(|(left, _, ls), (right, _, rs)| {
+        (rs + right.first_turn_index)
+            .cmp(&(ls + left.first_turn_index))
             .then_with(|| left.uuid.cmp(&right.uuid))
     });
     Ok(candidates.into_iter().next())
 }
 
 fn sent_dispatch_for_uuid(
+    context: &RuntimeContext,
+    cache: &mut HashMap<String, Vec<TapeRow>>,
     indexes: &[SqliteIndex],
+    recovery: &mut crate::ingest::recovery::QueryRecovery,
     uuid: &str,
 ) -> Result<Option<DispatchLinkRow>, CliError> {
-    let mut candidates = Vec::new();
+    // Examine the latest known occurrence in each continuation, including
+    // received rows, so a same-turn received tie can suppress an older sender.
+    // Separate roots (other sessions/stores) retain the existing selection rule.
+    let mut histories = Vec::new();
+    let mut seen = HashSet::new();
     for index in indexes {
-        if let Some(link) = index.sent_dispatch_for_uuid(uuid)? {
-            candidates.push(link);
+        for row in index.dispatch_links_for_uuid(uuid)? {
+            // Old per-segment rows can have the wrong first direction. Resolve
+            // their bound recovery context before considering any sender.
+            let tape_id = recovery
+                .lookup(context, &row.tape_id)?
+                .map(|r| r.context_tape.clone())
+                .unwrap_or(row.tape_id);
+            if seen.insert(tape_id.clone()) {
+                let (mut first, tapes) =
+                    first_dispatches_in_history(context, cache, indexes, &tape_id)?;
+                histories.push((tape_id, first.remove(uuid), tapes));
+            }
         }
     }
-    candidates.sort_by(|left, right| {
-        right
-            .first_turn_index
-            .cmp(&left.first_turn_index)
+    let mut candidates = Vec::new();
+    for (tip, first, _) in &histories {
+        if histories
+            .iter()
+            .any(|(other, _, tapes)| other != tip && tapes.contains(tip))
+        {
+            continue;
+        }
+        if let Some((link, tape_id, start)) = first
+            && link.direction == DispatchDirection::Sent
+        {
+            candidates.push((
+                DispatchLinkRow {
+                    tape_id: tape_id.clone(),
+                    uuid: link.uuid.clone(),
+                    first_turn_index: link.first_turn_index,
+                    direction: link.direction,
+                },
+                *start,
+            ));
+        }
+    }
+    candidates.sort_by(|(left, ls), (right, rs)| {
+        (rs + right.first_turn_index)
+            .cmp(&(ls + left.first_turn_index))
             .then_with(|| left.tape_id.cmp(&right.tape_id))
     });
-    Ok(candidates.into_iter().next())
+    Ok(candidates.into_iter().next().map(|(link, _)| link))
 }
 
 pub(crate) fn build_dispatch_session(

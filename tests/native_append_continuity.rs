@@ -152,6 +152,18 @@ fn logical_result(root: &Path) -> Value {
     assert_eq!(chain[0]["received_turn_index"], 0);
     assert_eq!(chain[0]["edit_turn_index"], 1);
     assert_eq!(chain[0]["parent_sent_turn_index"], 0);
+    let child = chain[0]
+        .get("edit_session")
+        .unwrap_or(&chain[0]["session"])
+        .as_str()
+        .unwrap();
+    assert_public_chain(
+        &out,
+        &[
+            child.into(),
+            chain[0]["parent_session"].as_str().unwrap().into(),
+        ],
+    );
     let db = rusqlite::Connection::open(root.join("home/.engram/index.sqlite")).unwrap();
     let counts: Vec<i64> = [
         "evidence_windows",
@@ -354,6 +366,14 @@ fn split_middle_sender_preserves_a_b_c_chain_and_excludes_sibling() {
     assert_eq!(chain[1]["received_uuid"], UUID);
     assert_eq!(chain[0]["parent_sent_turn_index"], 1);
     assert_eq!(chain[1]["edit_turn_index"], 1);
+    assert_public_chain(
+        &out,
+        &[
+            chain[0]["session"].as_str().unwrap().into(),
+            chain[0]["parent_session"].as_str().unwrap().into(),
+            chain[1]["parent_session"].as_str().unwrap().into(),
+        ],
+    );
     assert!(
         out["sessions"]
             .as_array()
@@ -361,6 +381,41 @@ fn split_middle_sender_preserves_a_b_c_chain_and_excludes_sibling() {
             .iter()
             .all(|s| s["session_id"] != sibling_state["tape_id"])
     );
+    // N2: recovering both the historical edit and its middle sender must keep
+    // the complete public three-session chain, not only dispatch tuples.
+    let old_tapes = snapshots(root);
+    let counts = stored_counts(root);
+    for input in [&middle, &child] {
+        let path = cursor(root, input);
+        let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        state.as_object_mut().unwrap().remove("continuity");
+        fs::write(&path, line(state)).unwrap();
+        let upgrade = cli(root, &["ingest", input.to_str().unwrap()], None);
+        assert_eq!(upgrade["failure_count"], 0);
+        assert_eq!(upgrade["native_recovery"]["sources"], 1);
+        assert_eq!(upgrade["skipped_unchanged"], 1);
+    }
+    let recovered = cli(root, &["explain", "--", TEXT], None);
+    let chain = recovered["dispatch_lineage"].as_array().unwrap();
+    assert_eq!(chain.len(), 2, "{recovered}");
+    assert_eq!(chain[0]["received_uuid"], LATER);
+    assert_eq!(chain[1]["received_uuid"], UUID);
+    assert_eq!(chain[0]["parent_session"], chain[1]["session"]);
+    assert_public_chain(
+        &recovered,
+        &[
+            chain[0]["edit_session"].as_str().unwrap().into(),
+            chain[0]["parent_session"].as_str().unwrap().into(),
+            chain[1]["parent_session"].as_str().unwrap().into(),
+        ],
+    );
+    assert_eq!(stored_counts(root), counts);
+    for (name, bytes) in old_tapes {
+        assert_eq!(
+            bytes,
+            fs::read(root.join("home/.engram/tapes").join(name)).unwrap()
+        );
+    }
 }
 
 #[test]
@@ -1024,6 +1079,285 @@ fn contract_negative_controls_do_not_manufacture_native_lineage() {
             println!(
                 "{}",
                 json!({"harness":if claude {"claude"} else {"codex"},"negative_control":control,"dispatch_hops":0,"edit_evidence_retained":1})
+            );
+        }
+    }
+}
+
+// N1: identical native chronology must select the same first marker, regardless
+// of which complete raw record ends a poll (including a legacy cursor bootstrap).
+fn n1_message(claude: bool, uuid: &str, second: u8) -> String {
+    let text = format!("<engram-src id=\"{uuid}\"/> received");
+    if claude {
+        line(
+            json!({"type":"user","sessionId":"worker","timestamp":format!("2026-09-21T00:00:{second:02}Z"),"message":{"role":"user","content":text}}),
+        )
+    } else {
+        codex(
+            "message",
+            json!({"role":"user","content":[{"type":"input_text","text":text}]}),
+            second,
+        )
+    }
+}
+fn n1_send(claude: bool, uuid: &str, second: u8) -> String {
+    let mut row: Value = serde_json::from_str(&native_sender(
+        if claude {
+            "tool_use"
+        } else {
+            "custom_tool_call"
+        },
+        uuid,
+    ))
+    .unwrap();
+    row["timestamp"] = json!(format!("2026-09-21T00:00:{second:02}Z"));
+    // Distinct raw calls; only the dispatch UUID repeats.
+    if claude {
+        row["sessionId"] = json!("worker");
+        row["message"]["content"][0]["id"] = json!(format!("send-{second}"));
+    } else {
+        row["payload"]["call_id"] = json!(format!("send-{second}"));
+    }
+    line(row)
+}
+fn n1_ingest(
+    root: &Path,
+    input: &Path,
+    rows: &[String],
+    split: Option<usize>,
+    legacy: bool,
+) -> Vec<Value> {
+    let mut events = Vec::new();
+    let mut from = 0;
+    for end in split.into_iter().chain(std::iter::once(rows.len())) {
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(input)
+            .unwrap()
+            .write_all(rows[from..end].concat().as_bytes())
+            .unwrap();
+        let before = if root.join("home/.engram/tapes").exists() {
+            snapshots(root)
+        } else {
+            Vec::new()
+        };
+        let result = cli(root, &["ingest", input.to_str().unwrap()], None);
+        assert_eq!(result["failure_count"], 0);
+        for (name, bytes) in before {
+            assert_eq!(
+                bytes,
+                fs::read(root.join("home/.engram/tapes").join(name)).unwrap()
+            );
+        }
+        let state: Value = serde_json::from_slice(&fs::read(cursor(root, input)).unwrap()).unwrap();
+        events.extend(
+            tape_rows(root, state["tape_id"].as_str().unwrap())
+                .into_iter()
+                .filter(|r| r["k"] != "meta"),
+        );
+        if legacy && from == 0 {
+            let mut old = state;
+            old.as_object_mut().unwrap().remove("continuity");
+            fs::write(cursor(root, input), line(old)).unwrap();
+        }
+        from = end;
+    }
+    events
+}
+fn assert_public_chain(out: &Value, leaf_to_root: &[String]) {
+    let sessions = out["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), leaf_to_root.len(), "{out}");
+    let mut descendants = Vec::new();
+    for (i, id) in leaf_to_root.iter().enumerate() {
+        let s = sessions.iter().find(|s| s["session_id"] == *id).unwrap();
+        let parent = leaf_to_root.get(i + 1).map_or(Value::Null, |id| json!(id));
+        let children = if i == 0 {
+            json!([])
+        } else {
+            json!([leaf_to_root[i - 1]])
+        };
+        assert_eq!(s["parent"], parent, "{out}");
+        assert_eq!(s["children"], children, "{out}");
+        assert_eq!(s["depth"], leaf_to_root.len() - i - 1, "{out}");
+        assert_eq!(s["chain_length"], leaf_to_root.len(), "{out}");
+        descendants.push(json!({"session_id":id,"parent":parent,"children":children,"depth":leaf_to_root.len()-i-1}));
+    }
+    descendants.reverse();
+    assert_eq!(
+        out["chains"],
+        json!([{"root_session_id":leaf_to_root.last().unwrap(),"descendants":descendants}]),
+        "{out}"
+    );
+}
+#[test]
+fn n1_repeated_receives_and_direction_ties_match_full_split_and_legacy() {
+    for claude in [false, true] {
+        for case in [
+            "uvu",
+            "uu",
+            "sent_then_received",
+            "sent_received_tie",
+            "received_sent_tie",
+        ] {
+            let mut prefix = match case {
+                "uvu" => vec![
+                    n1_message(claude, UUID, 1),
+                    n1_message(claude, LATER, 2),
+                    n1_message(claude, UUID, 3),
+                ],
+                "uu" => vec![n1_message(claude, UUID, 1), n1_message(claude, UUID, 2)],
+                "sent_then_received" => vec![
+                    n1_send(claude, UUID, 1),
+                    n1_message(claude, LATER, 2),
+                    n1_message(claude, UUID, 3),
+                ],
+                "sent_received_tie" => vec![n1_send(claude, UUID, 1), n1_message(claude, UUID, 1)],
+                _ => vec![n1_message(claude, UUID, 1), n1_send(claude, UUID, 1)],
+            };
+            let prefix_len = prefix.len();
+            let offset = if claude { 1 } else { 2 };
+            for raw in &rows(claude)[offset..offset + 2] {
+                let mut row: Value = serde_json::from_str(raw).unwrap();
+                row["timestamp"] = json!(format!("2026-09-21T00:00:{:02}Z", prefix.len() + 4));
+                prefix.push(line(row));
+            }
+            let mut expected = None;
+            for mode in ["full", "split", "legacy"] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path();
+                setup(root);
+                let parent = line(
+                    json!({"t":"2026-09-21T00:00:00Z","k":"tool.call","tool":"exec","args":{"prompt":format!("<engram-src id=\"{LATER}\"/>")}}),
+                );
+                cli(root, &["record", "--stdin"], Some(&parent));
+                let input = root.join(if claude {
+                    "receiver.claude.jsonl"
+                } else {
+                    "receiver.codex.jsonl"
+                });
+                let events = n1_ingest(
+                    root,
+                    &input,
+                    &prefix,
+                    (mode != "full").then_some(prefix_len - 1),
+                    mode == "legacy",
+                );
+                let out = cli(root, &["explain", "--", TEXT], None);
+                let hop = &out["dispatch_lineage"][0];
+                assert_eq!(
+                    out["dispatch_lineage"].as_array().unwrap().len(),
+                    1,
+                    "{case} {mode}: {out}"
+                );
+                let (uuid, received, edit) = match case {
+                    "uvu" => (LATER, 1, 3),
+                    "uu" => (UUID, 0, 2),
+                    "sent_then_received" => (LATER, 0, 2),
+                    _ => (UUID, 0, 1),
+                };
+                assert_eq!(hop["received_uuid"], uuid, "{case} {mode}: {out}");
+                assert_eq!(hop["received_turn_index"], received);
+                assert_eq!(hop["edit_turn_index"], edit);
+                assert_eq!(hop["parent_sent_turn_index"], 0);
+                assert_public_chain(
+                    &out,
+                    &[
+                        hop["session"].as_str().unwrap().into(),
+                        hop["parent_session"].as_str().unwrap().into(),
+                    ],
+                );
+                let logical = json!({"uuid":hop["received_uuid"],"received":received,"edit":edit,"parent":hop["parent_session"],"parent_turn":hop["parent_sent_turn_index"],"counts":stored_counts(root),"events":events});
+                if let Some(expected) = &expected {
+                    assert_eq!(&logical, expected, "{claude} {case} {mode}");
+                } else {
+                    expected = Some(logical);
+                }
+                let repeat = cli(root, &["ingest", input.to_str().unwrap()], None);
+                assert_eq!(repeat["skipped_unchanged"], 1);
+                assert_eq!(repeat["failure_count"], 0);
+            }
+            println!("N1 receiver: claude={claude} case={case} full/split/legacy equal");
+        }
+    }
+}
+
+#[test]
+fn n1_repeated_sender_and_received_direction_preserve_parent_identity() {
+    for claude in [false, true] {
+        for received_first in [false, true] {
+            let mut expected = None;
+            for mode in ["full", "split", "legacy"] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path();
+                fs::create_dir_all(root.join("home")).unwrap();
+                let parent = root.join(if claude {
+                    "parent.claude.jsonl"
+                } else {
+                    "parent.codex.jsonl"
+                });
+                let sequence = vec![
+                    if received_first {
+                        n1_message(claude, UUID, 1)
+                    } else {
+                        n1_send(claude, UUID, 1)
+                    },
+                    n1_message(claude, LATER, 2),
+                    n1_send(claude, UUID, 3),
+                ];
+                n1_ingest(
+                    root,
+                    &parent,
+                    &sequence,
+                    (mode != "full").then_some(2),
+                    mode == "legacy",
+                );
+                let input = root.join(if claude {
+                    "receiver.claude.jsonl"
+                } else {
+                    "receiver.codex.jsonl"
+                });
+                let receiver = rows(claude);
+                let end = if claude { 3 } else { 4 };
+                fs::write(&input, receiver[..end].concat()).unwrap();
+                cli(root, &["ingest", input.to_str().unwrap()], None);
+                let out = cli(root, &["explain", "--", TEXT], None);
+                if received_first {
+                    assert_eq!(out["dispatch_lineage"], json!([]), "{out}");
+                    continue;
+                }
+                let hop = &out["dispatch_lineage"][0];
+                assert_eq!(hop["parent_sent_turn_index"], 0, "{out}");
+                // Parent tape may be segmented/context-only, but it must contain
+                // the original sender call, never the repeated later call.
+                let parent_rows = tape_rows(root, hop["parent_session"].as_str().unwrap());
+                assert!(
+                    parent_rows
+                        .iter()
+                        .any(|r| r["k"] == "tool.call" && r["t"] == "2026-09-21T00:00:01Z")
+                );
+                assert_public_chain(
+                    &out,
+                    &[
+                        hop["session"].as_str().unwrap().into(),
+                        hop["parent_session"].as_str().unwrap().into(),
+                    ],
+                );
+                let logical = json!([
+                    hop["received_uuid"],
+                    hop["received_turn_index"],
+                    hop["edit_turn_index"],
+                    hop["parent_sent_turn_index"],
+                    stored_counts(root)
+                ]);
+                if let Some(expected) = &expected {
+                    assert_eq!(&logical, expected);
+                } else {
+                    expected = Some(logical);
+                }
+            }
+            println!(
+                "N1 sender: claude={claude} received_first={received_first} full/split/legacy equal"
             );
         }
     }

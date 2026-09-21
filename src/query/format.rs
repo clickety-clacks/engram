@@ -565,7 +565,13 @@ pub fn annotate_chain_fields(sessions: &mut [Value], dispatch_lineage: &[Value])
     let mut parent_of = HashMap::<String, String>::new();
     let mut children_of = HashMap::<String, Vec<String>>::new();
     for link in dispatch_lineage {
-        let Some(child) = link.get("session").and_then(Value::as_str) else {
+        // Recovery keeps context provenance in `session`; the physical edit
+        // remains the child displayed in the ordinary sessions/chain model.
+        let Some(child) = link
+            .get("edit_session")
+            .or_else(|| link.get("session"))
+            .and_then(Value::as_str)
+        else {
             continue;
         };
         let Some(parent) = link.get("parent_session").and_then(Value::as_str) else {

@@ -4,3 +4,5 @@
 
 > This is a greenfield app with no users. Feel free to suggest structural and breaking refactors to help bend this codebase into the right shape.
 
+
+Native append lineage: dispatch rows retain first occurrences only within each tape. Query selection must fold immutable predecessor segments before choosing a UUID/direction; a repeated marker must not renew its turn. Recovered hops retain context in `session` and the original evidence child in `edit_session`; public chain formatting must use the latter when present.
