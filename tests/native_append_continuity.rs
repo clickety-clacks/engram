@@ -827,3 +827,204 @@ fn ambiguous_legacy_events_fail_without_advancing_cursor_or_publishing_context()
     assert_eq!(tapes_before.len(), snapshots(root).len());
     assert_eq!(stored_counts(root), fixture["counts"]);
 }
+
+fn native_sender(kind: &str, uuid: &str) -> String {
+    let prompt = format!("<engram-src id=\"{uuid}\"/> perform the bounded task");
+    let command = format!("tightbeam wake --prompt '{prompt}'");
+    match kind {
+        "function_call" => codex(
+            "function_call",
+            json!({"call_id":"send","name":"exec_command","arguments":json!({"cmd":command}).to_string()}),
+            0,
+        ),
+        "custom_tool_call" => codex(
+            "custom_tool_call",
+            json!({"call_id":"send","name":"exec","input":format!("text(await tools.exec_command({}));", json!({"cmd":command}))}),
+            0,
+        ),
+        "tool_use" => line(
+            json!({"type":"assistant","sessionId":"parent","timestamp":"2026-09-21T00:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"send","name":"Bash","input":{"command":command}}]}}),
+        ),
+        _ => panic!("unsupported sender fixture"),
+    }
+}
+
+#[test]
+fn contract_native_sender_shapes_and_normalized_input_follow_actual_parent_across_restarts() {
+    for kind in [
+        "function_call",
+        "custom_tool_call",
+        "tool_use",
+        "normalized",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("home")).unwrap();
+        if kind == "normalized" {
+            setup(root);
+        } else {
+            let sender = root.join(if kind == "tool_use" {
+                "sender.claude.jsonl"
+            } else {
+                "sender.codex.jsonl"
+            });
+            fs::write(&sender, native_sender(kind, UUID)).unwrap();
+            cli(root, &["ingest", sender.to_str().unwrap()], None);
+        }
+        let db = rusqlite::Connection::open(root.join("home/.engram/index.sqlite")).unwrap();
+        let parent: String = db
+            .query_row(
+                "SELECT tape_id FROM dispatch_links WHERE uuid = ?1 AND direction = 'sent'",
+                [UUID],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(db);
+        let claude = kind == "tool_use";
+        let receiver = root.join(if claude {
+            "receiver.claude.jsonl"
+        } else {
+            "receiver.codex.jsonl"
+        });
+        let events = rows(claude);
+        // Each call starts a new product process, exercising the persisted cursor
+        // through marker, tool call and paired result boundaries.
+        for event in &events {
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&receiver)
+                .unwrap()
+                .write_all(event.as_bytes())
+                .unwrap();
+            cli(root, &["ingest", receiver.to_str().unwrap()], None);
+        }
+        let result = cli(root, &["explain", "--", TEXT], None);
+        assert_eq!(result["dispatch_lineage"].as_array().unwrap().len(), 1);
+        assert_eq!(result["dispatch_lineage"][0]["parent_session"], parent);
+        assert_eq!(result["dispatch_lineage"][0]["received_uuid"], UUID);
+        assert_eq!(result["dispatch_lineage"][0]["received_turn_index"], 0);
+        assert_eq!(result["dispatch_lineage"][0]["edit_turn_index"], 1);
+        assert_eq!(fs::read_to_string(&receiver).unwrap(), events.concat());
+        let repeat = cli(root, &["ingest", receiver.to_str().unwrap()], None);
+        assert_eq!(repeat["imported_tapes"], 0);
+        assert_eq!(repeat["skipped_unchanged"], 1);
+        println!(
+            "{}",
+            json!({"sender_shape":kind,"actual_parent_tape":parent,"dispatch_hops":1,"receiver_turn":0,"edit_turn":1,"restart_each_append":true,"repeat_imports":0})
+        );
+    }
+}
+
+#[test]
+fn contract_negative_controls_do_not_manufacture_native_lineage() {
+    for claude in [false, true] {
+        for control in [
+            "missing_sender",
+            "unrelated_uuid",
+            "receiver_after_edit",
+            "tool_result_sender",
+            "quoted_guidance",
+            "tool_result_receiver",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            fs::create_dir_all(root.join("home")).unwrap();
+            let marker = format!("<engram-src id=\"{UUID}\"/>");
+            let result_marker = if claude {
+                line(
+                    json!({"type":"user","sessionId":"worker","timestamp":"2026-09-21T00:00:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"quoted","content":format!("quoted output: {marker}")}]}}),
+                )
+            } else {
+                codex(
+                    "custom_tool_call_output",
+                    json!({"call_id":"quoted","output":format!("quoted output: {marker}")}),
+                    1,
+                )
+            };
+            let sender = match control {
+                "missing_sender" => None,
+                "unrelated_uuid" => Some(native_sender(
+                    if claude { "tool_use" } else { "function_call" },
+                    LATER,
+                )),
+                "tool_result_sender" => Some(result_marker.clone()),
+                "quoted_guidance" => Some(if claude {
+                    line(
+                        json!({"type":"assistant","sessionId":"parent","timestamp":"2026-09-21T00:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":format!("Guidance quotes `{marker}`; this prose is not a sending tool call.")}]}}),
+                    )
+                } else {
+                    codex(
+                        "message",
+                        json!({"role":"assistant","content":[{"type":"output_text","text":format!("Guidance quotes `{marker}`; this prose is not a sending tool call.")}]}),
+                        0,
+                    )
+                }),
+                _ => Some(native_sender(
+                    if claude {
+                        "tool_use"
+                    } else {
+                        "custom_tool_call"
+                    },
+                    UUID,
+                )),
+            };
+            if let Some(raw) = sender {
+                let path = root.join(if claude {
+                    "sender.claude.jsonl"
+                } else {
+                    "sender.codex.jsonl"
+                });
+                fs::write(&path, raw).unwrap();
+                cli(root, &["ingest", path.to_str().unwrap()], None);
+            }
+            let mut events = rows(claude);
+            events.pop(); // Remove the unrelated later message from the shared fixture.
+            let receive = if claude { 0 } else { 1 };
+            let marker_event = events.remove(receive);
+            if control == "tool_result_receiver" {
+                events.insert(receive, result_marker);
+            } else if control != "receiver_after_edit" {
+                events.insert(receive, marker_event.clone());
+            }
+            let receiver = root.join(if claude {
+                "receiver.claude.jsonl"
+            } else {
+                "receiver.codex.jsonl"
+            });
+            fs::write(&receiver, events.concat()).unwrap();
+            cli(root, &["ingest", receiver.to_str().unwrap()], None);
+            if control == "receiver_after_edit" {
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&receiver)
+                    .unwrap()
+                    .write_all(marker_event.replace("00:00:01Z", "00:00:04Z").as_bytes())
+                    .unwrap();
+                cli(root, &["ingest", receiver.to_str().unwrap()], None);
+            }
+            let result = cli(root, &["explain", "--", TEXT], None);
+            assert!(
+                result["dispatch_lineage"].as_array().unwrap().is_empty(),
+                "{control}: {result}"
+            );
+            let db = rusqlite::Connection::open(root.join("home/.engram/index.sqlite")).unwrap();
+            if matches!(
+                control,
+                "missing_sender" | "unrelated_uuid" | "tool_result_sender" | "quoted_guidance"
+            ) {
+                let sent: i64 = db.query_row("SELECT COUNT(*) FROM dispatch_links WHERE uuid = ?1 AND direction = 'sent'", [UUID], |r| r.get(0)).unwrap();
+                assert_eq!(sent, 0, "{control} manufactured a sender");
+            }
+            if control == "tool_result_receiver" {
+                let received: i64 = db.query_row("SELECT COUNT(*) FROM dispatch_links WHERE uuid = ?1 AND direction = 'received'", [UUID], |r| r.get(0)).unwrap();
+                assert_eq!(received, 0);
+            }
+            assert_eq!(stored_counts(root)["evidence_windows"], 1);
+            println!(
+                "{}",
+                json!({"harness":if claude {"claude"} else {"codex"},"negative_control":control,"dispatch_hops":0,"edit_evidence_retained":1})
+            );
+        }
+    }
+}
