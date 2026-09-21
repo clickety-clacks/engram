@@ -1,3 +1,6 @@
+mod continuity;
+use continuity::{Continuity, NativeState};
+
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -75,7 +78,7 @@ pub fn run_ingest(
             }
         };
 
-        let prior_state = match load_ingest_state_for_path(paths, &abs_path) {
+        let mut prior_state = match load_ingest_state_for_path(paths, &abs_path) {
             Ok(value) => value,
             Err(err) => {
                 failures.push(json!({
@@ -90,8 +93,15 @@ pub fn run_ingest(
         let mut full_reason = None::<&str>;
         if let Some(prev) = prior_state.as_ref() {
             let prior_tape_path = tape_path_for_tapes_dir(&context.tapes_dir, &prev.tape_id);
-            let prior_tape_missing = !prior_tape_path.exists();
-            let prior_tape_unindexed = !index.has_tape(&prev.tape_id)?;
+            let prior_tape_missing = !prior_tape_path.exists()
+                || prev.continuity.as_ref().is_some_and(|state| {
+                    !tape_path_for_tapes_dir(&context.tapes_dir, &state.tape_id).exists()
+                });
+            let prior_tape_unindexed = !index.has_tape(&prev.tape_id)?
+                || match &prev.continuity {
+                    Some(state) => !index.has_tape(&state.tape_id)?,
+                    None => false,
+                };
             if prior_tape_missing || prior_tape_unindexed {
                 should_run_full = true;
                 full_reason = Some(if prior_tape_missing {
@@ -109,7 +119,7 @@ pub fn run_ingest(
                         full_reason = Some("guard_mismatch");
                     }
                     Ok(true) => {
-                        if metadata.len() == prev.byte_cursor {
+                        if metadata.len() == prev.byte_cursor && prev.continuity.is_some() {
                             skipped_unchanged += 1;
                             continue;
                         }
@@ -122,6 +132,52 @@ pub fn run_ingest(
                         continue;
                     }
                 }
+            }
+        }
+
+        // Old cursors lack pending calls and predecessor history. Read their committed
+        // prefix once to bootstrap native state; archive it as dispatch context only,
+        // never re-index its evidence or rewrite existing immutable tapes.
+        if !should_run_full && let Some(prev) = prior_state.as_mut() {
+            if prev.continuity.is_none()
+                && let Some(adapter) = adapter_id_from_name(&prev.adapter)
+                && let Some(mut native) = NativeState::new(adapter)
+            {
+                let mut prefix = String::new();
+                File::open(&abs_path)
+                    .and_then(|file| file.take(prev.byte_cursor).read_to_string(&mut prefix))
+                    .map_err(|err| CliError::io("cursor_context_error", err))?;
+                let normalized = native.convert(&prefix)?;
+                let (normalized, turns) = continuity::annotate(&normalized, None, true)?;
+                let mut rows: Vec<Value> = normalized
+                    .lines()
+                    .map(serde_json::from_str)
+                    .collect::<Result<_, _>>()?;
+                if let Some(meta) = rows.iter_mut().find(|row| row["k"] == "meta") {
+                    meta["context_raw_prefix_bytes"] = json!(prev.byte_cursor);
+                    meta["context_raw_prefix_sha256"] = json!(tape_id_for_contents(&prefix));
+                }
+                let normalized = rows
+                    .iter()
+                    .map(serde_json::to_string)
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join("\n")
+                    + "\n";
+                let id = tape_id_for_contents(&normalized);
+                store_normalized(context, &id, &normalized)?;
+                let links = extract_dispatch_links_from_transcript(&normalized);
+                index.ingest_tape_events_with_dispatch(&id, &[], &links, LINK_THRESHOLD_DEFAULT)?;
+                prev.continuity = Some(Continuity {
+                    native,
+                    message_turns: turns,
+                    tape_id: id,
+                    last_message_timestamp: continuity::last_message_timestamp(&normalized),
+                });
+                save_ingest_state_for_path(paths, &abs_path, prev)?;
+            }
+            if metadata.len() == prev.byte_cursor {
+                skipped_unchanged += 1;
+                continue;
             }
         }
 
@@ -199,7 +255,15 @@ pub fn run_ingest(
             }
         };
 
-        let adapter = adapter_hint.filter(|adapter| adapter_claims_input(*adapter, ingest_input));
+        // A guarded native cursor already identifies its format. Metadata-only
+        // append records need not independently look like a new transcript.
+        let adapter = adapter_hint.filter(|adapter| {
+            (!should_run_full
+                && prior_state
+                    .as_ref()
+                    .is_some_and(|state| state.continuity.is_some()))
+                || adapter_claims_input(*adapter, ingest_input)
+        });
         let adapter = if let Some(value) = adapter {
             value
         } else if let Some(value) = detect_adapter_for_input(&abs_path, ingest_input) {
@@ -255,7 +319,22 @@ pub fn run_ingest(
             }
         };
 
-        let normalized = match convert_with_adapter(adapter, ingest_input) {
+        let previous = if should_run_full {
+            None
+        } else {
+            prior_state
+                .as_ref()
+                .and_then(|state| state.continuity.as_ref())
+        };
+        let mut native = previous
+            .map(|state| state.native.clone())
+            .or_else(|| NativeState::new(adapter));
+        let conversion = if let Some(native) = native.as_mut() {
+            native.convert(ingest_input).map_err(|err| err.to_string())
+        } else {
+            convert_with_adapter(adapter, ingest_input).map_err(|err| err.to_string())
+        };
+        let normalized = match conversion {
             Ok(output) => output,
             Err(err) => {
                 failures.push(json!({
@@ -266,6 +345,11 @@ pub fn run_ingest(
                 }));
                 continue;
             }
+        };
+        let (normalized, turns) = if native.is_some() {
+            continuity::annotate(&normalized, previous, false)?
+        } else {
+            (normalized, 0)
         };
         let events = match parse_jsonl_events(&normalized) {
             Ok(events) => events,
@@ -283,10 +367,25 @@ pub fn run_ingest(
             .iter()
             .any(|event| !matches!(event.event.data, TapeEventData::Meta(_)))
         {
+            if !should_run_full && let (Some(prev), Some(native)) = (prior_state.as_ref(), native) {
+                let mut state = prev.clone();
+                state.byte_cursor = next_cursor;
+                state.cursor_guard = build_cursor_guard(&abs_path, next_cursor)?;
+                if let Some(continuity) = state.continuity.as_mut() {
+                    continuity.native = native;
+                }
+                save_ingest_state_for_path(paths, &abs_path, &state)?;
+            }
             skipped_non_transcript += 1;
             continue;
         }
-        let dispatch_links = extract_dispatch_links_from_transcript(ingest_input);
+        // Use the normalized chronology: native envelopes and standalone calls
+        // do not necessarily correspond one-to-one to message turns.
+        let dispatch_links = extract_dispatch_links_from_transcript(if native.is_some() {
+            &normalized
+        } else {
+            ingest_input
+        });
 
         let tape_id = tape_id_for_contents(&normalized);
         let tape_path = tape_path_for_tapes_dir(&context.tapes_dir, &tape_id);
@@ -325,6 +424,13 @@ pub fn run_ingest(
             byte_cursor: next_cursor,
             cursor_guard,
             adapter: adapter.as_str().to_string(),
+            continuity: native.map(|native| Continuity {
+                native,
+                message_turns: previous.map_or(0, |state| state.message_turns) + turns,
+                tape_id: tape_id.clone(),
+                last_message_timestamp: continuity::last_message_timestamp(&normalized)
+                    .or_else(|| previous.and_then(|state| state.last_message_timestamp.clone())),
+            }),
             tape_id,
         };
         if let Err(err) = save_ingest_state_for_path(paths, &abs_path, &state) {
@@ -361,6 +467,18 @@ pub(crate) struct IngestFileState {
     pub cursor_guard: IngestCursorGuard,
     pub adapter: String,
     pub tape_id: String,
+    #[serde(default)]
+    continuity: Option<Continuity>,
+}
+
+fn store_normalized(context: &RuntimeContext, id: &str, normalized: &str) -> Result<(), CliError> {
+    let path = tape_path_for_tapes_dir(&context.tapes_dir, id);
+    if !path.exists() {
+        let bytes =
+            compress_jsonl(normalized).map_err(|err| CliError::io("compress_error", err))?;
+        atomic_write(&path, &bytes).map_err(|err| CliError::io("write_error", err))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn discover_local_transcript_candidates(cwd: &Path) -> Result<Vec<PathBuf>, CliError> {

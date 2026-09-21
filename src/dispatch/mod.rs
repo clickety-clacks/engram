@@ -46,9 +46,13 @@ pub fn collect_dispatch_upstream_sessions(
             let mut current_tape = tape_id.to_string();
             let mut current_turn = edit_turn;
             let mut visited = HashSet::new();
-            while let Some(received) =
-                latest_received_dispatch_before_turn(indexes, &current_tape, current_turn)?
-            {
+            while let Some((received, received_tape, received_start)) = latest_received_in_history(
+                context,
+                &mut rows_cache,
+                indexes,
+                &current_tape,
+                current_turn,
+            )? {
                 let Some(parent) = sent_dispatch_for_uuid(indexes, &received.uuid)? else {
                     break;
                 };
@@ -65,14 +69,28 @@ pub fn collect_dispatch_upstream_sessions(
                 }
 
                 if seen_hops.insert(hop_key) {
-                    chain.push(json!({
+                    let current_start = message_turn_start(load_tape_rows_cached(
+                        context,
+                        &mut rows_cache,
+                        &current_tape,
+                    )?);
+                    let parent_start = message_turn_start(load_tape_rows_cached(
+                        context,
+                        &mut rows_cache,
+                        &parent.tape_id,
+                    )?);
+                    let mut hop = json!({
                         "session": current_tape,
-                        "edit_turn_index": current_turn,
+                        "edit_turn_index": current_start + current_turn,
                         "received_uuid": received.uuid,
-                        "received_turn_index": received.first_turn_index,
+                        "received_turn_index": received_start + received.first_turn_index,
                         "parent_session": parent.tape_id,
-                        "parent_sent_turn_index": parent.first_turn_index,
-                    }));
+                        "parent_sent_turn_index": parent_start + parent.first_turn_index,
+                    });
+                    if received_tape != current_tape {
+                        hop["received_session"] = json!(received_tape);
+                    }
+                    chain.push(hop);
                 }
 
                 if seen_tapes.insert(parent.tape_id.clone())
@@ -88,6 +106,42 @@ pub fn collect_dispatch_upstream_sessions(
     }
 
     Ok((chain, extras))
+}
+
+fn message_turn_start(rows: &[TapeRow]) -> i64 {
+    rows.iter()
+        .find(|row| row.value["k"] == "meta")
+        .and_then(|row| row.value["ingest_continuation"]["message_turn_start"].as_i64())
+        .unwrap_or(0)
+}
+
+/// Follow immutable append segments only backwards. Never borrow markers from
+/// a later segment or another session (including siblings sharing a UUID).
+fn latest_received_in_history(
+    context: &RuntimeContext,
+    cache: &mut HashMap<String, Vec<TapeRow>>,
+    indexes: &[SqliteIndex],
+    tape_id: &str,
+    turn: i64,
+) -> Result<Option<(DispatchLink, String, i64)>, CliError> {
+    let mut tape = tape_id.to_string();
+    let cutoff = message_turn_start(load_tape_rows_cached(context, cache, tape_id)?) + turn;
+    let mut visited = HashSet::new();
+    while visited.insert(tape.clone()) {
+        let rows = load_tape_rows_cached(context, cache, &tape)?;
+        let start = message_turn_start(rows);
+        if let Some(link) = latest_received_dispatch_before_turn(indexes, &tape, cutoff - start)? {
+            return Ok(Some((link, tape, start)));
+        }
+        let previous = rows
+            .iter()
+            .find(|row| row.value["k"] == "meta")
+            .and_then(|row| row.value["ingest_continuation"]["previous_tape_id"].as_str())
+            .map(ToOwned::to_owned);
+        let Some(previous) = previous else { break };
+        tape = previous;
+    }
+    Ok(None)
 }
 
 fn latest_received_dispatch_before_turn(
@@ -211,6 +265,30 @@ pub fn extract_dispatch_links_from_transcript(transcript: &str) -> Vec<DispatchL
         let Ok(row) = serde_json::from_str::<Value>(line) else {
             continue;
         };
+        if row["k"] == "meta" {
+            last_message_timestamp = row["ingest_continuation"]["last_message_timestamp"]
+                .as_str()
+                .map(ToOwned::to_owned);
+        }
+        if row["type"] == "response_item"
+            && matches!(
+                row["payload"]["type"].as_str(),
+                Some("custom_tool_call" | "function_call")
+            )
+        {
+            let mut uuids = HashSet::new();
+            for key in ["input", "arguments"] {
+                collect_dispatch_uuids_anywhere(&row["payload"][key], &mut uuids);
+            }
+            for uuid in uuids {
+                record_first_dispatch(
+                    &mut first_by_uuid,
+                    uuid,
+                    turn_index,
+                    DispatchDirection::Sent,
+                );
+            }
+        }
         if row.get("k").and_then(Value::as_str) == Some("tool.call") {
             let mut dispatch_uuids = HashSet::new();
             if let Some(args) = row.get("args") {
@@ -232,6 +310,18 @@ pub fn extract_dispatch_links_from_transcript(transcript: &str) -> Vec<DispatchL
             }
         }
         for message in extract_message_objects(&row) {
+            // Native Claude user envelopes also carry tool results. Their
+            // quoted output is neither a received message nor a sender call.
+            let mut native_user;
+            let message = if row["type"] == "user" {
+                native_user = message.clone();
+                if let Some(blocks) = native_user["content"].as_array_mut() {
+                    blocks.retain(|block| block["type"] != "tool_result");
+                }
+                &native_user
+            } else {
+                message
+            };
             let dispatch_in_message = extract_dispatch_direction_by_uuid(message);
             for (uuid, direction) in dispatch_in_message {
                 record_first_dispatch(&mut first_by_uuid, uuid, turn_index, direction);
@@ -292,8 +382,10 @@ pub(crate) fn extract_message_objects<'a>(row: &'a Value) -> Vec<&'a Value> {
         return out;
     };
 
-    if obj.get("type").and_then(Value::as_str) == Some("message")
-        && let Some(message) = obj.get("message")
+    if matches!(
+        obj.get("type").and_then(Value::as_str),
+        Some("message" | "assistant" | "user")
+    ) && let Some(message) = obj.get("message")
     {
         out.push(message);
     }

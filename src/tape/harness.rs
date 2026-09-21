@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::adapters::structured::bounded_shell_read;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ClaudeToolContext {
     tool: String,
     structured: Vec<Value>,
@@ -13,18 +14,37 @@ struct ClaudeToolContext {
     edit_claims: u32,
 }
 
-pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Error> {
-    let mut out = Vec::new();
-    let mut tool_by_id: HashMap<String, ClaudeToolContext> = HashMap::new();
-    let mut session_id: Option<String> = None;
-    let mut first_timestamp: Option<String> = None;
-    let mut model: Option<String> = None;
-    let mut session_cwd: Option<String> = None;
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub(crate) struct ClaudeState {
+    tool_by_id: HashMap<String, ClaudeToolContext>,
+    session_id: Option<String>,
+    model: Option<String>,
+    session_cwd: Option<String>,
+    read_total: u32,
+    read_emitted: u32,
+    edit_total: u32,
+    edit_emitted: u32,
+}
 
-    let mut read_total = 0u32;
-    let mut read_emitted = 0u32;
-    let mut edit_total = 0u32;
-    let mut edit_emitted = 0u32;
+pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Error> {
+    claude_jsonl_incremental(input, &mut ClaudeState::default())
+}
+
+pub(crate) fn claude_jsonl_incremental(
+    input: &str,
+    state: &mut ClaudeState,
+) -> Result<String, serde_json::Error> {
+    let mut out = Vec::new();
+    let mut tool_by_id = std::mem::take(&mut state.tool_by_id);
+    let mut session_id = state.session_id.clone();
+    let mut first_timestamp: Option<String> = None;
+    let mut model = state.model.clone();
+    let mut session_cwd = state.session_cwd.clone();
+
+    let mut read_total = state.read_total;
+    let mut read_emitted = state.read_emitted;
+    let mut edit_total = state.edit_total;
+    let mut edit_emitted = state.edit_emitted;
 
     for line in input.lines() {
         if line.trim().is_empty() {
@@ -68,6 +88,13 @@ pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
                 }
                 if let Some(blocks) = content.and_then(Value::as_array) {
                     for block in blocks {
+                        if block.get("type").and_then(Value::as_str) == Some("text") {
+                            if let Some(text) = block.get("text").and_then(Value::as_str) {
+                                out.push(json!({"t": timestamp, "k": "msg.in",
+                                    "source": source_block("claude-code", session_id.as_deref()),
+                                    "role": role, "content": text}));
+                            }
+                        }
                         if block.get("type").and_then(Value::as_str) != Some("tool_result") {
                             continue;
                         }
@@ -352,6 +379,14 @@ pub fn claude_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
         }),
     );
 
+    state.tool_by_id = tool_by_id;
+    state.session_id = session_id;
+    state.model = model;
+    state.session_cwd = session_cwd;
+    state.read_total = read_total;
+    state.read_emitted = read_emitted;
+    state.edit_total = edit_total;
+    state.edit_emitted = edit_emitted;
     to_jsonl(&out)
 }
 

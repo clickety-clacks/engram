@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::structured::{bounded_shell_read, parse_patch, patch_is_complete};
@@ -8,13 +9,27 @@ const CODEX_COVERAGE_TOOL: &str = "full";
 const CODEX_COVERAGE_READ: &str = "partial";
 const CODEX_COVERAGE_EDIT: &str = "partial";
 
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub(crate) struct CodexState {
+    calls: HashMap<String, CodexCall>,
+    session_id: Option<String>,
+    session_cwd: Option<String>,
+}
+
 pub fn codex_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Error> {
+    codex_jsonl_incremental(input, &mut CodexState::default())
+}
+
+pub(crate) fn codex_jsonl_incremental(
+    input: &str,
+    state: &mut CodexState,
+) -> Result<String, serde_json::Error> {
     let mut out = Vec::new();
-    let mut calls: HashMap<String, CodexCall> = HashMap::new();
-    let mut session_id: Option<String> = None;
+    let mut calls = std::mem::take(&mut state.calls);
+    let mut session_id = state.session_id.clone();
     let mut first_timestamp: Option<String> = None;
     let mut emitted_meta = false;
-    let mut session_cwd = None::<String>;
+    let mut session_cwd = state.session_cwd.clone();
 
     for line in input.lines() {
         if line.trim().is_empty() {
@@ -244,6 +259,9 @@ pub fn codex_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Erro
         meta.insert("coverage.edit".to_string(), json!(edit_coverage));
     }
 
+    state.calls = calls;
+    state.session_id = session_id;
+    state.session_cwd = session_cwd;
     to_jsonl(&out)
 }
 
@@ -464,7 +482,7 @@ fn value_to_argument_string(value: &Value) -> String {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CodexCall {
     tool: String,
     args: String,
