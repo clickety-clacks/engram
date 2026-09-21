@@ -601,6 +601,39 @@ fn stored_counts(root: &Path) -> Value {
     }
     Value::Object(out)
 }
+fn assert_context_only_archives(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let db = rusqlite::Connection::open(root.join("home/.engram/index.sqlite")).unwrap();
+    let mut contexts = std::collections::BTreeMap::new();
+    for (name, bytes) in snapshots(root) {
+        let id = name.strip_suffix(".jsonl.zst").unwrap();
+        let rows = tape_rows(root, id);
+        if !rows
+            .iter()
+            .any(|row| row["k"] == "meta" && row["ingest_context_only"] == true)
+        {
+            continue;
+        }
+        assert!(rows.iter().all(|row| matches!(
+            row["k"].as_str(),
+            Some("meta" | "msg.in" | "msg.out" | "tool.call")
+        )));
+        for table in ["evidence_windows", "edges", "tombstones"] {
+            let count: i64 = db
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE tape_id = ?1"),
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "context-only tape {id} acquired {table} rows");
+        }
+        let postings: i64 = db.query_row("SELECT COUNT(*) FROM evidence_features f JOIN evidence_windows w USING(evidence_id) WHERE w.tape_id = ?1", [id], |r| r.get(0)).unwrap();
+        assert_eq!(postings, 0, "context-only tape acquired postings");
+        contexts.insert(id.to_string(), bytes);
+    }
+    assert!(!contexts.is_empty());
+    contexts
+}
 #[test]
 fn old_binary_full_and_split_stores_recover_historical_lineage_once() {
     for raw in [
@@ -631,13 +664,35 @@ fn old_binary_full_and_split_stores_recover_historical_lineage_once() {
             .keys()
             .map(|name| root.join(name))
             .collect();
+        let source_bytes: Vec<_> = files.iter().map(|file| fs::read(file).unwrap()).collect();
         for file in &files {
-            cli(root, &["ingest", file.to_str().unwrap()], None);
+            let previous: Value =
+                serde_json::from_slice(&fs::read(cursor(root, file)).unwrap()).unwrap();
+            assert_eq!(previous["byte_cursor"], fs::metadata(file).unwrap().len());
+            let upgrade = cli(root, &["ingest", file.to_str().unwrap()], None);
+            assert_eq!(upgrade["imported_tapes"], 0);
+            assert_eq!(upgrade["skipped_unchanged"], 1);
+            assert_eq!(upgrade["native_recovery"]["sources"], 1);
         }
+        assert_eq!(
+            source_bytes,
+            files
+                .iter()
+                .map(|file| fs::read(file).unwrap())
+                .collect::<Vec<_>>()
+        );
         assert_eq!(logical_result(root)["edit_turn"], 1);
         assert_eq!(stored_counts(root), fixture["counts"]);
         let repaired = cli(root, &["explain", "--", TEXT], None);
         let historical = &repaired["dispatch_lineage"][0];
+        let context_bytes = assert_context_only_archives(root);
+        assert_eq!(context_bytes.len(), files.len());
+        assert!(context_bytes.contains_key(historical["session"].as_str().unwrap()));
+        let old_edit_rows = tape_rows(root, historical["edit_session"].as_str().unwrap());
+        assert_eq!(
+            old_edit_rows[historical["edit_event_offset"].as_u64().unwrap() as usize]["k"],
+            "code.edit"
+        );
         assert!(
             fixture["tapes"]
                 .get(historical["edit_session"].as_str().unwrap())
@@ -674,6 +729,22 @@ fn old_binary_full_and_split_stores_recover_historical_lineage_once() {
         cli(root, &["fingerprint"], None);
         assert_eq!(logical_result(root)["edit_turn"], 1);
         assert_eq!(stored_counts(root), fixture["counts"]);
+        assert_eq!(context_bytes, assert_context_only_archives(root));
+        assert_eq!(
+            source_bytes,
+            files
+                .iter()
+                .map(|file| fs::read(file).unwrap())
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "{}",
+            json!({"case":files.iter().map(|p| p.file_name().unwrap().to_string_lossy()).collect::<Vec<_>>(),
+            "legacy_tapes":fixture["tapes"].as_object().unwrap().len(),
+            "new_source_bytes":0,"context_tapes":context_bytes.keys().collect::<Vec<_>>(),
+            "historical_edit_session":historical["edit_session"],"historical_edit_offset":historical["edit_event_offset"],
+            "counts_before_and_after_rebuild":fixture["counts"],"context_only_bytes_unchanged":true,"context_evidence_and_postings":0})
+        );
     }
 }
 
