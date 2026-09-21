@@ -60,8 +60,11 @@ pub fn classify_explain_target(
     }
 
     if has_span_shape(target) {
-        let (file, start, end) = parse_file_range_target(target)?;
-        if cwd.join(file).exists() {
+        let (file, _) = target.rsplit_once(':').expect("span shape has colon");
+        // Punctuation alone does not make literal source text a file range.
+        // Validate the suffix only when its prefix names an actual file.
+        if cwd.join(file).is_file() {
+            let (_, start, end) = parse_file_range_target(target)?;
             return Ok(ExplainTarget::FileRange {
                 file: file.to_string(),
                 start,

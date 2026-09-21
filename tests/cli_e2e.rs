@@ -56,6 +56,69 @@ fn tape_id_for_contents(input: &str) -> String {
 }
 
 #[test]
+fn explain_literal_colon_hyphen_matches_file_contents() {
+    for text in [
+        "const label = \"audit: foo-bar\";",
+        "audit: foo-bar",
+        "missing.rs:2-a",
+        "missing.rs:0-2",
+        "missing.rs:9-2",
+        "missing.rs:4294967296-4294967297",
+        "const url = \"https://example.com/foo-bar\";\nnext();",
+    ] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path();
+        run_json(repo, &["init"], None);
+        fs::write(repo.join("fixture.txt"), text).expect("fixture");
+        let transcript = serde_json::json!({
+            "t": "2026-09-21T00:00:00Z", "k": "code.read",
+            "file": "fixture.txt", "range": [1, 2], "text": text
+        })
+        .to_string()
+            + "\n";
+        run_json(repo, &["record", "--stdin"], Some(&transcript));
+        let literal = run_json(repo, &["explain", "--", text], None);
+        let file = run_json(repo, &["explain", "fixture.txt"], None);
+        assert_eq!(literal["query"]["anchors"], file["query"]["anchors"]);
+        assert_eq!(literal["sessions"], file["sessions"]);
+        assert!(!literal["sessions"].as_array().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn explain_file_ranges_keep_selection_and_validation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+    run_json(repo, &["init"], None);
+    let text = "const label = \"audit: foo-bar\";";
+    // Exercise colons where the filesystem permits them (not on Windows).
+    let name = if cfg!(windows) {
+        "file name-with-hyphen.txt"
+    } else {
+        "file name:with-hyphen.txt"
+    };
+    fs::write(repo.join(name), format!("unrelated\n{text}\nlast\n")).unwrap();
+    let transcript = serde_json::json!({
+        "t": "2026-09-21T00:00:00Z", "k": "code.read",
+        "file": name, "range": [2, 2], "text": text
+    })
+    .to_string()
+        + "\n";
+    run_json(repo, &["record", "--stdin"], Some(&transcript));
+    let literal = run_json(repo, &["explain", "--", text], None);
+    let range = run_json(repo, &["explain", &format!("{name}:2-2")], None);
+    assert_eq!(range["sessions"], literal["sessions"]);
+    assert!(!range["sessions"].as_array().unwrap().is_empty());
+    for suffix in ["2-a", "a-2", "0-2", "3-2", "2-99", "4294967296-4294967297"] {
+        let output = run_cli(repo, &["explain", &format!("{name}:{suffix}")], None);
+        assert!(!output.status.success(), "{suffix}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let error: Value = serde_json::from_str(stderr.lines().last().unwrap()).unwrap();
+        assert_eq!(error["error"], "invalid_span", "{suffix}");
+    }
+}
+
+#[test]
 fn init_record_tapes_show_and_explain_roundtrip() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();
