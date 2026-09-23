@@ -17,6 +17,8 @@ use super::transport;
 
 pub const MAX_NON_FILE_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 16 * 1024;
+pub const DEFAULT_READ_FILE_COMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
+pub const DEFAULT_DECOMPRESSED_BYTES_PER_TAPE: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct PeerRequest {
@@ -90,6 +92,7 @@ pub struct RemoteOwner {
     pub protocol: u64,
     pub schema: u64,
     pub query_semantics: u64,
+    pub limits: HashMap<String, u64>,
     pub exports: BTreeMap<String, Result<PeerExport, PeerFailure>>,
     client: PeerClient,
 }
@@ -162,6 +165,24 @@ impl RemoteOwner {
             .and_then(Value::as_str)
             .ok_or_else(|| PeerFailure::new("protocol_error", "open response has no build id"))?
             .to_string();
+        let limits = response
+            .stats
+            .get("limits")
+            .and_then(Value::as_object)
+            .ok_or_else(|| PeerFailure::new("protocol_error", "open response has no limits"))?
+            .iter()
+            .map(|(name, value)| {
+                value
+                    .as_u64()
+                    .map(|value| (name.clone(), value))
+                    .ok_or_else(|| {
+                        PeerFailure::new(
+                            "protocol_error",
+                            format!("peer limit `{name}` is not numeric"),
+                        )
+                    })
+            })
+            .collect::<Result<HashMap<_, _>, _>>()?;
 
         let mut exports = BTreeMap::new();
         for row in response.data {
@@ -276,6 +297,7 @@ impl RemoteOwner {
             protocol,
             schema,
             query_semantics,
+            limits,
             exports,
             client,
         })
@@ -294,6 +316,50 @@ impl RemoteOwner {
     }
 }
 
+/// Decode one strict RFC 4648 base64 payload produced by `read_file`.
+pub fn decode_base64_chunk(encoded: &str) -> Result<Vec<u8>, String> {
+    fn value(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let bytes = encoded.as_bytes();
+    if bytes.len() % 4 != 0 {
+        return Err("base64 payload length is not a multiple of four".into());
+    }
+    let mut decoded = Vec::with_capacity(bytes.len() / 4 * 3);
+    for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+        let last = index + 1 == bytes.len() / 4;
+        let a = value(chunk[0]).ok_or_else(|| "invalid base64 alphabet".to_string())?;
+        let b = value(chunk[1]).ok_or_else(|| "invalid base64 alphabet".to_string())?;
+        decoded.push((a << 2) | (b >> 4));
+        match (chunk[2], chunk[3]) {
+            (b'=', b'=') if last && b & 0x0f == 0 => {}
+            (b'=', _) => return Err("invalid base64 padding".into()),
+            (c, b'=') if last => {
+                let c = value(c).ok_or_else(|| "invalid base64 alphabet".to_string())?;
+                if c & 0x03 != 0 {
+                    return Err("non-canonical base64 padding".into());
+                }
+                decoded.push((b << 4) | (c >> 2));
+            }
+            (c, d) => {
+                let c = value(c).ok_or_else(|| "invalid base64 alphabet".to_string())?;
+                let d = value(d).ok_or_else(|| "invalid base64 alphabet".to_string())?;
+                decoded.push((b << 4) | (c >> 2));
+                decoded.push((c << 6) | d);
+            }
+        }
+    }
+    Ok(decoded)
+}
+
 fn required_u64(value: &Value, key: &str) -> Result<u64, PeerFailure> {
     value.get(key).and_then(Value::as_u64).ok_or_else(|| {
         PeerFailure::new(
@@ -301,6 +367,26 @@ fn required_u64(value: &Value, key: &str) -> Result<u64, PeerFailure> {
             format!("open response has no numeric {key}"),
         )
     })
+}
+
+#[cfg(test)]
+mod base64_tests {
+    use super::decode_base64_chunk;
+
+    #[test]
+    fn decodes_empty_and_padded_chunks() {
+        assert_eq!(decode_base64_chunk("").unwrap(), b"");
+        assert_eq!(decode_base64_chunk("Zg==").unwrap(), b"f");
+        assert_eq!(decode_base64_chunk("Zm8=").unwrap(), b"fo");
+        assert_eq!(decode_base64_chunk("Zm9v").unwrap(), b"foo");
+    }
+
+    #[test]
+    fn rejects_malformed_and_noncanonical_chunks() {
+        for value in ["Zg=", "=m9v", "Zg==AAAA", "Zh==", "Zm9=", "Z m8="] {
+            assert!(decode_base64_chunk(value).is_err(), "accepted {value:?}");
+        }
+    }
 }
 
 impl PeerClient {
@@ -713,7 +799,7 @@ mod tests {
             command: Some(vec![
                 "/bin/sh".into(),
                 "-c".into(),
-                "while IFS= read -r request; do id=$(printf '%s\\n' \"$request\" | sed -n 's/.*\\\"id\\\":\\([0-9][0-9]*\\).*/\\1/p'); printf '{\"id\":%s,\"data\":{\"store\":\"eezo/default\",\"status\":\"ok\",\"db\":\"/owner/index.sqlite\",\"tape_dirs\":[\"/owner/tapes\"],\"reader_mode\":\"live\",\"snapshot_at\":\"2026-09-23T00:00:00Z\"}}\\n{\"id\":%s,\"end\":true,\"ok\":true,\"stats\":{\"self\":\"eezo\",\"build\":\"0.2.1\",\"protocol\":1,\"schema\":4,\"query_semantics\":1}}\\n' \"$id\" \"$id\"; done".into(),
+                "while IFS= read -r request; do id=$(printf '%s\\n' \"$request\" | sed -n 's/.*\\\"id\\\":\\([0-9][0-9]*\\).*/\\1/p'); printf '{\"id\":%s,\"data\":{\"store\":\"eezo/default\",\"status\":\"ok\",\"db\":\"/owner/index.sqlite\",\"tape_dirs\":[\"/owner/tapes\"],\"reader_mode\":\"live\",\"snapshot_at\":\"2026-09-23T00:00:00Z\"}}\\n{\"id\":%s,\"end\":true,\"ok\":true,\"stats\":{\"self\":\"eezo\",\"build\":\"0.2.1\",\"protocol\":1,\"schema\":4,\"query_semantics\":1,\"limits\":{\"read_file_compressed_bytes\":268435456,\"decompressed_bytes_per_tape\":536870912}}}\\n' \"$id\" \"$id\"; done".into(),
             ]),
             engram: "/unused".into(),
             exports: vec!["default".into()],

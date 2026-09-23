@@ -10,9 +10,13 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
+use engram::access::client::{
+    DEFAULT_DECOMPRESSED_BYTES_PER_TAPE, DEFAULT_READ_FILE_COMPRESSED_BYTES, PeerFailure,
+    PeerRequest, RemoteOwner, decode_base64_chunk,
+};
 use engram::config::{
     EffectiveWatchSource, ensure_user_config, load_effective_config_read_only,
-    load_effective_config_with_override, load_frozen_stores,
+    load_effective_config_with_override, load_frozen_stores, load_topology,
 };
 use engram::dispatch::{
     collect_dispatch_upstream_sessions, extract_dispatch_links_from_transcript,
@@ -39,7 +43,7 @@ use engram::store::tapes::{
     parse_jsonl_rows, print_json, read_tape_content, resolve_tape_path, tape_id_from_path,
     tape_lookup_dirs,
 };
-use engram::tape::compress::decompress_jsonl;
+use engram::tape::compress::{decompress_jsonl, decompress_jsonl_with_limit};
 use engram::tape::event::parse_jsonl_events;
 use engram::{CliError, RepoPaths, RuntimeContext, ensure_db_parent, home_dir, path_string};
 use notify::event::{ModifyKind, RenameMode};
@@ -47,6 +51,7 @@ use notify::{
     Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 #[derive(Parser, Debug)]
 #[command(name = "engram")]
@@ -104,6 +109,8 @@ struct ShowArgs {
     tape_id: String,
     #[arg(long)]
     raw: bool,
+    #[arg(long, value_name = "MACHINE/EXPORT")]
+    store: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -219,7 +226,11 @@ fn run() -> Result<(), CliError> {
             cmd_tapes(&paths, &context)
         }
         Command::Show(args) => {
-            let context = resolve_runtime_context(&cwd)?;
+            let context = if args.store.is_some() {
+                resolve_query_runtime_context(&cwd)?
+            } else {
+                resolve_runtime_context(&cwd)?
+            };
             cmd_show(&paths, &context, args)
         }
         Command::Gc => {
@@ -1032,6 +1043,9 @@ fn cmd_tapes(paths: &RepoPaths, context: &RuntimeContext) -> Result<(), CliError
 }
 
 fn cmd_show(paths: &RepoPaths, context: &RuntimeContext, args: ShowArgs) -> Result<(), CliError> {
+    if let Some(store) = args.store.as_deref() {
+        return cmd_show_remote(context, &args.tape_id, args.raw, store);
+    }
     ensure_local_store(paths)?;
     print_context_conspicuity(context);
     let Some(tape_path) = resolve_tape_path(context, &args.tape_id) else {
@@ -1061,6 +1075,274 @@ fn cmd_show(paths: &RepoPaths, context: &RuntimeContext, args: ShowArgs) -> Resu
         "meta": extract_meta(&events),
         "events": compacted,
     }))
+}
+
+fn cmd_show_remote(
+    context: &RuntimeContext,
+    tape_id: &str,
+    raw: bool,
+    store_ref: &str,
+) -> Result<(), CliError> {
+    print_context_conspicuity(context);
+    let (machine, export) = store_ref
+        .split_once('/')
+        .filter(|(machine, export)| {
+            !machine.is_empty() && !export.is_empty() && !export.contains('/')
+        })
+        .ok_or_else(|| {
+            CliError::new(
+                "invalid_store",
+                "remote store must be written as <machine>/<export>",
+            )
+        })?;
+    let home = home_dir()?;
+    let topology = load_topology(&home)
+        .map_err(|error| CliError::new("config_error", error.to_string()))?
+        .ok_or_else(|| {
+            CliError::new(
+                "topology_missing",
+                "remote show requires ~/.engram/topology.yml",
+            )
+        })?;
+    if machine == topology.self_label {
+        return Err(CliError::new(
+            "store_selection_unsupported",
+            "--store currently selects a configured remote machine/export",
+        ));
+    }
+    eprintln!("topology: ~/.engram/topology.yml peers={machine}");
+    let mut peer = topology.peers.get(machine).cloned().ok_or_else(|| {
+        CliError::new(
+            "peer_not_configured",
+            format!("peer `{machine}` is not configured in ~/.engram/topology.yml"),
+        )
+    })?;
+    if !peer.exports.iter().any(|candidate| candidate == export) {
+        return Err(CliError::new(
+            "store_not_configured",
+            format!("export `{store_ref}` is not selected in the peer topology"),
+        ));
+    }
+    peer.exports = vec![export.to_string()];
+
+    let mut owner = RemoteOwner::connect(
+        machine,
+        &topology.self_label,
+        &peer,
+        Duration::from_millis(5_000),
+    )
+    .map_err(peer_failure_to_cli)?;
+    owner
+        .exports
+        .get(export)
+        .ok_or_else(|| CliError::new("protocol_error", "peer omitted the selected export"))?
+        .as_ref()
+        .map_err(|failure| peer_failure_to_cli(failure.clone()))?;
+
+    let locate = one_peer_response(
+        &mut owner,
+        PeerRequest::new(
+            "locate_tapes",
+            vec![export.to_string()],
+            json!({"tape_ids":[tape_id]}),
+        ),
+        "locate_tapes",
+    )?;
+    if locate.data.len() != 1
+        || locate.data[0].get("tape_id").and_then(Value::as_str) != Some(tape_id)
+    {
+        return Err(CliError::new(
+            "protocol_error",
+            "peer returned an invalid locate_tapes result",
+        ));
+    }
+    let located = &locate.data[0];
+    let Some(file) = located.get("file").filter(|file| !file.is_null()) else {
+        return Err(CliError::new(
+            "tape_not_found",
+            format!("tape `{tape_id}` is not present at `{store_ref}`"),
+        ));
+    };
+    let file_machine = file
+        .get("machine")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::new("protocol_error", "peer file address has no machine"))?;
+    let file_path = file
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::new("protocol_error", "peer file address has no path"))?;
+    let file_kind = file
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::new("protocol_error", "peer file address has no kind"))?;
+    if file_machine != machine || file_kind != "tape" || !Path::new(file_path).is_absolute() {
+        return Err(CliError::new(
+            "protocol_error",
+            "peer returned an invalid remote tape address",
+        ));
+    }
+    let file_bytes = located
+        .get("size_bytes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| CliError::new("protocol_error", "peer file result has no size"))?;
+    let compressed_limit = owner
+        .limits
+        .get("read_file_compressed_bytes")
+        .copied()
+        .unwrap_or(DEFAULT_READ_FILE_COMPRESSED_BYTES)
+        .min(DEFAULT_READ_FILE_COMPRESSED_BYTES);
+    if file_bytes > compressed_limit {
+        return Err(CliError::new(
+            "budget_exceeded",
+            format!("remote tape is {file_bytes} compressed bytes; limit is {compressed_limit}"),
+        ));
+    }
+
+    let read = one_peer_response(
+        &mut owner,
+        PeerRequest::new(
+            "read_file",
+            vec![export.to_string()],
+            json!({
+                "address": file,
+                "max_bytes": compressed_limit,
+            }),
+        ),
+        "read_file",
+    )?;
+    let capacity = usize::try_from(file_bytes).map_err(|_| {
+        CliError::new(
+            "budget_exceeded",
+            "remote tape size does not fit caller address space",
+        )
+    })?;
+    let mut compressed = Vec::with_capacity(capacity);
+    for chunk in &read.data {
+        if chunk.get("tape_id").and_then(Value::as_str) != Some(tape_id) {
+            return Err(CliError::new(
+                "protocol_error",
+                "read_file returned a chunk for a different tape",
+            ));
+        }
+        let offset = chunk
+            .get("offset")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| CliError::new("protocol_error", "read_file chunk has no offset"))?;
+        if offset != compressed.len() as u64 {
+            return Err(CliError::new(
+                "incomplete_stream",
+                "remote tape stream has a gap or overlapping chunk",
+            ));
+        }
+        let encoded = chunk
+            .get("bytes_b64")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CliError::new("protocol_error", "read_file chunk has no bytes"))?;
+        let bytes = decode_base64_chunk(encoded)
+            .map_err(|message| CliError::new("protocol_error", message))?;
+        if compressed.len().saturating_add(bytes.len()) > capacity {
+            return Err(CliError::new(
+                "incomplete_stream",
+                "remote tape stream exceeds the located file size",
+            ));
+        }
+        compressed.extend_from_slice(&bytes);
+    }
+    if compressed.len() != capacity
+        || read.stats.get("complete").and_then(Value::as_bool) != Some(true)
+        || read.stats.get("bytes").and_then(Value::as_u64) != Some(file_bytes)
+        || read.stats.get("tape_id").and_then(Value::as_str) != Some(tape_id)
+    {
+        return Err(CliError::new(
+            "incomplete_stream",
+            "peer did not complete the remote tape stream",
+        ));
+    }
+    let decompressed_limit = owner
+        .limits
+        .get("decompressed_bytes_per_tape")
+        .copied()
+        .unwrap_or(DEFAULT_DECOMPRESSED_BYTES_PER_TAPE)
+        .min(DEFAULT_DECOMPRESSED_BYTES_PER_TAPE);
+    let content = match decompress_jsonl_with_limit(&compressed, decompressed_limit) {
+        Ok(content) => content,
+        Err(error) if error.to_string().starts_with("decompressed tape exceeds ") => {
+            return Err(CliError::new("budget_exceeded", error.to_string()));
+        }
+        Err(error) => return Err(CliError::io("decompress_error", error)),
+    };
+    let digest = format!("{:x}", Sha256::digest(content.as_bytes()));
+    let id_verified = is_sha256_tape_id(tape_id);
+    if id_verified && tape_id.to_ascii_lowercase() != digest {
+        return Err(CliError::new(
+            "id_mismatch",
+            format!("remote tape `{tape_id}` content hashes to `{digest}`"),
+        ));
+    }
+    if raw {
+        print!("{content}");
+        return Ok(());
+    }
+    let events = parse_jsonl_events(&content)?;
+    let rows = parse_jsonl_rows(&content)?;
+    let compacted = rows
+        .iter()
+        .map(|row| compact_event(row.offset, &row.value))
+        .collect::<Vec<_>>();
+    print_json(&json!({
+        "tape_id": tape_id,
+        "path": null,
+        "location": {
+            "machine": machine,
+            "store": store_ref,
+            "path": file_path,
+        },
+        "digest": digest,
+        "id_verified": id_verified,
+        "event_count": events.len(),
+        "meta": extract_meta(&events),
+        "events": compacted,
+    }))
+}
+
+fn one_peer_response(
+    owner: &mut RemoteOwner,
+    request: PeerRequest,
+    operation: &str,
+) -> Result<engram::access::client::PeerResponse, CliError> {
+    owner
+        .round(&[request], Duration::from_secs(30))
+        .pop()
+        .ok_or_else(|| {
+            CliError::new(
+                "protocol_error",
+                format!("peer returned no result for {operation}"),
+            )
+        })?
+        .map_err(peer_failure_to_cli)
+}
+
+fn peer_failure_to_cli(failure: PeerFailure) -> CliError {
+    let code = match failure.code.as_str() {
+        "unavailable" => "unavailable",
+        "timeout" => "timeout",
+        "incompatible" => "incompatible",
+        "incompatible_semantics" => "incompatible_semantics",
+        "label_mismatch" => "label_mismatch",
+        "reader_unavailable" => "reader_unavailable",
+        "tape_unavailable" => "tape_unavailable",
+        "tape_changed" => "tape_changed",
+        "over_limit" | "budget_exceeded" => "budget_exceeded",
+        "id_mismatch" => "id_mismatch",
+        "protocol_error" => "protocol_error",
+        "protocol_mismatch" => "protocol_mismatch",
+        _ => "peer_error",
+    };
+    CliError::new(code, format!("{}: {}", failure.code, failure.message))
+}
+
+fn is_sha256_tape_id(tape_id: &str) -> bool {
+    tape_id.len() == 64 && tape_id.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn cmd_gc(paths: &RepoPaths, context: &RuntimeContext) -> Result<(), CliError> {

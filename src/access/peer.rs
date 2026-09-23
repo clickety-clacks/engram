@@ -284,6 +284,18 @@ impl PeerSession {
             "protocol": PROTOCOL_VERSION,
             "schema": SCHEMA_VERSION,
             "query_semantics": QUERY_SEMANTICS_VERSION,
+            "limits": {
+                "read_file_compressed_bytes": configured_limit(
+                    &self.topology.limits,
+                    "read_file_compressed_bytes",
+                    MAX_READ_FILE_BYTES,
+                ),
+                "decompressed_bytes_per_tape": configured_limit(
+                    &self.topology.limits,
+                    "decompressed_bytes_per_tape",
+                    512 * 1024 * 1024,
+                ),
+            },
             "opened": opened,
         }))
     }
@@ -432,6 +444,11 @@ impl PeerSession {
                 "max_bytes is outside the read_file limit",
             ));
         }
+        let max_bytes = max_bytes.min(configured_limit(
+            &self.topology.limits,
+            "read_file_compressed_bytes",
+            MAX_READ_FILE_BYTES,
+        ));
         let export = self.require_open(&stores[0])?;
         let (path, tape_id) = resolve_file_address(&self.topology.self_label, export, &address)?;
         if self.memoized_file_size(&path).is_none() {
@@ -526,6 +543,10 @@ impl PeerSession {
             .insert(path.to_path_buf(), size);
         size
     }
+}
+
+fn configured_limit(limits: &BTreeMap<String, u64>, key: &str, default: u64) -> u64 {
+    limits.get(key).copied().unwrap_or(default).min(default)
 }
 
 fn write_open_failure<W: Write>(
