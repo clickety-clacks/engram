@@ -59,8 +59,12 @@ fn open_query_index(path: &Path, mode: ReaderMode) -> Result<SqliteIndex, CliErr
         ReaderMode::Frozen => "frozen",
     };
     let fix = match mode {
-        ReaderMode::Live => "grant SQLite write access to the parent directory so it can create -shm, or declare a stable captured copy in ~/.engram/topology.yml under frozen_stores",
-        ReaderMode::Frozen => "verify the declared frozen copy exists, is readable, and has the expected schema",
+        ReaderMode::Live => {
+            "grant SQLite write access to the parent directory so it can create -shm, or declare a stable captured copy in ~/.engram/topology.yml under frozen_stores"
+        }
+        ReaderMode::Frozen => {
+            "verify the declared frozen copy exists, is readable, and has the expected schema"
+        }
     };
     SqliteIndex::open_reader_mode(&path_string(path), mode).map_err(|error| {
         CliError::new(

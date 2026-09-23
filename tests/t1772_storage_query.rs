@@ -211,7 +211,9 @@ fn live_reader_in_read_only_directory_reports_unavailability_and_fix() {
     let result = open_query_indexes(&context);
     fs::set_permissions(&live_dir, fs::Permissions::from_mode(0o755)).expect("restore dir mode");
 
-    let error = result.err().expect("live reader should require -shm access");
+    let error = result
+        .err()
+        .expect("live reader should require -shm access");
     assert_eq!(error.code, "reader_unavailable");
     assert!(error.message.contains(&primary.display().to_string()));
     assert!(error.message.contains("grant SQLite write access"));
