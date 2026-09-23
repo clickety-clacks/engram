@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 
 use crate::index::{ReaderMode, SqliteIndex};
 
+pub mod client;
 pub mod peer;
+pub mod transport;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MachineRef(pub String);
