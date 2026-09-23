@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser, Subcommand};
 use engram::config::{
     EffectiveWatchSource, ensure_user_config, load_effective_config_read_only,
-    load_effective_config_with_override,
+    load_effective_config_with_override, load_frozen_stores,
 };
 use engram::dispatch::{
     collect_dispatch_upstream_sessions, extract_dispatch_links_from_transcript,
@@ -69,6 +69,14 @@ enum Command {
     Tapes,
     Show(ShowArgs),
     Gc,
+    #[command(hide = true)]
+    PeerServe(PeerServeArgs),
+}
+
+#[derive(Args, Debug)]
+struct PeerServeArgs {
+    #[arg(long, required = true)]
+    stdio: bool,
 }
 
 #[derive(Args, Debug, Default)]
@@ -217,6 +225,15 @@ fn run() -> Result<(), CliError> {
         Command::Gc => {
             let context = resolve_runtime_context(&cwd)?;
             cmd_gc(&paths, &context)
+        }
+        Command::PeerServe(args) => {
+            if args.stdio {
+                let home = home_dir()?;
+                engram::access::peer::serve_stdio(&home)
+                    .map_err(|message| CliError::new("peer_serve", message))
+            } else {
+                Err(CliError::new("peer_serve", "peer-serve requires --stdio"))
+            }
         }
     }
 }
@@ -398,6 +415,7 @@ fn cmd_init(paths: &RepoPaths) -> Result<(), CliError> {
         config_path: paths.root.join("config.yml"),
         db_path: paths.root.join("index.sqlite"),
         tapes_dir: local_tapes_dir.clone(),
+        frozen_stores: Vec::new(),
         tape_lookup_dirs: vec![local_tapes_dir, home.join(".engram").join("tapes")],
         additional_stores: Vec::new(),
         explain_default_limit: 10,
@@ -529,10 +547,12 @@ fn cmd_watch_with_home(cwd: &Path, args: WatchArgs, home: &Path) -> Result<(), C
     let config = load_effective_config_with_override(cwd, home, config_override.as_deref())
         .map_err(|err| CliError::new("config_error", err.to_string()))?;
     let tape_lookup_dirs = tape_lookup_dirs(cwd, home, &config);
+    let frozen_stores = resolved_frozen_store_paths(home, &config.additional_stores)?;
     let context = RuntimeContext {
         config_path: config.path,
         db_path: config.db,
         tapes_dir: config.tapes_dir,
+        frozen_stores,
         tape_lookup_dirs,
         additional_stores: config.additional_stores,
         explain_default_limit: config.explain_default_limit,
@@ -1492,10 +1512,12 @@ fn runtime_context_from_config(
     config: engram::config::EffectiveConfig,
 ) -> Result<RuntimeContext, CliError> {
     let tape_lookup_dirs = tape_lookup_dirs(cwd, &home, &config);
+    let frozen_stores = resolved_frozen_store_paths(home, &config.additional_stores)?;
     Ok(RuntimeContext {
         config_path: config.path,
         db_path: config.db,
         tapes_dir: config.tapes_dir,
+        frozen_stores,
         tape_lookup_dirs,
         additional_stores: config.additional_stores,
         explain_default_limit: config.explain_default_limit,
@@ -1507,6 +1529,28 @@ fn runtime_context_from_config(
         metrics_log: config.metrics.log,
         watch: config.watch,
     })
+}
+
+fn resolved_frozen_store_paths(
+    home: &Path,
+    additional_stores: &[PathBuf],
+) -> Result<Vec<PathBuf>, CliError> {
+    let mut resolved = Vec::new();
+    for frozen in load_frozen_stores(home)
+        .map_err(|error| CliError::new("config_error", error.to_string()))?
+    {
+        if additional_stores.contains(&frozen.db) {
+            if !resolved.contains(&frozen.db) {
+                resolved.push(frozen.db);
+            }
+        } else {
+            eprintln!(
+                "warning: ignoring frozen store `{}` because it is not in additional_stores",
+                frozen.db.display()
+            );
+        }
+    }
+    Ok(resolved)
 }
 
 fn ensure_local_store(paths: &RepoPaths) -> Result<(), CliError> {

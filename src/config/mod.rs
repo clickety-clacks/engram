@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -25,24 +26,42 @@ pub struct FrozenStoreConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawTopology {
+    version: u32,
+    #[serde(rename = "self")]
+    self_name: String,
     #[serde(default)]
-    version: Option<u32>,
+    exports: BTreeMap<String, RawExport>,
     #[serde(default)]
-    self_label: Option<String>,
-    #[serde(rename = "self", default)]
-    self_name: Option<String>,
+    peers: BTreeMap<String, RawPeer>,
     #[serde(default)]
-    exports: Option<serde_yaml::Value>,
-    #[serde(default)]
-    peers: Option<serde_yaml::Value>,
-    #[serde(default)]
-    limits: Option<serde_yaml::Value>,
+    limits: BTreeMap<String, u64>,
     #[serde(default)]
     frozen_stores: Vec<RawFrozenStore>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawExport {
+    db: String,
+    tape_dirs: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPeer {
+    #[serde(default)]
+    ssh: Option<String>,
+    #[serde(default)]
+    command: Option<Vec<String>>,
+    engram: String,
+    #[serde(default)]
+    exports: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawFrozenStore {
     db: String,
     label: String,
@@ -52,28 +71,164 @@ struct RawFrozenStore {
     captured_at: Option<String>,
 }
 
-/// Read the home-only topology annotation used to select immutable stores.
-/// The rest of topology is intentionally left opaque until its owner layer is
-/// implemented; this keeps repository configs from gaining network authority.
-pub fn load_frozen_stores(home: &Path) -> Result<Vec<FrozenStoreConfig>, ConfigError> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopologyExport {
+    pub db: PathBuf,
+    pub tape_dirs: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopologyPeer {
+    pub ssh: Option<String>,
+    pub command: Option<Vec<String>>,
+    pub engram: String,
+    pub exports: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Topology {
+    pub self_label: String,
+    pub exports: BTreeMap<String, TopologyExport>,
+    pub peers: BTreeMap<String, TopologyPeer>,
+    pub limits: BTreeMap<String, u64>,
+    pub frozen_stores: Vec<FrozenStoreConfig>,
+}
+
+/// Read the home-only topology. This never creates a configuration file or
+/// searches a repository/workspace for one.
+pub fn load_topology(home: &Path) -> Result<Option<Topology>, ConfigError> {
     let path = home.join(".engram/topology.yml");
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     let raw: RawTopology = serde_yaml::from_str(&fs::read_to_string(path)?)?;
-    if raw.version.is_some_and(|version| version != 1) {
-        return Err(ConfigError::InvalidPath("topology version must be 1".into()));
+    if raw.version != 1 {
+        return Err(ConfigError::InvalidPath(
+            "topology version must be 1".into(),
+        ));
     }
-    let _ = (raw.self_label, raw.self_name, raw.exports, raw.peers, raw.limits);
-    raw.frozen_stores
+    validate_topology_label(&raw.self_name)?;
+
+    const LIMITS: &[&str] = &[
+        "concurrent_peer_connections",
+        "connect_open_deadline_ms",
+        "request_timeout_ms",
+        "total_query_deadline_ms",
+        "owner_session_max_secs",
+        "owner_idle_timeout_secs",
+        "frame_size",
+        "items_per_batch",
+        "non_file_response_bytes",
+        "grep_k",
+        "dispatch_hops_per_edit",
+        "predecessor_segments_per_history",
+        "decompressed_bytes_per_tape",
+        "read_file_compressed_bytes",
+    ];
+    if let Some(key) = raw
+        .limits
+        .keys()
+        .find(|key| !LIMITS.contains(&key.as_str()))
+    {
+        return Err(ConfigError::InvalidPath(format!(
+            "unknown topology limit `{key}`"
+        )));
+    }
+
+    let base = home.join(".engram");
+    let mut exports = BTreeMap::new();
+    for (name, export) in raw.exports {
+        validate_topology_label(&name)?;
+        if export.tape_dirs.is_empty() {
+            return Err(ConfigError::InvalidPath(format!(
+                "export `{name}` must declare at least one tape directory"
+            )));
+        }
+        let db = resolve_path(&export.db, &base, home)?;
+        let mut tape_dirs = Vec::new();
+        for raw_dir in export.tape_dirs {
+            let dir = resolve_path(&raw_dir, &base, home)?;
+            let canonical = fs::canonicalize(&dir).map_err(ConfigError::Io)?;
+            if !canonical.is_dir() {
+                return Err(ConfigError::InvalidPath(format!(
+                    "tape directory is not a directory: {}",
+                    canonical.display()
+                )));
+            }
+            if !tape_dirs.contains(&canonical) {
+                tape_dirs.push(canonical);
+            }
+        }
+        exports.insert(name, TopologyExport { db, tape_dirs });
+    }
+
+    let mut peers = BTreeMap::new();
+    for (name, peer) in raw.peers {
+        validate_topology_label(&name)?;
+        if peer.ssh.is_some() == peer.command.is_some() {
+            return Err(ConfigError::InvalidPath(format!(
+                "peer `{name}` must declare exactly one of ssh or command"
+            )));
+        }
+        if peer.engram.trim().is_empty()
+            || peer.command.as_ref().is_some_and(Vec::is_empty)
+            || peer.ssh.as_deref().is_some_and(str::is_empty)
+        {
+            return Err(ConfigError::InvalidPath(format!(
+                "peer `{name}` has an empty transport or executable"
+            )));
+        }
+        peers.insert(
+            name,
+            TopologyPeer {
+                ssh: peer.ssh,
+                command: peer.command,
+                engram: peer.engram,
+                exports: peer.exports,
+            },
+        );
+    }
+
+    let frozen_stores = raw
+        .frozen_stores
         .into_iter()
-        .map(|store| Ok(FrozenStoreConfig {
-            db: resolve_path(&store.db, home, home)?,
-            label: store.label,
-            source: store.source,
-            captured_at: store.captured_at,
-        }))
-        .collect()
+        .map(|store| {
+            Ok(FrozenStoreConfig {
+                db: resolve_path(&store.db, &base, home)?,
+                label: store.label,
+                source: store.source,
+                captured_at: store.captured_at,
+            })
+        })
+        .collect::<Result<Vec<_>, ConfigError>>()?;
+
+    Ok(Some(Topology {
+        self_label: raw.self_name,
+        exports,
+        peers,
+        limits: raw.limits,
+        frozen_stores,
+    }))
+}
+
+fn validate_topology_label(label: &str) -> Result<(), ConfigError> {
+    if label.is_empty()
+        || label.len() > 255
+        || label.starts_with('.')
+        || !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    {
+        return Err(ConfigError::InvalidPath(format!(
+            "invalid topology label `{label}`"
+        )));
+    }
+    Ok(())
+}
+
+/// Read the home-only topology annotation used to select immutable stores.
+pub fn load_frozen_stores(home: &Path) -> Result<Vec<FrozenStoreConfig>, ConfigError> {
+    Ok(load_topology(home)?.map_or_else(Vec::new, |topology| topology.frozen_stores))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use config::EffectiveWatchConfig;
 
-pub mod anchor;
 pub mod access;
+pub mod anchor;
 pub mod config;
 pub mod dispatch;
 pub mod index;
@@ -59,6 +59,7 @@ pub struct RuntimeContext {
     pub config_path: PathBuf,
     pub db_path: PathBuf,
     pub tapes_dir: PathBuf,
+    pub frozen_stores: Vec<PathBuf>,
     pub tape_lookup_dirs: Vec<PathBuf>,
     pub additional_stores: Vec<PathBuf>,
     pub explain_default_limit: usize,

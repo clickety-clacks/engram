@@ -15,7 +15,8 @@ use crate::index::lineage::{
 };
 use crate::tape::event::{FileRange, TapeEventAt, TapeEventData};
 
-const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 4;
+pub const QUERY_SEMANTICS_VERSION: u32 = 1;
 const EXACT_EVIDENCE_SQL: &str =
     "SELECT evidence_id, anchor, tape_id, event_offset, kind, file_path, timestamp
      FROM evidence_windows
@@ -138,24 +139,20 @@ impl SqliteIndex {
     }
 
     pub fn open_reader_mode(path: &str, mode: ReaderMode) -> rusqlite::Result<Self> {
-        let wal_path = format!("{path}-wal");
-        let shm_path = format!("{path}-shm");
-        let conn = if mode == ReaderMode::Live
-            && (Path::new(&wal_path).exists() || Path::new(&shm_path).exists())
-        {
-            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?
-        } else {
-            let absolute = std::fs::canonicalize(path)
-                .map_err(|_| rusqlite::Error::InvalidPath(Path::new(path).to_path_buf()))?;
-            let uri = format!(
-                "file:{}?mode=ro&immutable=1",
-                encode_sqlite_uri_path(&absolute.to_string_lossy())
-            );
-            Connection::open_with_flags(
-                uri,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-            )?
+        let absolute = std::fs::canonicalize(path)
+            .map_err(|_| rusqlite::Error::InvalidPath(Path::new(path).to_path_buf()))?;
+        let mode_query = match mode {
+            ReaderMode::Live => "mode=ro",
+            ReaderMode::Frozen => "mode=ro&immutable=1",
         };
+        let uri = format!(
+            "file:{}?{mode_query}",
+            encode_sqlite_uri_path(&absolute.to_string_lossy())
+        );
+        let conn = Connection::open_with_flags(
+            uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )?;
         let index = Self {
             conn,
             access_kind: AccessKind::Reader,
@@ -185,12 +182,30 @@ impl SqliteIndex {
     }
 
     pub fn begin_snapshot(&self) -> rusqlite::Result<ReadSnapshot<'_>> {
+        self.pin_snapshot()?;
+        Ok(ReadSnapshot { index: self })
+    }
+
+    /// Pin this reader's SQLite snapshot until `end_pinned_snapshot` or drop.
+    /// Peer sessions use this explicit form because the connection outlives an
+    /// individual protocol request.
+    pub fn pin_snapshot(&self) -> rusqlite::Result<()> {
         if self.access_kind != AccessKind::Reader {
             return Err(rusqlite::Error::InvalidQuery);
         }
         self.conn.execute_batch("BEGIN DEFERRED")?;
-        self.conn.query_row("PRAGMA schema_version", [], |_row| Ok(()))?;
-        Ok(ReadSnapshot { index: self })
+        if let Err(error) = self
+            .conn
+            .query_row("SELECT 1 FROM sqlite_master LIMIT 1", [], |_row| Ok(()))
+        {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn end_pinned_snapshot(&self) -> rusqlite::Result<()> {
+        self.conn.execute_batch("ROLLBACK")
     }
 
     pub fn with_read_transaction<T>(
@@ -1331,7 +1346,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn reader_opens_schema_v4_without_wal_shm_or_file_mutation() {
+    fn frozen_reader_opens_schema_v4_without_wal_shm_or_file_mutation() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().unwrap();
@@ -1345,7 +1360,8 @@ mod tests {
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
 
         {
-            let reader = SqliteIndex::open_reader(path.to_str().unwrap()).unwrap();
+            let reader =
+                SqliteIndex::open_reader_mode(path.to_str().unwrap(), ReaderMode::Frozen).unwrap();
             assert!(reader.referenced_tape_ids().unwrap().is_empty());
         }
 
@@ -1353,6 +1369,38 @@ mod tests {
         assert!(!path.with_extension("sqlite-wal").exists());
         assert!(!path.with_extension("sqlite-shm").exists());
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn live_reader_observes_commits_without_immutable_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index.sqlite");
+        {
+            let writer = SqliteIndex::open_writer(path.to_str().unwrap()).unwrap();
+            writer
+                .conn
+                .execute("INSERT INTO tapes (tape_id) VALUES ('before')", [])
+                .unwrap();
+        }
+        let reader =
+            SqliteIndex::open_reader_mode(path.to_str().unwrap(), ReaderMode::Live).unwrap();
+        assert_eq!(reader.reader_mode(), Some(ReaderMode::Live));
+        {
+            let writer = SqliteIndex::open_writer(path.to_str().unwrap()).unwrap();
+            writer
+                .conn
+                .execute("INSERT INTO tapes (tape_id) VALUES ('after')", [])
+                .unwrap();
+        }
+        assert_eq!(
+            reader
+                .with_read_transaction(|conn| {
+                    conn.query_row("SELECT COUNT(*) FROM tapes", [], |row| row.get::<_, i64>(0))
+                })
+                .unwrap(),
+            2,
+            "live readers must observe a later transaction when no snapshot is pinned"
+        );
     }
 
     #[test]
@@ -1437,7 +1485,8 @@ mod tests {
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
 
         {
-            let reader = SqliteIndex::open_reader(path.to_str().unwrap()).unwrap();
+            let reader =
+                SqliteIndex::open_reader_mode(path.to_str().unwrap(), ReaderMode::Frozen).unwrap();
             let operation_error = reader.with_read_transaction(|conn| -> rusqlite::Result<()> {
                 assert_eq!(
                     conn.query_row("SELECT COUNT(*) FROM tapes", [], |row| row.get::<_, i64>(0))?,

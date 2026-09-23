@@ -119,26 +119,31 @@ fn primary_and_additional_query_stores_open_without_mutation_when_non_writable()
     use std::os::unix::fs::PermissionsExt;
 
     let temp = tempfile::tempdir().expect("tempdir");
-    let primary = temp.path().join("primary.sqlite");
-    let additional = temp.path().join("additional.sqlite");
+    let active_dir = temp.path().join("active");
+    let frozen_dir = temp.path().join("frozen");
+    fs::create_dir_all(&active_dir).expect("active dir");
+    fs::create_dir_all(&frozen_dir).expect("frozen dir");
+    let primary = active_dir.join("primary.sqlite");
+    let additional = frozen_dir.join("additional.sqlite");
     for path in [&primary, &additional] {
         drop(SqliteIndex::open_writer(path.to_str().unwrap()).expect("writer"));
     }
     let primary_before = fs::read(&primary).expect("primary bytes");
     let additional_before = fs::read(&additional).expect("additional bytes");
-    let listing_before = fs::read_dir(temp.path())
+    let listing_before = fs::read_dir(&frozen_dir)
         .expect("listing")
         .map(|entry| entry.unwrap().file_name())
         .collect::<Vec<_>>();
 
     fs::set_permissions(&primary, fs::Permissions::from_mode(0o444)).expect("primary mode");
     fs::set_permissions(&additional, fs::Permissions::from_mode(0o444)).expect("additional mode");
-    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o555)).expect("dir mode");
+    fs::set_permissions(&frozen_dir, fs::Permissions::from_mode(0o555)).expect("frozen dir mode");
 
     let context = RuntimeContext {
         config_path: temp.path().join("config.yml"),
         db_path: primary.clone(),
         tapes_dir: temp.path().join("tapes"),
+        frozen_stores: vec![additional.clone()],
         tape_lookup_dirs: Vec::new(),
         additional_stores: vec![additional.clone()],
         explain_default_limit: 10,
@@ -160,13 +165,13 @@ fn primary_and_additional_query_stores_open_without_mutation_when_non_writable()
         additional_before
     );
     assert_eq!(
-        fs::read_dir(temp.path())
+        fs::read_dir(&frozen_dir)
             .expect("listing after")
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>(),
         listing_before
     );
-    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755)).expect("restore mode");
+    fs::set_permissions(&frozen_dir, fs::Permissions::from_mode(0o755)).expect("restore mode");
 }
 
 #[test]

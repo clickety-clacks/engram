@@ -10,7 +10,7 @@ use crate::dispatch::message_turn_to_event_offset;
 use crate::index::lineage::{
     Cardinality, EvidenceFragmentRef, EvidenceKind, LocationDelta, StoredEdgeClass,
 };
-use crate::index::{DispatchDirection, EdgeRow, SqliteIndex};
+use crate::index::{DispatchDirection, EdgeRow, ReaderMode, SqliteIndex};
 use crate::query::explain::{
     ExplainResult, ExplainTraversal, PrettyConfidenceTier, explain_across_indexes_by_anchor,
     pretty_tier,
@@ -35,11 +35,19 @@ pub enum ExplainTarget {
 pub fn open_query_indexes(context: &RuntimeContext) -> Result<Vec<SqliteIndex>, CliError> {
     let mut indexes = Vec::new();
     if context.db_path.exists() {
-        indexes.push(SqliteIndex::open_reader(&path_string(&context.db_path))?);
+        indexes.push(SqliteIndex::open_reader_mode(
+            &path_string(&context.db_path),
+            ReaderMode::Live,
+        )?);
     }
     for store in &context.additional_stores {
         if store.exists() {
-            indexes.push(SqliteIndex::open_reader(&path_string(store))?);
+            let mode = if context.frozen_stores.contains(store) {
+                ReaderMode::Frozen
+            } else {
+                ReaderMode::Live
+            };
+            indexes.push(SqliteIndex::open_reader_mode(&path_string(store), mode)?);
         }
     }
     if indexes.is_empty() {
