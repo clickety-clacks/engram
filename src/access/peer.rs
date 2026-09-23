@@ -4,7 +4,8 @@
 //! creation, or write operation. A process opens only the named exports in its
 //! home-only topology and keeps their read snapshots until stdin closes.
 
-use std::collections::{BTreeMap, HashSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -33,6 +34,7 @@ struct OpenExport {
 struct PeerSession {
     topology: Topology,
     opened: BTreeMap<String, OpenExport>,
+    tape_file_sizes: RefCell<HashMap<PathBuf, Option<u64>>>,
 }
 
 #[derive(Debug)]
@@ -64,6 +66,7 @@ pub fn serve_stdio(home: &Path) -> Result<(), String> {
     let mut session = PeerSession {
         topology,
         opened: BTreeMap::new(),
+        tape_file_sizes: RefCell::new(HashMap::new()),
     };
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -253,12 +256,7 @@ impl PeerSession {
             for tape_id in &tape_ids {
                 validate_tape_id(tape_id)?;
                 let indexed = export.index.has_tape(tape_id)?;
-                let path = tape_path(&export.config, tape_id);
-                let file = path.as_ref().and_then(|path| {
-                    fs::metadata(path)
-                        .ok()
-                        .map(|metadata| (path, metadata.len()))
-                });
+                let file = self.tape_path(&export.config, tape_id);
                 write_data(
                     output,
                     id,
@@ -266,7 +264,7 @@ impl PeerSession {
                         "store": format!("{}/{}", self.topology.self_label, store),
                         "tape_id": tape_id,
                         "indexed": indexed,
-                        "file": file.map(|(path, _)| json!({ "machine": self.topology.self_label, "path": path, "kind": "tape" })),
+                        "file": file.as_ref().map(|(path, _)| json!({ "machine": self.topology.self_label, "path": path, "kind": "tape" })),
                         "size_bytes": file.map(|(_, size)| size),
                     }),
                 )?;
@@ -390,6 +388,12 @@ impl PeerSession {
         }
         let export = self.require_open(&stores[0])?;
         let (path, tape_id) = resolve_file_address(&self.topology.self_label, export, &address)?;
+        if self.memoized_file_size(&path).is_none() {
+            return Err(PeerError::new(
+                "tape_unavailable",
+                format!("tape `{tape_id}` is not present in this export"),
+            ));
+        }
         let mut options = OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
@@ -454,6 +458,28 @@ impl PeerSession {
             .get(name)
             .ok_or_else(|| PeerError::new("not_opened", format!("export `{name}` was not opened")))
     }
+
+    fn tape_path(&self, export: &TopologyExport, tape_id: &str) -> Option<(PathBuf, u64)> {
+        let filename = format!("{tape_id}.jsonl.zst");
+        export.tape_dirs.iter().find_map(|dir| {
+            let path = dir.join(&filename);
+            self.memoized_file_size(&path).map(|size| (path, size))
+        })
+    }
+
+    fn memoized_file_size(&self, path: &Path) -> Option<u64> {
+        if let Some(size) = self.tape_file_sizes.borrow().get(path) {
+            return *size;
+        }
+        let size = fs::symlink_metadata(path)
+            .ok()
+            .filter(|metadata| metadata.file_type().is_file())
+            .map(|metadata| metadata.len());
+        self.tape_file_sizes
+            .borrow_mut()
+            .insert(path.to_path_buf(), size);
+        size
+    }
 }
 
 fn write_dispatch_row<W: Write>(
@@ -481,15 +507,6 @@ fn write_dispatch_row<W: Write>(
             "direction": direction,
         }),
     )
-}
-
-fn tape_path(export: &TopologyExport, tape_id: &str) -> Option<PathBuf> {
-    let filename = format!("{tape_id}.jsonl.zst");
-    export
-        .tape_dirs
-        .iter()
-        .map(|dir| dir.join(&filename))
-        .find(|path| path.is_file())
 }
 
 fn resolve_file_address(
@@ -523,12 +540,6 @@ fn resolve_file_address(
         return Err(PeerError::new(
             "invalid_file_address",
             "path must be a tape directly inside a declared tape directory",
-        ));
-    }
-    if !address.path.exists() {
-        return Err(PeerError::new(
-            "tape_unavailable",
-            format!("tape `{tape_id}` is not present in this export"),
         ));
     }
     Ok((address.path.clone(), tape_id.to_string()))
@@ -700,6 +711,7 @@ mod tests {
         let mut session = PeerSession {
             topology,
             opened: BTreeMap::new(),
+            tape_file_sizes: RefCell::new(HashMap::new()),
         };
         let mut output = Vec::new();
         for line in input.lines() {
@@ -763,6 +775,108 @@ mod tests {
         assert_eq!(frames[4]["data"]["file"]["kind"], "tape");
         assert_eq!(frames[4]["data"]["size_bytes"], 20);
         assert_eq!(frames[5]["ok"], true);
+    }
+
+    #[test]
+    fn tape_existence_is_memoized_both_when_present_and_missing() {
+        let (_temp, home, _db, tapes) = configured_home();
+        let present = tapes.join("present.jsonl.zst");
+        fs::write(&present, b"cached").expect("present tape");
+        let topology = load_topology(&home).expect("topology").expect("configured");
+        let mut session = PeerSession {
+            topology,
+            opened: BTreeMap::new(),
+            tape_file_sizes: RefCell::new(HashMap::new()),
+        };
+        let mut output = Vec::new();
+        let open: Value = serde_json::from_str(&request(1, "open", &["default"], json!({})))
+            .expect("open request");
+        session
+            .handle(&open, &open["id"], &mut output)
+            .expect("open owner");
+        output.clear();
+
+        let locate_missing: Value = serde_json::from_str(&request(
+            2,
+            "locate_tapes",
+            &["default"],
+            json!({"tape_ids":["appears-later"]}),
+        ))
+        .expect("locate missing request");
+        session
+            .handle(&locate_missing, &locate_missing["id"], &mut output)
+            .expect("first missing lookup");
+        let first_missing: Value = serde_json::from_slice(&output).expect("missing frame");
+        assert_eq!(first_missing["data"]["file"], Value::Null);
+        output.clear();
+
+        let appeared = tapes.join("appears-later.jsonl.zst");
+        fs::write(&appeared, b"new tape").expect("create tape mid-session");
+        let locate_missing_again: Value = serde_json::from_str(&request(
+            3,
+            "locate_tapes",
+            &["default"],
+            json!({"tape_ids":["appears-later"]}),
+        ))
+        .expect("second locate missing request");
+        session
+            .handle(
+                &locate_missing_again,
+                &locate_missing_again["id"],
+                &mut output,
+            )
+            .expect("memoized missing lookup");
+        let still_missing: Value = serde_json::from_slice(&output).expect("missing frame");
+        assert_eq!(still_missing["data"]["file"], Value::Null);
+        output.clear();
+
+        let read_new_file: Value = serde_json::from_str(&request(
+            4,
+            "read_file",
+            &["default"],
+            json!({"address":tape_address("test-owner", &appeared)}),
+        ))
+        .expect("read newly appeared tape request");
+        let error = session
+            .handle(&read_new_file, &read_new_file["id"], &mut output)
+            .expect_err("negative existence result is retained");
+        assert_eq!(error.code, "tape_unavailable");
+
+        let locate_present: Value = serde_json::from_str(&request(
+            5,
+            "locate_tapes",
+            &["default"],
+            json!({"tape_ids":["present"]}),
+        ))
+        .expect("locate present request");
+        session
+            .handle(&locate_present, &locate_present["id"], &mut output)
+            .expect("first present lookup");
+        let first_present: Value = serde_json::from_slice(&output).expect("present frame");
+        assert_eq!(first_present["data"]["size_bytes"], 6);
+        output.clear();
+
+        fs::remove_file(&present).expect("remove tape mid-session");
+        let locate_present_again: Value = serde_json::from_str(&request(
+            6,
+            "locate_tapes",
+            &["default"],
+            json!({"tape_ids":["present"]}),
+        ))
+        .expect("second locate present request");
+        session
+            .handle(
+                &locate_present_again,
+                &locate_present_again["id"],
+                &mut output,
+            )
+            .expect("memoized present lookup");
+        let still_present: Value = serde_json::from_slice(&output).expect("present frame");
+        assert_eq!(
+            still_present["data"]["file"]["path"].as_str(),
+            present.to_str()
+        );
+        assert_eq!(still_present["data"]["size_bytes"], 6);
     }
 
     #[test]
@@ -844,6 +958,7 @@ mod tests {
         let mut session = PeerSession {
             topology,
             opened: BTreeMap::new(),
+            tape_file_sizes: RefCell::new(HashMap::new()),
         };
         let mut output = Vec::new();
         let open: Value = serde_json::from_str(&request(1, "open", &["default"], json!({})))
