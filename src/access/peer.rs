@@ -205,8 +205,53 @@ impl PeerSession {
             };
             if !self.opened.contains_key(name) {
                 let db = config.db.to_string_lossy();
-                let index = SqliteIndex::open_reader_mode(&db, ReaderMode::Live)?;
-                index.pin_snapshot()?;
+                let index = match SqliteIndex::open_reader_mode(&db, ReaderMode::Live) {
+                    Ok(index) => index,
+                    Err(rusqlite::Error::InvalidQuery) => {
+                        write_open_failure(
+                            output,
+                            id,
+                            &self.topology.self_label,
+                            name,
+                            "incompatible",
+                            "schema_mismatch",
+                            format!(
+                                "export schema is not supported; expected schema v{SCHEMA_VERSION}"
+                            ),
+                        )?;
+                        continue;
+                    }
+                    Err(error) => {
+                        write_open_failure(
+                            output,
+                            id,
+                            &self.topology.self_label,
+                            name,
+                            "unavailable",
+                            "reader_unavailable",
+                            format!(
+                                "cannot open Live reader for {}: {error}; grant SQLite write access to the parent directory so it can create -shm, or declare a stable captured copy under frozen_stores",
+                                config.db.display()
+                            ),
+                        )?;
+                        continue;
+                    }
+                };
+                if let Err(error) = index.pin_snapshot() {
+                    write_open_failure(
+                        output,
+                        id,
+                        &self.topology.self_label,
+                        name,
+                        "unavailable",
+                        "reader_unavailable",
+                        format!(
+                            "cannot pin Live reader snapshot for {}: {error}; grant SQLite write access to the parent directory so it can create -shm, or declare a stable captured copy under frozen_stores",
+                            config.db.display()
+                        ),
+                    )?;
+                    continue;
+                }
                 let snapshot_at = chrono::DateTime::<chrono::Utc>::from(SystemTime::now())
                     .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
                 self.opened.insert(
@@ -236,6 +281,7 @@ impl PeerSession {
         Ok(json!({
             "self": self.topology.self_label,
             "build": env!("CARGO_PKG_VERSION"),
+            "protocol": PROTOCOL_VERSION,
             "schema": SCHEMA_VERSION,
             "query_semantics": QUERY_SEMANTICS_VERSION,
             "opened": opened,
@@ -480,6 +526,27 @@ impl PeerSession {
             .insert(path.to_path_buf(), size);
         size
     }
+}
+
+fn write_open_failure<W: Write>(
+    output: &mut W,
+    id: &Value,
+    machine: &str,
+    export: &str,
+    status: &str,
+    code: &str,
+    message: String,
+) -> Result<(), PeerError> {
+    write_data(
+        output,
+        id,
+        json!({
+            "store": format!("{machine}/{export}"),
+            "status": status,
+            "phase": "open",
+            "error": {"code": code, "message": message},
+        }),
+    )
 }
 
 fn write_dispatch_row<W: Write>(
@@ -752,6 +819,47 @@ mod tests {
         assert_eq!(frames[0]["data"]["store"], "test-owner/default");
         assert_eq!(frames[1]["data"]["status"], "not_exported");
         assert_eq!(frames[2]["end"], true);
+    }
+
+    #[test]
+    fn open_excludes_schema_v3_per_export_without_aborting_compatible_exports() {
+        let (_temp, home, _db, _tapes) = configured_home();
+        let legacy_db = home.join(".engram/legacy.sqlite");
+        let legacy_tapes = home.join(".engram/legacy-tapes");
+        fs::create_dir_all(&legacy_tapes).expect("legacy tape directory");
+        let legacy = rusqlite::Connection::open(&legacy_db).expect("legacy database");
+        legacy
+            .pragma_update(None, "user_version", 3)
+            .expect("schema v3 version");
+        drop(legacy);
+
+        let topology_path = home.join(".engram/topology.yml");
+        let mut topology = fs::read_to_string(&topology_path).expect("topology");
+        topology.push_str(&format!(
+            "  legacy:\n    db: {}\n    tape_dirs:\n      - {}\n",
+            legacy_db.display(),
+            legacy_tapes.display()
+        ));
+        fs::write(&topology_path, topology).expect("add legacy export");
+
+        let output = run(
+            &home,
+            &format!(
+                "{}\n",
+                request(1, "open", &["legacy", "default"], json!({}))
+            ),
+        );
+        let frames = output
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0]["data"]["status"], "incompatible");
+        assert_eq!(frames[0]["data"]["phase"], "open");
+        assert_eq!(frames[0]["data"]["error"]["code"], "schema_mismatch");
+        assert_eq!(frames[1]["data"]["status"], "ok");
+        assert_eq!(frames[2]["stats"]["opened"], 1);
+        assert_eq!(frames[2]["stats"]["protocol"], PROTOCOL_VERSION);
     }
 
     #[test]

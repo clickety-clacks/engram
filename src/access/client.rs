@@ -1,6 +1,6 @@
 //! One-query peer process with pipelined request rounds and framed responses.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -71,6 +71,236 @@ pub struct PeerClient {
     stdout_thread: Option<JoinHandle<()>>,
     stderr_thread: Option<JoinHandle<()>>,
     stderr: Arc<Mutex<Vec<u8>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerExport {
+    pub name: String,
+    pub db: String,
+    pub tape_dirs: Vec<String>,
+    pub reader_mode: String,
+    pub snapshot_at: String,
+}
+
+/// One selected peer process and the negotiated exports it opened for this
+/// invocation. Failed exports remain represented individually.
+pub struct RemoteOwner {
+    pub machine: String,
+    pub build: String,
+    pub protocol: u64,
+    pub schema: u64,
+    pub query_semantics: u64,
+    pub exports: BTreeMap<String, Result<PeerExport, PeerFailure>>,
+    client: PeerClient,
+}
+
+impl RemoteOwner {
+    pub fn connect(
+        machine: &str,
+        caller: &str,
+        peer: &TopologyPeer,
+        timeout: Duration,
+    ) -> Result<Self, PeerFailure> {
+        let mut client = PeerClient::spawn(peer)
+            .map_err(|error| PeerFailure::new("unavailable", error.to_string()))?;
+        let request = PeerRequest::new(
+            "open",
+            peer.exports.clone(),
+            Value::Object(Default::default()),
+        );
+        let mut outcomes = client.round(&[request], timeout);
+        let response = outcomes
+            .pop()
+            .ok_or_else(|| PeerFailure::new("protocol_error", "peer open returned no outcome"))?
+            .map_err(|failure| match failure.code.as_str() {
+                "unknown_operation" | "protocol_mismatch" => {
+                    PeerFailure::new("incompatible", failure.message)
+                }
+                _ => failure,
+            })?;
+        let reported_machine = response
+            .stats
+            .get("self")
+            .and_then(Value::as_str)
+            .ok_or_else(|| PeerFailure::new("protocol_error", "open response has no self label"))?;
+        if reported_machine != machine || reported_machine == caller {
+            return Err(PeerFailure::new(
+                "label_mismatch",
+                format!("configured peer `{machine}` reported self `{reported_machine}`"),
+            ));
+        }
+        let protocol = required_u64(&response.stats, "protocol")?;
+        if protocol != PROTOCOL_VERSION {
+            return Err(PeerFailure::new(
+                "incompatible",
+                format!("peer protocol {protocol} does not match {PROTOCOL_VERSION}"),
+            ));
+        }
+        let schema = required_u64(&response.stats, "schema")?;
+        if schema != crate::index::SCHEMA_VERSION as u64 {
+            return Err(PeerFailure::new(
+                "incompatible",
+                format!(
+                    "peer schema {schema} does not match {}",
+                    crate::index::SCHEMA_VERSION
+                ),
+            ));
+        }
+        let query_semantics = required_u64(&response.stats, "query_semantics")?;
+        if query_semantics != crate::index::QUERY_SEMANTICS_VERSION as u64 {
+            return Err(PeerFailure::new(
+                "incompatible_semantics",
+                format!(
+                    "peer query semantics {query_semantics} does not match {}",
+                    crate::index::QUERY_SEMANTICS_VERSION
+                ),
+            ));
+        }
+        let build = response
+            .stats
+            .get("build")
+            .and_then(Value::as_str)
+            .ok_or_else(|| PeerFailure::new("protocol_error", "open response has no build id"))?
+            .to_string();
+
+        let mut exports = BTreeMap::new();
+        for row in response.data {
+            let Some(store) = row.get("store").and_then(Value::as_str) else {
+                return Err(PeerFailure::new(
+                    "protocol_error",
+                    "open export result has no store name",
+                ));
+            };
+            let Some(name) = store.strip_prefix(&format!("{machine}/")) else {
+                return Err(PeerFailure::new(
+                    "label_mismatch",
+                    format!("peer returned store `{store}` outside `{machine}`"),
+                ));
+            };
+            if !peer.exports.iter().any(|expected| expected == name) || exports.contains_key(name) {
+                return Err(PeerFailure::new(
+                    "protocol_error",
+                    format!("peer returned an unexpected or duplicate export `{store}`"),
+                ));
+            }
+            let status = row
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("invalid");
+            let result = match status {
+                "ok" => {
+                    let db = row.get("db").and_then(Value::as_str).ok_or_else(|| {
+                        PeerFailure::new("protocol_error", "open export has no db path")
+                    })?;
+                    let tape_dirs = row
+                        .get("tape_dirs")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| {
+                            PeerFailure::new("protocol_error", "open export has no tape_dirs")
+                        })?
+                        .iter()
+                        .map(|value| {
+                            value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                                PeerFailure::new(
+                                    "protocol_error",
+                                    "open tape directory is not a string",
+                                )
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let reader_mode =
+                        row.get("reader_mode")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                PeerFailure::new("protocol_error", "open export has no reader mode")
+                            })?;
+                    let snapshot_at =
+                        row.get("snapshot_at")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                PeerFailure::new(
+                                    "protocol_error",
+                                    "open export has no snapshot time",
+                                )
+                            })?;
+                    Ok(PeerExport {
+                        name: name.to_string(),
+                        db: db.to_string(),
+                        tape_dirs,
+                        reader_mode: reader_mode.to_string(),
+                        snapshot_at: snapshot_at.to_string(),
+                    })
+                }
+                "incompatible" => Err(PeerFailure::new(
+                    "incompatible",
+                    row.get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("peer export schema is incompatible"),
+                )),
+                "unavailable" => Err(PeerFailure::new(
+                    row.get("error")
+                        .and_then(|error| error.get("code"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("reader_unavailable"),
+                    row.get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("peer export could not be opened"),
+                )),
+                "not_exported" => Err(PeerFailure::new(
+                    "incompatible",
+                    format!("configured export `{name}` was not declared by the peer"),
+                )),
+                _ => {
+                    return Err(PeerFailure::new(
+                        "protocol_error",
+                        format!("peer returned unknown export status `{status}`"),
+                    ));
+                }
+            };
+            exports.insert(name.to_string(), result);
+        }
+        for name in &peer.exports {
+            if !exports.contains_key(name) {
+                return Err(PeerFailure::new(
+                    "protocol_error",
+                    format!("open response omitted configured export `{machine}/{name}`"),
+                ));
+            }
+        }
+
+        Ok(Self {
+            machine: machine.to_string(),
+            build,
+            protocol,
+            schema,
+            query_semantics,
+            exports,
+            client,
+        })
+    }
+
+    pub fn round(
+        &mut self,
+        requests: &[PeerRequest],
+        timeout: Duration,
+    ) -> Vec<Result<PeerResponse, PeerFailure>> {
+        self.client.round(requests, timeout)
+    }
+
+    pub fn stderr_text(&self) -> String {
+        self.client.stderr_text()
+    }
+}
+
+fn required_u64(value: &Value, key: &str) -> Result<u64, PeerFailure> {
+    value.get(key).and_then(Value::as_u64).ok_or_else(|| {
+        PeerFailure::new(
+            "protocol_error",
+            format!("open response has no numeric {key}"),
+        )
+    })
 }
 
 impl PeerClient {
@@ -473,5 +703,36 @@ mod tests {
             assert_eq!(response.data[0]["seen"], index as u64 + 1);
             assert_eq!(response.stats["done"], true);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_owner_validates_identity_and_records_open_export_metadata() {
+        let peer = TopologyPeer {
+            ssh: None,
+            command: Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "while IFS= read -r request; do id=$(printf '%s\\n' \"$request\" | sed -n 's/.*\\\"id\\\":\\([0-9][0-9]*\\).*/\\1/p'); printf '{\"id\":%s,\"data\":{\"store\":\"eezo/default\",\"status\":\"ok\",\"db\":\"/owner/index.sqlite\",\"tape_dirs\":[\"/owner/tapes\"],\"reader_mode\":\"live\",\"snapshot_at\":\"2026-09-23T00:00:00Z\"}}\\n{\"id\":%s,\"end\":true,\"ok\":true,\"stats\":{\"self\":\"eezo\",\"build\":\"0.2.1\",\"protocol\":1,\"schema\":4,\"query_semantics\":1}}\\n' \"$id\" \"$id\"; done".into(),
+            ]),
+            engram: "/unused".into(),
+            exports: vec!["default".into()],
+        };
+        let owner = RemoteOwner::connect("eezo", "gibson", &peer, Duration::from_secs(5))
+            .expect("compatible peer");
+        assert_eq!(owner.machine, "eezo");
+        assert_eq!(owner.build, "0.2.1");
+        assert_eq!(owner.protocol, PROTOCOL_VERSION);
+        assert_eq!(owner.schema, crate::index::SCHEMA_VERSION as u64);
+        assert_eq!(
+            owner.query_semantics,
+            crate::index::QUERY_SEMANTICS_VERSION as u64
+        );
+        let export = owner.exports["default"]
+            .as_ref()
+            .expect("open export metadata");
+        assert_eq!(export.db, "/owner/index.sqlite");
+        assert_eq!(export.tape_dirs, ["/owner/tapes"]);
+        assert_eq!(export.reader_mode, "live");
     }
 }

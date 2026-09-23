@@ -178,6 +178,11 @@ pub fn load_topology(home: &Path) -> Result<Option<Topology>, ConfigError> {
                 "peer `{name}` has an empty transport or executable"
             )));
         }
+        if peer.ssh.is_some() && !Path::new(&peer.engram).is_absolute() {
+            return Err(ConfigError::InvalidPath(format!(
+                "peer `{name}` Engram executable must be an absolute owner path"
+            )));
+        }
         peers.insert(
             name,
             TopologyPeer {
@@ -1061,5 +1066,20 @@ mod tests {
         assert_eq!(stores.len(), 1);
         assert_eq!(stores[0].db, home.join("copies/racter.sqlite"));
         assert_eq!(stores[0].label, "racter-copy");
+    }
+
+    #[test]
+    fn topology_ssh_peer_requires_an_absolute_remote_executable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".engram")).expect("home");
+        std::fs::write(
+            home.join(".engram/topology.yml"),
+            "version: 1\nself: gibson\npeers:\n  eezo:\n    ssh: eezo\n    engram: bin/engram\n    exports: [default]\n",
+        )
+        .expect("topology");
+
+        let error = super::load_topology(&home).expect_err("relative remote executable");
+        assert!(error.to_string().contains("must be an absolute owner path"));
     }
 }
