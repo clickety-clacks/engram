@@ -115,9 +115,13 @@ fn feature_composite_span_and_tombstone_modes_are_explicit() {
 
 #[cfg(unix)]
 #[test]
-fn primary_and_additional_query_stores_open_without_mutation_when_non_writable() {
+fn live_primary_and_frozen_additional_query_stores_open_without_index_file_mutation() {
     use std::os::unix::fs::PermissionsExt;
 
+    // D1/T1: the old test placed both readers under one non-writable parent and
+    // depended on automatic immutable-mode inference. Live readers now remain
+    // mode=ro and may need parent-directory access for SQLite's -shm file, so
+    // only the explicitly frozen captured copy belongs in the non-writable dir.
     let temp = tempfile::tempdir().expect("tempdir");
     let active_dir = temp.path().join("active");
     let frozen_dir = temp.path().join("frozen");
@@ -172,6 +176,47 @@ fn primary_and_additional_query_stores_open_without_mutation_when_non_writable()
         listing_before
     );
     fs::set_permissions(&frozen_dir, fs::Permissions::from_mode(0o755)).expect("restore mode");
+}
+
+#[cfg(unix)]
+#[test]
+fn live_reader_in_read_only_directory_reports_unavailability_and_fix() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let live_dir = temp.path().join("live");
+    fs::create_dir(&live_dir).expect("live directory");
+    let primary = live_dir.join("primary.sqlite");
+    drop(SqliteIndex::open_writer(primary.to_str().unwrap()).expect("writer"));
+    let before = fs::read(&primary).expect("primary bytes");
+    fs::set_permissions(&primary, fs::Permissions::from_mode(0o444)).expect("read-only file");
+    fs::set_permissions(&live_dir, fs::Permissions::from_mode(0o555)).expect("read-only dir");
+
+    let context = RuntimeContext {
+        config_path: temp.path().join("config.yml"),
+        db_path: primary.clone(),
+        tapes_dir: temp.path().join("tapes"),
+        frozen_stores: Vec::new(),
+        tape_lookup_dirs: Vec::new(),
+        additional_stores: Vec::new(),
+        explain_default_limit: 10,
+        peek_default_lines: 30,
+        peek_default_before: 30,
+        peek_default_after: 10,
+        peek_grep_context: 5,
+        metrics_enabled: true,
+        metrics_log: temp.path().join("metrics.jsonl"),
+        watch: None,
+    };
+    let result = open_query_indexes(&context);
+    fs::set_permissions(&live_dir, fs::Permissions::from_mode(0o755)).expect("restore dir mode");
+
+    let error = result.err().expect("live reader should require -shm access");
+    assert_eq!(error.code, "reader_unavailable");
+    assert!(error.message.contains(&primary.display().to_string()));
+    assert!(error.message.contains("grant SQLite write access"));
+    assert!(error.message.contains("frozen_stores"));
+    assert_eq!(fs::read(&primary).expect("primary after"), before);
 }
 
 #[test]

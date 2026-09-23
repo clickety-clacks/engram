@@ -35,10 +35,7 @@ pub enum ExplainTarget {
 pub fn open_query_indexes(context: &RuntimeContext) -> Result<Vec<SqliteIndex>, CliError> {
     let mut indexes = Vec::new();
     if context.db_path.exists() {
-        indexes.push(SqliteIndex::open_reader_mode(
-            &path_string(&context.db_path),
-            ReaderMode::Live,
-        )?);
+        indexes.push(open_query_index(&context.db_path, ReaderMode::Live)?);
     }
     for store in &context.additional_stores {
         if store.exists() {
@@ -47,13 +44,33 @@ pub fn open_query_indexes(context: &RuntimeContext) -> Result<Vec<SqliteIndex>, 
             } else {
                 ReaderMode::Live
             };
-            indexes.push(SqliteIndex::open_reader_mode(&path_string(store), mode)?);
+            indexes.push(open_query_index(store, mode)?);
         }
     }
     if indexes.is_empty() {
         return Err(rusqlite::Error::InvalidPath(context.db_path.clone()).into());
     }
     Ok(indexes)
+}
+
+fn open_query_index(path: &Path, mode: ReaderMode) -> Result<SqliteIndex, CliError> {
+    let mode_label = match mode {
+        ReaderMode::Live => "live",
+        ReaderMode::Frozen => "frozen",
+    };
+    let fix = match mode {
+        ReaderMode::Live => "grant SQLite write access to the parent directory so it can create -shm, or declare a stable captured copy in ~/.engram/topology.yml under frozen_stores",
+        ReaderMode::Frozen => "verify the declared frozen copy exists, is readable, and has the expected schema",
+    };
+    SqliteIndex::open_reader_mode(&path_string(path), mode).map_err(|error| {
+        CliError::new(
+            "reader_unavailable",
+            format!(
+                "store `{}` could not be opened in {mode_label} read-only mode: {error}. Fix: {fix}.",
+                path.display()
+            ),
+        )
+    })
 }
 
 pub fn classify_explain_target(

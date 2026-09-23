@@ -1346,6 +1346,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    // D1/T1: this intentionally exercises Frozen mode. The previous test name
+    // implied arbitrary readers could use immutable mode when sidecars were
+    // absent; Live readers must instead remain mode=ro.
     fn frozen_reader_opens_schema_v4_without_wal_shm_or_file_mutation() {
         use std::os::unix::fs::PermissionsExt;
 
