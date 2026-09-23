@@ -17,6 +17,66 @@ pub struct EffectiveConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrozenStoreConfig {
+    pub db: PathBuf,
+    pub label: String,
+    pub source: Option<String>,
+    pub captured_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTopology {
+    #[serde(default)]
+    version: Option<u32>,
+    #[serde(default)]
+    self_label: Option<String>,
+    #[serde(rename = "self", default)]
+    self_name: Option<String>,
+    #[serde(default)]
+    exports: Option<serde_yaml::Value>,
+    #[serde(default)]
+    peers: Option<serde_yaml::Value>,
+    #[serde(default)]
+    limits: Option<serde_yaml::Value>,
+    #[serde(default)]
+    frozen_stores: Vec<RawFrozenStore>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawFrozenStore {
+    db: String,
+    label: String,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    captured_at: Option<String>,
+}
+
+/// Read the home-only topology annotation used to select immutable stores.
+/// The rest of topology is intentionally left opaque until its owner layer is
+/// implemented; this keeps repository configs from gaining network authority.
+pub fn load_frozen_stores(home: &Path) -> Result<Vec<FrozenStoreConfig>, ConfigError> {
+    let path = home.join(".engram/topology.yml");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw: RawTopology = serde_yaml::from_str(&fs::read_to_string(path)?)?;
+    if raw.version.is_some_and(|version| version != 1) {
+        return Err(ConfigError::InvalidPath("topology version must be 1".into()));
+    }
+    let _ = (raw.self_label, raw.self_name, raw.exports, raw.peers, raw.limits);
+    raw.frozen_stores
+        .into_iter()
+        .map(|store| Ok(FrozenStoreConfig {
+            db: resolve_path(&store.db, home, home)?,
+            label: store.label,
+            source: store.source,
+            captured_at: store.captured_at,
+        }))
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectivePeekConfig {
     pub default_lines: usize,
     pub default_before: usize,
@@ -829,5 +889,22 @@ mod tests {
         assert_eq!(watch.sources[0].path, custom_root.join("sessions"));
         assert_eq!(watch.sources[0].pattern, "session-*.json");
         assert_eq!(watch.sources[0].glob, None);
+    }
+
+    #[test]
+    fn topology_frozen_store_paths_are_home_only_and_resolved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".engram")).expect("home");
+        std::fs::write(
+            home.join(".engram/topology.yml"),
+            "version: 1\nself: gibson\nfrozen_stores:\n  - db: ~/copies/racter.sqlite\n    label: racter-copy\n    source: racter/default\n    captured_at: '2026-09-23T00:00:00Z'\n",
+        )
+        .expect("topology");
+
+        let stores = super::load_frozen_stores(&home).expect("frozen stores");
+        assert_eq!(stores.len(), 1);
+        assert_eq!(stores[0].db, home.join("copies/racter.sqlite"));
+        assert_eq!(stores[0].label, "racter-copy");
     }
 }

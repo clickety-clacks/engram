@@ -82,12 +82,29 @@ pub struct DispatchLinkRow {
 pub struct SqliteIndex {
     conn: Connection,
     access_kind: AccessKind,
+    reader_mode: Option<ReaderMode>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AccessKind {
     Reader,
     Writer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReaderMode {
+    Live,
+    Frozen,
+}
+
+pub struct ReadSnapshot<'a> {
+    index: &'a SqliteIndex,
+}
+
+impl Drop for ReadSnapshot<'_> {
+    fn drop(&mut self) {
+        let _ = self.index.conn.execute_batch("ROLLBACK");
+    }
 }
 
 impl SqliteIndex {
@@ -103,6 +120,7 @@ impl SqliteIndex {
         let index = Self {
             conn,
             access_kind: AccessKind::Writer,
+            reader_mode: None,
         };
         let version = index.user_version()?;
         if existed && version != SCHEMA_VERSION {
@@ -116,9 +134,15 @@ impl SqliteIndex {
     }
 
     pub fn open_reader(path: &str) -> rusqlite::Result<Self> {
+        Self::open_reader_mode(path, ReaderMode::Live)
+    }
+
+    pub fn open_reader_mode(path: &str, mode: ReaderMode) -> rusqlite::Result<Self> {
         let wal_path = format!("{path}-wal");
         let shm_path = format!("{path}-shm");
-        let conn = if Path::new(&wal_path).exists() || Path::new(&shm_path).exists() {
+        let conn = if mode == ReaderMode::Live
+            && (Path::new(&wal_path).exists() || Path::new(&shm_path).exists())
+        {
             Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?
         } else {
             let absolute = std::fs::canonicalize(path)
@@ -135,7 +159,9 @@ impl SqliteIndex {
         let index = Self {
             conn,
             access_kind: AccessKind::Reader,
+            reader_mode: Some(mode),
         };
+        index.conn.execute_batch("PRAGMA query_only = ON")?;
         if index.user_version()? != SCHEMA_VERSION {
             return Err(rusqlite::Error::InvalidQuery);
         }
@@ -147,10 +173,24 @@ impl SqliteIndex {
         let index = Self {
             conn,
             access_kind: AccessKind::Writer,
+            reader_mode: None,
         };
         index.configure_writer()?;
         index.create_schema_v4()?;
         Ok(index)
+    }
+
+    pub fn reader_mode(&self) -> Option<ReaderMode> {
+        self.reader_mode
+    }
+
+    pub fn begin_snapshot(&self) -> rusqlite::Result<ReadSnapshot<'_>> {
+        if self.access_kind != AccessKind::Reader {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        self.conn.execute_batch("BEGIN DEFERRED")?;
+        self.conn.query_row("PRAGMA schema_version", [], |_row| Ok(()))?;
+        Ok(ReadSnapshot { index: self })
     }
 
     pub fn with_read_transaction<T>(

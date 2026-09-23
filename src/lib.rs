@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use config::EffectiveWatchConfig;
 
 pub mod anchor;
+pub mod access;
 pub mod config;
 pub mod dispatch;
 pub mod index;

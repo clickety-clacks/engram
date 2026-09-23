@@ -803,6 +803,15 @@ pub fn record_transcript(
     let tape_path = tape_path_for_id(paths, &tape_id);
     let tape_file_exists = tape_path.exists();
     ensure_db_parent(db_path)?;
+
+    // Publish the immutable tape before derived rows. An interrupted ingest
+    // may leave an unindexed tape, but never rows without their source.
+    if !tape_file_exists {
+        let compressed =
+            compress_jsonl(transcript).map_err(|err| CliError::io("compress_error", err))?;
+        atomic_write(&tape_path, &compressed).map_err(|err| CliError::io("write_error", err))?;
+    }
+
     let index = SqliteIndex::open_writer(&path_string(db_path))?;
     let already_indexed = index.has_tape(&tape_id)?;
 
@@ -814,12 +823,6 @@ pub fn record_transcript(
             LINK_THRESHOLD_DEFAULT,
         )?;
     }
-    if !tape_file_exists {
-        let compressed =
-            compress_jsonl(transcript).map_err(|err| CliError::io("compress_error", err))?;
-        atomic_write(&tape_path, &compressed).map_err(|err| CliError::io("write_error", err))?;
-    }
-
     let compressed_len = fs::metadata(&tape_path)
         .map_err(|err| CliError::io("metadata_error", err))?
         .len();
