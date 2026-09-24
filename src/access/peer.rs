@@ -18,8 +18,7 @@ use super::{FileAddress, FileKind, MAX_NON_FILE_RESPONSE_BYTES, MachineRef};
 use crate::config::{Topology, TopologyExport, load_topology};
 use crate::index::{QUERY_SEMANTICS_VERSION, ReaderMode, SCHEMA_VERSION, SqliteIndex};
 use crate::query::format::{
-    DateFilter, extract_latest_timestamp_from_rows, is_provenance_row,
-    session_matches_date_filter,
+    DateFilter, extract_latest_timestamp_from_rows, is_provenance_row, session_matches_date_filter,
 };
 use crate::store::tapes::parse_jsonl_rows;
 use crate::tape::compress::decompress_jsonl_with_limit;
@@ -435,9 +434,8 @@ impl PeerSession {
             let entries = fs::read_dir(dir)
                 .map_err(|error| PeerError::new("tape_inventory_error", error.to_string()))?;
             for entry in entries {
-                let entry = entry.map_err(|error| {
-                    PeerError::new("tape_inventory_error", error.to_string())
-                })?;
+                let entry = entry
+                    .map_err(|error| PeerError::new("tape_inventory_error", error.to_string()))?;
                 if let Some(tape_id) = crate::store::tapes::tape_id_from_path(&entry.path())
                     && validate_tape_id(&tape_id).is_ok()
                 {
@@ -499,30 +497,26 @@ impl PeerSession {
                 )?;
                 continue;
             };
-            let summary = match scan_tape_for_grep(
-                &path,
-                compressed_size,
-                &self.topology.limits,
-                pattern,
-            ) {
-                Ok(summary) => summary,
-                Err(error) => {
-                    let failure = json!({
-                        "type": "failure",
-                        "tape_id": tape_id,
-                        "error": {"code": error.code, "message": error.message},
-                    });
-                    append_grep_failure(
-                        &mut failures,
-                        failure,
-                        id,
-                        &mut failure_bytes,
-                        top_bytes,
-                        response_limit,
-                    )?;
-                    continue;
-                }
-            };
+            let summary =
+                match scan_tape_for_grep(&path, compressed_size, &self.topology.limits, pattern) {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        let failure = json!({
+                            "type": "failure",
+                            "tape_id": tape_id,
+                            "error": {"code": error.code, "message": error.message},
+                        });
+                        append_grep_failure(
+                            &mut failures,
+                            failure,
+                            id,
+                            &mut failure_bytes,
+                            top_bytes,
+                            response_limit,
+                        )?;
+                        continue;
+                    }
+                };
             if summary.match_count == 0
                 || !session_matches_date_filter(
                     &json!({"timestamp": summary.timestamp}),
@@ -565,9 +559,7 @@ impl PeerSession {
             });
             if k > 0 {
                 let mut candidate = GrepCandidate::from_record(record);
-                let replaces_worst = top
-                    .peek()
-                    .is_some_and(|worst| candidate < *worst);
+                let replaces_worst = top.peek().is_some_and(|worst| candidate < *worst);
                 if top.len() < k || replaces_worst {
                     candidate.frame_size = grep_data_frame_size(id, &candidate.record)? as u64;
                     if candidate.frame_size as usize > MAX_FRAME_BYTES {
@@ -1140,7 +1132,8 @@ fn scan_tape_for_grep(
     limits: &BTreeMap<String, u64>,
     pattern: &str,
 ) -> Result<GrepTapeSummary, PeerError> {
-    let compressed_limit = configured_limit(limits, "read_file_compressed_bytes", MAX_READ_FILE_BYTES);
+    let compressed_limit =
+        configured_limit(limits, "read_file_compressed_bytes", MAX_READ_FILE_BYTES);
     if expected_size > compressed_limit {
         return Err(PeerError::new(
             "budget_exceeded",
@@ -1175,7 +1168,8 @@ fn scan_tape_for_grep(
 
     let decoder = zstd::stream::read::Decoder::new(file.take(compressed_limit.saturating_add(1)))
         .map_err(|error| PeerError::new("invalid_tape", error.to_string()))?;
-    let decompressed_limit = configured_limit(limits, "decompressed_bytes_per_tape", 512 * 1024 * 1024);
+    let decompressed_limit =
+        configured_limit(limits, "decompressed_bytes_per_tape", 512 * 1024 * 1024);
     let mut reader = io::BufReader::new(decoder.take(decompressed_limit.saturating_add(1)));
     let mut line = Vec::new();
     let mut bytes_read = 0u64;

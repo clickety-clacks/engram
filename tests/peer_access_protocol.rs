@@ -409,7 +409,10 @@ fn command_peer_grep_scan_returns_ranked_page_and_per_tape_failure() {
     assert_eq!(response.stats["returned"], 1);
     assert_eq!(response.stats["truncated"], true);
     assert_eq!(response.stats["failures"], 1);
-    assert_eq!(response.stats["time_range"]["start"], "2026-09-24T12:35:00Z");
+    assert_eq!(
+        response.stats["time_range"]["start"],
+        "2026-09-24T12:35:00Z"
+    );
     assert_eq!(response.stats["time_range"]["end"], "2026-09-25T12:35:00Z");
     assert_eq!(response.data[0]["type"], "match");
     assert_eq!(response.data[0]["tape_id"], "a");
