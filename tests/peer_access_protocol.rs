@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use engram::access::client::{PeerRequest, RemoteOwner};
 use engram::config::TopologyPeer;
-use engram::index::SqliteIndex;
+use engram::index::{DispatchDirection, DispatchLink, SqliteIndex};
 use serde_json::json;
 use sha2::Digest;
 
@@ -86,18 +86,41 @@ fn remote_show_reads_only_the_selected_peer_tape_and_verifies_its_digest() {
     let db = owner_engram.join("index.sqlite");
     drop(SqliteIndex::open_writer(db.to_str().expect("UTF-8 DB path")).expect("create owner DB"));
 
-    let content = "{\"t\":\"2026-09-23T12:34:56Z\",\"k\":\"msg.in\",\"content\":\"from peer\"}\n";
+    let content = concat!(
+        "{\"t\":\"2026-09-23T12:34:56Z\",\"k\":\"msg.in\",\"content\":\"first line\"}\n",
+        "{\"t\":\"2026-09-23T12:34:57Z\",\"k\":\"msg.out\",\"content\":\"second marker\"}\n",
+        "{\"t\":\"2026-09-23T12:34:58Z\",\"k\":\"msg.in\",\"content\":\"third marker\"}\n",
+        "{\"t\":\"2026-09-23T12:34:59Z\",\"k\":\"note\",\"content\":\"small filler\"}\n",
+    )
+    .to_string()
+        + &format!(
+            "{{\"t\":\"2026-09-23T12:35:00Z\",\"k\":\"note\",\"content\":\"{}\"}}\n",
+            "x".repeat(1_500)
+        );
     let tape_id = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
     let compressed = zstd::stream::encode_all(content.as_bytes(), 0).expect("compress tape");
     let tape = tapes.join(format!("{tape_id}.jsonl.zst"));
     std::fs::write(&tape, &compressed).expect("write owner tape");
+    let index = SqliteIndex::open_writer(db.to_str().expect("UTF-8 DB path"))
+        .expect("open owner index to seed dispatch row");
+    index
+        .insert_dispatch_link(
+            &tape_id,
+            &DispatchLink {
+                uuid: "fixture-dispatch".into(),
+                first_turn_index: 2,
+                direction: DispatchDirection::Received,
+            },
+        )
+        .expect("seed received dispatch row");
+    drop(index);
     let opaque_id = "opaque-fixture";
     let opaque_tape = tapes.join(format!("{opaque_id}.jsonl.zst"));
     std::fs::write(&opaque_tape, compressed).expect("write opaque owner tape");
     std::fs::write(
         owner_engram.join("topology.yml"),
         format!(
-            "version: 1\nself: emulated-owner\nexports:\n  default:\n    db: {}\n    tape_dirs:\n      - {}\n",
+            "version: 1\nself: emulated-owner\nexports:\n  default:\n    db: {}\n    tape_dirs:\n      - {}\nlimits:\n  non_file_response_bytes: 1024\n",
             db.display(),
             tapes.display()
         ),
@@ -109,7 +132,7 @@ fn remote_show_reads_only_the_selected_peer_tape_and_verifies_its_digest() {
     std::fs::create_dir_all(&caller_engram).expect("caller config directory");
     std::fs::write(
         caller_engram.join("config.yml"),
-        "db: ~/.engram/index.sqlite\ntapes_dir: ~/.engram/tapes\n",
+        "db: ~/.engram/index.sqlite\ntapes_dir: ~/.engram/tapes\npeek:\n  grep_context: 1\n",
     )
     .expect("write caller config");
     let binary = env!("CARGO_BIN_EXE_engram");
@@ -161,11 +184,127 @@ fn remote_show_reads_only_the_selected_peer_tape_and_verifies_its_digest() {
     );
     assert_eq!(value["digest"], tape_id);
     assert_eq!(value["id_verified"], true);
-    assert_eq!(value["event_count"], 1);
+    assert_eq!(value["event_count"], 5);
     assert!(String::from_utf8_lossy(&output.stderr).contains("peers=emulated-owner"));
     assert!(
         !repo.join(".engram").exists(),
         "remote query created caller store files"
+    );
+
+    let explicit_peek = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "peek",
+            &tape_id,
+            "--store",
+            "emulated-owner/default",
+            "--start",
+            "2",
+            "--lines",
+            "1",
+        ])
+        .output()
+        .expect("run explicit remote peek");
+    assert!(
+        explicit_peek.status.success(),
+        "explicit remote peek failed: {}",
+        String::from_utf8_lossy(&explicit_peek.stderr)
+    );
+    let explicit_value: serde_json::Value =
+        serde_json::from_slice(&explicit_peek.stdout).expect("explicit peek JSON");
+    assert_eq!(explicit_value["session"]["content"][0]["line"], 2);
+    assert_eq!(
+        explicit_value["session"]["content"][0]["text"],
+        "{\"t\":\"2026-09-23T12:34:57Z\",\"k\":\"msg.out\",\"content\":\"second marker\"}"
+    );
+    assert_eq!(
+        explicit_value["session"]["location"]["machine"],
+        "emulated-owner"
+    );
+
+    let anchor_peek = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "peek",
+            &tape_id,
+            "--store",
+            "emulated-owner/default",
+            "--before",
+            "0",
+            "--after",
+            "0",
+        ])
+        .output()
+        .expect("run default-anchor remote peek");
+    assert!(
+        anchor_peek.status.success(),
+        "default-anchor remote peek failed: {}",
+        String::from_utf8_lossy(&anchor_peek.stderr)
+    );
+    let anchor_value: serde_json::Value =
+        serde_json::from_slice(&anchor_peek.stdout).expect("anchor peek JSON");
+    assert_eq!(anchor_value["session"]["window_start"], 3);
+    assert_eq!(anchor_value["session"]["window_end"], 3);
+    assert_eq!(anchor_value["session"]["content"][0]["line"], 3);
+
+    let grep_peek = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "peek",
+            &tape_id,
+            "--store",
+            "emulated-owner/default",
+            "--grep-filter",
+            "third marker",
+        ])
+        .output()
+        .expect("run remote grep peek");
+    assert!(
+        grep_peek.status.success(),
+        "remote grep peek failed: {}",
+        String::from_utf8_lossy(&grep_peek.stderr)
+    );
+    let grep_value: serde_json::Value =
+        serde_json::from_slice(&grep_peek.stdout).expect("grep peek JSON");
+    assert_eq!(grep_value["session"]["content"][1]["line"], 3);
+
+    let oversized_peek = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "peek",
+            &tape_id,
+            "--store",
+            "emulated-owner/default",
+            "--start",
+            "5",
+            "--lines",
+            "1",
+        ])
+        .output()
+        .expect("run over-budget remote peek");
+    assert!(!oversized_peek.status.success());
+    assert!(
+        oversized_peek.stdout.is_empty(),
+        "over-budget peek emitted partial lines"
+    );
+    let stderr = String::from_utf8_lossy(&oversized_peek.stderr);
+    let error: serde_json::Value =
+        serde_json::from_str(stderr.lines().last().expect("budget error line"))
+            .expect("budget error JSON");
+    assert_eq!(error["error"]["code"], "budget_exceeded");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("narrow")
+    );
+    assert!(
+        !repo.join(".engram").exists(),
+        "remote peek created caller store files"
     );
 
     let raw = Command::new(binary)

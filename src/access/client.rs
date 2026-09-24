@@ -12,10 +12,10 @@ use serde_json::{Value, json};
 
 use crate::config::TopologyPeer;
 
+pub use super::MAX_NON_FILE_RESPONSE_BYTES;
 use super::peer::{MAX_FRAME_BYTES, PROTOCOL_VERSION};
 use super::transport;
 
-pub const MAX_NON_FILE_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 16 * 1024;
 pub const DEFAULT_READ_FILE_COMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
 pub const DEFAULT_DECOMPRESSED_BYTES_PER_TAPE: u64 = 512 * 1024 * 1024;

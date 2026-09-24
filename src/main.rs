@@ -15,7 +15,7 @@ use engram::access::client::{
     PeerRequest, RemoteOwner, decode_base64_chunk,
 };
 use engram::config::{
-    EffectiveWatchSource, ensure_user_config, load_effective_config_read_only,
+    EffectiveWatchSource, TopologyPeer, ensure_user_config, load_effective_config_read_only,
     load_effective_config_with_override, load_frozen_stores, load_topology,
 };
 use engram::dispatch::{
@@ -174,6 +174,8 @@ struct PeekArgs {
     after: Option<usize>,
     #[arg(long)]
     grep_filter: Option<String>,
+    #[arg(long, value_name = "MACHINE/EXPORT")]
+    store: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -1084,60 +1086,7 @@ fn cmd_show_remote(
     store_ref: &str,
 ) -> Result<(), CliError> {
     print_context_conspicuity(context);
-    let (machine, export) = store_ref
-        .split_once('/')
-        .filter(|(machine, export)| {
-            !machine.is_empty() && !export.is_empty() && !export.contains('/')
-        })
-        .ok_or_else(|| {
-            CliError::new(
-                "invalid_store",
-                "remote store must be written as <machine>/<export>",
-            )
-        })?;
-    let home = home_dir()?;
-    let topology = load_topology(&home)
-        .map_err(|error| CliError::new("config_error", error.to_string()))?
-        .ok_or_else(|| {
-            CliError::new(
-                "topology_missing",
-                "remote show requires ~/.engram/topology.yml",
-            )
-        })?;
-    if machine == topology.self_label {
-        return Err(CliError::new(
-            "store_selection_unsupported",
-            "--store currently selects a configured remote machine/export",
-        ));
-    }
-    eprintln!("topology: ~/.engram/topology.yml peers={machine}");
-    let mut peer = topology.peers.get(machine).cloned().ok_or_else(|| {
-        CliError::new(
-            "peer_not_configured",
-            format!("peer `{machine}` is not configured in ~/.engram/topology.yml"),
-        )
-    })?;
-    if !peer.exports.iter().any(|candidate| candidate == export) {
-        return Err(CliError::new(
-            "store_not_configured",
-            format!("export `{store_ref}` is not selected in the peer topology"),
-        ));
-    }
-    peer.exports = vec![export.to_string()];
-
-    let mut owner = RemoteOwner::connect(
-        machine,
-        &topology.self_label,
-        &peer,
-        Duration::from_millis(5_000),
-    )
-    .map_err(peer_failure_to_cli)?;
-    owner
-        .exports
-        .get(export)
-        .ok_or_else(|| CliError::new("protocol_error", "peer omitted the selected export"))?
-        .as_ref()
-        .map_err(|failure| peer_failure_to_cli(failure.clone()))?;
+    let (machine, export, mut owner) = connect_remote_store(store_ref, "remote show")?;
 
     let locate = one_peer_response(
         &mut owner,
@@ -1305,6 +1254,67 @@ fn cmd_show_remote(
     }))
 }
 
+fn connect_remote_store(
+    store_ref: &str,
+    command: &str,
+) -> Result<(String, String, RemoteOwner), CliError> {
+    let (machine, export) = store_ref
+        .split_once('/')
+        .filter(|(machine, export)| {
+            !machine.is_empty() && !export.is_empty() && !export.contains('/')
+        })
+        .ok_or_else(|| {
+            CliError::new(
+                "invalid_store",
+                "remote store must be written as <machine>/<export>",
+            )
+        })?;
+    let home = home_dir()?;
+    let topology = load_topology(&home)
+        .map_err(|error| CliError::new("config_error", error.to_string()))?
+        .ok_or_else(|| {
+            CliError::new(
+                "topology_missing",
+                format!("{command} requires ~/.engram/topology.yml"),
+            )
+        })?;
+    if machine == topology.self_label {
+        return Err(CliError::new(
+            "store_selection_unsupported",
+            "--store currently selects a configured remote machine/export",
+        ));
+    }
+    eprintln!("topology: ~/.engram/topology.yml peers={machine}");
+    let mut peer: TopologyPeer = topology.peers.get(machine).cloned().ok_or_else(|| {
+        CliError::new(
+            "peer_not_configured",
+            format!("peer `{machine}` is not configured in ~/.engram/topology.yml"),
+        )
+    })?;
+    if !peer.exports.iter().any(|candidate| candidate == export) {
+        return Err(CliError::new(
+            "store_not_configured",
+            format!("export `{store_ref}` is not selected in the peer topology"),
+        ));
+    }
+    peer.exports = vec![export.to_string()];
+
+    let owner = RemoteOwner::connect(
+        machine,
+        &topology.self_label,
+        &peer,
+        Duration::from_millis(5_000),
+    )
+    .map_err(peer_failure_to_cli)?;
+    owner
+        .exports
+        .get(export)
+        .ok_or_else(|| CliError::new("protocol_error", "peer omitted the selected export"))?
+        .as_ref()
+        .map_err(|failure| peer_failure_to_cli(failure.clone()))?;
+    Ok((machine.to_string(), export.to_string(), owner))
+}
+
 fn one_peer_response(
     owner: &mut RemoteOwner,
     request: PeerRequest,
@@ -1326,11 +1336,14 @@ fn peer_failure_to_cli(failure: PeerFailure) -> CliError {
     let code = match failure.code.as_str() {
         "unavailable" => "unavailable",
         "timeout" => "timeout",
+        "no_results" => "no_results",
+        "invalid_request" => "invalid_request",
         "incompatible" => "incompatible",
         "incompatible_semantics" => "incompatible_semantics",
         "label_mismatch" => "label_mismatch",
         "reader_unavailable" => "reader_unavailable",
         "tape_unavailable" => "tape_unavailable",
+        "invalid_tape" => "invalid_tape",
         "tape_changed" => "tape_changed",
         "over_limit" | "budget_exceeded" => "budget_exceeded",
         "id_mismatch" => "id_mismatch",
@@ -1634,6 +1647,9 @@ fn cmd_grep(_paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Res
 
 fn cmd_peek(_paths: &RepoPaths, context: &RuntimeContext, args: PeekArgs) -> Result<(), CliError> {
     print_context_conspicuity(context);
+    if let Some(store_ref) = args.store.clone() {
+        return cmd_peek_remote(context, args, &store_ref);
+    }
 
     let indexes = open_query_indexes(context)?;
     let session_id = args.session_id;
@@ -1753,6 +1769,239 @@ fn cmd_peek(_paths: &RepoPaths, context: &RuntimeContext, args: PeekArgs) -> Res
             "total_lines": total_lines,
             "content": content,
         }
+        }),
+    )
+}
+
+fn cmd_peek_remote(
+    context: &RuntimeContext,
+    args: PeekArgs,
+    store_ref: &str,
+) -> Result<(), CliError> {
+    let (machine, export, mut owner) = connect_remote_store(store_ref, "remote peek")?;
+    let session_id = args.session_id;
+    if args.grep_filter.is_none() && args.start == Some(0) {
+        return Err(CliError::new(
+            "invalid_request",
+            "--start is a 1-based line number",
+        ));
+    }
+
+    let anchor_turn = if args.start.is_none() && args.grep_filter.is_none() {
+        let rows = one_peer_response(
+            &mut owner,
+            PeerRequest::new(
+                "dispatch_rows",
+                vec![export.clone()],
+                json!({"by_tape":[session_id]}),
+            ),
+            "dispatch_rows",
+        )?;
+        let mut first_received: Option<(i64, String)> = None;
+        for row in rows.data {
+            if row.get("store").and_then(Value::as_str) != Some(store_ref)
+                || row.get("tape_id").and_then(Value::as_str) != Some(session_id.as_str())
+            {
+                return Err(CliError::new(
+                    "protocol_error",
+                    "peer returned a dispatch row for a different store or tape",
+                ));
+            }
+            let direction = row
+                .get("direction")
+                .and_then(Value::as_str)
+                .ok_or_else(|| CliError::new("protocol_error", "dispatch row has no direction"))?;
+            if !matches!(direction, "received" | "sent") {
+                return Err(CliError::new(
+                    "protocol_error",
+                    "dispatch row has an invalid direction",
+                ));
+            }
+            let turn = row
+                .get("first_turn_index")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| CliError::new("protocol_error", "dispatch row has no turn index"))?;
+            let uuid = row
+                .get("uuid")
+                .and_then(Value::as_str)
+                .ok_or_else(|| CliError::new("protocol_error", "dispatch row has no UUID"))?;
+            if direction == "received"
+                && first_received
+                    .as_ref()
+                    .is_none_or(|(best_turn, best_uuid)| {
+                        turn < *best_turn || (turn == *best_turn && uuid < best_uuid.as_str())
+                    })
+            {
+                first_received = Some((turn, uuid.to_string()));
+            }
+        }
+        first_received.map(|(turn, _)| turn)
+    } else {
+        None
+    };
+
+    let mut request_args = serde_json::Map::new();
+    request_args.insert("tape_id".into(), json!(session_id));
+    if let Some(pattern) = args.grep_filter.as_deref() {
+        request_args.insert("grep_filter".into(), json!(pattern));
+        request_args.insert(
+            "grep_context".into(),
+            json!(context.peek_grep_context.max(1)),
+        );
+    } else if let Some(start) = args.start {
+        request_args.insert("start".into(), json!(start));
+        request_args.insert(
+            "lines".into(),
+            json!(args.lines.unwrap_or(context.peek_default_lines).max(1)),
+        );
+    } else {
+        if let Some(turn) = anchor_turn {
+            request_args.insert("anchor_turn".into(), json!(turn));
+        }
+        request_args.insert(
+            "before".into(),
+            json!(args.before.unwrap_or(context.peek_default_before)),
+        );
+        request_args.insert(
+            "after".into(),
+            json!(args.after.unwrap_or(context.peek_default_after)),
+        );
+    }
+
+    let response = one_peer_response(
+        &mut owner,
+        PeerRequest::new("peek_lines", vec![export], Value::Object(request_args)),
+        "peek_lines",
+    )
+    .map_err(|error| {
+        if error.code == "budget_exceeded" {
+            CliError::new(
+                "budget_exceeded",
+                format!(
+                    "{}; narrow --lines, the --before/--after window, or --grep-filter context",
+                    error.message
+                ),
+            )
+        } else {
+            error
+        }
+    })?;
+
+    if response.stats.get("tape_id").and_then(Value::as_str) != Some(session_id.as_str()) {
+        return Err(CliError::new(
+            "protocol_error",
+            "peer returned peek statistics for a different tape",
+        ));
+    }
+    let total_lines = response
+        .stats
+        .get("total_lines")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| CliError::new("protocol_error", "peek response has no total_lines"))?;
+    let window_start = response
+        .stats
+        .get("window_start")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| CliError::new("protocol_error", "peek response has no window_start"))?;
+    let window_end = response
+        .stats
+        .get("window_end")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| CliError::new("protocol_error", "peek response has no window_end"))?;
+    let returned = response
+        .stats
+        .get("returned")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| CliError::new("protocol_error", "peek response has no returned count"))?;
+    if response.data.len() != returned
+        || window_start == 0
+        || window_start > window_end
+        || window_end > total_lines
+    {
+        return Err(CliError::new(
+            "protocol_error",
+            "peer returned inconsistent peek window statistics",
+        ));
+    }
+    let timestamp = response
+        .stats
+        .get("timestamp")
+        .cloned()
+        .unwrap_or(Value::Null);
+    if !timestamp.is_null() && !timestamp.is_string() {
+        return Err(CliError::new(
+            "protocol_error",
+            "peek timestamp must be a string or null",
+        ));
+    }
+    let mut previous_line = 0usize;
+    let mut first_line = None;
+    let mut content = Vec::with_capacity(response.data.len());
+    for row in response.data {
+        if row.get("tape_id").and_then(Value::as_str) != Some(session_id.as_str()) {
+            return Err(CliError::new(
+                "protocol_error",
+                "peer returned a line for a different tape",
+            ));
+        }
+        let line = row
+            .get("line")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| CliError::new("protocol_error", "peek line has no valid number"))?;
+        let text = row
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CliError::new("protocol_error", "peek line has no text"))?;
+        if line <= previous_line || line < window_start || line > window_end {
+            return Err(CliError::new(
+                "protocol_error",
+                "peer returned unordered or out-of-range peek lines",
+            ));
+        }
+        first_line.get_or_insert(line);
+        previous_line = line;
+        content.push(json!({"line":line,"text":text}));
+    }
+    if content.is_empty() {
+        return Err(CliError::new("no_results", session_id));
+    }
+    if first_line != Some(window_start) || previous_line != window_end {
+        return Err(CliError::new(
+            "protocol_error",
+            "peer returned peek lines that do not cover the stated window bounds",
+        ));
+    }
+
+    emit_query_result(
+        "peek",
+        json!({
+            "query": {
+                "command": "peek",
+                "session_id": session_id,
+                "start": args.start,
+                "lines": args.lines,
+                "before": args.before,
+                "after": args.after,
+                "grep_filter": args.grep_filter,
+                "store": store_ref,
+            },
+            "session": {
+                "session_id": session_id,
+                "timestamp": timestamp,
+                "window_start": window_start,
+                "window_end": window_end,
+                "total_lines": total_lines,
+                "content": content,
+                "location": {
+                    "machine": machine,
+                    "store": store_ref,
+                },
+            }
         }),
     )
 }

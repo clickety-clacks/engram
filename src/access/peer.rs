@@ -13,9 +13,12 @@ use std::time::SystemTime;
 
 use serde_json::{Value, json};
 
-use super::{FileAddress, FileKind, MachineRef};
+use super::{FileAddress, FileKind, MAX_NON_FILE_RESPONSE_BYTES, MachineRef};
 use crate::config::{Topology, TopologyExport, load_topology};
 use crate::index::{QUERY_SEMANTICS_VERSION, ReaderMode, SCHEMA_VERSION, SqliteIndex};
+use crate::query::format::extract_latest_timestamp_from_rows;
+use crate::store::tapes::parse_jsonl_rows;
+use crate::tape::compress::decompress_jsonl_with_limit;
 
 pub const PROTOCOL_VERSION: u64 = 1;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -181,6 +184,7 @@ impl PeerSession {
             "open" => self.open(&stores, args, id, output),
             "locate_tapes" => self.locate_tapes(&stores, args, id, output),
             "dispatch_rows" => self.dispatch_rows(&stores, args, id, output),
+            "peek_lines" => self.peek_lines(&stores, args, id, output),
             "read_file" => self.read_file(&stores, args, id, output),
             _ => Err(PeerError::new(
                 "unknown_operation",
@@ -385,6 +389,244 @@ impl PeerSession {
         Ok(json!({ "stores": stores.len() }))
     }
 
+    fn peek_lines<W: Write>(
+        &self,
+        stores: &[String],
+        args: &serde_json::Map<String, Value>,
+        id: &Value,
+        output: &mut W,
+    ) -> Result<Value, PeerError> {
+        reject_unknown_keys(
+            args,
+            &[
+                "tape_id",
+                "start",
+                "lines",
+                "anchor_turn",
+                "before",
+                "after",
+                "grep_filter",
+                "grep_context",
+            ],
+        )?;
+        if stores.len() != 1 {
+            return Err(PeerError::new(
+                "invalid_request",
+                "peek_lines requires exactly one store",
+            ));
+        }
+        let tape_id = args
+            .get("tape_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| PeerError::new("invalid_request", "args.tape_id must be a string"))?;
+        validate_tape_id(tape_id)?;
+        let start = optional_usize(args.get("start"), "args.start")?;
+        let lines_count = optional_usize(args.get("lines"), "args.lines")?;
+        let anchor_turn = optional_i64(args.get("anchor_turn"), "args.anchor_turn")?;
+        let before = optional_usize(args.get("before"), "args.before")?.unwrap_or(30);
+        let after = optional_usize(args.get("after"), "args.after")?.unwrap_or(10);
+        let grep_filter = args
+            .get("grep_filter")
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                    PeerError::new("invalid_request", "args.grep_filter must be a string")
+                })
+            })
+            .transpose()?;
+        let grep_context = optional_usize(args.get("grep_context"), "args.grep_context")?
+            .unwrap_or(5)
+            .max(1);
+        let selected_modes = usize::from(start.is_some())
+            + usize::from(anchor_turn.is_some())
+            + usize::from(grep_filter.is_some());
+        if selected_modes > 1 {
+            return Err(PeerError::new(
+                "invalid_request",
+                "peek_lines accepts only one of start, anchor_turn, or grep_filter",
+            ));
+        }
+        if start == Some(0) {
+            return Err(PeerError::new(
+                "invalid_request",
+                "args.start is a 1-based line number",
+            ));
+        }
+
+        let export = self.require_open(&stores[0])?;
+        let Some((path, compressed_size)) = self.tape_path(&export.config, tape_id) else {
+            return Err(PeerError::new(
+                "tape_unavailable",
+                format!("tape `{tape_id}` is not present in this export"),
+            ));
+        };
+        let raw_text = read_tape_for_query(&path, compressed_size, &self.topology.limits)?;
+        let rows = parse_jsonl_rows(&raw_text)
+            .map_err(|error| PeerError::new("invalid_tape", error.message))?;
+        let total_lines = raw_text.lines().count();
+        let timestamp = extract_latest_timestamp_from_rows(&rows);
+        let response_limit = configured_limit(
+            &self.topology.limits,
+            "non_file_response_bytes",
+            MAX_NON_FILE_RESPONSE_BYTES as u64,
+        ) as usize;
+        let minimum_frame_bytes = 32usize;
+
+        let mut selected_ranges = Vec::<(usize, usize)>::new();
+        let (window_start, window_end, selected_count) = if let Some(pattern) = grep_filter {
+            let mut selected_count = 0usize;
+            for (index, line) in raw_text.lines().enumerate() {
+                if !line.contains(&pattern) {
+                    continue;
+                }
+                let range_start = index.saturating_sub(grep_context);
+                let range_end = usize::min(
+                    total_lines.saturating_sub(1),
+                    index.saturating_add(grep_context),
+                );
+                if let Some(last) = selected_ranges.last_mut()
+                    && range_start <= last.1.saturating_add(1)
+                {
+                    if range_end > last.1 {
+                        selected_count = selected_count.saturating_add(range_end - last.1);
+                        last.1 = range_end;
+                    }
+                } else {
+                    selected_count = selected_count
+                        .saturating_add(range_end.saturating_sub(range_start).saturating_add(1));
+                    selected_ranges.push((range_start, range_end));
+                }
+                if selected_count > response_limit / minimum_frame_bytes {
+                    return Err(PeerError::new(
+                        "budget_exceeded",
+                        "requested peek exceeds the response budget; narrow --lines, the before/after window, or grep context",
+                    ));
+                }
+            }
+            if selected_ranges.is_empty() {
+                return Err(PeerError::new("no_results", "grep filter matched no lines"));
+            }
+            let first = selected_ranges.first().expect("nonempty ranges").0;
+            let last = selected_ranges.last().expect("nonempty ranges").1;
+            (first + 1, last + 1, selected_count)
+        } else {
+            let anchor_line = if let Some(turn) = anchor_turn {
+                crate::dispatch::message_turn_to_event_offset(&rows, turn)
+                    .and_then(|offset| rows.iter().position(|row| row.offset == offset))
+                    .map(|position| position + 1)
+                    .unwrap_or(1)
+            } else {
+                1
+            };
+            if let Some(start) = start {
+                let line_count = lines_count.unwrap_or(30).max(1);
+                let end = usize::min(
+                    total_lines,
+                    start.saturating_add(line_count).saturating_sub(1),
+                );
+                let count = if total_lines == 0 || end == 0 || start > end {
+                    0
+                } else {
+                    selected_ranges.push((start - 1, end - 1));
+                    end - start + 1
+                };
+                (start, end, count)
+            } else {
+                let range_start = anchor_line.saturating_sub(before).max(1);
+                let range_end = usize::min(total_lines, anchor_line.saturating_add(after));
+                let count = if total_lines == 0 || range_end == 0 || range_start > range_end {
+                    0
+                } else {
+                    selected_ranges.push((range_start - 1, range_end - 1));
+                    range_end - range_start + 1
+                };
+                (range_start, range_end, count)
+            }
+        };
+
+        if selected_count == 0 {
+            return Err(PeerError::new(
+                "no_results",
+                format!("tape `{tape_id}` has no lines in the requested window"),
+            ));
+        }
+        if selected_count > response_limit / minimum_frame_bytes {
+            return Err(PeerError::new(
+                "budget_exceeded",
+                "requested peek exceeds the response budget; narrow --lines, the before/after window, or grep context",
+            ));
+        }
+        let stats = json!({
+            "tape_id": tape_id,
+            "total_lines": total_lines,
+            "timestamp": timestamp,
+            "window_start": window_start,
+            "window_end": window_end,
+            "returned": selected_count,
+        });
+        let mut response_bytes = 0usize;
+        let mut data = Vec::with_capacity(selected_count);
+        let mut range_index = 0usize;
+        for (line_index, text) in raw_text.lines().enumerate() {
+            while selected_ranges
+                .get(range_index)
+                .is_some_and(|(_, range_end)| line_index > *range_end)
+            {
+                range_index += 1;
+            }
+            if !selected_ranges
+                .get(range_index)
+                .is_some_and(|(range_start, range_end)| {
+                    line_index >= *range_start && line_index <= *range_end
+                })
+            {
+                continue;
+            }
+            let item = json!({
+                "tape_id": tape_id,
+                "line": line_index + 1,
+                "text": text,
+            });
+            let frame_size = serde_json::to_vec(&json!({"id": id, "data": item}))
+                .map_err(|error| PeerError::new("json_error", error.to_string()))?
+                .len()
+                .saturating_add(1);
+            if frame_size > MAX_FRAME_BYTES {
+                return Err(PeerError::new(
+                    "budget_exceeded",
+                    "a requested peek line exceeds the frame limit; narrow the line window or grep context",
+                ));
+            }
+            response_bytes = response_bytes.saturating_add(frame_size);
+            if response_bytes > response_limit {
+                return Err(PeerError::new(
+                    "budget_exceeded",
+                    "requested peek exceeds the response budget; narrow --lines, the before/after window, or grep context",
+                ));
+            }
+            data.push(item);
+        }
+        let terminal_size = serde_json::to_vec(&json!({
+            "id": id,
+            "end": true,
+            "ok": true,
+            "stats": stats,
+        }))
+        .map_err(|error| PeerError::new("json_error", error.to_string()))?
+        .len()
+        .saturating_add(1);
+        if response_bytes.saturating_add(terminal_size) > response_limit {
+            return Err(PeerError::new(
+                "budget_exceeded",
+                "requested peek exceeds the response budget; narrow --lines, the before/after window, or grep context",
+            ));
+        }
+        for item in data {
+            write_data(output, id, item)?;
+        }
+        Ok(stats)
+    }
+
     fn read_file<W: Write>(
         &self,
         stores: &[String],
@@ -547,6 +789,99 @@ impl PeerSession {
 
 fn configured_limit(limits: &BTreeMap<String, u64>, key: &str, default: u64) -> u64 {
     limits.get(key).copied().unwrap_or(default).min(default)
+}
+
+fn optional_usize(value: Option<&Value>, name: &str) -> Result<Option<usize>, PeerError> {
+    value
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|number| usize::try_from(number).ok())
+                .ok_or_else(|| PeerError::new("invalid_request", format!("{name} is invalid")))
+        })
+        .transpose()
+}
+
+fn optional_i64(value: Option<&Value>, name: &str) -> Result<Option<i64>, PeerError> {
+    value
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value.as_i64().ok_or_else(|| {
+                PeerError::new(
+                    "invalid_request",
+                    format!("{name} must be a signed integer"),
+                )
+            })
+        })
+        .transpose()
+}
+
+fn read_tape_for_query(
+    path: &Path,
+    expected_size: u64,
+    limits: &BTreeMap<String, u64>,
+) -> Result<String, PeerError> {
+    let compressed_limit =
+        configured_limit(limits, "read_file_compressed_bytes", MAX_READ_FILE_BYTES);
+    if expected_size > compressed_limit {
+        return Err(PeerError::new(
+            "budget_exceeded",
+            format!("compressed tape exceeds {compressed_limit} byte limit"),
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| PeerError::new("tape_unavailable", error.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| PeerError::new("tape_unavailable", error.to_string()))?;
+    if !metadata.file_type().is_file() {
+        return Err(PeerError::new(
+            "invalid_file",
+            "tape path is not a regular file",
+        ));
+    }
+    if metadata.len() != expected_size {
+        return Err(PeerError::new(
+            "tape_changed",
+            "tape size changed during the query",
+        ));
+    }
+    let capacity = usize::try_from(expected_size)
+        .map_err(|_| PeerError::new("budget_exceeded", "tape size exceeds address space"))?;
+    let mut compressed = Vec::with_capacity(capacity);
+    file.take(compressed_limit.saturating_add(1))
+        .read_to_end(&mut compressed)
+        .map_err(|error| PeerError::new("read_error", error.to_string()))?;
+    if compressed.len() as u64 > compressed_limit {
+        return Err(PeerError::new(
+            "budget_exceeded",
+            format!("compressed tape exceeds {compressed_limit} byte limit"),
+        ));
+    }
+    if compressed.len() as u64 != expected_size {
+        return Err(PeerError::new(
+            "tape_changed",
+            "tape size changed while it was read",
+        ));
+    }
+    let decompressed_limit =
+        configured_limit(limits, "decompressed_bytes_per_tape", 512 * 1024 * 1024);
+    decompress_jsonl_with_limit(&compressed, decompressed_limit).map_err(|error| {
+        if error.to_string().starts_with("decompressed tape exceeds ") {
+            PeerError::new("budget_exceeded", error.to_string())
+        } else {
+            PeerError::new("invalid_tape", error.to_string())
+        }
+    })
 }
 
 fn write_open_failure<W: Write>(

@@ -11,6 +11,8 @@ pub mod client;
 pub mod peer;
 pub mod transport;
 
+pub const MAX_NON_FILE_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MachineRef(pub String);
 
