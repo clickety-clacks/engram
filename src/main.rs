@@ -30,7 +30,7 @@ use engram::query::explain::ExplainTraversal;
 #[cfg(test)]
 use engram::query::format::MAX_QUERY_WINDOW_ANCHORS;
 use engram::query::format::{
-    DateFilter, ExplainTarget, annotate_chain_fields, apply_session_truncation,
+    DateFilter, ExplainTarget, GrepRank, annotate_chain_fields, apply_session_truncation,
     build_chain_metadata, build_session_windows, classify_explain_target, collect_anchor_scores,
     collect_grep_matches, collect_touch_evidence, compact_event, compare_explain_sessions,
     compare_grep_sessions, default_peek_anchor_line, derive_anchor_candidates, edge_to_json,
@@ -159,6 +159,10 @@ struct GrepArgs {
     until: Option<String>,
     #[arg(long)]
     count: bool,
+    #[arg(long, value_name = "PEER")]
+    peers: Option<String>,
+    #[arg(long)]
+    require_complete: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1593,7 +1597,17 @@ fn cmd_explain(
 fn cmd_grep(_paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Result<(), CliError> {
     print_context_conspicuity(context);
 
-    let indexes = open_query_indexes(context)?;
+    let indexes = if args.peers.is_some()
+        && !context.db_path.exists()
+        && context
+            .additional_stores
+            .iter()
+            .all(|store| !store.exists())
+    {
+        Vec::new()
+    } else {
+        open_query_indexes(context)?
+    };
     let (raw_sessions, grep_rank_by_session) =
         collect_grep_matches(context, &indexes, &args.pattern)?;
     let score_by_session = grep_rank_by_session
@@ -1605,6 +1619,10 @@ fn cmd_grep(_paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Res
         format_sessions_for_agent(context, &indexes, raw_sessions, &score_by_session, None)?;
     sessions.retain(|session| session_matches_date_filter(session, &date_filter));
     sessions.sort_by(|a, b| compare_grep_sessions(a, b, &grep_rank_by_session));
+
+    if args.peers.is_some() {
+        return cmd_grep_with_peer(context, indexes, sessions, grep_rank_by_session, args);
+    }
     if sessions.is_empty() {
         return Err(CliError::new("no_results", args.pattern));
     }
@@ -1643,6 +1661,805 @@ fn cmd_grep(_paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Res
         "truncated": truncated,
         }),
     )
+}
+
+fn cmd_grep_with_peer(
+    context: &RuntimeContext,
+    indexes: Vec<SqliteIndex>,
+    mut sessions: Vec<Value>,
+    mut ranks: HashMap<String, GrepRank>,
+    args: GrepArgs,
+) -> Result<(), CliError> {
+    let home = home_dir()?;
+    let topology = load_topology(&home)
+        .map_err(|error| CliError::new("config_error", error.to_string()))?
+        .ok_or_else(|| {
+            CliError::new(
+                "topology_missing",
+                "grep --peers requires ~/.engram/topology.yml",
+            )
+        })?;
+    let selection = args.peers.as_deref().unwrap_or_default();
+    let machine = select_single_peer(selection, &topology.peers)?;
+    eprintln!("topology: ~/.engram/topology.yml peers={machine}");
+    let peer = topology.peers.get(&machine).cloned().ok_or_else(|| {
+        CliError::new(
+            "peer_not_configured",
+            format!("peer `{machine}` is not configured in ~/.engram/topology.yml"),
+        )
+    })?;
+    if peer.exports.is_empty() {
+        return Err(CliError::new(
+            "peer_exports_missing",
+            format!("peer `{machine}` declares no queryable exports"),
+        ));
+    }
+
+    for session in &mut sessions {
+        let session_id = session
+            .get("session_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        session["tape_id"] = json!(session_id);
+        session["location"] = local_grep_location(context, &topology.self_label, &session_id);
+        session["locations"] = json!([session["location"].clone()]);
+    }
+
+    let page_limit = args.limit.unwrap_or(context.explain_default_limit).min(25);
+    let k = args.offset.saturating_add(page_limit);
+    let mut source_rows = local_grep_source_rows(context, &topology.self_label);
+    let fallback_store = format!("{}/local-files", topology.self_label);
+    if sessions
+        .iter()
+        .any(|session| session["location"]["store"].as_str() == Some(fallback_store.as_str()))
+    {
+        source_rows.push(json!({
+            "store": fallback_store,
+            "kind": "local_tapes",
+            "status": "ok",
+        }));
+    }
+    for (unselected, config) in &topology.peers {
+        if unselected == &machine {
+            continue;
+        }
+        if config.exports.is_empty() {
+            source_rows.push(json!({
+                "store": format!("{unselected}/*"),
+                "status": "not_selected",
+            }));
+        } else {
+            for export in &config.exports {
+                source_rows.push(json!({
+                    "store": format!("{unselected}/{export}"),
+                    "status": "not_selected",
+                }));
+            }
+        }
+    }
+
+    let mut identity_conflicts = Vec::new();
+    let mut source_totals = vec![sessions.len()];
+    let mut source_count_known = true;
+    let mut source_time_ranges = vec![
+        sessions
+            .iter()
+            .filter_map(|session| session.get("timestamp").and_then(Value::as_str))
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>(),
+    ];
+    let mut any_source_failure = false;
+    let mut any_store_truncated = false;
+    let mut peer_owner = None;
+    let mut grep_ok_exports = Vec::new();
+
+    match RemoteOwner::connect(
+        &machine,
+        &topology.self_label,
+        &peer,
+        Duration::from_millis(5_000),
+    ) {
+        Err(failure) => {
+            any_source_failure = true;
+            for export in &peer.exports {
+                source_rows.push(json!({
+                    "store": format!("{machine}/{export}"),
+                    "kind": "peer",
+                    "status": peer_failure_status(&failure.code),
+                    "phase": "open",
+                    "error": {"code": failure.code, "message": failure.message},
+                }));
+            }
+        }
+        Ok(mut owner) => {
+            let mut active_exports = Vec::new();
+            for export in &peer.exports {
+                match owner.exports.get(export) {
+                    Some(Ok(opened)) => {
+                        source_rows.push(json!({
+                            "store": format!("{machine}/{export}"),
+                            "db": opened.db,
+                            "kind": "peer",
+                            "status": "ok",
+                            "snapshot_at": opened.snapshot_at,
+                            "build": owner.build,
+                            "semantics": owner.query_semantics,
+                        }));
+                        active_exports.push(export.clone());
+                    }
+                    Some(Err(failure)) => {
+                        any_source_failure = true;
+                        source_rows.push(json!({
+                            "store": format!("{machine}/{export}"),
+                            "kind": "peer",
+                            "status": peer_failure_status(&failure.code),
+                            "phase": "open",
+                            "error": {"code": failure.code, "message": failure.message},
+                        }));
+                    }
+                    None => {
+                        any_source_failure = true;
+                        source_rows.push(json!({
+                            "store": format!("{machine}/{export}"),
+                            "kind": "peer",
+                            "status": "failed",
+                            "phase": "open",
+                            "error": {"code": "protocol_error", "message": "peer omitted configured export"},
+                        }));
+                    }
+                }
+            }
+
+            let grep_limit = owner.limits.get("grep_k").copied().unwrap_or(10_000);
+            if k as u64 > grep_limit {
+                return Err(CliError::new(
+                    "budget_exceeded",
+                    format!("grep page requires k={k}; peer limit is {grep_limit}"),
+                ));
+            }
+            let requests = active_exports
+                .iter()
+                .map(|export| {
+                    PeerRequest::new(
+                        "grep_scan",
+                        vec![export.clone()],
+                        json!({
+                            "pattern": args.pattern,
+                            "since": args.since,
+                            "until": args.until,
+                            "k": k,
+                        }),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let outcomes = owner.round(&requests, Duration::from_secs(30));
+            let mut grep_succeeded = Vec::new();
+            for (index, export) in active_exports.iter().enumerate() {
+                let Some(outcome) = outcomes.get(index) else {
+                    any_source_failure = true;
+                    mark_source_phase(
+                        &mut source_rows,
+                        &format!("{machine}/{export}"),
+                        "grep_scan",
+                        "protocol_error",
+                        "peer returned no grep_scan outcome",
+                    );
+                    continue;
+                };
+                let response = match outcome {
+                    Ok(response) => response,
+                    Err(failure) => {
+                        any_source_failure = true;
+                        mark_source_phase(
+                            &mut source_rows,
+                            &format!("{machine}/{export}"),
+                            "grep_scan",
+                            &failure.code,
+                            &failure.message,
+                        );
+                        continue;
+                    }
+                };
+                let total = match response.stats.get("total").and_then(Value::as_u64) {
+                    Some(value) => value as usize,
+                    None => {
+                        any_source_failure = true;
+                        mark_source_phase(
+                            &mut source_rows,
+                            &format!("{machine}/{export}"),
+                            "grep_scan",
+                            "protocol_error",
+                            "grep_scan response has no total count",
+                        );
+                        continue;
+                    }
+                };
+                let store_name = format!("{machine}/{export}");
+                let mut store_failures = Vec::new();
+                let mut valid_response = true;
+                let mut store_records = Vec::<(Value, GrepRank)>::new();
+                for record in &response.data {
+                    match record.get("type").and_then(Value::as_str) {
+                        Some("failure") => {
+                            any_source_failure = true;
+                            store_failures.push(record.clone());
+                        }
+                        Some("match") => {
+                            match format_peer_grep_session(record, &machine, export, context) {
+                                Ok((session, rank)) => {
+                                    store_records.push((session, rank));
+                                }
+                                Err(error) => {
+                                    any_source_failure = true;
+                                    valid_response = false;
+                                    store_failures.push(json!({
+                                        "error": {"code": error.code, "message": error.message},
+                                    }));
+                                }
+                            }
+                        }
+                        _ => {
+                            any_source_failure = true;
+                            valid_response = false;
+                            store_failures.push(json!({
+                                "error": {"code": "protocol_error", "message": "unknown grep_scan data record"},
+                            }));
+                        }
+                    }
+                }
+                source_totals.push(total);
+                if !store_failures.is_empty() {
+                    mark_source_failures(
+                        &mut source_rows,
+                        &store_name,
+                        "grep_scan",
+                        &store_failures,
+                    );
+                    source_count_known = false;
+                }
+                source_time_ranges.push(peer_time_range(&response.stats));
+                any_store_truncated |= response
+                    .stats
+                    .get("truncated")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(total > k);
+                if !valid_response {
+                    continue;
+                }
+                for (mut session, rank) in store_records {
+                    let tape_id = session["tape_id"].as_str().unwrap_or_default().to_string();
+                    session["locations"] = json!([session["location"].clone()]);
+                    merge_peer_grep_session(
+                        &mut sessions,
+                        &mut ranks,
+                        &mut identity_conflicts,
+                        session,
+                        rank,
+                        &tape_id,
+                    );
+                }
+                grep_succeeded.push(export.clone());
+            }
+            grep_ok_exports = grep_succeeded;
+            peer_owner = Some(owner);
+        }
+    }
+
+    let mut page_ranked = sessions;
+    page_ranked.sort_by(|a, b| compare_grep_sessions(a, b, &ranks));
+    let start = args.offset.min(page_ranked.len());
+    let page_len = page_limit.min(page_ranked.len().saturating_sub(start));
+    if !args.count && page_len > 0 {
+        let page_ids = page_ranked
+            .iter()
+            .skip(start)
+            .take(page_len)
+            .filter_map(|session| session.get("tape_id").and_then(Value::as_str))
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let mut refs_by_tape =
+            HashMap::<String, std::collections::HashSet<(String, String)>>::new();
+        for session in page_ranked.iter().skip(start).take(page_len) {
+            let Some(tape_id) = session.get("tape_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let refs = refs_by_tape.entry(tape_id.to_string()).or_default();
+            for index in &indexes {
+                for link in index.dispatch_links_for_tape(tape_id)? {
+                    let direction =
+                        if matches!(link.direction, engram::index::DispatchDirection::Received) {
+                            "received"
+                        } else {
+                            "sent"
+                        };
+                    refs.insert((link.uuid, direction.to_string()));
+                }
+            }
+        }
+        if let Some(owner) = peer_owner.as_mut() {
+            let requests = grep_ok_exports
+                .iter()
+                .map(|export| {
+                    PeerRequest::new(
+                        "dispatch_rows",
+                        vec![export.clone()],
+                        json!({"by_tape": page_ids.clone()}),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let outcomes = owner.round(&requests, Duration::from_secs(30));
+            for (index, export) in grep_ok_exports.iter().enumerate() {
+                let store_name = format!("{machine}/{export}");
+                match outcomes.get(index) {
+                    Some(Ok(response)) => {
+                        for row in &response.data {
+                            let Some(tape_id) = row.get("tape_id").and_then(Value::as_str) else {
+                                any_source_failure = true;
+                                mark_source_phase(
+                                    &mut source_rows,
+                                    &store_name,
+                                    "dispatch_rows",
+                                    "protocol_error",
+                                    "dispatch row has no tape_id",
+                                );
+                                break;
+                            };
+                            let Some(uuid) = row.get("uuid").and_then(Value::as_str) else {
+                                any_source_failure = true;
+                                mark_source_phase(
+                                    &mut source_rows,
+                                    &store_name,
+                                    "dispatch_rows",
+                                    "protocol_error",
+                                    "dispatch row has no uuid",
+                                );
+                                break;
+                            };
+                            let Some(direction) = row.get("direction").and_then(Value::as_str)
+                            else {
+                                any_source_failure = true;
+                                mark_source_phase(
+                                    &mut source_rows,
+                                    &store_name,
+                                    "dispatch_rows",
+                                    "protocol_error",
+                                    "dispatch row has no direction",
+                                );
+                                break;
+                            };
+                            if !matches!(direction, "received" | "sent") {
+                                any_source_failure = true;
+                                mark_source_phase(
+                                    &mut source_rows,
+                                    &store_name,
+                                    "dispatch_rows",
+                                    "protocol_error",
+                                    "dispatch row has an unknown direction",
+                                );
+                                break;
+                            }
+                            refs_by_tape
+                                .entry(tape_id.to_string())
+                                .or_default()
+                                .insert((uuid.to_string(), direction.to_string()));
+                        }
+                    }
+                    Some(Err(failure)) => {
+                        any_source_failure = true;
+                        mark_source_phase(
+                            &mut source_rows,
+                            &store_name,
+                            "dispatch_rows",
+                            &failure.code,
+                            &failure.message,
+                        );
+                    }
+                    None => {
+                        any_source_failure = true;
+                        mark_source_phase(
+                            &mut source_rows,
+                            &store_name,
+                            "dispatch_rows",
+                            "protocol_error",
+                            "peer returned no dispatch_rows outcome",
+                        );
+                    }
+                }
+            }
+        }
+        for session in &mut page_ranked[start..start + page_len] {
+            let tape_id = session["tape_id"].as_str().unwrap_or_default();
+            if any_source_failure {
+                session["refs_up"] = Value::Null;
+                session["refs_down"] = Value::Null;
+            } else if let Some(refs) = refs_by_tape.get(tape_id) {
+                session["refs_up"] = json!(
+                    refs.iter()
+                        .filter(|(_, direction)| direction == "received")
+                        .count()
+                );
+                session["refs_down"] = json!(
+                    refs.iter()
+                        .filter(|(_, direction)| direction == "sent")
+                        .count()
+                );
+            }
+        }
+    }
+
+    let any_selected_failure = any_source_failure
+        || source_rows.iter().any(|source| {
+            source
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| {
+                    status == "unavailable"
+                        || status == "incompatible"
+                        || status == "label_mismatch"
+                        || status == "failed"
+                        || status == "partial"
+                })
+        });
+    let coverage = if any_selected_failure {
+        "partial"
+    } else {
+        "complete"
+    };
+    if args.require_complete && any_selected_failure {
+        return Err(CliError::new(
+            "incomplete_coverage",
+            "grep --require-complete rejected one or more failed peer sources",
+        ));
+    }
+
+    let total_exact = source_count_known
+        && !any_selected_failure
+        && source_totals.iter().skip(1).all(|total| *total <= k);
+    let exact_total = if total_exact {
+        Some(page_ranked.len())
+    } else {
+        None
+    };
+    let min_total = source_totals
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(page_ranked.len());
+    let max_total = if source_count_known && !any_selected_failure {
+        Some(
+            source_totals
+                .iter()
+                .fold(0usize, |sum, value| sum.saturating_add(*value)),
+        )
+    } else {
+        None
+    };
+    let total_bounds = if exact_total.is_none() {
+        Some(json!({"min": min_total, "max": max_total}))
+    } else {
+        None
+    };
+    let time_range = if any_selected_failure {
+        Value::Null
+    } else {
+        merge_grep_time_ranges(&source_time_ranges)
+    };
+    let page = page_ranked
+        .iter()
+        .skip(start)
+        .take(page_limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    let returned = page.len();
+    let truncated = if any_selected_failure {
+        Value::Null
+    } else if let Some(total) = exact_total {
+        json!(args.offset.saturating_add(returned) < total)
+    } else {
+        json!(any_store_truncated || args.offset.saturating_add(returned) < page_ranked.len())
+    };
+    let output_sessions = if args.count { Vec::new() } else { page };
+    let mut payload = json!({
+        "query": {
+            "command": "grep",
+            "pattern": args.pattern,
+            "limit": args.limit,
+            "offset": args.offset,
+            "since": args.since,
+            "until": args.until,
+            "count": args.count,
+            "peers": selection,
+            "require_complete": args.require_complete,
+        },
+        "sessions": output_sessions,
+        "lineage": [],
+        "dispatch_lineage": [],
+        "tombstones": [],
+        "stores_queried": indexes.len() + grep_ok_exports.len(),
+        "returned": returned,
+        "total": exact_total,
+        "time_range": time_range,
+        "truncated": truncated,
+        "federation": {
+            "self": topology.self_label,
+            "coverage": coverage,
+            "sources": source_rows,
+            "identity_conflicts": identity_conflicts,
+        },
+    });
+    if let Some(bounds) = total_bounds {
+        payload["total_bounds"] = bounds;
+    }
+    if returned == 0 {
+        if any_selected_failure {
+            emit_query_result("grep", payload)?;
+        }
+        return Err(CliError::new("no_results", args.pattern));
+    }
+    emit_query_result("grep", payload)
+}
+
+fn select_single_peer(
+    selection: &str,
+    peers: &std::collections::BTreeMap<String, TopologyPeer>,
+) -> Result<String, CliError> {
+    if selection == "all" {
+        if peers.len() != 1 {
+            return Err(CliError::new(
+                "unsupported_scope",
+                "this grep federation slice supports `--peers` with one configured peer",
+            ));
+        }
+        return peers.keys().next().cloned().ok_or_else(|| {
+            CliError::new("peer_not_configured", "topology has no configured peers")
+        });
+    }
+    let selected = selection.split(',').map(str::trim).collect::<Vec<_>>();
+    if selected.len() != 1 || selected[0].is_empty() {
+        return Err(CliError::new(
+            "unsupported_scope",
+            "this grep federation slice supports exactly one selected peer",
+        ));
+    }
+    Ok(selected[0].to_string())
+}
+
+fn local_grep_source_rows(context: &RuntimeContext, machine: &str) -> Vec<Value> {
+    let mut sources = Vec::new();
+    if context.db_path.exists() {
+        sources.push(json!({
+            "store": format!("{machine}/local:0"),
+            "db": context.db_path,
+            "kind": "primary",
+            "status": "ok",
+        }));
+    }
+    for (index, db) in context.additional_stores.iter().enumerate() {
+        if !db.exists() {
+            continue;
+        }
+        sources.push(json!({
+            "store": format!("{machine}/local:{}", index + 1),
+            "db": db,
+            "kind": if context.frozen_stores.contains(db) { "frozen" } else { "local" },
+            "status": "ok",
+        }));
+    }
+    sources
+}
+
+fn local_grep_location(context: &RuntimeContext, machine: &str, tape_id: &str) -> Value {
+    let Some(path) = resolve_tape_path(context, tape_id) else {
+        return json!({"machine": machine, "store": format!("{machine}/local-files")});
+    };
+    if path.parent() == Some(context.tapes_dir.as_path()) {
+        return json!({"machine": machine, "store": format!("{machine}/local:0")});
+    }
+    for (index, db) in context.additional_stores.iter().enumerate() {
+        let Some(parent) = db.parent() else {
+            continue;
+        };
+        let tapes_dir = parent.join("tapes");
+        if path.parent() == Some(tapes_dir.as_path()) {
+            return json!({
+                "machine": machine,
+                "store": format!("{machine}/local:{}", index + 1),
+            });
+        }
+    }
+    json!({"machine": machine, "store": format!("{machine}/local-files")})
+}
+
+fn peer_failure_status(code: &str) -> &'static str {
+    match code {
+        "incompatible" | "incompatible_semantics" => "incompatible",
+        "label_mismatch" => "label_mismatch",
+        _ => "unavailable",
+    }
+}
+
+fn mark_source_phase(sources: &mut [Value], store: &str, phase: &str, code: &str, message: &str) {
+    if let Some(source) = sources
+        .iter_mut()
+        .find(|source| source.get("store").and_then(Value::as_str) == Some(store))
+    {
+        source["status"] = json!(if phase == "open" {
+            peer_failure_status(code)
+        } else {
+            "failed"
+        });
+        source["phase"] = json!(phase);
+        source["error"] = json!({"code": code, "message": message});
+    }
+}
+
+fn mark_source_failures(sources: &mut [Value], store: &str, phase: &str, failures: &[Value]) {
+    if let Some(source) = sources
+        .iter_mut()
+        .find(|source| source.get("store").and_then(Value::as_str) == Some(store))
+    {
+        source["status"] = json!("partial");
+        source["phase"] = json!(phase);
+        source["failures"] = json!(failures);
+    }
+}
+
+fn format_peer_grep_session(
+    record: &Value,
+    machine: &str,
+    export: &str,
+    context: &RuntimeContext,
+) -> Result<(Value, GrepRank), CliError> {
+    let required_usize = |key: &str| -> Result<usize, CliError> {
+        record
+            .get(key)
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| {
+                CliError::new(
+                    "protocol_error",
+                    format!("grep_scan match has no valid {key}"),
+                )
+            })
+    };
+    let tape_id = record
+        .get("tape_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::new("protocol_error", "grep_scan match has no tape_id"))?;
+    let timestamp = record
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::new("protocol_error", "grep_scan match has no timestamp"))?;
+    let total_lines = required_usize("total_lines")?;
+    let anchor_line = required_usize("anchor_line")?;
+    let match_count = required_usize("match_count")?;
+    let provenance_match_count = required_usize("provenance_match_count")?;
+    let provenance_event_count = required_usize("provenance_event_count")?;
+    let refs_up = required_usize("refs_up")?;
+    let refs_down = required_usize("refs_down")?;
+    let files_touched = record
+        .get("files_touched")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| {
+            CliError::new(
+                "protocol_error",
+                "grep_scan match has no files_touched array",
+            )
+        })?;
+    let line_count = context.peek_default_lines.max(1);
+    let default_before = line_count * 3 / 4;
+    let window_start = anchor_line.saturating_sub(default_before).max(1);
+    let window_end = if total_lines == 0 {
+        0
+    } else {
+        usize::min(
+            total_lines,
+            window_start.saturating_add(line_count).saturating_sub(1),
+        )
+    };
+    let store = format!("{machine}/{export}");
+    Ok((
+        json!({
+            "session_id": tape_id,
+            "tape_id": tape_id,
+            "timestamp": timestamp,
+            "window_start": window_start,
+            "window_end": window_end,
+            "total_lines": total_lines,
+            "confidence": match_count as f32,
+            "refs_up": refs_up,
+            "refs_down": refs_down,
+            "files_touched": files_touched,
+            "touches": [],
+            "location": {"machine": machine, "store": store},
+        }),
+        GrepRank {
+            provenance_match_count,
+            match_count,
+            provenance_event_count,
+        },
+    ))
+}
+
+fn merge_peer_grep_session(
+    sessions: &mut Vec<Value>,
+    ranks: &mut HashMap<String, GrepRank>,
+    conflicts: &mut Vec<Value>,
+    mut incoming: Value,
+    rank: GrepRank,
+    tape_id: &str,
+) {
+    let location = incoming["location"].clone();
+    let store = location["store"].as_str().unwrap_or("peer").to_string();
+    if let Some(existing_index) = sessions
+        .iter()
+        .position(|session| session.get("tape_id").and_then(Value::as_str) == Some(tape_id))
+    {
+        let existing_id = sessions[existing_index]["session_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let existing_rank = ranks.get(&existing_id).copied().unwrap_or_default();
+        let same_timestamp = sessions[existing_index].get("timestamp") == incoming.get("timestamp");
+        if existing_rank == rank && same_timestamp {
+            let locations = sessions[existing_index]
+                .get_mut("locations")
+                .and_then(Value::as_array_mut)
+                .expect("federated session locations initialized");
+            locations.push(location);
+            return;
+        }
+        let existing_location = sessions[existing_index]
+            .get("location")
+            .cloned()
+            .unwrap_or_else(|| json!({"store":"local"}));
+        let existing_store = existing_location["store"].as_str().unwrap_or("local");
+        let qualified_existing = format!("{tape_id}@{existing_store}");
+        if existing_id == tape_id {
+            sessions[existing_index]["session_id"] = json!(qualified_existing);
+            ranks.remove(&existing_id);
+            ranks.insert(qualified_existing.clone(), existing_rank);
+        }
+        incoming["session_id"] = json!(format!("{tape_id}@{store}"));
+        conflicts.push(json!({
+            "tape_id": tape_id,
+            "stores": [existing_store, store],
+            "rank_keys": [
+                {"provenance_match_count": existing_rank.provenance_match_count, "match_count": existing_rank.match_count, "provenance_event_count": existing_rank.provenance_event_count, "timestamp": sessions[existing_index]["timestamp"]},
+                {"provenance_match_count": rank.provenance_match_count, "match_count": rank.match_count, "provenance_event_count": rank.provenance_event_count, "timestamp": incoming["timestamp"]},
+            ],
+        }));
+    }
+    let session_id = incoming["session_id"]
+        .as_str()
+        .unwrap_or(tape_id)
+        .to_string();
+    ranks.insert(session_id, rank);
+    sessions.push(incoming);
+}
+
+fn peer_time_range(stats: &Value) -> Vec<String> {
+    ["start", "end"]
+        .iter()
+        .filter_map(|key| stats.get("time_range")?.get(*key)?.as_str())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn merge_grep_time_ranges(ranges: &[Vec<String>]) -> Value {
+    let mut timestamps = ranges.iter().flatten().cloned().collect::<Vec<_>>();
+    timestamps.sort();
+    timestamps.dedup();
+    if timestamps.is_empty() {
+        json!({"start": Value::Null, "end": Value::Null})
+    } else {
+        json!({"start": timestamps.first(), "end": timestamps.last()})
+    }
 }
 
 fn cmd_peek(_paths: &RepoPaths, context: &RuntimeContext, args: PeekArgs) -> Result<(), CliError> {

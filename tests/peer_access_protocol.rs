@@ -500,6 +500,295 @@ fn remote_show_rejects_a_corrupted_content_addressed_tape() {
 }
 
 #[test]
+fn grep_with_one_selected_peer_merges_local_and_remote_results() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let owner_home = temp.path().join("owner-home");
+    let owner_engram = owner_home.join(".engram");
+    let owner_tapes = owner_engram.join("tapes");
+    std::fs::create_dir_all(&owner_tapes).expect("owner tape directory");
+    let owner_db = owner_engram.join("index.sqlite");
+    drop(SqliteIndex::open_writer(owner_db.to_str().expect("owner DB path")).expect("owner DB"));
+    let remote_id = "remote-grep-session";
+    let remote_content = "{\"t\":\"2026-09-24T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-federated remote\"}\n";
+    let compressed =
+        zstd::stream::encode_all(remote_content.as_bytes(), 0).expect("compress remote tape");
+    std::fs::write(
+        owner_tapes.join(format!("{remote_id}.jsonl.zst")),
+        compressed,
+    )
+    .expect("write remote tape");
+    let shared_content = "{\"t\":\"2026-09-24T11:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-federated shared\"}\n";
+    let compressed =
+        zstd::stream::encode_all(shared_content.as_bytes(), 0).expect("compress shared tape");
+    std::fs::write(owner_tapes.join("local-grep-session.jsonl.zst"), compressed)
+        .expect("write duplicate remote tape");
+    let conflicting_content = concat!(
+        "{\"t\":\"2026-09-24T10:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-federated conflict\"}\n",
+        "{\"t\":\"2026-09-24T10:01:00Z\",\"k\":\"msg.in\",\"content\":\"needle-federated conflict again\"}\n",
+    );
+    let compressed = zstd::stream::encode_all(conflicting_content.as_bytes(), 0)
+        .expect("compress conflicting tape");
+    std::fs::write(owner_tapes.join("collision-session.jsonl.zst"), compressed)
+        .expect("write conflicting remote tape");
+    std::fs::write(
+        owner_engram.join("topology.yml"),
+        format!(
+            "version: 1\nself: emulated-owner\nexports:\n  default:\n    db: {}\n    tape_dirs:\n      - {}\n",
+            owner_db.display(),
+            owner_tapes.display()
+        ),
+    )
+    .expect("owner topology");
+
+    let caller_home = temp.path().join("caller-home");
+    let caller_engram = caller_home.join(".engram");
+    std::fs::create_dir_all(&caller_engram).expect("caller home");
+    let repo = temp.path().join("repo");
+    let local_engram = repo.join(".engram");
+    let local_tapes = local_engram.join("tapes");
+    std::fs::create_dir_all(&local_tapes).expect("local tapes");
+    let local_db = local_engram.join("index.sqlite");
+    drop(SqliteIndex::open_writer(local_db.to_str().expect("local DB path")).expect("local DB"));
+    std::fs::write(
+        caller_engram.join("config.yml"),
+        format!(
+            "db: {}\ntapes_dir: {}\n",
+            local_db.display(),
+            local_tapes.display()
+        ),
+    )
+    .expect("local config");
+    let local_id = "local-grep-session";
+    let compressed =
+        zstd::stream::encode_all(shared_content.as_bytes(), 0).expect("compress local tape");
+    std::fs::write(
+        local_tapes.join(format!("{local_id}.jsonl.zst")),
+        compressed,
+    )
+    .expect("write local tape");
+    let local_conflict = "{\"t\":\"2026-09-24T10:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-federated conflict\"}\n";
+    let compressed = zstd::stream::encode_all(local_conflict.as_bytes(), 0)
+        .expect("compress local conflicting tape");
+    std::fs::write(local_tapes.join("collision-session.jsonl.zst"), compressed)
+        .expect("write local conflicting tape");
+
+    let unselected_marker = temp.path().join("unselected-peer-was-started");
+    std::fs::write(
+        caller_engram.join("topology.yml"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "self": "caller",
+            "peers": {
+                "emulated-owner": {
+                    "command": ["/usr/bin/env", format!("HOME={}", owner_home.display()), binary, "peer-serve", "--stdio"],
+                    "engram": binary,
+                    "exports": ["default"],
+                },
+                "not-selected": {
+                    "command": ["/usr/bin/touch", unselected_marker],
+                    "engram": "/unused/engram",
+                    "exports": ["default"],
+                }
+            }
+        }))
+        .expect("serialize caller topology"),
+    )
+    .expect("caller topology");
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["grep", "needle-federated", "--peers", "emulated-owner"])
+        .output()
+        .expect("run federated grep");
+    assert!(
+        output.status.success(),
+        "federated grep failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("grep JSON");
+    let sessions = result["sessions"].as_array().expect("sessions");
+    assert_eq!(sessions.len(), 4);
+    let local = sessions
+        .iter()
+        .find(|session| session["tape_id"] == local_id)
+        .expect("local result");
+    assert_eq!(local["location"]["machine"], "caller");
+    assert_eq!(local["locations"].as_array().unwrap().len(), 2);
+    let remote = sessions
+        .iter()
+        .find(|session| session["tape_id"] == remote_id)
+        .expect("remote result");
+    assert_eq!(remote["location"]["machine"], "emulated-owner");
+    assert_eq!(remote["location"]["store"], "emulated-owner/default");
+    assert_eq!(
+        result["federation"]["identity_conflicts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        sessions
+            .iter()
+            .any(|session| { session["session_id"] == "collision-session@caller/local:0" })
+    );
+    assert!(
+        sessions
+            .iter()
+            .any(|session| { session["session_id"] == "collision-session@emulated-owner/default" })
+    );
+    assert_eq!(result["federation"]["coverage"], "complete");
+    assert_eq!(result["total"], 4);
+    assert!(
+        result["federation"]["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|source| source["store"] == "not-selected/default"
+                && source["status"] == "not_selected")
+    );
+    assert!(!unselected_marker.exists(), "unselected peer was launched");
+}
+
+#[test]
+fn grep_without_peer_selection_does_not_start_configured_peers() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let caller_home = temp.path().join("caller-home");
+    let caller_engram = caller_home.join(".engram");
+    std::fs::create_dir_all(&caller_engram).expect("caller home");
+    let marker = temp.path().join("peer-was-started");
+    std::fs::write(
+        caller_engram.join("topology.yml"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "self": "caller",
+            "peers": {
+                "sentinel": {
+                    "command": ["/usr/bin/touch", marker],
+                    "engram": "/unused/engram",
+                    "exports": ["default"],
+                }
+            }
+        }))
+        .expect("serialize topology"),
+    )
+    .expect("topology");
+    let repo = temp.path().join("repo");
+    let local_engram = repo.join(".engram");
+    let tapes = local_engram.join("tapes");
+    std::fs::create_dir_all(&tapes).expect("local tapes");
+    let db = local_engram.join("index.sqlite");
+    drop(SqliteIndex::open_writer(db.to_str().expect("DB path")).expect("local DB"));
+    std::fs::write(
+        caller_engram.join("config.yml"),
+        format!("db: {}\ntapes_dir: {}\n", db.display(), tapes.display()),
+    )
+    .expect("local config");
+    let content =
+        "{\"t\":\"2026-09-24T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-local\"}\n";
+    let compressed = zstd::stream::encode_all(content.as_bytes(), 0).expect("compress tape");
+    std::fs::write(tapes.join("local-only.jsonl.zst"), compressed).expect("write local tape");
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["grep", "needle-local"])
+        .output()
+        .expect("run local grep");
+    assert!(
+        output.status.success(),
+        "local grep failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("grep JSON");
+    assert!(result.get("federation").is_none());
+    assert!(!marker.exists(), "local grep started a configured peer");
+}
+
+#[test]
+fn grep_unavailable_peer_is_partial_and_require_complete_fails() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let caller_home = temp.path().join("caller-home");
+    let caller_engram = caller_home.join(".engram");
+    std::fs::create_dir_all(&caller_engram).expect("caller home");
+    let repo = temp.path().join("repo");
+    let local_engram = repo.join(".engram");
+    let tapes = local_engram.join("tapes");
+    std::fs::create_dir_all(&tapes).expect("local tapes");
+    let db = local_engram.join("index.sqlite");
+    drop(SqliteIndex::open_writer(db.to_str().expect("DB path")).expect("local DB"));
+    std::fs::write(
+        caller_engram.join("config.yml"),
+        format!("db: {}\ntapes_dir: {}\n", db.display(), tapes.display()),
+    )
+    .expect("local config");
+    let content =
+        "{\"t\":\"2026-09-24T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-partial\"}\n";
+    let compressed = zstd::stream::encode_all(content.as_bytes(), 0).expect("compress tape");
+    std::fs::write(tapes.join("local-partial.jsonl.zst"), compressed).expect("write local tape");
+    std::fs::write(
+        caller_engram.join("topology.yml"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "self": "caller",
+            "peers": {
+                "offline": {
+                    "command": ["/usr/bin/false"],
+                    "engram": binary,
+                    "exports": ["default"],
+                }
+            }
+        }))
+        .expect("serialize topology"),
+    )
+    .expect("topology");
+
+    let partial = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["grep", "needle-partial", "--peers", "offline"])
+        .output()
+        .expect("run partial grep");
+    assert!(
+        partial.status.success(),
+        "partial grep should succeed: {}",
+        String::from_utf8_lossy(&partial.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&partial.stdout).expect("partial JSON");
+    assert_eq!(result["federation"]["coverage"], "partial");
+    assert!(result["federation"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|source| source["store"] == "offline/default" && source["status"] == "unavailable"));
+    assert_eq!(result["total"], serde_json::Value::Null);
+    assert_eq!(result["total_bounds"]["max"], serde_json::Value::Null);
+
+    let required = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "grep",
+            "needle-partial",
+            "--peers",
+            "offline",
+            "--require-complete",
+        ])
+        .output()
+        .expect("run require-complete grep");
+    assert!(!required.status.success());
+    let stderr = String::from_utf8_lossy(&required.stderr);
+    assert!(
+        stderr.contains("incomplete_coverage"),
+        "unexpected error: {stderr}"
+    );
+}
+
+#[test]
 fn local_show_without_peer_selection_does_not_spawn_configured_peers() {
     let temp = tempfile::tempdir().expect("tempdir");
     let caller_home = temp.path().join("caller-home");

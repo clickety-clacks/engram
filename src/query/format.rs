@@ -239,11 +239,11 @@ pub fn collect_grep_matches(
     Ok((raw_sessions, rank_by_session))
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GrepRank {
-    provenance_match_count: usize,
+    pub provenance_match_count: usize,
     pub match_count: usize,
-    provenance_event_count: usize,
+    pub provenance_event_count: usize,
 }
 
 pub fn compare_grep_sessions(
