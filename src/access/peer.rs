@@ -5,7 +5,8 @@
 //! home-only topology and keeps their read snapshots until stdin closes.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -16,7 +17,10 @@ use serde_json::{Value, json};
 use super::{FileAddress, FileKind, MAX_NON_FILE_RESPONSE_BYTES, MachineRef};
 use crate::config::{Topology, TopologyExport, load_topology};
 use crate::index::{QUERY_SEMANTICS_VERSION, ReaderMode, SCHEMA_VERSION, SqliteIndex};
-use crate::query::format::extract_latest_timestamp_from_rows;
+use crate::query::format::{
+    DateFilter, extract_latest_timestamp_from_rows, is_provenance_row,
+    session_matches_date_filter,
+};
 use crate::store::tapes::parse_jsonl_rows;
 use crate::tape::compress::decompress_jsonl_with_limit;
 
@@ -184,6 +188,7 @@ impl PeerSession {
             "open" => self.open(&stores, args, id, output),
             "locate_tapes" => self.locate_tapes(&stores, args, id, output),
             "dispatch_rows" => self.dispatch_rows(&stores, args, id, output),
+            "grep_scan" => self.grep_scan(&stores, args, id, output),
             "peek_lines" => self.peek_lines(&stores, args, id, output),
             "read_file" => self.read_file(&stores, args, id, output),
             _ => Err(PeerError::new(
@@ -387,6 +392,260 @@ impl PeerSession {
             }
         }
         Ok(json!({ "stores": stores.len() }))
+    }
+
+    fn grep_scan<W: Write>(
+        &self,
+        stores: &[String],
+        args: &serde_json::Map<String, Value>,
+        id: &Value,
+        output: &mut W,
+    ) -> Result<Value, PeerError> {
+        reject_unknown_keys(args, &["pattern", "since", "until", "k"])?;
+        if stores.len() != 1 {
+            return Err(PeerError::new(
+                "invalid_request",
+                "grep_scan requires exactly one store",
+            ));
+        }
+        let pattern = args
+            .get("pattern")
+            .and_then(Value::as_str)
+            .ok_or_else(|| PeerError::new("invalid_request", "args.pattern must be a string"))?;
+        let k = optional_usize(args.get("k"), "args.k")?.unwrap_or(25);
+        let k_limit = configured_limit(&self.topology.limits, "grep_k", 10_000);
+        if k as u64 > k_limit {
+            return Err(PeerError::new(
+                "budget_exceeded",
+                format!("grep top-k exceeds configured limit {k_limit}"),
+            ));
+        }
+        let since = optional_string(args.get("since"), "args.since")?;
+        let until = optional_string(args.get("until"), "args.until")?;
+        let date_filter = DateFilter::parse(since.as_deref(), until.as_deref())
+            .map_err(|error| PeerError::new(error.code, error.message))?;
+
+        let export = self.require_open(&stores[0])?;
+        let mut tape_ids = export
+            .index
+            .referenced_tape_ids()?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        for dir in &export.config.tape_dirs {
+            let entries = fs::read_dir(dir)
+                .map_err(|error| PeerError::new("tape_inventory_error", error.to_string()))?;
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    PeerError::new("tape_inventory_error", error.to_string())
+                })?;
+                if let Some(tape_id) = crate::store::tapes::tape_id_from_path(&entry.path())
+                    && validate_tape_id(&tape_id).is_ok()
+                {
+                    tape_ids.insert(tape_id);
+                }
+            }
+        }
+        let mut tape_ids = tape_ids.into_iter().collect::<Vec<_>>();
+        tape_ids.sort();
+
+        let mut top = BinaryHeap::new();
+        let mut failures = Vec::new();
+        let response_limit = configured_limit(
+            &self.topology.limits,
+            "non_file_response_bytes",
+            MAX_NON_FILE_RESPONSE_BYTES as u64,
+        );
+        let mut top_bytes = 0u64;
+        let mut failure_bytes = 0u64;
+        let mut total = 0usize;
+        let mut time_min: Option<String> = None;
+        let mut time_max: Option<String> = None;
+        let store_ref = format!("{}/{}", self.topology.self_label, stores[0]);
+
+        for tape_id in tape_ids {
+            if let Err(error) = validate_tape_id(&tape_id) {
+                let failure = json!({
+                    "type": "failure",
+                    "tape_id": tape_id,
+                    "error": {"code": error.code, "message": error.message},
+                });
+                append_grep_failure(
+                    &mut failures,
+                    failure,
+                    id,
+                    &mut failure_bytes,
+                    top_bytes,
+                    response_limit,
+                )?;
+                continue;
+            }
+            let indexed = export.index.has_tape(&tape_id)?;
+            let Some((path, compressed_size)) = self.tape_path(&export.config, &tape_id) else {
+                let failure = json!({
+                    "type": "failure",
+                    "tape_id": tape_id,
+                    "error": {
+                        "code": "tape_unavailable",
+                        "message": "indexed tape is not present in this export's tape directories",
+                    },
+                });
+                append_grep_failure(
+                    &mut failures,
+                    failure,
+                    id,
+                    &mut failure_bytes,
+                    top_bytes,
+                    response_limit,
+                )?;
+                continue;
+            };
+            let summary = match scan_tape_for_grep(
+                &path,
+                compressed_size,
+                &self.topology.limits,
+                pattern,
+            ) {
+                Ok(summary) => summary,
+                Err(error) => {
+                    let failure = json!({
+                        "type": "failure",
+                        "tape_id": tape_id,
+                        "error": {"code": error.code, "message": error.message},
+                    });
+                    append_grep_failure(
+                        &mut failures,
+                        failure,
+                        id,
+                        &mut failure_bytes,
+                        top_bytes,
+                        response_limit,
+                    )?;
+                    continue;
+                }
+            };
+            if summary.match_count == 0
+                || !session_matches_date_filter(
+                    &json!({"timestamp": summary.timestamp}),
+                    &date_filter,
+                )
+            {
+                continue;
+            }
+
+            total = total.saturating_add(1);
+            if !summary.timestamp.is_empty() {
+                if time_min
+                    .as_ref()
+                    .is_none_or(|current| summary.timestamp < *current)
+                {
+                    time_min = Some(summary.timestamp.clone());
+                }
+                if time_max
+                    .as_ref()
+                    .is_none_or(|current| summary.timestamp > *current)
+                {
+                    time_max = Some(summary.timestamp.clone());
+                }
+            }
+            let (refs_up, refs_down) = dispatch_ref_counts(&export.index, &tape_id)?;
+            let record = json!({
+                "type": "match",
+                "store": store_ref.clone(),
+                "tape_id": tape_id,
+                "indexed": indexed,
+                "match_count": summary.match_count,
+                "provenance_match_count": summary.provenance_match_count,
+                "provenance_event_count": summary.provenance_event_count,
+                "timestamp": summary.timestamp,
+                "total_lines": summary.total_lines,
+                "anchor_line": summary.anchor_line,
+                "files_touched": summary.files_touched,
+                "refs_up": refs_up,
+                "refs_down": refs_down,
+            });
+            if k > 0 {
+                let mut candidate = GrepCandidate::from_record(record);
+                let replaces_worst = top
+                    .peek()
+                    .is_some_and(|worst| candidate < *worst);
+                if top.len() < k || replaces_worst {
+                    candidate.frame_size = grep_data_frame_size(id, &candidate.record)? as u64;
+                    if candidate.frame_size as usize > MAX_FRAME_BYTES {
+                        return Err(PeerError::new(
+                            "budget_exceeded",
+                            "a grep result exceeds the maximum frame size",
+                        ));
+                    }
+                }
+                if top.len() < k {
+                    top_bytes = top_bytes.saturating_add(candidate.frame_size);
+                    if top_bytes.saturating_add(failure_bytes) > response_limit {
+                        return Err(PeerError::new(
+                            "budget_exceeded",
+                            format!("grep response exceeds {response_limit} byte limit"),
+                        ));
+                    }
+                    top.push(candidate);
+                } else if replaces_worst {
+                    let worst = top.pop().expect("peeked top candidate");
+                    let next_bytes = top_bytes
+                        .saturating_sub(worst.frame_size)
+                        .saturating_add(candidate.frame_size);
+                    if next_bytes.saturating_add(failure_bytes) > response_limit {
+                        return Err(PeerError::new(
+                            "budget_exceeded",
+                            format!("grep response exceeds {response_limit} byte limit"),
+                        ));
+                    }
+                    top_bytes = next_bytes;
+                    top.push(candidate);
+                }
+            }
+        }
+
+        let time_range = json!({
+            "start": time_min,
+            "end": time_max,
+        });
+        let matches = top.into_sorted_vec();
+        let returned = matches.len();
+        let failure_count = failures.len();
+        let stats = json!({
+            "store": store_ref,
+            "total": total,
+            "returned": returned,
+            "time_range": time_range,
+            "truncated": total > k,
+            "failures": failure_count,
+        });
+        let records = matches
+            .into_iter()
+            .map(|candidate| candidate.record)
+            .chain(failures)
+            .collect::<Vec<_>>();
+        let terminal_size = serde_json::to_vec(&json!({
+            "id": id,
+            "end": true,
+            "ok": true,
+            "stats": stats,
+        }))
+        .map_err(|error| PeerError::new("json_error", error.to_string()))?
+        .len()
+        .saturating_add(1) as u64;
+        if top_bytes
+            .saturating_add(failure_bytes)
+            .saturating_add(terminal_size)
+            > response_limit
+        {
+            return Err(PeerError::new(
+                "budget_exceeded",
+                format!("grep response exceeds {response_limit} byte limit"),
+            ));
+        }
+        for record in records {
+            write_data(output, id, record)?;
+        }
+        Ok(stats)
     }
 
     fn peek_lines<W: Write>(
@@ -789,6 +1048,283 @@ impl PeerSession {
 
 fn configured_limit(limits: &BTreeMap<String, u64>, key: &str, default: u64) -> u64 {
     limits.get(key).copied().unwrap_or(default).min(default)
+}
+
+#[derive(Debug)]
+struct GrepTapeSummary {
+    match_count: usize,
+    provenance_match_count: usize,
+    provenance_event_count: usize,
+    timestamp: String,
+    total_lines: usize,
+    anchor_line: usize,
+    files_touched: Vec<String>,
+}
+
+#[derive(Debug)]
+struct GrepCandidate {
+    record: Value,
+    tape_id: String,
+    provenance_match_count: usize,
+    match_count: usize,
+    provenance_event_count: usize,
+    timestamp: String,
+    frame_size: u64,
+}
+
+impl GrepCandidate {
+    fn from_record(record: Value) -> Self {
+        let tape_id = record
+            .get("tape_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let number = |name: &str| {
+            record
+                .get(name)
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or_default()
+        };
+        Self {
+            tape_id,
+            provenance_match_count: number("provenance_match_count"),
+            match_count: number("match_count"),
+            provenance_event_count: number("provenance_event_count"),
+            timestamp: record
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            record,
+            frame_size: 0,
+        }
+    }
+}
+
+impl PartialEq for GrepCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for GrepCandidate {}
+
+impl PartialOrd for GrepCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for GrepCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Less means a better result. BinaryHeap therefore keeps its worst
+        // retained result at the root, ready to be replaced by a better one.
+        other
+            .provenance_match_count
+            .cmp(&self.provenance_match_count)
+            .then_with(|| other.match_count.cmp(&self.match_count))
+            .then_with(|| {
+                other
+                    .provenance_event_count
+                    .cmp(&self.provenance_event_count)
+            })
+            .then_with(|| other.timestamp.cmp(&self.timestamp))
+            .then_with(|| self.tape_id.cmp(&other.tape_id))
+    }
+}
+
+fn scan_tape_for_grep(
+    path: &Path,
+    expected_size: u64,
+    limits: &BTreeMap<String, u64>,
+    pattern: &str,
+) -> Result<GrepTapeSummary, PeerError> {
+    let compressed_limit = configured_limit(limits, "read_file_compressed_bytes", MAX_READ_FILE_BYTES);
+    if expected_size > compressed_limit {
+        return Err(PeerError::new(
+            "budget_exceeded",
+            format!("compressed tape exceeds {compressed_limit} byte limit"),
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| PeerError::new("tape_unavailable", error.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| PeerError::new("tape_unavailable", error.to_string()))?;
+    if !metadata.file_type().is_file() {
+        return Err(PeerError::new(
+            "invalid_file",
+            "tape path is not a regular file",
+        ));
+    }
+    if metadata.len() != expected_size {
+        return Err(PeerError::new(
+            "tape_changed",
+            "tape size changed during the query",
+        ));
+    }
+
+    let decoder = zstd::stream::read::Decoder::new(file.take(compressed_limit.saturating_add(1)))
+        .map_err(|error| PeerError::new("invalid_tape", error.to_string()))?;
+    let decompressed_limit = configured_limit(limits, "decompressed_bytes_per_tape", 512 * 1024 * 1024);
+    let mut reader = io::BufReader::new(decoder.take(decompressed_limit.saturating_add(1)));
+    let mut line = Vec::new();
+    let mut bytes_read = 0u64;
+    let mut total_lines = 0usize;
+    let mut match_count = 0usize;
+    let mut provenance_match_count = 0usize;
+    let mut provenance_event_count = 0usize;
+    let mut first_match = None;
+    let mut first_provenance_match = None;
+    let mut timestamp = String::new();
+    let mut files_touched = HashSet::new();
+
+    loop {
+        line.clear();
+        let bytes = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|error| PeerError::new("invalid_tape", error.to_string()))?;
+        if bytes == 0 {
+            break;
+        }
+        bytes_read = bytes_read.saturating_add(bytes as u64);
+        if bytes_read > decompressed_limit {
+            return Err(PeerError::new(
+                "budget_exceeded",
+                format!("decompressed tape exceeds {decompressed_limit} byte limit"),
+            ));
+        }
+        let mut content_end = line.len();
+        if line.get(content_end.saturating_sub(1)) == Some(&b'\n') {
+            content_end -= 1;
+            if line.get(content_end.saturating_sub(1)) == Some(&b'\r') {
+                content_end -= 1;
+            }
+        }
+        let text = std::str::from_utf8(&line[..content_end])
+            .map_err(|error| PeerError::new("invalid_tape", error.to_string()))?;
+        let line_offset = total_lines as u64;
+        total_lines = total_lines.saturating_add(1);
+        if text.contains(pattern) {
+            match_count = match_count.saturating_add(1);
+            first_match.get_or_insert(line_offset);
+        }
+
+        if !text.trim().is_empty() {
+            let value: Value = serde_json::from_slice(&line[..content_end])
+                .map_err(|error| PeerError::new("invalid_tape", error.to_string()))?;
+            if is_provenance_row(&value) {
+                provenance_event_count = provenance_event_count.saturating_add(1);
+                if text.contains(pattern) {
+                    provenance_match_count = provenance_match_count.saturating_add(1);
+                    first_provenance_match.get_or_insert(line_offset);
+                }
+            }
+            if let Some(row_timestamp) = value.get("t").and_then(Value::as_str)
+                && row_timestamp > timestamp.as_str()
+            {
+                timestamp = row_timestamp.to_string();
+            }
+            for field in ["file", "from_file", "to_file"] {
+                if let Some(file) = value.get(field).and_then(Value::as_str) {
+                    files_touched.insert(file.to_string());
+                }
+            }
+        }
+    }
+
+    let mut files_touched = files_touched.into_iter().collect::<Vec<_>>();
+    files_touched.sort();
+    let anchor_offset = first_provenance_match.or(first_match).unwrap_or_default();
+    Ok(GrepTapeSummary {
+        match_count,
+        provenance_match_count,
+        provenance_event_count,
+        timestamp,
+        total_lines,
+        anchor_line: usize::try_from(anchor_offset)
+            .unwrap_or_default()
+            .saturating_add(1),
+        files_touched,
+    })
+}
+
+fn dispatch_ref_counts(index: &SqliteIndex, tape_id: &str) -> Result<(usize, usize), PeerError> {
+    let mut up = 0usize;
+    let mut down = 0usize;
+    let mut seen = HashSet::new();
+    for link in index.dispatch_links_for_tape(tape_id)? {
+        let received = matches!(link.direction, crate::index::DispatchDirection::Received);
+        if !seen.insert((link.uuid, received)) {
+            continue;
+        }
+        if received {
+            up = up.saturating_add(1);
+        } else {
+            down = down.saturating_add(1);
+        }
+    }
+    Ok((up, down))
+}
+
+fn optional_string(value: Option<&Value>, name: &str) -> Result<Option<String>, PeerError> {
+    value
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            let text = value.as_str().ok_or_else(|| {
+                PeerError::new("invalid_request", format!("{name} must be a string"))
+            })?;
+            if text.contains('\0') {
+                return Err(PeerError::new(
+                    "invalid_request",
+                    format!("{name} contains a NUL byte"),
+                ));
+            }
+            Ok(text.to_string())
+        })
+        .transpose()
+}
+
+fn grep_data_frame_size(id: &Value, record: &Value) -> Result<usize, PeerError> {
+    serde_json::to_vec(&json!({"id": id, "data": record}))
+        .map(|frame| frame.len().saturating_add(1))
+        .map_err(|error| PeerError::new("json_error", error.to_string()))
+}
+
+fn append_grep_failure(
+    failures: &mut Vec<Value>,
+    failure: Value,
+    id: &Value,
+    failure_bytes: &mut u64,
+    top_bytes: u64,
+    response_limit: u64,
+) -> Result<(), PeerError> {
+    let size = grep_data_frame_size(id, &failure)?;
+    if size > MAX_FRAME_BYTES {
+        return Err(PeerError::new(
+            "budget_exceeded",
+            "a grep failure exceeds the maximum frame size",
+        ));
+    }
+    let next_bytes = failure_bytes.saturating_add(size as u64);
+    if top_bytes.saturating_add(next_bytes) > response_limit {
+        return Err(PeerError::new(
+            "budget_exceeded",
+            format!("grep response exceeds {response_limit} byte limit"),
+        ));
+    }
+    *failure_bytes = next_bytes;
+    failures.push(failure);
+    Ok(())
 }
 
 fn optional_usize(value: Option<&Value>, name: &str) -> Result<Option<usize>, PeerError> {

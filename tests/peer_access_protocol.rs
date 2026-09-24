@@ -344,6 +344,86 @@ fn remote_show_reads_only_the_selected_peer_tape_and_verifies_its_digest() {
 }
 
 #[test]
+fn command_peer_grep_scan_returns_ranked_page_and_per_tape_failure() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let owner_home = temp.path().join("owner-home");
+    let owner_engram = owner_home.join(".engram");
+    let tapes = owner_engram.join("tapes");
+    std::fs::create_dir_all(&tapes).expect("owner tape directory");
+    let db = owner_engram.join("index.sqlite");
+    drop(SqliteIndex::open_writer(db.to_str().expect("UTF-8 DB path")).expect("create owner DB"));
+
+    let provenance = concat!(
+        "{\"t\":\"2026-09-24T12:34:56Z\",\"k\":\"code.edit\",\"file\":\"src/a.rs\",\"after_text\":\"needle in source\"}\n",
+        "{\"t\":\"2026-09-24T12:35:00Z\",\"k\":\"msg.in\",\"content\":\"needle in discussion\"}\n",
+    );
+    let mentions = concat!(
+        "{\"t\":\"2026-09-25T12:34:56Z\",\"k\":\"note\",\"content\":\"needle one\"}\n",
+        "{\"t\":\"2026-09-25T12:35:00Z\",\"k\":\"note\",\"content\":\"needle two\"}\n",
+    );
+    for (tape_id, content) in [("a", provenance), ("b", mentions)] {
+        let compressed = zstd::stream::encode_all(content.as_bytes(), 0).expect("compress tape");
+        std::fs::write(tapes.join(format!("{tape_id}.jsonl.zst")), compressed)
+            .expect("write owner tape");
+    }
+    std::fs::write(tapes.join("broken.jsonl.zst"), b"not a zstd tape")
+        .expect("write malformed tape");
+    std::fs::write(
+        owner_engram.join("topology.yml"),
+        format!(
+            "version: 1\nself: emulated-owner\nexports:\n  default:\n    db: {}\n    tape_dirs:\n      - {}\nlimits:\n  non_file_response_bytes: 8388608\n",
+            db.display(),
+            tapes.display()
+        ),
+    )
+    .expect("write owner topology");
+
+    let peer = TopologyPeer {
+        ssh: None,
+        command: Some(vec![
+            "/usr/bin/env".into(),
+            format!("HOME={}", owner_home.display()),
+            env!("CARGO_BIN_EXE_engram").into(),
+            "peer-serve".into(),
+            "--stdio".into(),
+        ]),
+        engram: env!("CARGO_BIN_EXE_engram").into(),
+        exports: vec!["default".into()],
+    };
+    let mut owner = RemoteOwner::connect("emulated-owner", "caller", &peer, Duration::from_secs(5))
+        .expect("real peer handshake");
+    let response = owner
+        .round(
+            &[PeerRequest::new(
+                "grep_scan",
+                vec!["default".into()],
+                json!({"pattern":"needle", "k":1}),
+            )],
+            Duration::from_secs(5),
+        )
+        .pop()
+        .expect("grep outcome")
+        .expect("grep operation succeeds with per-tape failure");
+
+    assert_eq!(response.stats["total"], 2);
+    assert_eq!(response.stats["returned"], 1);
+    assert_eq!(response.stats["truncated"], true);
+    assert_eq!(response.stats["failures"], 1);
+    assert_eq!(response.stats["time_range"]["start"], "2026-09-24T12:35:00Z");
+    assert_eq!(response.stats["time_range"]["end"], "2026-09-25T12:35:00Z");
+    assert_eq!(response.data[0]["type"], "match");
+    assert_eq!(response.data[0]["tape_id"], "a");
+    assert_eq!(response.data[0]["indexed"], false);
+    assert_eq!(response.data[0]["match_count"], 2);
+    assert_eq!(response.data[0]["provenance_match_count"], 1);
+    assert_eq!(response.data[0]["anchor_line"], 1);
+    assert_eq!(response.data[0]["files_touched"], json!(["src/a.rs"]));
+    assert_eq!(response.data[1]["type"], "failure");
+    assert_eq!(response.data[1]["tape_id"], "broken");
+    assert_eq!(response.data[1]["error"]["code"], "invalid_tape");
+}
+
+#[test]
 fn remote_show_rejects_a_corrupted_content_addressed_tape() {
     let temp = tempfile::tempdir().expect("tempdir");
     let owner_home = temp.path().join("owner-home");
