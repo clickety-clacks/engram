@@ -619,7 +619,7 @@ impl PeerClient {
                                 &mut pending,
                                 &mut outcomes,
                                 "budget_exceeded",
-                                "peer read_file response exceeds the requested compressed-byte budget",
+                                "peer read_file response exceeds the bounded response-byte budget",
                             );
                             break;
                         }
