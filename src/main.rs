@@ -1917,10 +1917,8 @@ fn cmd_grep_with_peer(
                         );
                         continue;
                     };
-                    let Some(store_truncated) = response
-                        .stats
-                        .get("truncated")
-                        .and_then(Value::as_bool)
+                    let Some(store_truncated) =
+                        response.stats.get("truncated").and_then(Value::as_bool)
                     else {
                         any_source_failure = true;
                         grep_scan_incomplete = true;
