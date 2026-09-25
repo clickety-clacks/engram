@@ -1254,9 +1254,7 @@ fn cmd_show_peers_inner(
             .to_string();
         if !source_rows
             .iter()
-            .any(|source| {
-                source.get("store").and_then(Value::as_str) == Some(local_store.as_str())
-            })
+            .any(|source| source.get("store").and_then(Value::as_str) == Some(local_store.as_str()))
         {
             source_rows.push(json!({
                 "store": local_store.clone(),
@@ -1434,11 +1432,7 @@ fn cmd_show_peers_inner(
             let requests = batches
                 .iter()
                 .map(|batch| {
-                    PeerRequest::new(
-                        "locate_tapes",
-                        batch.clone(),
-                        json!({"tape_ids":[tape_id]}),
-                    )
+                    PeerRequest::new("locate_tapes", batch.clone(), json!({"tape_ids":[tape_id]}))
                 })
                 .collect::<Vec<_>>();
             locate_batches.insert(machine.clone(), batches);
@@ -1638,7 +1632,12 @@ fn cmd_show_peers_inner(
                 .collect::<Vec<_>>();
             let exports = locators
                 .iter()
-                .filter_map(|locator| locator.store_ref.split_once('/').map(|(_, export)| export.to_string()))
+                .filter_map(|locator| {
+                    locator
+                        .store_ref
+                        .split_once('/')
+                        .map(|(_, export)| export.to_string())
+                })
                 .collect::<Vec<_>>();
             read_locators.insert(machine.clone(), locators);
             read_jobs.push(PeerRoundJob {

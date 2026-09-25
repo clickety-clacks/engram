@@ -561,9 +561,14 @@ fn show_with_selected_peers_reads_and_deduplicates_matching_remote_tapes() {
     assert_eq!(value["id_verified"], true);
     assert_eq!(value["locations"].as_array().unwrap().len(), 2);
     assert_eq!(value["federation"]["coverage"], "complete");
-    assert!(value["federation"]["sources"].as_array().unwrap().iter().any(
-        |source| source["store"] == "not-selected/default" && source["status"] == "not_selected"
-    ));
+    assert!(
+        value["federation"]["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|source| source["store"] == "not-selected/default"
+                && source["status"] == "not_selected")
+    );
     assert!(!unselected_marker.exists(), "unselected peer was launched");
 }
 
@@ -573,7 +578,12 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
     let binary = env!("CARGO_BIN_EXE_engram");
     let content = "{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"show partial selected peers\"}\n";
     let tape_id = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
-    let available = write_grep_owner(temp.path(), "available", binary, &[(tape_id.as_str(), content)]);
+    let available = write_grep_owner(
+        temp.path(),
+        "available",
+        binary,
+        &[(tape_id.as_str(), content)],
+    );
     let offline = json!({
         "command": ["/usr/bin/false"],
         "engram": "/unused/engram",
@@ -629,7 +639,10 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
     assert!(!required.status.success());
     let stderr = String::from_utf8_lossy(&required.stderr);
     let error: serde_json::Value = serde_json::from_str(
-        stderr.lines().last().expect("incomplete coverage error line"),
+        stderr
+            .lines()
+            .last()
+            .expect("incomplete coverage error line"),
     )
     .expect("error JSON");
     assert_eq!(error["error"]["code"], "incomplete_coverage");
