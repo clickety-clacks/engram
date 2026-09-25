@@ -653,8 +653,8 @@ impl PeerSession {
             let window_lines = optional_usize(item.get("window_lines"), "window_lines")?
                 .unwrap_or(30)
                 .max(1);
-            let include_digest = optional_bool(item.get("include_digest"), "include_digest")?
-                .unwrap_or(false);
+            let include_digest =
+                optional_bool(item.get("include_digest"), "include_digest")?.unwrap_or(false);
             if window_lines > 10_000 {
                 return Err(PeerError::new(
                     "invalid_request",
@@ -1908,11 +1908,9 @@ fn optional_bool(value: Option<&Value>, name: &str) -> Result<Option<bool>, Peer
     value
         .filter(|value| !value.is_null())
         .map(|value| {
-            value
-                .as_bool()
-                .ok_or_else(|| {
-                    PeerError::new("invalid_request", format!("{name} must be a boolean"))
-                })
+            value.as_bool().ok_or_else(|| {
+                PeerError::new("invalid_request", format!("{name} must be a boolean"))
+            })
         })
         .transpose()
 }
