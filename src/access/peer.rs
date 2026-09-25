@@ -16,9 +16,12 @@ use serde_json::{Value, json};
 
 use super::{FileAddress, FileKind, MAX_NON_FILE_RESPONSE_BYTES, MachineRef};
 use crate::config::{Topology, TopologyExport, load_topology};
-use crate::index::{QUERY_SEMANTICS_VERSION, ReaderMode, SCHEMA_VERSION, SqliteIndex};
+use crate::index::{
+    QUERY_SEMANTICS_VERSION, ReaderMode, SCHEMA_VERSION, SqliteIndex, semantic_edge_key,
+};
 use crate::query::format::{
-    DateFilter, extract_latest_timestamp_from_rows, is_provenance_row, session_matches_date_filter,
+    DateFilter, edge_to_json, extract_latest_timestamp_from_rows, is_provenance_row,
+    session_matches_date_filter,
 };
 use crate::store::tapes::parse_jsonl_rows;
 use crate::tape::compress::decompress_jsonl_with_limit;
@@ -26,6 +29,7 @@ use crate::tape::compress::decompress_jsonl_with_limit;
 pub const PROTOCOL_VERSION: u64 = 1;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_BATCH_ITEMS: usize = 128;
+const MAX_ANCHOR_BYTES: usize = 16 * 1024;
 pub const MAX_READ_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const READ_FILE_CHUNK_BYTES: usize = 720 * 1024;
 
@@ -187,6 +191,8 @@ impl PeerSession {
             "open" => self.open(&stores, args, id, output),
             "locate_tapes" => self.locate_tapes(&stores, args, id, output),
             "dispatch_rows" => self.dispatch_rows(&stores, args, id, output),
+            "lookup_anchors" => self.lookup_anchors(&stores, args, id, output),
+            "lookup_edges" => self.lookup_edges(&stores, args, id, output),
             "grep_scan" => self.grep_scan(&stores, args, id, output),
             "peek_lines" => self.peek_lines(&stores, args, id, output),
             "read_file" => self.read_file(&stores, args, id, output),
@@ -396,6 +402,184 @@ impl PeerSession {
             }
         }
         Ok(json!({ "stores": stores.len() }))
+    }
+
+    fn lookup_anchors<W: Write>(
+        &self,
+        stores: &[String],
+        args: &serde_json::Map<String, Value>,
+        id: &Value,
+        output: &mut W,
+    ) -> Result<Value, PeerError> {
+        reject_unknown_keys(args, &["anchors", "include_deleted"])?;
+        let anchors = anchor_batch(args.get("anchors"), "args.anchors")?;
+        let include_deleted = match args.get("include_deleted") {
+            None => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => {
+                return Err(PeerError::new(
+                    "invalid_request",
+                    "args.include_deleted must be a boolean",
+                ));
+            }
+        };
+        let response_limit = configured_limit(
+            &self.topology.limits,
+            "non_file_response_bytes",
+            MAX_NON_FILE_RESPONSE_BYTES as u64,
+        )
+        .saturating_sub(1024);
+        let mut response_bytes = 0u64;
+        let mut records = 0usize;
+        for store in stores {
+            let export = self.require_open(store)?;
+            let store_ref = format!("{}/{}", self.topology.self_label, store);
+            for anchor in &anchors {
+                let matching = export.index.matching_window_anchors(anchor)?;
+                write_data_limited(
+                    output,
+                    id,
+                    json!({
+                        "type": "anchor_result",
+                        "store": store_ref,
+                        "anchor": anchor,
+                        "matching_window_anchors": matching,
+                    }),
+                    &mut response_bytes,
+                    response_limit,
+                )?;
+                records += 1;
+
+                for fragment in export.index.evidence_for_anchor(anchor)? {
+                    let held = self.tape_path(&export.config, &fragment.tape_id).is_some();
+                    write_data_limited(
+                        output,
+                        id,
+                        json!({
+                            "type": "fragment",
+                            "store": store_ref,
+                            "anchor": anchor,
+                            "tape_id": fragment.tape_id,
+                            "event_offset": fragment.event_offset,
+                            "kind": match fragment.kind {
+                                crate::index::lineage::EvidenceKind::Edit => "edit",
+                                crate::index::lineage::EvidenceKind::Read => "read",
+                            },
+                            "file_path": fragment.file_path,
+                            "timestamp": fragment.timestamp,
+                            "held": held,
+                        }),
+                        &mut response_bytes,
+                        response_limit,
+                    )?;
+                    records += 1;
+                }
+
+                if include_deleted {
+                    for tombstone in export.index.tombstones_for_anchor(anchor)? {
+                        write_data_limited(
+                            output,
+                            id,
+                            json!({
+                                "type": "tombstone",
+                                "store": store_ref,
+                                "query_anchor": anchor,
+                                "anchor": tombstone.anchor_hashes.first(),
+                                "tape_id": tombstone.tape_id,
+                                "event_offset": tombstone.event_offset,
+                                "file_path": tombstone.file_path,
+                                "range": {
+                                    "start": tombstone.range_at_deletion.start,
+                                    "end": tombstone.range_at_deletion.end,
+                                },
+                                "timestamp": tombstone.timestamp,
+                            }),
+                            &mut response_bytes,
+                            response_limit,
+                        )?;
+                        records += 1;
+                    }
+                }
+            }
+        }
+        Ok(json!({"records": records}))
+    }
+
+    fn lookup_edges<W: Write>(
+        &self,
+        stores: &[String],
+        args: &serde_json::Map<String, Value>,
+        id: &Value,
+        output: &mut W,
+    ) -> Result<Value, PeerError> {
+        reject_unknown_keys(args, &["nodes", "min_confidence", "include_forensics"])?;
+        let nodes = anchor_batch(args.get("nodes"), "args.nodes")?;
+        let min_confidence = match args.get("min_confidence") {
+            None => 0.5,
+            Some(value) => value.as_f64().ok_or_else(|| {
+                PeerError::new("invalid_request", "args.min_confidence must be a number")
+            })? as f32,
+        };
+        if !min_confidence.is_finite() || !(0.0..=1.0).contains(&min_confidence) {
+            return Err(PeerError::new(
+                "invalid_request",
+                "args.min_confidence must be in [0.0, 1.0]",
+            ));
+        }
+        let include_forensics = match args.get("include_forensics") {
+            None => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => {
+                return Err(PeerError::new(
+                    "invalid_request",
+                    "args.include_forensics must be a boolean",
+                ));
+            }
+        };
+        let response_limit = configured_limit(
+            &self.topology.limits,
+            "non_file_response_bytes",
+            MAX_NON_FILE_RESPONSE_BYTES as u64,
+        )
+        .saturating_sub(1024);
+        let mut response_bytes = 0u64;
+        let mut records = 0usize;
+        for store in stores {
+            let export = self.require_open(store)?;
+            let store_ref = format!("{}/{}", self.topology.self_label, store);
+            for node in &nodes {
+                write_data_limited(
+                    output,
+                    id,
+                    json!({"type": "node_result", "store": store_ref, "node": node}),
+                    &mut response_bytes,
+                    response_limit,
+                )?;
+                records += 1;
+                let mut seen = HashSet::new();
+                let mut edges =
+                    export
+                        .index
+                        .inbound_edges(node, min_confidence, include_forensics)?;
+                edges.extend(export.index.outbound_edges(
+                    node,
+                    min_confidence,
+                    include_forensics,
+                )?);
+                for edge in edges {
+                    if !seen.insert(semantic_edge_key(&edge)) {
+                        continue;
+                    }
+                    let mut record = edge_to_json(&edge);
+                    record["type"] = json!("edge");
+                    record["store"] = json!(store_ref);
+                    record["node"] = json!(node);
+                    write_data_limited(output, id, record, &mut response_bytes, response_limit)?;
+                    records += 1;
+                }
+            }
+        }
+        Ok(json!({"records": records}))
     }
 
     fn grep_scan<W: Write>(
@@ -1520,6 +1704,18 @@ fn validate_tape_id(id: &str) -> Result<(), PeerError> {
 }
 
 fn string_batch(value: Option<&Value>, label: &str) -> Result<Vec<String>, PeerError> {
+    string_batch_limited(value, label, 255)
+}
+
+fn anchor_batch(value: Option<&Value>, label: &str) -> Result<Vec<String>, PeerError> {
+    string_batch_limited(value, label, MAX_ANCHOR_BYTES)
+}
+
+fn string_batch_limited(
+    value: Option<&Value>,
+    label: &str,
+    max_item_bytes: usize,
+) -> Result<Vec<String>, PeerError> {
     let values = value
         .and_then(Value::as_array)
         .ok_or_else(|| PeerError::new("invalid_request", format!("{label} must be an array")))?;
@@ -1535,7 +1731,7 @@ fn string_batch(value: Option<&Value>, label: &str) -> Result<Vec<String>, PeerE
         let item = value.as_str().ok_or_else(|| {
             PeerError::new("invalid_request", format!("{label} items must be strings"))
         })?;
-        if item.is_empty() || item.len() > 255 || item.contains('\0') {
+        if item.is_empty() || item.len() > max_item_bytes || item.contains('\0') {
             return Err(PeerError::new(
                 "invalid_request",
                 format!("{label} contains an invalid string"),
@@ -1570,6 +1766,37 @@ fn reject_unknown_keys(
 
 fn write_data<W: Write>(output: &mut W, id: &Value, data: Value) -> Result<(), PeerError> {
     write_frame(output, &json!({"id": id, "data": data}))
+}
+
+fn write_data_limited<W: Write>(
+    output: &mut W,
+    id: &Value,
+    data: Value,
+    used_bytes: &mut u64,
+    response_limit: u64,
+) -> Result<(), PeerError> {
+    let mut frame = serde_json::to_vec(&json!({"id": id, "data": data}))
+        .map_err(|error| PeerError::new("json_error", error.to_string()))?;
+    let frame_bytes = frame.len().saturating_add(1) as u64;
+    if frame_bytes as usize > MAX_FRAME_BYTES {
+        return Err(PeerError::new(
+            "budget_exceeded",
+            "a lookup result exceeds the maximum response frame size",
+        ));
+    }
+    if used_bytes.saturating_add(frame_bytes) > response_limit {
+        return Err(PeerError::new(
+            "budget_exceeded",
+            format!("lookup response exceeds {response_limit} byte limit"),
+        ));
+    }
+    frame.push(b'\n');
+    output
+        .write_all(&frame)
+        .and_then(|_| output.flush())
+        .map_err(|error| PeerError::new("write_error", error.to_string()))?;
+    *used_bytes = used_bytes.saturating_add(frame_bytes);
+    Ok(())
 }
 
 fn write_terminal<W: Write>(

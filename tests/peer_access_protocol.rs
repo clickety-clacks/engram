@@ -1806,6 +1806,202 @@ fn topology_status_check_exports_counts_indexed_tapes_without_regular_files() {
 }
 
 #[test]
+fn peer_anchor_and_edge_lookups_preserve_membership_held_and_forensics_data() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let before = (1..=24)
+        .map(|line| format!("fn before_{line}() {{ value_{line}(); }}\n"))
+        .collect::<String>();
+    let after = (1..=24)
+        .map(|line| format!("fn after_{line}() {{ value_{line}(); }}\n"))
+        .collect::<String>();
+    let events = [
+        json!({
+            "t": "2026-09-25T12:00:00Z",
+            "k": "code.edit",
+            "file": "src/lib.rs",
+            "before_range": [1, 24],
+            "after_range": [1, 24],
+            "before_text": before,
+            "after_text": after,
+        })
+        .to_string(),
+        json!({
+            "t": "2026-09-25T12:01:00Z",
+            "k": "code.edit",
+            "file": "src/lib.rs",
+            "before_range": [1, 24],
+            "before_text": before,
+            "after_text": null,
+        })
+        .to_string(),
+    ]
+    .join("\n")
+        + "\n";
+
+    let remote = write_grep_owner(
+        temp.path(),
+        "anchor-owner",
+        binary,
+        &[("held-tape", &events)],
+    );
+    let owner_home = temp.path().join("anchor-owner-home");
+    let owner_db = owner_home.join(".engram/index.sqlite");
+    let writer =
+        SqliteIndex::open_writer(owner_db.to_str().expect("owner DB path")).expect("owner index");
+    let parsed = engram::tape::event::parse_jsonl_events(&events).expect("parse events");
+    writer
+        .ingest_tape_events(
+            "held-tape",
+            &parsed,
+            engram::index::lineage::LINK_THRESHOLD_DEFAULT,
+        )
+        .expect("index held tape");
+    writer
+        .ingest_tape_events(
+            "missing-file-tape",
+            &parsed,
+            engram::index::lineage::LINK_THRESHOLD_DEFAULT,
+        )
+        .expect("index missing-file tape");
+    drop(writer);
+
+    let peer = TopologyPeer {
+        ssh: None,
+        command: Some(vec![
+            "/usr/bin/env".into(),
+            format!("HOME={}", owner_home.display()),
+            binary.into(),
+            "peer-serve".into(),
+            "--stdio".into(),
+        ]),
+        engram: binary.to_string(),
+        exports: remote["exports"]
+            .as_array()
+            .expect("configured exports")
+            .iter()
+            .map(|export| export.as_str().expect("export name").to_string())
+            .collect(),
+    };
+    let mut owner = RemoteOwner::connect("anchor-owner", "caller", &peer, Duration::from_secs(5))
+        .expect("connect owner");
+    let after_window = engram::anchor::fingerprint_windows(&after)
+        .into_iter()
+        .next()
+        .expect("after fingerprint window");
+    let before_window = engram::anchor::fingerprint_windows(&before)
+        .into_iter()
+        .next()
+        .expect("before fingerprint window");
+
+    let anchor_response = owner.round(
+        &[PeerRequest::new(
+            "lookup_anchors",
+            vec!["default".into()],
+            json!({"anchors": [after_window.features[0]], "include_deleted": false}),
+        )],
+        Duration::from_secs(5),
+    );
+    let anchor_response = anchor_response
+        .into_iter()
+        .next()
+        .expect("anchor response")
+        .expect("anchor lookup");
+    assert!(anchor_response.data.iter().any(|row| {
+        row["type"] == "anchor_result"
+            && row["matching_window_anchors"]
+                .as_array()
+                .is_some_and(|anchors| anchors.iter().any(|anchor| anchor == &after_window.anchor))
+    }));
+    let fragments = anchor_response
+        .data
+        .iter()
+        .filter(|row| row["type"] == "fragment")
+        .collect::<Vec<_>>();
+    assert!(fragments.iter().any(|row| {
+        row["tape_id"] == "held-tape" && row["held"] == true && row["kind"] == "edit"
+    }));
+    assert!(
+        fragments
+            .iter()
+            .any(|row| { row["tape_id"] == "missing-file-tape" && row["held"] == false })
+    );
+
+    let edge_response = owner.round(
+        &[PeerRequest::new(
+            "lookup_edges",
+            vec!["default".into()],
+            json!({
+                "nodes": [after_window.anchor],
+                "min_confidence": 0.0,
+                "include_forensics": true,
+            }),
+        )],
+        Duration::from_secs(5),
+    );
+    let edge_response = edge_response
+        .into_iter()
+        .next()
+        .expect("edge response")
+        .expect("edge lookup");
+    assert!(
+        edge_response.data.iter().any(|row| {
+            row["type"] == "edge"
+                && row["node"] == after_window.anchor
+                && (row["from_anchor"] == after_window.anchor
+                    || row["to_anchor"] == after_window.anchor)
+                && row["stored_class"] == "location_only"
+        }),
+        "forensics lookup omitted the location-only edge for the queried node"
+    );
+
+    let filtered_edge_response = owner.round(
+        &[PeerRequest::new(
+            "lookup_edges",
+            vec!["default".into()],
+            json!({
+                "nodes": [after_window.anchor],
+                "min_confidence": 0.0,
+                "include_forensics": false,
+            }),
+        )],
+        Duration::from_secs(5),
+    );
+    let filtered_edge_response = filtered_edge_response
+        .into_iter()
+        .next()
+        .expect("filtered edge response")
+        .expect("filtered edge lookup");
+    assert!(
+        filtered_edge_response
+            .data
+            .iter()
+            .all(|row| row["type"] != "edge"),
+        "default traversal returned a location-only edge"
+    );
+
+    let tombstone_response = owner.round(
+        &[PeerRequest::new(
+            "lookup_anchors",
+            vec!["default".into()],
+            json!({"anchors": [before_window.features[0]], "include_deleted": true}),
+        )],
+        Duration::from_secs(5),
+    );
+    let tombstone_response = tombstone_response
+        .into_iter()
+        .next()
+        .expect("tombstone response")
+        .expect("tombstone lookup");
+    assert!(tombstone_response.data.iter().any(|row| {
+        row["type"] == "tombstone"
+            && row["tape_id"] == "held-tape"
+            && row["range"]["start"] == 1
+            && row["range"]["end"] == 24
+    }));
+}
+
+#[test]
 fn grep_preserves_known_truncation_when_another_selected_peer_is_unavailable() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = env!("CARGO_BIN_EXE_engram");
