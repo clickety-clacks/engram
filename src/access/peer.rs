@@ -2617,9 +2617,7 @@ mod tests {
         let (frames_tx, frames_rx) = mpsc::channel::<Result<Option<Vec<u8>>, String>>();
         let (flush_tx, flush_rx) = mpsc::channel();
         frames_tx
-            .send(Ok(Some(
-                request(1, "test", &[], json!({})).into_bytes(),
-            )))
+            .send(Ok(Some(request(1, "test", &[], json!({})).into_bytes())))
             .expect("first request");
         let producer = thread::spawn(move || {
             flush_rx
@@ -2627,9 +2625,7 @@ mod tests {
                 .expect("first terminal response flush");
             thread::sleep(Duration::from_millis(200));
             frames_tx
-                .send(Ok(Some(
-                    request(2, "test", &[], json!({})).into_bytes(),
-                )))
+                .send(Ok(Some(request(2, "test", &[], json!({})).into_bytes())))
                 .expect("second request should still have a live owner");
         });
 

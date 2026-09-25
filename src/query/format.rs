@@ -1390,11 +1390,7 @@ mod chain_graph_tests {
                 .iter()
                 .map(|session| session["session_id"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            vec![
-                "z-root",
-                "z-child-ranked-first",
-                "z-child-ranked-second"
-            ]
+            vec!["z-root", "z-child-ranked-first", "z-child-ranked-second"]
         );
     }
 

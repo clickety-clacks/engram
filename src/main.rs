@@ -3502,8 +3502,7 @@ fn cmd_grep_with_peer(
         .fold(0usize, |sum, total| sum.saturating_add(*total));
     let total_exact = source_count_known
         && !grep_scan_incomplete
-        && (matched_source_count <= 1
-            || source_totals.iter().skip(1).all(|total| *total <= k));
+        && (matched_source_count <= 1 || source_totals.iter().skip(1).all(|total| *total <= k));
     let exact_total = if total_exact {
         Some(if matched_source_count <= 1 {
             source_total_sum
