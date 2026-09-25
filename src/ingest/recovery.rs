@@ -357,12 +357,7 @@ impl QueryRecovery {
         context: &RuntimeContext,
         tape: &str,
     ) -> Result<Option<&Locator>, CliError> {
-        self.lookup_with_reader(
-            &context.tape_lookup_dirs,
-            tape,
-            u64::MAX,
-            read_tape_content,
-        )
+        self.lookup_with_reader(&context.tape_lookup_dirs, tape, u64::MAX, read_tape_content)
     }
 
     /// Resolve and verify one tape's recovery binding with an owner-selected

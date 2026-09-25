@@ -2193,7 +2193,11 @@ fn peer_tape_facts_verifies_and_returns_native_recovery_binding() {
         .expect("recovery integrity response")
         .expect_err("missing recovery edit offset must be fatal");
     assert_eq!(missing_point.code, "native_recovery_error");
-    assert!(missing_point.message.contains("missing from recovery points"));
+    assert!(
+        missing_point
+            .message
+            .contains("missing from recovery points")
+    );
 }
 
 #[test]
