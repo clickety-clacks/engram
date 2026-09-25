@@ -20,8 +20,8 @@ use crate::index::{
     QUERY_SEMANTICS_VERSION, ReaderMode, SCHEMA_VERSION, SqliteIndex, semantic_edge_key,
 };
 use crate::query::format::{
-    DateFilter, collect_files_touched_from_rows, edge_to_json,
-    extract_latest_timestamp_from_rows, is_provenance_row, session_matches_date_filter,
+    DateFilter, collect_files_touched_from_rows, edge_to_json, extract_latest_timestamp_from_rows,
+    is_provenance_row, session_matches_date_filter,
 };
 use crate::store::tapes::{TapeRow, parse_jsonl_rows};
 use crate::tape::compress::decompress_jsonl_with_limit;
@@ -634,12 +634,9 @@ impl PeerSession {
                     "window_lines",
                 ],
             )?;
-            let tape_id = item
-                .get("tape_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    PeerError::new("invalid_request", "tape_facts item needs a tape_id")
-                })?;
+            let tape_id = item.get("tape_id").and_then(Value::as_str).ok_or_else(|| {
+                PeerError::new("invalid_request", "tape_facts item needs a tape_id")
+            })?;
             validate_tape_id(tape_id)?;
             if !seen_tapes.insert(tape_id.to_string()) {
                 return Err(PeerError::new(
@@ -649,8 +646,7 @@ impl PeerSession {
             }
             let edit_offsets = optional_u64_array(item.get("edit_offsets"), "edit_offsets")?;
             let turns = optional_nonnegative_i64_array(item.get("turns"), "turns")?;
-            let anchor_offsets =
-                optional_u64_array(item.get("anchor_offsets"), "anchor_offsets")?;
+            let anchor_offsets = optional_u64_array(item.get("anchor_offsets"), "anchor_offsets")?;
             let grep_filter = optional_string(item.get("grep_filter"), "grep_filter")?;
             let window_lines = optional_usize(item.get("window_lines"), "window_lines")?
                 .unwrap_or(30)
@@ -673,13 +669,7 @@ impl PeerSession {
                     "tape is not present in this export".into(),
                 );
                 failure["summary"] = empty_tape_summary();
-                write_data_limited(
-                    output,
-                    id,
-                    failure,
-                    &mut response_bytes,
-                    response_limit,
-                )?;
+                write_data_limited(output, id, failure, &mut response_bytes, response_limit)?;
                 continue;
             };
             let raw_text = match read_tape_for_query(&path, compressed_size, &self.topology.limits)
@@ -744,8 +734,8 @@ impl PeerSession {
                 }
             };
 
-            let locator = recovery
-                .lookup_with_reader(&export.config.tape_dirs, tape_id, |context_path| {
+            let locator =
+                recovery.lookup_with_reader(&export.config.tape_dirs, tape_id, |context_path| {
                     let Some(size) = self.memoized_file_size(context_path) else {
                         return Err(crate::CliError::new(
                             "tape_unavailable",
@@ -765,15 +755,17 @@ impl PeerSession {
                 }
             };
             if let Some(locator) = locator
-                && let Some(offset) = edit_offsets
-                    .iter()
-                    .find(|offset| !locator.recovered.points.iter().any(|point| point.old_offset == **offset))
+                && let Some(offset) = edit_offsets.iter().find(|offset| {
+                    !locator
+                        .recovered
+                        .points
+                        .iter()
+                        .any(|point| point.old_offset == **offset)
+                })
             {
                 return Err(PeerError::new(
                     "native_recovery_error",
-                    format!(
-                        "{store_ref}: edit offset {offset} is missing from recovery points"
-                    ),
+                    format!("{store_ref}: edit offset {offset} is missing from recovery points"),
                 ));
             }
 
@@ -829,9 +821,9 @@ impl PeerSession {
                             .iter()
                             .find(|point| point.old_offset == *offset)
                     });
-                    let global_turn = point.map(|point| point.turn).or_else(|| {
-                        segment_turn_start.checked_add(segment_turn)
-                    });
+                    let global_turn = point
+                        .map(|point| point.turn)
+                        .or_else(|| segment_turn_start.checked_add(segment_turn));
                     json!({
                         "event_offset": offset,
                         "present": present,
@@ -899,37 +891,36 @@ impl PeerSession {
                     unresolved_predecessor = Some(previous);
                     break;
                 }
-                let Some((previous_path, previous_size)) = self.tape_path(&export.config, &previous)
+                let Some((previous_path, previous_size)) =
+                    self.tape_path(&export.config, &previous)
                 else {
                     chain_status = "missing_predecessor";
                     unresolved_predecessor = Some(previous);
                     break;
                 };
-                let previous_text = match read_tape_for_query(
-                    &previous_path,
-                    previous_size,
-                    &self.topology.limits,
-                ) {
-                    Ok(text) => text,
-                    Err(error) => {
-                        write_data_limited(
-                            output,
-                            id,
-                            tape_facts_failure(
-                                &store_ref,
-                                tape_id,
-                                indexed,
-                                "failed",
-                                error.code,
-                                error.message,
-                            ),
-                            &mut response_bytes,
-                            response_limit,
-                        )?;
-                        chain_status = "failed";
-                        break;
-                    }
-                };
+                let previous_text =
+                    match read_tape_for_query(&previous_path, previous_size, &self.topology.limits)
+                    {
+                        Ok(text) => text,
+                        Err(error) => {
+                            write_data_limited(
+                                output,
+                                id,
+                                tape_facts_failure(
+                                    &store_ref,
+                                    tape_id,
+                                    indexed,
+                                    "failed",
+                                    error.code,
+                                    error.message,
+                                ),
+                                &mut response_bytes,
+                                response_limit,
+                            )?;
+                            chain_status = "failed";
+                            break;
+                        }
+                    };
                 let previous_rows = match parse_jsonl_rows(&previous_text) {
                     Ok(rows) => rows,
                     Err(error) => {
@@ -951,27 +942,28 @@ impl PeerSession {
                         break;
                     }
                 };
-                let (previous_segment, previous_id) = match tape_segment_metadata(&previous, &previous_rows) {
-                    Ok(segment) => segment,
-                    Err(error) => {
-                        write_data_limited(
-                            output,
-                            id,
-                            tape_facts_failure(
-                                &store_ref,
-                                tape_id,
-                                indexed,
-                                "failed",
-                                error.code,
-                                error.message,
-                            ),
-                            &mut response_bytes,
-                            response_limit,
-                        )?;
-                        chain_status = "failed";
-                        break;
-                    }
-                };
+                let (previous_segment, previous_id) =
+                    match tape_segment_metadata(&previous, &previous_rows) {
+                        Ok(segment) => segment,
+                        Err(error) => {
+                            write_data_limited(
+                                output,
+                                id,
+                                tape_facts_failure(
+                                    &store_ref,
+                                    tape_id,
+                                    indexed,
+                                    "failed",
+                                    error.code,
+                                    error.message,
+                                ),
+                                &mut response_bytes,
+                                response_limit,
+                            )?;
+                            chain_status = "failed";
+                            break;
+                        }
+                    };
                 predecessor_chain.push(previous_segment);
                 next_id = previous_id;
             }
@@ -2194,10 +2186,7 @@ fn tape_segment_metadata(
         .filter(|value| !value.is_null())
         .map(|value| {
             value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
-                PeerError::new(
-                    "invalid_tape",
-                    "previous_tape_id metadata must be a string",
-                )
+                PeerError::new("invalid_tape", "previous_tape_id metadata must be a string")
             })
         })
         .transpose()?;

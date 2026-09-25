@@ -47,8 +47,8 @@ fn valid_tape_id(id: &str) -> bool {
 }
 
 fn read_locator(path: &Path) -> Result<Locator, CliError> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|e| CliError::io("native_recovery_error", e))?;
+    let metadata =
+        fs::symlink_metadata(path).map_err(|e| CliError::io("native_recovery_error", e))?;
     if !metadata.file_type().is_file() {
         return Err(error("recovery locator is not a regular file"));
     }
@@ -72,8 +72,7 @@ fn read_locator(path: &Path) -> Result<Locator, CliError> {
     if bytes.len() as u64 > MAX_RECOVERY_LOCATOR_BYTES {
         return Err(error("recovery locator exceeds the 1 MiB limit"));
     }
-    serde_json::from_slice(&bytes)
-        .map_err(|e| error(format!("recovery locator is invalid: {e}")))
+    serde_json::from_slice(&bytes).map_err(|e| error(format!("recovery locator is invalid: {e}")))
 }
 
 fn directory(context: &RuntimeContext) -> PathBuf {
@@ -402,9 +401,10 @@ impl QueryRecovery {
                         .into_iter()
                         .find(|r| r["k"] == "meta")
                         .ok_or_else(|| error("recovery context meta missing"))?;
-                    let recoveries: Vec<RecoveredTape> =
-                        serde_json::from_value(stored["native_recovery_v1"].clone())
-                            .map_err(|e| error(format!("recovery context binding is invalid: {e}")))?;
+                    let recoveries: Vec<RecoveredTape> = serde_json::from_value(
+                        stored["native_recovery_v1"].clone(),
+                    )
+                    .map_err(|e| error(format!("recovery context binding is invalid: {e}")))?;
                     self.contexts
                         .insert(locator.context_tape.clone(), recoveries);
                 }

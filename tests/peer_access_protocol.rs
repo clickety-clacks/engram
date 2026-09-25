@@ -2019,10 +2019,7 @@ fn peer_tape_facts_returns_segment_history_turn_maps_and_bounded_summaries() {
         temp.path(),
         "facts-owner",
         binary,
-        &[
-            ("current-segment", current),
-            ("previous-segment", previous),
-        ],
+        &[("current-segment", current), ("previous-segment", previous)],
     );
     let peer = TopologyPeer {
         ssh: None,
@@ -2175,7 +2172,10 @@ fn peer_tape_facts_verifies_and_returns_native_recovery_binding() {
     assert_eq!(facts["recovery_binding"]["points"][0]["old_offset"], 2);
     assert_eq!(facts["recovery_binding"]["points"][0]["source_offset"], 3);
     assert_eq!(facts["edit_offset_to_turn"][0]["turn"], 2);
-    assert_eq!(facts["edit_offset_to_turn"][0]["recovered_source_offset"], 3);
+    assert_eq!(
+        facts["edit_offset_to_turn"][0]["recovered_source_offset"],
+        3
+    );
 }
 
 #[test]
