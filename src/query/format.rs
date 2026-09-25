@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
 
@@ -589,10 +589,8 @@ pub fn annotate_chain_fields(sessions: &mut [Value], dispatch_lineage: &[Value])
         .iter()
         .filter_map(|session| session.get("session_id").and_then(Value::as_str))
         .map(ToOwned::to_owned)
-        .collect::<HashSet<_>>();
-
-    let mut parent_of = HashMap::<String, String>::new();
-    let mut children_of = HashMap::<String, Vec<String>>::new();
+        .collect::<BTreeSet<_>>();
+    let mut edges = Vec::new();
     for link in dispatch_lineage {
         // Recovery keeps context provenance in `session`; the physical edit
         // remains the child displayed in the ordinary sessions/chain model.
@@ -606,31 +604,9 @@ pub fn annotate_chain_fields(sessions: &mut [Value], dispatch_lineage: &[Value])
         let Some(parent) = link.get("parent_session").and_then(Value::as_str) else {
             continue;
         };
-        if !ids.contains(child) || !ids.contains(parent) {
-            continue;
-        }
-        parent_of.insert(child.to_string(), parent.to_string());
-        children_of
-            .entry(parent.to_string())
-            .or_default()
-            .push(child.to_string());
+        edges.push((child.to_string(), parent.to_string()));
     }
-    for children in children_of.values_mut() {
-        children.sort();
-    }
-
-    let mut root_for = HashMap::<String, String>::new();
-    for id in &ids {
-        let mut current = id.clone();
-        while let Some(parent) = parent_of.get(&current) {
-            current = parent.clone();
-        }
-        root_for.insert(id.clone(), current);
-    }
-    let mut chain_len = HashMap::<String, usize>::new();
-    for root in root_for.values() {
-        *chain_len.entry(root.clone()).or_insert(0) += 1;
-    }
+    let graph = session_chain_graph(ids, edges);
 
     for session in sessions {
         let Some(id) = session
@@ -640,23 +616,30 @@ pub fn annotate_chain_fields(sessions: &mut [Value], dispatch_lineage: &[Value])
         else {
             continue;
         };
-        let mut depth = 0usize;
-        let mut current = id.clone();
-        while let Some(parent) = parent_of.get(&current) {
-            depth += 1;
-            current = parent.clone();
-        }
-        let parent = parent_of.get(&id).cloned();
-        let children = children_of.get(&id).cloned().unwrap_or_default();
-        let root = root_for.get(&id).cloned().unwrap_or_else(|| id.clone());
-        let length = chain_len.get(&root).copied().unwrap_or(1);
+        let parents = graph.parents.get(&id).cloned().unwrap_or_default();
+        let children = graph.children.get(&id).cloned().unwrap_or_default();
+        let component = graph
+            .node_component
+            .get(&id)
+            .map(|index| &graph.components[*index]);
+        let depth = graph.depths.get(&id).copied().unwrap_or(0);
+        let length = component.map_or(1, |component| component.ids.len());
 
         if let Some(obj) = session.as_object_mut() {
             obj.insert("depth".to_string(), json!(depth));
             obj.insert(
                 "parent".to_string(),
-                parent.map(Value::from).unwrap_or(Value::Null),
+                if parents.len() == 1 {
+                    json!(parents.first().expect("one parent"))
+                } else {
+                    Value::Null
+                },
             );
+            if parents.len() > 1 {
+                obj.insert("parents".to_string(), json!(parents));
+            } else {
+                obj.remove("parents");
+            }
             obj.insert("children".to_string(), json!(children));
             obj.insert("chain_length".to_string(), json!(length));
         }
@@ -664,49 +647,196 @@ pub fn annotate_chain_fields(sessions: &mut [Value], dispatch_lineage: &[Value])
 }
 
 pub fn build_chain_metadata(sessions: &[Value]) -> Vec<Value> {
-    let mut parent_of = HashMap::<String, String>::new();
-    for session in sessions {
-        if let (Some(id), Some(parent)) = (
-            session.get("session_id").and_then(Value::as_str),
-            session.get("parent").and_then(Value::as_str),
-        ) {
-            parent_of.insert(id.to_string(), parent.to_string());
-        }
-    }
-    let mut by_root = HashMap::<String, Vec<Value>>::new();
-    let mut root_order = Vec::<String>::new();
+    let ids = sessions
+        .iter()
+        .filter_map(|session| session.get("session_id").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect::<BTreeSet<_>>();
+    let mut edges = Vec::new();
     for session in sessions {
         let Some(id) = session.get("session_id").and_then(Value::as_str) else {
             continue;
         };
-        let mut root = id.to_string();
-        while let Some(parent) = parent_of.get(&root) {
-            root = parent.clone();
+        if let Some(parents) = session.get("parents").and_then(Value::as_array) {
+            edges.extend(
+                parents
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|parent| (id.to_string(), parent.to_string())),
+            );
+        } else if let Some(parent) = session.get("parent").and_then(Value::as_str) {
+            edges.push((id.to_string(), parent.to_string()));
         }
-        if !root_order.iter().any(|value| value == &root) {
-            root_order.push(root.clone());
-        }
-        by_root.entry(root).or_default().push(json!({
-            "session_id": id,
-            "depth": session.get("depth").cloned().unwrap_or_else(|| json!(0)),
-            "parent": session.get("parent").cloned().unwrap_or(Value::Null),
-            "children": session.get("children").cloned().unwrap_or_else(|| json!([])),
-        }));
     }
+    let graph = session_chain_graph(ids, edges);
     let mut out = Vec::new();
-    for root in root_order {
-        let mut descendants = by_root.remove(&root).unwrap_or_default();
+    for component in &graph.components {
+        let mut descendants = component
+            .ids
+            .iter()
+            .filter_map(|id| {
+                let session = sessions.iter().find(|session| {
+                    session.get("session_id").and_then(Value::as_str) == Some(id.as_str())
+                })?;
+                let parents = graph.parents.get(id).cloned().unwrap_or_default();
+                let children = graph.children.get(id).cloned().unwrap_or_default();
+                let mut row = json!({
+                    "session_id": id,
+                    "depth": graph.depths.get(id).copied().unwrap_or(0),
+                    "parent": if parents.len() == 1 {
+                        json!(parents.first().expect("one parent"))
+                    } else {
+                        Value::Null
+                    },
+                    "children": children,
+                });
+                if parents.len() > 1 {
+                    row["parents"] = json!(parents);
+                }
+                // Retain any display-specific chain annotations already
+                // computed for this session without trusting them for graph
+                // construction.
+                if session.get("cycle").and_then(Value::as_bool) == Some(true) {
+                    row["cycle"] = json!(true);
+                }
+                Some(row)
+            })
+            .collect::<Vec<_>>();
         descendants.sort_by(|a, b| {
             let ad = a.get("depth").and_then(Value::as_u64).unwrap_or(0);
             let bd = b.get("depth").and_then(Value::as_u64).unwrap_or(0);
-            ad.cmp(&bd)
+            ad.cmp(&bd).then_with(|| {
+                a.get("session_id")
+                    .and_then(Value::as_str)
+                    .cmp(&b.get("session_id").and_then(Value::as_str))
+            })
         });
-        out.push(json!({
-            "root_session_id": root,
-            "descendants": descendants,
-        }));
+        let mut chain = json!({"descendants": descendants});
+        if component.roots.len() > 1 {
+            chain["root_session_ids"] = json!(component.roots);
+        } else {
+            chain["root_session_id"] = json!(component.display_root);
+        }
+        if component.cycle {
+            chain["cycle"] = json!(true);
+        }
+        out.push(chain);
     }
     out
+}
+
+struct ChainComponent {
+    ids: BTreeSet<String>,
+    roots: Vec<String>,
+    display_root: String,
+    cycle: bool,
+}
+
+struct SessionChainGraph {
+    parents: BTreeMap<String, BTreeSet<String>>,
+    children: BTreeMap<String, BTreeSet<String>>,
+    components: Vec<ChainComponent>,
+    node_component: BTreeMap<String, usize>,
+    depths: BTreeMap<String, usize>,
+}
+
+fn session_chain_graph(
+    ids: BTreeSet<String>,
+    edges: impl IntoIterator<Item = (String, String)>,
+) -> SessionChainGraph {
+    let mut parents = ids
+        .iter()
+        .cloned()
+        .map(|id| (id, BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+    let mut children = parents.clone();
+    for (child, parent) in edges {
+        if parents.contains_key(&child) && parents.contains_key(&parent) {
+            parents
+                .entry(child.clone())
+                .or_default()
+                .insert(parent.clone());
+            children.entry(parent).or_default().insert(child);
+        }
+    }
+
+    let mut unseen = ids;
+    let mut components = Vec::new();
+    let mut node_component = BTreeMap::new();
+    let mut depths = BTreeMap::<String, usize>::new();
+    while let Some(start) = unseen.iter().next().cloned() {
+        unseen.remove(&start);
+        let mut component_ids = BTreeSet::from([start.clone()]);
+        let mut queue = VecDeque::from([start]);
+        while let Some(id) = queue.pop_front() {
+            let neighbors = parents
+                .get(&id)
+                .into_iter()
+                .flatten()
+                .chain(children.get(&id).into_iter().flatten());
+            for neighbor in neighbors {
+                if unseen.remove(neighbor) {
+                    component_ids.insert(neighbor.clone());
+                    queue.push_back(neighbor.clone());
+                }
+            }
+        }
+
+        let roots = component_ids
+            .iter()
+            .filter(|id| parents.get(*id).is_none_or(BTreeSet::is_empty))
+            .cloned()
+            .collect::<Vec<_>>();
+        let cycle = roots.is_empty();
+        let display_root = roots
+            .first()
+            .cloned()
+            .or_else(|| component_ids.first().cloned())
+            .expect("component is non-empty");
+        let starts = if cycle {
+            vec![display_root.clone()]
+        } else {
+            roots.clone()
+        };
+        let mut breadth = VecDeque::new();
+        for root in starts {
+            if depths.insert(root.clone(), 0).is_none() {
+                breadth.push_back(root);
+            }
+        }
+        while let Some(id) = breadth.pop_front() {
+            let depth = depths[&id];
+            for neighbor in parents
+                .get(&id)
+                .into_iter()
+                .flatten()
+                .chain(children.get(&id).into_iter().flatten())
+            {
+                if component_ids.contains(neighbor) && !depths.contains_key(neighbor) {
+                    depths.insert(neighbor.clone(), depth.saturating_add(1));
+                    breadth.push_back(neighbor.clone());
+                }
+            }
+        }
+        let index = components.len();
+        for id in &component_ids {
+            node_component.insert(id.clone(), index);
+        }
+        components.push(ChainComponent {
+            ids: component_ids,
+            roots,
+            display_root,
+            cycle,
+        });
+    }
+
+    SessionChainGraph {
+        parents,
+        children,
+        components,
+        node_component,
+        depths,
+    }
 }
 
 pub fn default_peek_anchor_line(
@@ -1126,5 +1256,71 @@ pub(crate) fn pretty_tier_name(tier: PrettyConfidenceTier) -> &'static str {
         PrettyConfidenceTier::Related => "related",
         PrettyConfidenceTier::Hidden => "hidden",
         PrettyConfidenceTier::ForensicsOnly => "forensics_only",
+    }
+}
+
+#[cfg(test)]
+mod chain_graph_tests {
+    use super::*;
+
+    #[test]
+    fn chain_graph_retains_multiple_parents_and_reports_multiple_roots() {
+        let mut sessions = vec![
+            json!({"session_id": "a"}),
+            json!({"session_id": "b"}),
+            json!({"session_id": "c"}),
+        ];
+        let hops = vec![
+            json!({"session": "c", "parent_session": "a"}),
+            json!({"session": "c", "parent_session": "b"}),
+        ];
+
+        annotate_chain_fields(&mut sessions, &hops);
+
+        let child = sessions
+            .iter()
+            .find(|session| session["session_id"] == "c")
+            .expect("child session");
+        assert_eq!(child["parent"], Value::Null);
+        assert_eq!(child["parents"], json!(["a", "b"]));
+        assert_eq!(child["depth"], 1);
+        assert_eq!(child["chain_length"], 3);
+
+        let chains = build_chain_metadata(&sessions);
+        assert_eq!(chains.len(), 1);
+        assert_eq!(chains[0]["root_session_ids"], json!(["a", "b"]));
+        assert!(chains[0].get("root_session_id").is_none());
+        assert_eq!(
+            chains[0]["descendants"]
+                .as_array()
+                .expect("component sessions")
+                .iter()
+                .map(|session| (
+                    session["session_id"].as_str().unwrap(),
+                    session["depth"].as_u64().unwrap(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![("a", 0), ("b", 0), ("c", 1)]
+        );
+    }
+
+    #[test]
+    fn chain_graph_formats_a_pure_cycle_with_a_stable_display_root() {
+        let mut sessions = vec![json!({"session_id": "b"}), json!({"session_id": "a"})];
+        let hops = vec![
+            json!({"session": "a", "parent_session": "b"}),
+            json!({"session": "b", "parent_session": "a"}),
+        ];
+
+        annotate_chain_fields(&mut sessions, &hops);
+        let chains = build_chain_metadata(&sessions);
+
+        assert_eq!(chains.len(), 1);
+        assert_eq!(chains[0]["root_session_id"], "a");
+        assert_eq!(chains[0]["cycle"], true);
+        assert_eq!(chains[0]["descendants"][0]["session_id"], "a");
+        assert_eq!(chains[0]["descendants"][0]["depth"], 0);
+        assert_eq!(chains[0]["descendants"][1]["session_id"], "b");
+        assert_eq!(chains[0]["descendants"][1]["depth"], 1);
     }
 }

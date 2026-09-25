@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{HashSet, VecDeque};
 
 use crate::index::lineage::EvidenceFragmentRef;
@@ -95,7 +96,7 @@ pub fn retrieve_lineage(
             let key = edge_key(edge);
             !seen_edges.contains(&key) && candidate_edges.insert(key)
         });
-        edges.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+        edges.sort_by(compare_edge_candidates);
         for edge in edges.into_iter().take(traversal.max_fanout) {
             if out.len() >= traversal.max_edges {
                 break;
@@ -136,6 +137,40 @@ pub(crate) fn edge_key(
         edge.agent_link,
         edge.note.clone(),
     )
+}
+
+/// Order equal-confidence lineage evidence by its semantic fields, never by
+/// the database row id or which store happened to answer first.
+pub(crate) fn compare_edge_candidates(a: &EdgeRow, b: &EdgeRow) -> Ordering {
+    b.confidence
+        .total_cmp(&a.confidence)
+        .then_with(|| a.from_anchor.cmp(&b.from_anchor))
+        .then_with(|| a.to_anchor.cmp(&b.to_anchor))
+        .then_with(|| {
+            location_delta_order(a.location_delta).cmp(&location_delta_order(b.location_delta))
+        })
+        .then_with(|| cardinality_order(a.cardinality).cmp(&cardinality_order(b.cardinality)))
+        .then_with(|| a.agent_link.cmp(&b.agent_link))
+        .then_with(|| a.note.cmp(&b.note))
+}
+
+fn location_delta_order(value: crate::index::lineage::LocationDelta) -> u8 {
+    use crate::index::lineage::LocationDelta;
+    match value {
+        LocationDelta::Same => 0,
+        LocationDelta::Adjacent => 1,
+        LocationDelta::Moved => 2,
+        LocationDelta::Absent => 3,
+    }
+}
+
+fn cardinality_order(value: crate::index::lineage::Cardinality) -> u8 {
+    use crate::index::lineage::Cardinality;
+    match value {
+        Cardinality::OneToOne => 0,
+        Cardinality::OneToMany => 1,
+        Cardinality::ManyToOne => 2,
+    }
 }
 
 pub fn explain_by_anchor(
@@ -238,7 +273,7 @@ pub fn explain_across_indexes_by_anchor(
             let key = edge_key(edge);
             !seen_edges.contains(&key) && candidate_edges.insert(key)
         });
-        candidates.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+        candidates.sort_by(compare_edge_candidates);
         for edge in candidates.into_iter().take(traversal.max_fanout) {
             if lineage.len() >= traversal.max_edges {
                 break;
@@ -291,6 +326,185 @@ mod tests {
         (1..=24)
             .map(|line| format!("fn {prefix}_{line}() {{ value_{line}(); }}\n"))
             .collect()
+    }
+
+    fn edge_row(
+        from_anchor: &str,
+        to_anchor: &str,
+        confidence: f32,
+        location_delta: LocationDelta,
+        cardinality: Cardinality,
+        agent_link: bool,
+        note: Option<&str>,
+    ) -> EdgeRow {
+        EdgeRow {
+            from_anchor: from_anchor.into(),
+            to_anchor: to_anchor.into(),
+            confidence,
+            location_delta,
+            cardinality,
+            agent_link,
+            note: note.map(ToOwned::to_owned),
+            stored_class: crate::index::lineage::StoredEdgeClass::Lineage,
+        }
+    }
+
+    #[test]
+    fn semantic_edge_order_is_stable_across_equal_confidence_candidates() {
+        let edges = vec![
+            edge_row(
+                "b",
+                "a",
+                0.9,
+                LocationDelta::Same,
+                Cardinality::OneToOne,
+                false,
+                None,
+            ),
+            edge_row(
+                "a",
+                "c",
+                0.8,
+                LocationDelta::Same,
+                Cardinality::OneToOne,
+                false,
+                None,
+            ),
+            edge_row(
+                "a",
+                "b",
+                0.9,
+                LocationDelta::Moved,
+                Cardinality::OneToOne,
+                false,
+                None,
+            ),
+            edge_row(
+                "a",
+                "b",
+                0.9,
+                LocationDelta::Same,
+                Cardinality::OneToMany,
+                false,
+                None,
+            ),
+            edge_row(
+                "a",
+                "b",
+                0.9,
+                LocationDelta::Same,
+                Cardinality::OneToOne,
+                false,
+                Some("z"),
+            ),
+            edge_row(
+                "a",
+                "b",
+                0.9,
+                LocationDelta::Same,
+                Cardinality::OneToOne,
+                false,
+                None,
+            ),
+            edge_row(
+                "a",
+                "b",
+                0.9,
+                LocationDelta::Same,
+                Cardinality::OneToOne,
+                true,
+                None,
+            ),
+        ];
+        let mut forward = edges.clone();
+        forward.sort_by(compare_edge_candidates);
+        let mut reverse = edges.into_iter().rev().collect::<Vec<_>>();
+        reverse.sort_by(compare_edge_candidates);
+
+        let key = |rows: &[EdgeRow]| {
+            rows.iter()
+                .map(|edge| {
+                    (
+                        edge.from_anchor.clone(),
+                        edge.to_anchor.clone(),
+                        edge.confidence,
+                        edge.location_delta,
+                        edge.cardinality,
+                        edge.agent_link,
+                        edge.note.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(key(&forward), key(&reverse));
+        assert_eq!(
+            key(&forward),
+            vec![
+                (
+                    "a".to_string(),
+                    "b".to_string(),
+                    0.9,
+                    LocationDelta::Same,
+                    Cardinality::OneToOne,
+                    false,
+                    None,
+                ),
+                (
+                    "a".to_string(),
+                    "b".to_string(),
+                    0.9,
+                    LocationDelta::Same,
+                    Cardinality::OneToOne,
+                    false,
+                    Some("z".to_string()),
+                ),
+                (
+                    "a".to_string(),
+                    "b".to_string(),
+                    0.9,
+                    LocationDelta::Same,
+                    Cardinality::OneToOne,
+                    true,
+                    None,
+                ),
+                (
+                    "a".to_string(),
+                    "b".to_string(),
+                    0.9,
+                    LocationDelta::Same,
+                    Cardinality::OneToMany,
+                    false,
+                    None,
+                ),
+                (
+                    "a".to_string(),
+                    "b".to_string(),
+                    0.9,
+                    LocationDelta::Moved,
+                    Cardinality::OneToOne,
+                    false,
+                    None,
+                ),
+                (
+                    "b".to_string(),
+                    "a".to_string(),
+                    0.9,
+                    LocationDelta::Same,
+                    Cardinality::OneToOne,
+                    false,
+                    None,
+                ),
+                (
+                    "a".to_string(),
+                    "c".to_string(),
+                    0.8,
+                    LocationDelta::Same,
+                    Cardinality::OneToOne,
+                    false,
+                    None,
+                ),
+            ]
+        );
     }
 
     fn edit(offset: u64, before: &str, after: &str) -> TapeEventAt {
