@@ -1730,9 +1730,7 @@ fn cmd_show_peers_inner(
         let first_digest = &remote_digests[&remote_locators[0].store_ref];
         if remote_locators
             .iter()
-            .any(|locator| {
-                remote_digests[&locator.store_ref].as_str() != first_digest.as_str()
-            })
+            .any(|locator| remote_digests[&locator.store_ref].as_str() != first_digest.as_str())
         {
             let stores = remote_locators
                 .iter()
