@@ -3025,6 +3025,76 @@ mod tests {
     }
 
     #[test]
+    fn dropping_owner_session_releases_its_pinned_reader_transaction() {
+        let (_temp, home, db, _tapes) = configured_home();
+        let topology = load_topology(&home).expect("topology").expect("configured");
+        let mut session = PeerSession {
+            topology,
+            opened: BTreeMap::new(),
+            tape_file_sizes: RefCell::new(HashMap::new()),
+        };
+        let mut output = Vec::new();
+        let open: Value = serde_json::from_str(&request(1, "open", &["default"], json!({})))
+            .expect("open request");
+        session
+            .handle(&open, &open["id"], &mut output)
+            .expect("open owner");
+
+        {
+            let writer = SqliteIndex::open_writer(db.to_str().expect("utf8 path"))
+                .expect("writer while owner is open");
+            writer
+                .insert_dispatch_link(
+                    "abc",
+                    &DispatchLink {
+                        uuid: "visible-after-owner-exit".into(),
+                        first_turn_index: 9,
+                        direction: DispatchDirection::Sent,
+                    },
+                )
+                .expect("writer commit while pinned reader is open");
+        }
+
+        assert!(
+            session.opened["default"]
+                .index
+                .dispatch_links_for_uuid("visible-after-owner-exit")
+                .expect("pinned read")
+                .is_empty(),
+            "owner should retain its original snapshot until the session ends"
+        );
+
+        // The real peer exits by dropping PeerSession when stdin closes or its
+        // watchdog expires. Dropping the owner must release the WAL snapshot,
+        // so a checkpoint can pass it instead of waiting for the session cap.
+        drop(session);
+        let checkpoint = rusqlite::Connection::open(&db)
+            .expect("open checkpoint connection")
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .expect("checkpoint after owner session exit");
+        assert_eq!(
+            checkpoint.0, 0,
+            "checkpoint must not be blocked by the owner"
+        );
+
+        let fresh = SqliteIndex::open_reader(db.to_str().expect("utf8 path"))
+            .expect("fresh reader after owner exit");
+        assert_eq!(
+            fresh
+                .dispatch_links_for_uuid("visible-after-owner-exit")
+                .expect("fresh snapshot")[0]
+                .uuid,
+            "visible-after-owner-exit"
+        );
+    }
+
+    #[test]
     fn topology_parser_rejects_unknown_fields() {
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path();

@@ -5190,6 +5190,7 @@ fn cmd_explain_with_peers_inner(
 
     let mut touch_requests =
         std::collections::BTreeMap::<String, Vec<(String, PeerRequest)>>::new();
+    let mut touch_anchors_by_store = HashMap::<String, std::collections::HashSet<String>>::new();
     for (machine, owner) in &owners {
         for (export, status) in &owner.exports {
             if status.is_err() {
@@ -5205,6 +5206,10 @@ fn cmd_explain_with_peers_inner(
             );
             anchors.sort();
             anchors.dedup();
+            touch_anchors_by_store
+                .entry(store.clone())
+                .or_default()
+                .extend(anchors.iter().cloned());
             for chunk in anchors.chunks(peer_item_cap(owner)) {
                 touch_requests.entry(machine.clone()).or_default().push((
                     export.clone(),
@@ -5280,6 +5285,20 @@ fn cmd_explain_with_peers_inner(
                                 );
                                 continue;
                             };
+                            if !touch_anchors_by_store
+                                .get(&store)
+                                .is_some_and(|anchors| anchors.contains(query_anchor))
+                            {
+                                any_peer_failure = true;
+                                mark_source_phase(
+                                    &mut sources,
+                                    &store,
+                                    "lookup_anchors",
+                                    "protocol_error",
+                                    "peer touch fragment named an unrequested anchor",
+                                );
+                                continue;
+                            }
                             facts_by_store
                                 .entry(store.clone())
                                 .or_default()

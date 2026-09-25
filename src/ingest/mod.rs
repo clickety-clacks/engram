@@ -28,6 +28,11 @@ use crate::{CliError, RepoPaths, RuntimeContext, ensure_db_parent, home_dir, pat
 
 const CURSOR_GUARD_WINDOW: usize = 512;
 
+#[cfg(test)]
+thread_local! {
+    static PANIC_AFTER_TAPE_PUBLICATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub fn run_ingest(
     cwd: &Path,
     paths: &RepoPaths,
@@ -812,6 +817,13 @@ pub fn record_transcript(
         atomic_write(&tape_path, &compressed).map_err(|err| CliError::io("write_error", err))?;
     }
 
+    // Test-only crash injection at the durable tape / derived-index boundary.
+    // The production build contains no switch or environment-controlled path.
+    #[cfg(test)]
+    if PANIC_AFTER_TAPE_PUBLICATION.with(|inject| inject.replace(false)) {
+        panic!("injected interruption after tape publication and before indexing");
+    }
+
     let index = SqliteIndex::open_writer(&path_string(db_path))?;
     let already_indexed = index.has_tape(&tape_id)?;
 
@@ -847,6 +859,68 @@ pub fn record_transcript(
     }
 
     print_json(&Value::Object(payload))
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use super::{PANIC_AFTER_TAPE_PUBLICATION, record_transcript, tape_id_for_contents};
+    use crate::RepoPaths;
+    use crate::index::SqliteIndex;
+    use crate::store::tapes::tape_path_for_id;
+    use serde_json::json;
+
+    #[test]
+    fn interrupted_publication_leaves_a_complete_tape_without_derived_rows() {
+        let temp = tempfile::tempdir().expect("temporary repository");
+        let paths = RepoPaths {
+            root: temp.path().to_path_buf(),
+            tapes: temp.path().join(".engram/tapes"),
+            objects: temp.path().join(".engram/objects"),
+            cursors: temp.path().join(".engram/cursors"),
+        };
+        std::fs::create_dir_all(&paths.tapes).expect("tape directory");
+        let db_path = temp.path().join(".engram/index.sqlite");
+        std::fs::create_dir_all(db_path.parent().expect("database parent"))
+            .expect("database directory");
+        drop(
+            SqliteIndex::open_writer(db_path.to_str().expect("database path"))
+                .expect("index database"),
+        );
+
+        let transcript = concat!(
+            "{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"meta\"}\n",
+            "{\"t\":\"2026-09-25T12:01:00Z\",\"k\":\"msg.in\",\"content\":\"publication window\"}\n",
+        );
+        PANIC_AFTER_TAPE_PUBLICATION.with(|inject| inject.set(true));
+        let interrupted = catch_unwind(AssertUnwindSafe(|| {
+            let _ = record_transcript(&paths, &db_path, transcript, json!({}), None);
+        }));
+        assert!(interrupted.is_err(), "the post-publication fault must fire");
+
+        let tape_id = tape_id_for_contents(transcript);
+        let tape_path = tape_path_for_id(&paths, &tape_id);
+        assert!(tape_path.is_file(), "atomic tape publication must survive");
+        let compressed = std::fs::read(&tape_path).expect("published tape bytes");
+        let decoded = zstd::stream::decode_all(compressed.as_slice()).expect("complete zstd tape");
+        assert_eq!(decoded, transcript.as_bytes());
+
+        let before_retry = SqliteIndex::open_reader(db_path.to_str().expect("database path"))
+            .expect("read index after injected interruption");
+        assert!(
+            !before_retry.has_tape(&tape_id).expect("tape row lookup"),
+            "an interrupted ingest may leave the immutable tape, never derived rows without it"
+        );
+        drop(before_retry);
+
+        record_transcript(&paths, &db_path, transcript, json!({}), None)
+            .expect("retry should index the already-published tape");
+        let after_retry = SqliteIndex::open_reader(db_path.to_str().expect("database path"))
+            .expect("read index after retry");
+        assert!(after_retry.has_tape(&tape_id).expect("retried tape row"));
+        assert!(tape_path.is_file(), "indexing must retain the source tape");
+    }
 }
 
 pub fn now_iso8601() -> String {

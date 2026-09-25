@@ -1,4 +1,6 @@
+use std::collections::BTreeMap;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -9,6 +11,89 @@ use engram::index::{
 };
 use serde_json::json;
 use sha2::Digest;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SnapshotEntry {
+    Directory,
+    File(Vec<u8>),
+}
+
+fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, SnapshotEntry> {
+    fn visit(root: &Path, dir: &Path, files: &mut BTreeMap<PathBuf, SnapshotEntry>) {
+        let mut entries = std::fs::read_dir(dir)
+            .expect("read snapshot directory")
+            .map(|entry| entry.expect("snapshot entry"))
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let relative = path.strip_prefix(root).expect("relative snapshot path");
+            let kind = entry.file_type().expect("snapshot file type");
+            if kind.is_dir() {
+                files.insert(relative.to_path_buf(), SnapshotEntry::Directory);
+                visit(root, &path, files);
+            } else {
+                assert!(
+                    kind.is_file(),
+                    "fixture contains unexpected special file: {path:?}"
+                );
+                files.insert(
+                    relative.to_path_buf(),
+                    SnapshotEntry::File(std::fs::read(&path).expect("snapshot bytes")),
+                );
+            }
+        }
+    }
+
+    let mut files = BTreeMap::new();
+    visit(root, root, &mut files);
+    files
+}
+
+fn assert_owner_unchanged_except_sqlite_sidecars(
+    before: &BTreeMap<PathBuf, SnapshotEntry>,
+    after: &BTreeMap<PathBuf, SnapshotEntry>,
+) {
+    let stable = |tree: &BTreeMap<PathBuf, SnapshotEntry>| {
+        tree.iter()
+            .filter(|(path, _)| {
+                !matches!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some("index.sqlite-wal" | "index.sqlite-shm")
+                )
+            })
+            .map(|(path, entry)| (path.clone(), entry.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(stable(before), stable(after));
+    for path in after.keys().filter(|path| !before.contains_key(*path)) {
+        assert!(
+            matches!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some("index.sqlite-wal" | "index.sqlite-shm")
+            ) && path.parent() == Some(Path::new(".engram")),
+            "unexpected new owner path: {path:?}"
+        );
+    }
+}
+
+fn one_shot_handshake_peer(root: &Path, name: &str, frame: &str) -> TopologyPeer {
+    let script = root.join(format!("{name}-handshake.sh"));
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\nIFS= read -r request || exit 0\nprintf '%s\\n' '{frame}'\n"),
+    )
+    .expect("write one-shot peer");
+    TopologyPeer {
+        ssh: None,
+        command: Some(vec![
+            "/bin/sh".into(),
+            script.to_string_lossy().into_owned(),
+        ]),
+        engram: "/unused/engram".into(),
+        exports: vec![],
+    }
+}
 
 fn write_grep_owner(
     root: &std::path::Path,
@@ -549,6 +634,120 @@ fn write_unavailable_explain_fixture(
     (caller_home, repo)
 }
 
+fn scripted_anchor_validation_peer(
+    root: &Path,
+    machine: &str,
+    binary: &str,
+    scenario: &str,
+) -> serde_json::Value {
+    let script_path = root.join(format!("{machine}-anchor-validation-peer.sh"));
+    let script = [
+        "#!/bin/sh",
+        "set -eu",
+        "machine=\"$1\"",
+        "scenario=\"$2\"",
+        "lookup_count=0",
+        "while IFS= read -r request; do",
+        r#"  id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"#,
+        r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
+        "  case \"$op\" in",
+        "    open)",
+        r#"      printf '{"id":%s,"data":{"store":"%s/default","status":"ok","db":"/fixture/%s.sqlite","tape_dirs":[],"reader_mode":"live","snapshot_at":"2026-09-25T00:00:00Z"}}\n' "$id" "$machine" "$machine""#,
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"%s","build":"@BUILD@","protocol":1,"schema":@SCHEMA@,"query_semantics":@SEMANTICS@,"limits":{"items_per_batch":64}}}\n' "$id" "$machine""#,
+        "      ;;",
+        "    lookup_anchors)",
+        "      lookup_count=$((lookup_count + 1))",
+        "      if [ \"$lookup_count\" -eq 1 ]; then",
+        r#"        printf '{"id":%s,"data":{"type":"anchor_result","store":"%s/default","anchor":"query-anchor","matching_window_anchors":["reached-anchor"]}}\n' "$id" "$machine""#,
+        "        case \"$scenario\" in",
+        "          direct-missing)",
+        r#"            printf '{"id":%s,"data":{"type":"fragment","store":"%s/default","tape_id":"%s-tape","event_offset":1,"kind":"edit","file_path":"fixture.rs","timestamp":"2026-09-25T12:00:00Z"}}\n' "$id" "$machine" "$machine""#,
+        "            ;;",
+        "          direct-wrong)",
+        r#"            printf '{"id":%s,"data":{"type":"fragment","store":"%s/default","tape_id":"%s-tape","event_offset":1,"anchor":17,"kind":"edit","file_path":"fixture.rs","timestamp":"2026-09-25T12:00:00Z"}}\n' "$id" "$machine" "$machine""#,
+        "            ;;",
+        "          direct-foreign)",
+        "            if [ \"$machine\" = bad ]; then",
+        r#"              printf '{"id":%s,"data":{"type":"fragment","store":"%s/default","tape_id":"%s-tape","event_offset":1,"anchor":"foreign-anchor","kind":"edit","file_path":"fixture.rs","timestamp":"2026-09-25T12:00:00Z"}}\n' "$id" "$machine" "$machine""#,
+        "            else",
+        r#"              printf '{"id":%s,"data":{"type":"fragment","store":"%s/default","tape_id":"%s-tape","event_offset":1,"anchor":"query-anchor","kind":"edit","file_path":"fixture.rs","timestamp":"2026-09-25T12:00:00Z"}}\n' "$id" "$machine" "$machine""#,
+        "            fi",
+        "            ;;",
+        "          *)",
+        r#"            printf '{"id":%s,"data":{"type":"fragment","store":"%s/default","tape_id":"%s-tape","event_offset":1,"anchor":"query-anchor","kind":"edit","file_path":"fixture.rs","timestamp":"2026-09-25T12:00:00Z"}}\n' "$id" "$machine" "$machine""#,
+        "            ;;",
+        "        esac",
+        "      else",
+        "        case \"$scenario\" in",
+        "          touch-missing)",
+        r#"            printf '{"id":%s,"data":{"type":"fragment","store":"%s/default","tape_id":"%s-tape","event_offset":2,"kind":"edit","file_path":"touch.rs","timestamp":"2026-09-25T12:01:00Z"}}\n' "$id" "$machine" "$machine""#,
+        "            ;;",
+        "          touch-wrong)",
+        r#"            printf '{"id":%s,"data":{"type":"fragment","store":"%s/default","tape_id":"%s-tape","event_offset":2,"anchor":17,"kind":"edit","file_path":"touch.rs","timestamp":"2026-09-25T12:01:00Z"}}\n' "$id" "$machine" "$machine""#,
+        "            ;;",
+        "          touch-unrequested)",
+        r#"            printf '{"id":%s,"data":{"type":"fragment","store":"%s/default","tape_id":"%s-tape","event_offset":2,"anchor":"never-requested","kind":"edit","file_path":"touch.rs","timestamp":"2026-09-25T12:01:00Z"}}\n' "$id" "$machine" "$machine""#,
+        "            ;;",
+        "          touch-reached)",
+        r#"            printf '{"id":%s,"data":{"type":"fragment","store":"%s/default","tape_id":"%s-tape","event_offset":2,"anchor":"reached-anchor","kind":"edit","file_path":"touch.rs","timestamp":"2026-09-25T12:01:00Z"}}\n' "$id" "$machine" "$machine""#,
+        "            ;;",
+        "          *) ;;",
+        "        esac",
+        "      fi",
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"records":1}}\n' "$id""#,
+        "      ;;",
+        "    lookup_edges)",
+        r#"      printf '{"id":%s,"data":{"type":"node_result","store":"%s/default","node":"reached-anchor"}}\n' "$id" "$machine""#,
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"records":1}}\n' "$id""#,
+        "      ;;",
+        "    tape_facts)",
+        r#"      printf '{"id":%s,"data":{"type":"tape_facts","store":"%s/default","tape_id":"%s-tape","status":"ok","indexed":true,"segment":{"tape_id":"%s-tape","message_turn_start":0},"predecessor_chain":[{"tape_id":"%s-tape","message_turn_start":0}],"chain_status":"complete","unresolved_predecessor":null,"edit_offset_to_turn":[],"turn_to_offset":[],"recovery_binding":null,"summary":{"total_lines":1,"window_start":1,"window_end":1,"latest_timestamp":"2026-09-25T12:00:00Z","files_touched":[]}}}\n' "$id" "$machine" "$machine" "$machine" "$machine""#,
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"items":1}}\n' "$id""#,
+        "      ;;",
+        "    locate_tapes)",
+        r#"      printf '{"id":%s,"data":{"store":"%s/default","tape_id":"%s-tape","indexed":true,"file":{"machine":"%s","path":"/fixture/%s-tape.jsonl.zst","kind":"tape"},"size_bytes":1}}\n' "$id" "$machine" "$machine" "$machine" "$machine""#,
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"items":1}}\n' "$id""#,
+        "      ;;",
+        "    dispatch_rows)",
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{}}\n' "$id""#,
+        "      ;;",
+        "    *) exit 78 ;;",
+        "  esac",
+        "done",
+    ]
+    .join("\n")
+    .replace("@BUILD@", env!("CARGO_PKG_VERSION"))
+    .replace("@SCHEMA@", &SCHEMA_VERSION.to_string())
+    .replace("@SEMANTICS@", &QUERY_SEMANTICS_VERSION.to_string());
+    std::fs::write(&script_path, script).expect("write scripted anchor-validation peer");
+    json!({
+        "command": ["/bin/sh", script_path, machine, scenario],
+        "engram": binary,
+        "exports": ["default"],
+    })
+}
+
+fn run_anchor_validation_explain(
+    binary: &str,
+    caller_home: &Path,
+    repo: &Path,
+    peers: &str,
+    require_complete: bool,
+) -> std::process::Output {
+    let mut command = Command::new(binary);
+    command.current_dir(repo).env("HOME", caller_home).args([
+        "explain",
+        "query-anchor",
+        "--anchor",
+        "--peers",
+        peers,
+    ]);
+    if require_complete {
+        command.arg("--require-complete");
+    }
+    command.output().expect("run anchor-validation explain")
+}
+
 #[test]
 fn explain_peer_failure_without_local_matches_emits_partial_sources() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -619,6 +818,182 @@ fn explain_require_complete_peer_failure_precedes_no_results() {
 }
 
 #[test]
+fn explain_peers_rejects_unbound_direct_anchor_fragments() {
+    let binary = env!("CARGO_BIN_EXE_engram");
+    for scenario in ["direct-missing", "direct-wrong"] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (caller_home, repo) = write_local_grep_source(
+            temp.path(),
+            "unbound-direct-caller",
+            "{\"t\":\"2026-09-25T10:00:00Z\",\"k\":\"note\",\"content\":\"empty\"}\n",
+        );
+        let peer = scripted_anchor_validation_peer(temp.path(), "bad", binary, scenario);
+        set_peer_topology(&caller_home, json!({"bad": peer}));
+
+        let partial = run_anchor_validation_explain(binary, &caller_home, &repo, "bad", false);
+        assert!(!partial.status.success());
+        assert!(String::from_utf8_lossy(&partial.stderr).contains("no_results"));
+        let value: serde_json::Value =
+            serde_json::from_slice(&partial.stdout).expect("partial explain JSON");
+        assert!(value["sessions"].as_array().unwrap().is_empty());
+        assert_eq!(value["federation"]["coverage"], "partial");
+        let source = value["federation"]["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|source| source["store"] == "bad/default")
+            .expect("bad peer source");
+        assert_eq!(source["store"], "bad/default");
+        assert_eq!(source["phase"], "lookup_anchors");
+        assert_eq!(source["error"]["code"], "protocol_error");
+
+        let required = run_anchor_validation_explain(binary, &caller_home, &repo, "bad", true);
+        assert!(!required.status.success());
+        let stderr = String::from_utf8_lossy(&required.stderr);
+        assert!(stderr.contains("incomplete_results"), "{stderr}");
+        assert!(!stderr.contains("no_results"));
+    }
+}
+
+#[test]
+fn explain_peers_rejects_unrequested_direct_anchor_and_keeps_healthy_peer() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "foreign-direct-caller",
+        "{\"t\":\"2026-09-25T10:00:00Z\",\"k\":\"note\",\"content\":\"empty\"}\n",
+    );
+    let bad = scripted_anchor_validation_peer(temp.path(), "bad", binary, "direct-foreign");
+    let healthy = scripted_anchor_validation_peer(temp.path(), "healthy", binary, "direct-foreign");
+    set_peer_topology(&caller_home, json!({"bad": bad, "healthy": healthy}));
+
+    let output = run_anchor_validation_explain(binary, &caller_home, &repo, "bad,healthy", false);
+    assert!(
+        output.status.success(),
+        "healthy peer result was lost: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("explain JSON");
+    assert_eq!(value["federation"]["coverage"], "partial");
+    let sessions = value["sessions"].as_array().expect("sessions");
+    assert_eq!(
+        sessions.len(),
+        1,
+        "foreign fragment became a session: {value:#}"
+    );
+    assert_eq!(sessions[0]["store"], "healthy/default");
+    assert_eq!(sessions[0]["confidence"], 1.0);
+    let sources = value["federation"]["sources"].as_array().expect("sources");
+    let bad_source = sources
+        .iter()
+        .find(|source| source["store"] == "bad/default")
+        .expect("bad peer source");
+    assert_eq!(bad_source["phase"], "lookup_anchors");
+    assert_eq!(bad_source["error"]["code"], "protocol_error");
+}
+
+#[test]
+fn explain_peers_rejects_unbound_or_unrequested_touch_fragments() {
+    let binary = env!("CARGO_BIN_EXE_engram");
+    for scenario in ["touch-missing", "touch-wrong", "touch-unrequested"] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (caller_home, repo) = write_local_grep_source(
+            temp.path(),
+            "unbound-touch-caller",
+            "{\"t\":\"2026-09-25T10:00:00Z\",\"k\":\"note\",\"content\":\"empty\"}\n",
+        );
+        let peer = scripted_anchor_validation_peer(temp.path(), "touch", binary, scenario);
+        set_peer_topology(&caller_home, json!({"touch": peer}));
+
+        let output = run_anchor_validation_explain(binary, &caller_home, &repo, "touch", false);
+        assert!(
+            output.status.success(),
+            "direct evidence should survive {scenario}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("explain JSON");
+        assert_eq!(
+            value["federation"]["coverage"], "partial",
+            "{scenario}: {value:#}"
+        );
+        let source = value["federation"]["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|source| source["store"] == "touch/default")
+            .expect("touch source");
+        assert_eq!(source["phase"], "lookup_anchors");
+        assert_eq!(source["error"]["code"], "protocol_error");
+        let session = value["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["store"] == "touch/default")
+            .expect("completed direct fragment remains available");
+        let offsets = session["touches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|touch| touch["event_offset"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            offsets,
+            vec![1],
+            "invalid touch fragment was retained: {value:#}"
+        );
+    }
+}
+
+#[test]
+fn explain_peers_keeps_reached_only_touch_without_rescoring() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "reached-touch-caller",
+        "{\"t\":\"2026-09-25T10:00:00Z\",\"k\":\"note\",\"content\":\"empty\"}\n",
+    );
+    let peer = scripted_anchor_validation_peer(temp.path(), "reached", binary, "touch-reached");
+    set_peer_topology(&caller_home, json!({"reached": peer}));
+
+    let output = run_anchor_validation_explain(binary, &caller_home, &repo, "reached", false);
+    assert!(
+        output.status.success(),
+        "valid reached-only touch was rejected: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("explain JSON");
+    assert_eq!(value["federation"]["coverage"], "complete");
+    let session = value["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["store"] == "reached/default")
+        .expect("remote direct-evidence session");
+    assert_eq!(
+        session["confidence"], 1.0,
+        "reached-only hit affected direct score"
+    );
+    let offsets = session["touches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|touch| touch["event_offset"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        offsets,
+        vec![1, 2],
+        "valid reached-only fragment was discarded"
+    );
+    assert_eq!(
+        session["touches"][1]["event_offset"], 2,
+        "second touch is the reached-only evidence"
+    );
+}
+
+#[test]
 fn explain_peers_attributes_remote_only_edits_to_their_physical_owner() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = env!("CARGO_BIN_EXE_engram");
@@ -657,6 +1032,23 @@ fn explain_peers_attributes_remote_only_edits_to_their_physical_owner() {
             engram::index::lineage::LINK_THRESHOLD_DEFAULT,
         )
         .expect("index remote-only edit");
+    let query_anchors =
+        engram::query::format::derive_anchor_candidates(std::slice::from_ref(&source));
+    let distinct_direct_hits = query_anchors
+        .iter()
+        .filter(|anchor| {
+            index
+                .evidence_for_anchor(anchor)
+                .expect("query peer evidence by anchor")
+                .iter()
+                .any(|fragment| fragment.tape_id == tape_id)
+        })
+        .count();
+    assert!(
+        distinct_direct_hits >= 2,
+        "fixture needs distinct query anchors for the same physical tape; anchors={}, hits={distinct_direct_hits}",
+        query_anchors.len()
+    );
     let after_window = engram::anchor::fingerprint_windows(&source)
         .into_iter()
         .next()
@@ -737,6 +1129,15 @@ fn explain_peers_attributes_remote_only_edits_to_their_physical_owner() {
         .expect("remote-only edit session");
     assert_eq!(session["location"]["machine"], "remote-owner");
     assert_eq!(session["location"]["store"], "remote-owner/default");
+    let expected_confidence = distinct_direct_hits as f64 / query_anchors.len() as f64;
+    let actual_confidence = session["confidence"]
+        .as_f64()
+        .expect("remote direct-anchor score");
+    assert!(
+        (actual_confidence - expected_confidence).abs() < 1e-6,
+        "distinct requested anchors should score one deduplicated physical fragment: actual={actual_confidence}, expected={expected_confidence}, anchors={}, hits={distinct_direct_hits}",
+        query_anchors.len()
+    );
     assert_eq!(session["physical_identity"]["tape_id"], tape_id);
     assert_eq!(
         session["physical_identity"]["file"]["machine"],
@@ -2632,6 +3033,93 @@ fn command_peer_runs_real_peer_serve_against_an_isolated_owner_home() {
         owner.exports["default"].as_ref().unwrap().db,
         db.to_str().expect("UTF-8 DB path")
     );
+}
+
+#[test]
+fn peer_open_negotiation_types_each_incompatible_peer() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cases = [
+        (
+            "unknown-subcommand",
+            json!({
+                "id": 1,
+                "end": true,
+                "ok": false,
+                "error": {"code": "unknown_operation", "message": "unknown subcommand"}
+            })
+            .to_string(),
+            "incompatible",
+        ),
+        (
+            "protocol-mismatch",
+            json!({
+                "id": 1,
+                "end": true,
+                "ok": true,
+                "stats": {
+                    "self": "remote", "build": "fixture", "protocol": 2,
+                    "schema": SCHEMA_VERSION, "query_semantics": QUERY_SEMANTICS_VERSION,
+                    "limits": {}
+                }
+            })
+            .to_string(),
+            "incompatible",
+        ),
+        (
+            "schema-v3",
+            json!({
+                "id": 1,
+                "end": true,
+                "ok": true,
+                "stats": {
+                    "self": "remote", "build": "fixture", "protocol": 1,
+                    "schema": 3, "query_semantics": QUERY_SEMANTICS_VERSION,
+                    "limits": {}
+                }
+            })
+            .to_string(),
+            "incompatible",
+        ),
+        (
+            "semantics-mismatch",
+            json!({
+                "id": 1,
+                "end": true,
+                "ok": true,
+                "stats": {
+                    "self": "remote", "build": "fixture", "protocol": 1,
+                    "schema": SCHEMA_VERSION, "query_semantics": QUERY_SEMANTICS_VERSION + 1,
+                    "limits": {}
+                }
+            })
+            .to_string(),
+            "incompatible_semantics",
+        ),
+        (
+            "label-mismatch",
+            json!({
+                "id": 1,
+                "end": true,
+                "ok": true,
+                "stats": {
+                    "self": "unexpected", "build": "fixture", "protocol": 1,
+                    "schema": SCHEMA_VERSION, "query_semantics": QUERY_SEMANTICS_VERSION,
+                    "limits": {}
+                }
+            })
+            .to_string(),
+            "label_mismatch",
+        ),
+    ];
+
+    for (name, frame, expected_code) in cases {
+        let peer = one_shot_handshake_peer(temp.path(), name, &frame);
+        let error = match RemoteOwner::connect("remote", "caller", &peer, Duration::from_secs(1)) {
+            Ok(_) => panic!("case {name} unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, expected_code, "case {name}: {error:?}");
+    }
 }
 
 #[test]
@@ -5713,6 +6201,187 @@ fn peer_decompression_caps_are_reported_as_over_limit() {
 }
 
 #[test]
+fn peer_grep_returns_budget_exceeded_instead_of_a_truncated_page() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let contents = (0..24)
+        .map(|index| {
+            (
+                format!("budget-tape-{index:02}"),
+                format!(
+                    "{{\"t\":\"2026-09-25T12:{index:02}:00Z\",\"k\":\"meta\"}}\n{{\"t\":\"2026-09-25T12:{index:02}:01Z\",\"k\":\"note\",\"content\":\"needle result {index}\"}}\n"
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let tape_refs = contents
+        .iter()
+        .map(|(tape_id, content)| (tape_id.as_str(), content.as_str()))
+        .collect::<Vec<_>>();
+    let remote = write_grep_owner(temp.path(), "budget-owner", binary, &tape_refs);
+    let owner_home = temp.path().join("budget-owner-home");
+    let topology_path = owner_home.join(".engram/topology.yml");
+    let mut topology = std::fs::read_to_string(&topology_path).expect("owner topology");
+    topology.push_str("limits:\n  non_file_response_bytes: 1200\n");
+    std::fs::write(&topology_path, topology).expect("set response budget");
+    let peer = TopologyPeer {
+        ssh: None,
+        command: Some(
+            remote["command"]
+                .as_array()
+                .expect("owner command")
+                .iter()
+                .map(|arg| arg.as_str().expect("command arg").to_string())
+                .collect(),
+        ),
+        engram: binary.to_string(),
+        exports: vec!["default".into()],
+    };
+    let mut owner = RemoteOwner::connect("budget-owner", "caller", &peer, Duration::from_secs(5))
+        .expect("connect budget owner");
+    let failure = owner
+        .round(
+            &[PeerRequest::new(
+                "grep_scan",
+                vec!["default".into()],
+                json!({"pattern":"needle", "k":24}),
+            )],
+            Duration::from_secs(5),
+        )
+        .pop()
+        .expect("grep outcome")
+        .expect_err("owner must fail the operation instead of emitting a partial page");
+    assert_eq!(failure.code, "budget_exceeded");
+}
+
+#[test]
+fn peer_open_deadline_bounds_black_hole_latency_with_scheduling_margin() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "caller-before-open-timeout",
+        "{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-connect-deadline\"}\n",
+    );
+    std::fs::write(
+        caller_home.join(".engram/topology.yml"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "self": "caller",
+            "peers": {
+                "blackhole": {
+                    "command": ["/usr/bin/sleep", "60"],
+                    "engram": binary,
+                    "exports": ["default"],
+                }
+            },
+            "limits": {
+                "connect_open_deadline_ms": 200,
+                "total_query_deadline_ms": 2_000,
+            }
+        }))
+        .expect("serialize topology"),
+    )
+    .expect("write caller topology");
+
+    let started = Instant::now();
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["grep", "needle-connect-deadline", "--peers", "blackhole"])
+        .output()
+        .expect("run grep against black-holed peer");
+    let elapsed = started.elapsed();
+    assert!(
+        output.status.success(),
+        "partial local result should survive: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("grep JSON");
+    assert_eq!(result["federation"]["coverage"], "partial");
+    let source = result["federation"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["store"] == "blackhole/default")
+        .expect("black-hole source");
+    assert_eq!(source["status"], "unavailable");
+    assert_eq!(source["error"]["code"], "timeout");
+    assert!(
+        elapsed >= Duration::from_millis(150),
+        "deadline returned early: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "200ms connect deadline exceeded scheduling margin: {elapsed:?}"
+    );
+}
+
+#[test]
+fn federated_show_adds_no_application_files_to_caller_or_owner() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let content = concat!(
+        "{\"t\":\"2026-09-25T11:59:00Z\",\"k\":\"meta\",\"model\":\"file-audit\"}\n",
+        "{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"read-only owner fixture\"}\n",
+    );
+    let tape_id = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
+    let _peer_config =
+        write_grep_owner(temp.path(), "owner", binary, &[(tape_id.as_str(), content)]);
+    ingest_owner_test_tape(temp.path(), "owner", &tape_id, content, &[]);
+    let owner_home = temp.path().join("owner-home");
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "caller-file-audit",
+        "{\"t\":\"2026-09-25T11:00:00Z\",\"k\":\"note\",\"content\":\"local baseline\"}\n",
+    );
+    let caller_config = caller_home.join(".engram");
+    let peer_command = vec![
+        "/usr/bin/env".to_string(),
+        format!("HOME={}", owner_home.display()),
+        binary.to_string(),
+        "peer-serve".to_string(),
+        "--stdio".to_string(),
+    ];
+    std::fs::write(
+        caller_config.join("topology.yml"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "self": "caller",
+            "peers": {
+                "owner": {"command": peer_command, "engram": binary, "exports": ["default"]}
+            }
+        }))
+        .expect("serialize topology"),
+    )
+    .expect("write caller topology");
+    let caller_before = snapshot_tree(&caller_home);
+    let owner_before = snapshot_tree(&owner_home);
+    let repo_before = snapshot_tree(&repo);
+    for query_number in 0..100 {
+        let output = Command::new(binary)
+            .current_dir(&repo)
+            .env("HOME", &caller_home)
+            .args(["show", &tape_id, "--peers", "owner"])
+            .output()
+            .expect("run federated show");
+        assert!(
+            output.status.success(),
+            "federated show {query_number} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("show JSON");
+        assert_eq!(result["digest"], tape_id);
+        assert_eq!(result["location"]["machine"], "owner");
+        assert_eq!(result["federation"]["coverage"], "complete");
+    }
+
+    assert_eq!(snapshot_tree(&caller_home), caller_before);
+    assert_eq!(snapshot_tree(&repo), repo_before);
+    assert_owner_unchanged_except_sqlite_sidecars(&owner_before, &snapshot_tree(&owner_home));
+}
+
+#[test]
 fn grep_preserves_known_truncation_when_another_selected_peer_is_unavailable() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = env!("CARGO_BIN_EXE_engram");
@@ -6047,6 +6716,113 @@ fn grep_discards_match_frames_from_failed_scan_when_aggregating() {
     assert_eq!(peer_source["phase"], "grep_scan");
     assert_eq!(peer_source["error"]["code"], "injected_scan_failure");
     assert!(peer_source.get("grep_scan").is_none());
+}
+
+#[test]
+fn grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let complete = write_grep_owner(
+        temp.path(),
+        "complete",
+        binary,
+        &[(
+            "complete-tape",
+            "{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle complete peer\"}\n",
+        )],
+    );
+    let script_path = temp.path().join("disconnect-during-scan.sh");
+    let script = [
+        "#!/bin/sh",
+        "set -eu",
+        "while IFS= read -r request; do",
+        r#"  id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"#,
+        r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
+        r#"  case "$op" in"#,
+        "    open)",
+        r#"      printf '{"id":%s,"data":{"store":"broken/default","status":"ok","db":"/fixture/broken.sqlite","tape_dirs":[],"reader_mode":"live","snapshot_at":"2026-09-25T00:00:00Z"}}\n' "$id""#,
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"broken","build":"fixture","protocol":1,"schema":4,"query_semantics":1,"limits":{"grep_k":10000}}}\n' "$id""#,
+        "      ;;",
+        "    grep_scan)",
+        r#"      printf '{"id":%s,"data":{"type":"match","store":"broken/default","tape_id":"must-be-discarded","timestamp":"2026-09-25T13:00:00Z","total_lines":1,"anchor_line":1,"match_count":1,"provenance_match_count":0,"provenance_event_count":1,"refs_up":0,"refs_down":0,"files_touched":[]}}\n' "$id""#,
+        "      exit 0",
+        "      ;;",
+        "    *) exit 78 ;;",
+        "  esac",
+        "done",
+    ]
+    .join("\n");
+    std::fs::write(&script_path, script).expect("write disconnecting peer");
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "caller-before-disconnect",
+        "{\"t\":\"2026-09-25T11:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle local\"}\n",
+    );
+    set_peer_topology(
+        &caller_home,
+        json!({
+            "complete": complete,
+            "broken": {
+                "command": ["/bin/sh", script_path],
+                "engram": binary,
+                "exports": ["default"],
+            }
+        }),
+    );
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["grep", "needle", "--peers", "complete,broken"])
+        .output()
+        .expect("run concurrent grep with mid-response disconnect");
+    assert!(
+        output.status.success(),
+        "completed data should survive peer disconnect: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("grep JSON");
+    assert_eq!(result["federation"]["coverage"], "partial");
+    assert!(
+        result["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|session| { session["tape_id"] == "caller-before-disconnect" })
+    );
+    assert!(
+        result["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|session| { session["tape_id"] == "complete-tape" })
+    );
+    assert!(
+        result["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|session| { session["tape_id"] != "must-be-discarded" })
+    );
+    assert_eq!(result["total"], serde_json::Value::Null);
+    assert_eq!(result["truncated"], serde_json::Value::Null);
+    let broken = result["federation"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["store"] == "broken/default")
+        .expect("broken source row");
+    assert_eq!(broken["status"], "failed");
+    assert_eq!(broken["phase"], "grep_scan");
+    assert!(broken.get("grep_scan").is_none());
+    let complete = result["federation"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["store"] == "complete/default")
+        .expect("completed source row");
+    assert_eq!(complete["status"], "ok");
+    assert_eq!(complete["grep_scan"]["total"], 1);
 }
 
 #[test]
@@ -6400,7 +7176,7 @@ fn grep_uses_completed_local_count_as_truncation_proof() {
 }
 
 #[test]
-fn grep_keeps_completed_scan_aggregates_when_dispatch_metadata_fails() {
+fn grep_keeps_completed_scan_aggregates_when_dispatch_response_disconnects() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = env!("CARGO_BIN_EXE_engram");
     let (caller_home, repo) = write_local_grep_source(
@@ -6424,7 +7200,8 @@ fn grep_keeps_completed_scan_aggregates_when_dispatch_metadata_fails() {
         r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"total":1,"returned":1,"time_range":{"start":"2026-09-24T12:00:00Z","end":"2026-09-24T12:00:00Z"},"truncated":false}}\n' "$id""#,
         "      ;;",
         "    dispatch_rows)",
-        r#"      printf '{"id":%s,"end":true,"ok":false,"error":{"code":"injected_failure","message":"dispatch metadata unavailable"}}\n' "$id""#,
+        r#"      printf '{"id":%s,"data":{"uuid":"incomplete-dispatch-row"}}\n' "$id""#,
+        "      exit 0",
         "      ;;",
         "    *)",
         r#"      printf '{"id":%s,"end":true,"ok":false,"error":{"code":"unknown_operation","message":"unexpected operation"}}\n' "$id""#,
@@ -6462,8 +7239,9 @@ fn grep_keeps_completed_scan_aggregates_when_dispatch_metadata_fails() {
         .expect("run grep with failed metadata phase");
     assert!(
         output.status.success(),
-        "partial metadata failure should retain matching results: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "partial metadata failure should retain matching results; stderr: {}; stdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
     );
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("grep JSON");
     assert_eq!(result["federation"]["coverage"], "partial");
@@ -6482,6 +7260,7 @@ fn grep_keeps_completed_scan_aggregates_when_dispatch_metadata_fails() {
     assert_eq!(source["status"], "failed");
     assert_eq!(source["phase"], "dispatch_rows");
     assert_eq!(source["grep_scan"]["total"], 1);
+    assert!(source.get("dispatch_rows").is_none());
     assert_eq!(
         source["grep_scan"]["time_range"]["start"],
         "2026-09-24T12:00:00Z"
