@@ -1399,15 +1399,41 @@ mod chain_graph_tests {
         let mut sessions = vec![
             json!({"session_id": "root"}),
             json!({"session_id": "child"}),
+            json!({"session_id": "grandchild"}),
         ];
-        let hops = vec![json!({"session": "child", "parent_session": "root"})];
+        let hops = vec![
+            json!({"session": "child", "parent_session": "root"}),
+            json!({"session": "grandchild", "parent_session": "child"}),
+        ];
         annotate_chain_fields(&mut sessions, &hops);
-        let page = vec![sessions[1].clone()];
+
+        let control_chains = build_chain_metadata(&sessions);
+        let control_grandchild = control_chains
+            .iter()
+            .flat_map(|chain| chain["descendants"].as_array().expect("descendants"))
+            .find(|session| session["session_id"] == "grandchild")
+            .expect("unpaginated grandchild");
+        assert_eq!(control_grandchild["depth"], 2);
+        assert_eq!(control_grandchild["parent"], "child");
+
+        let (page, returned, total, _, truncated) =
+            apply_session_truncation(sessions.clone(), Some(1), 2, 10);
+        assert_eq!(returned, 1);
+        assert_eq!(total, 3);
+        assert!(truncated);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0]["session_id"], "grandchild");
 
         let chains = build_chain_metadata(&page);
-        assert_eq!(page[0]["depth"], 1);
-        assert_eq!(chains[0]["descendants"][0]["depth"], page[0]["depth"]);
-        assert_eq!(chains[0]["root_session_id"], "root");
+        let page_grandchild = &chains[0]["descendants"][0];
+        assert_eq!(page[0]["depth"], 2);
+        assert_eq!(page[0]["depth"], control_grandchild["depth"]);
+        assert_eq!(page[0]["parent"], "child");
+        assert_eq!(page_grandchild["session_id"], "grandchild");
+        assert_eq!(page_grandchild["depth"], page[0]["depth"]);
+        assert_eq!(page_grandchild["depth"], control_grandchild["depth"]);
+        assert_eq!(page_grandchild["parent"], "child");
+        assert_eq!(page_grandchild["parent"], control_grandchild["parent"]);
     }
 
     #[test]
