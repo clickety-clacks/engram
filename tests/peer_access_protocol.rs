@@ -768,6 +768,71 @@ fn show_keeps_holder_digest_when_unrelated_tape_facts_metadata_fails() {
 }
 
 #[test]
+fn show_keeps_holder_digest_when_predecessor_chain_metadata_fails() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let tape_id = "fingerprint-with-bad-predecessor";
+    let previous_id = "previous-segment";
+    let current = concat!(
+        "{\"k\":\"meta\",\"ingest_continuation\":{\"previous_tape_id\":\"previous-segment\"}}\n",
+        "{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"current tape\"}\n",
+    );
+    let bad_previous =
+        "{\"t\":\"2026-09-25T11:00:00Z\",\"k\":\"msg.in\",\"content\":\"no meta\"}\n";
+    let good_previous = concat!(
+        "{\"k\":\"meta\"}\n",
+        "{\"t\":\"2026-09-25T11:00:00Z\",\"k\":\"msg.in\",\"content\":\"prior tape\"}\n",
+    );
+    let mut alpha = write_grep_owner(
+        temp.path(),
+        "alpha",
+        binary,
+        &[(tape_id, current), (previous_id, bad_previous)],
+    );
+    let alpha_operations = log_peer_operations(temp.path(), "alpha", binary, &mut alpha);
+    let mut beta = write_grep_owner(
+        temp.path(),
+        "beta",
+        binary,
+        &[(tape_id, current), (previous_id, good_previous)],
+    );
+    let beta_operations = log_peer_operations(temp.path(), "beta", binary, &mut beta);
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "caller-other-tape",
+        "{\"t\":\"2026-09-25T10:00:00Z\",\"k\":\"note\",\"content\":\"local tape\"}\n",
+    );
+    std::fs::write(
+        caller_home.join(".engram/topology.yml"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "self": "caller",
+            "peers": {"alpha": alpha, "beta": beta},
+        }))
+        .expect("serialize caller topology"),
+    )
+    .expect("write caller topology");
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["show", tape_id, "--peers", "alpha,beta"])
+        .output()
+        .expect("run show with broken predecessor holder");
+    assert!(
+        output.status.success(),
+        "show should retain a current tape digest when its predecessor metadata fails: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("show JSON");
+    assert_eq!(value["location"]["machine"], "alpha");
+    assert_eq!(value["locations"].as_array().unwrap().len(), 2);
+    assert_eq!(value["federation"]["coverage"], "complete");
+    assert_eq!(operation_count(&alpha_operations, "read_file"), 1);
+    assert_eq!(operation_count(&beta_operations, "read_file"), 0);
+}
+
+#[test]
 fn show_with_local_and_remote_holders_keeps_local_choice_and_only_reads_digests_remotely() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = env!("CARGO_BIN_EXE_engram");
