@@ -15,7 +15,7 @@ use engram::access::client::{
     PeerRequest, PeerResponse, RemoteOwner, decode_base64_chunk,
 };
 use engram::config::{
-    EffectiveWatchSource, TopologyPeer, ensure_user_config, load_effective_config_read_only,
+    EffectiveWatchSource, Topology, TopologyPeer, ensure_user_config, load_effective_config_read_only,
     load_effective_config_with_override, load_frozen_stores, load_topology,
 };
 use engram::dispatch::{
@@ -23,7 +23,7 @@ use engram::dispatch::{
 };
 #[cfg(test)]
 use engram::index::DispatchDirection;
-use engram::index::SqliteIndex;
+use engram::index::{ReaderMode, SqliteIndex};
 use engram::index::lineage::LINK_THRESHOLD_DEFAULT;
 use engram::ingest::{extract_meta, git_head, now_iso8601, record_transcript, run_ingest};
 use engram::query::explain::ExplainTraversal;
@@ -95,9 +95,29 @@ enum Command {
     Peek(PeekArgs),
     Tapes,
     Show(ShowArgs),
+    Topology(TopologyArgs),
     Gc,
     #[command(hide = true)]
     PeerServe(PeerServeArgs),
+}
+
+#[derive(Args, Debug)]
+struct TopologyArgs {
+    #[command(subcommand)]
+    command: TopologyCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum TopologyCommand {
+    Status(TopologyStatusArgs),
+}
+
+#[derive(Args, Debug)]
+struct TopologyStatusArgs {
+    #[arg(long, value_name = "PEER")]
+    peers: Option<String>,
+    #[arg(long)]
+    check_exports: bool,
 }
 
 #[derive(Args, Debug)]
@@ -265,6 +285,9 @@ fn run() -> Result<(), CliError> {
             };
             cmd_show(&paths, &context, args)
         }
+        Command::Topology(args) => match args.command {
+            TopologyCommand::Status(args) => cmd_topology_status(args),
+        },
         Command::Gc => {
             let context = resolve_runtime_context(&cwd)?;
             cmd_gc(&paths, &context)
@@ -315,6 +338,7 @@ COMMANDS:
   explain    Find provenance for code (by fingerprint)
   grep       Find provenance for a term (by text search)
   peek       Read content from a provenance session
+  topology   Inspect peer handshakes and declared tape exports
   ingest     Import transcripts into the index
   watch      Continuously watch for new transcripts
 
@@ -1448,6 +1472,260 @@ fn cmd_gc(paths: &RepoPaths, context: &RuntimeContext) -> Result<(), CliError> {
     }))
 }
 
+fn cmd_topology_status(args: TopologyStatusArgs) -> Result<(), CliError> {
+    let home = home_dir()?;
+    let topology = load_topology(&home)
+        .map_err(|error| CliError::new("config_error", error.to_string()))?
+        .ok_or_else(|| {
+            CliError::new(
+                "topology_missing",
+                "topology status requires ~/.engram/topology.yml",
+            )
+        })?;
+    let selected = match args.peers.as_deref() {
+        Some(selection) => select_peers(selection, &topology.peers)?,
+        None => topology.peers.keys().cloned().collect(),
+    };
+    if !selected.is_empty() {
+        eprintln!(
+            "topology: ~/.engram/topology.yml peers={}",
+            selected.join(",")
+        );
+    }
+
+    let query_timeout = Duration::from_millis(
+        topology
+            .limits
+            .get("total_query_deadline_ms")
+            .copied()
+            .unwrap_or(PEER_QUERY_TIMEOUT.as_millis() as u64)
+            .min(PEER_QUERY_TIMEOUT.as_millis() as u64),
+    );
+    let query_deadline = Instant::now() + query_timeout;
+    let (cancelled, terminal_state) = if selected.is_empty() {
+        (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU8::new(PEER_QUERY_TERMINAL_COMMITTED)),
+        )
+    } else {
+        peer_cancellation_flag()?
+    };
+    let mut connections = connect_topology_status_peers(
+        &selected,
+        &topology,
+        query_deadline,
+        &cancelled,
+    );
+
+    let mut peer_rows = Vec::with_capacity(topology.peers.len());
+    let mut has_failures = false;
+    for (machine, peer) in &topology.peers {
+        if selected.contains(machine) {
+            let result = connections.remove(machine).unwrap_or_else(|| {
+                Err(PeerFailure {
+                    code: "unavailable".into(),
+                    message: "peer connection did not produce a result".into(),
+                })
+            });
+            let (row, failed) = topology_peer_status_row(machine, result);
+            has_failures |= failed;
+            peer_rows.push(row);
+        } else {
+            let stores = if peer.exports.is_empty() {
+                vec![format!("{machine}/*")]
+            } else {
+                peer.exports
+                    .iter()
+                    .map(|export| format!("{machine}/{export}"))
+                    .collect()
+            };
+            peer_rows.push(json!({
+                "machine": machine,
+                "status": "not_selected",
+                "stores": stores,
+            }));
+        }
+    }
+
+    let local_exports = if args.check_exports {
+        let rows = check_local_export_coverage(&topology);
+        has_failures |= rows
+            .iter()
+            .any(|row| row.get("status").and_then(Value::as_str) != Some("ok"));
+        rows
+    } else {
+        Vec::new()
+    };
+
+    finish_peer_query(Ok(()), &terminal_state, "topology status")?;
+    print_json(&json!({
+        "status": if has_failures { "partial" } else { "ok" },
+        "self": topology.self_label,
+        "selected_peers": selected,
+        "peers": peer_rows,
+        "check_exports": args.check_exports,
+        "local_exports": local_exports,
+        "watcher_caught_up": "unknown",
+    }))
+}
+
+fn topology_peer_status_row(
+    machine: &str,
+    result: Result<RemoteOwner, PeerFailure>,
+) -> (Value, bool) {
+    let owner = match result {
+        Ok(owner) => owner,
+        Err(error) => {
+            return (
+                json!({
+                    "machine": machine,
+                    "status": peer_failure_status(&error.code),
+                    "error": {"code": error.code, "message": error.message},
+                }),
+                true,
+            );
+        }
+    };
+
+    let mut failed = false;
+    let exports = owner
+        .exports
+        .iter()
+        .map(|(name, result)| match result {
+            Ok(export) => json!({
+                "store": format!("{machine}/{name}"),
+                "status": "ok",
+                "db": export.db,
+                "tape_dirs": export.tape_dirs,
+                "reader_mode": export.reader_mode,
+                "snapshot_at": export.snapshot_at,
+            }),
+            Err(error) => {
+                failed = true;
+                json!({
+                    "store": format!("{machine}/{name}"),
+                    "status": peer_failure_status(&error.code),
+                    "error": {"code": error.code, "message": error.message},
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+    (
+        json!({
+            "machine": machine,
+            "status": if failed { "partial" } else { "ok" },
+            "handshake": {
+                "self": owner.machine,
+                "build": owner.build,
+                "protocol": owner.protocol,
+                "schema": owner.schema,
+                "query_semantics": owner.query_semantics,
+                "limits": owner.limits,
+            },
+            "exports": exports,
+        }),
+        failed,
+    )
+}
+
+fn check_local_export_coverage(topology: &Topology) -> Vec<Value> {
+    topology
+        .exports
+        .iter()
+        .map(|(name, export)| {
+            match local_export_tape_coverage(export) {
+                Ok((indexed, missing)) => json!({
+                    "store": format!("{}/{name}", topology.self_label),
+                    "status": "ok",
+                    "db": export.db,
+                    "tape_dirs": export.tape_dirs,
+                    "indexed_tape_count": indexed,
+                    "indexed_tapes_without_file": missing,
+                }),
+                Err((code, message)) => json!({
+                    "store": format!("{}/{name}", topology.self_label),
+                    "status": if code == "incompatible" { "incompatible" } else { "unavailable" },
+                    "db": export.db,
+                    "tape_dirs": export.tape_dirs,
+                    "error": {"code": code, "message": message},
+                }),
+            }
+        })
+        .collect()
+}
+
+fn local_export_tape_coverage(
+    export: &engram::config::TopologyExport,
+) -> Result<(usize, usize), (String, String)> {
+    let db = export.db.to_string_lossy();
+    let index = SqliteIndex::open_reader_mode(&db, ReaderMode::Live).map_err(|error| {
+        let (code, message) = if matches!(error, rusqlite::Error::InvalidQuery) {
+            (
+                "incompatible".to_string(),
+                format!("export schema is not supported: {error}"),
+            )
+        } else {
+            (
+                "reader_unavailable".to_string(),
+                format!("cannot open Live reader for {}: {error}", export.db.display()),
+            )
+        };
+        (code, message)
+    })?;
+    index.pin_snapshot().map_err(|error| {
+        (
+            "reader_unavailable".to_string(),
+            format!("cannot pin Live reader snapshot for {}: {error}", export.db.display()),
+        )
+    })?;
+    let tape_ids = index.tape_ids().map_err(|error| {
+        (
+            "reader_unavailable".to_string(),
+            format!("cannot enumerate indexed tapes in {}: {error}", export.db.display()),
+        )
+    })?;
+    let mut missing = 0usize;
+    for tape_id in &tape_ids {
+        if !valid_tape_filename_segment(tape_id) {
+            return Err((
+                "invalid_tape_id".to_string(),
+                format!("index contains a tape ID that cannot be checked safely: {tape_id:?}"),
+            ));
+        }
+        let filename = format!("{tape_id}.jsonl.zst");
+        let mut found = false;
+        for directory in &export.tape_dirs {
+            match fs::symlink_metadata(directory.join(&filename)) {
+                Ok(metadata) if metadata.file_type().is_file() => {
+                    found = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err((
+                        "tape_inventory_error".to_string(),
+                        format!("cannot inspect tape {tape_id} in {}: {error}", directory.display()),
+                    ));
+                }
+            }
+        }
+        if !found {
+            missing += 1;
+        }
+    }
+    Ok((tape_ids.len(), missing))
+}
+
+fn valid_tape_filename_segment(tape_id: &str) -> bool {
+    !tape_id.is_empty()
+        && tape_id.len() <= 255
+        && !tape_id.starts_with('.')
+        && tape_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+}
+
 fn cmd_explain(
     cwd: &Path,
     _paths: &RepoPaths,
@@ -2486,6 +2764,71 @@ fn select_peers(
     }
 
     Ok(selected.into_iter().collect())
+}
+
+fn connect_topology_status_peers(
+    selected: &[String],
+    topology: &Topology,
+    deadline: Instant,
+    cancelled: &Arc<AtomicBool>,
+) -> HashMap<String, Result<RemoteOwner, PeerFailure>> {
+    let configured_concurrency = topology
+        .limits
+        .get("concurrent_peer_connections")
+        .copied()
+        .unwrap_or(MAX_CONCURRENT_PEERS as u64)
+        .clamp(1, MAX_CONCURRENT_PEERS as u64) as usize;
+    let configured_connect_timeout = Duration::from_millis(
+        topology
+            .limits
+            .get("connect_open_deadline_ms")
+            .copied()
+            .unwrap_or(PEER_CONNECT_OPEN_TIMEOUT.as_millis() as u64)
+            .min(PEER_CONNECT_OPEN_TIMEOUT.as_millis() as u64),
+    );
+    let mut results = HashMap::with_capacity(selected.len());
+    for batch in selected.chunks(configured_concurrency) {
+        let batch_results = std::thread::scope(|scope| {
+            let handles = batch
+                .iter()
+                .map(|machine| {
+                    let machine = machine.clone();
+                    let peer = topology.peers[&machine].clone();
+                    let caller = topology.self_label.clone();
+                    let timeout = configured_connect_timeout
+                        .min(deadline.saturating_duration_since(Instant::now()));
+                    let cancelled = Arc::clone(cancelled);
+                    scope.spawn(move || {
+                        let result = RemoteOwner::connect_cancellable(
+                            &machine,
+                            &caller,
+                            &peer,
+                            timeout,
+                            &cancelled,
+                        );
+                        (machine, result)
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .zip(batch)
+                .map(|(handle, machine)| {
+                    handle.join().unwrap_or_else(|_| {
+                        (
+                            machine.clone(),
+                            Err(PeerFailure {
+                                code: "unavailable".into(),
+                                message: "peer status worker panicked".into(),
+                            }),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+        results.extend(batch_results);
+    }
+    results
 }
 
 fn run_peer_rounds_concurrently(

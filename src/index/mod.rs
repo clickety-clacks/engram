@@ -683,6 +683,14 @@ impl SqliteIndex {
             .is_some())
     }
 
+    /// Return the tape IDs recorded by this index in deterministic order.
+    pub fn tape_ids(&self) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT tape_id FROM tapes ORDER BY tape_id ASC")?;
+        stmt.query_map([], |row| row.get(0))?.collect()
+    }
+
     pub fn ingest_tape_events(
         &self,
         tape_id: &str,

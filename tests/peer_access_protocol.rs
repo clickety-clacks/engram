@@ -1685,6 +1685,124 @@ fn grep_keeps_successful_peer_results_when_another_selected_peer_is_unavailable(
 }
 
 #[test]
+fn topology_status_reports_handshake_and_unselected_peer_without_starting_it() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let remote = write_grep_owner(temp.path(), "remote", binary, &[]);
+    let caller_home = temp.path().join("caller-home");
+    let caller_engram = caller_home.join(".engram");
+    std::fs::create_dir_all(&caller_engram).expect("caller home");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("caller repo");
+    let idle_marker = temp.path().join("unselected-peer-started");
+    let topology = json!({
+        "version": 1,
+        "self": "caller",
+        "peers": {
+            "remote": remote,
+            "idle": {
+                "command": ["/bin/sh", "-c", format!("touch {}", idle_marker.display())],
+                "engram": binary,
+                "exports": ["default"],
+            },
+        }
+    });
+    std::fs::write(
+        caller_engram.join("topology.yml"),
+        serde_json::to_vec(&topology).expect("serialize topology"),
+    )
+    .expect("write caller topology");
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["topology", "status", "--peers", "remote"])
+        .output()
+        .expect("run topology status");
+    assert!(
+        output.status.success(),
+        "topology status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("status JSON");
+    assert_eq!(result["self"], "caller");
+    assert_eq!(result["status"], "ok");
+    assert_eq!(result["watcher_caught_up"], "unknown");
+    let peers = result["peers"].as_array().expect("peer rows");
+    let remote = peers
+        .iter()
+        .find(|peer| peer["machine"] == "remote")
+        .expect("selected remote row");
+    assert_eq!(remote["status"], "ok");
+    assert_eq!(remote["handshake"]["self"], "remote");
+    assert_eq!(remote["handshake"]["protocol"], 1);
+    assert_eq!(remote["handshake"]["schema"], SCHEMA_VERSION);
+    assert_eq!(remote["handshake"]["query_semantics"], QUERY_SEMANTICS_VERSION);
+    assert_eq!(remote["exports"][0]["store"], "remote/default");
+    assert_eq!(remote["exports"][0]["status"], "ok");
+    let idle = peers
+        .iter()
+        .find(|peer| peer["machine"] == "idle")
+        .expect("unselected peer row");
+    assert_eq!(idle["status"], "not_selected");
+    assert!(!idle_marker.exists(), "unselected peer was launched");
+}
+
+#[test]
+fn topology_status_check_exports_counts_indexed_tapes_without_regular_files() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let caller_home = temp.path().join("caller-home");
+    let caller_engram = caller_home.join(".engram");
+    let tape_dir = caller_engram.join("tapes");
+    std::fs::create_dir_all(&tape_dir).expect("caller tape directory");
+    let db = caller_engram.join("index.sqlite");
+    let writer = SqliteIndex::open_writer(db.to_str().expect("db path")).expect("index");
+    writer
+        .ingest_tape_events("present", &[], 0.5)
+        .expect("index present tape");
+    writer
+        .ingest_tape_events("missing", &[], 0.5)
+        .expect("index missing tape");
+    drop(writer);
+    let tape = zstd::stream::encode_all(b"", 0).expect("compress empty tape");
+    std::fs::write(tape_dir.join("present.jsonl.zst"), tape).expect("write present tape");
+    std::fs::write(
+        caller_engram.join("topology.yml"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "self": "caller",
+            "exports": {
+                "default": {"db": db, "tape_dirs": [tape_dir]},
+            }
+        }))
+        .expect("serialize topology"),
+    )
+    .expect("write topology");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("caller repo");
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["topology", "status", "--check-exports"])
+        .output()
+        .expect("run export status check");
+    assert!(
+        output.status.success(),
+        "export status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("status JSON");
+    assert_eq!(result["status"], "ok");
+    assert_eq!(result["check_exports"], true);
+    assert_eq!(result["watcher_caught_up"], "unknown");
+    assert_eq!(result["local_exports"][0]["store"], "caller/default");
+    assert_eq!(result["local_exports"][0]["indexed_tape_count"], 2);
+    assert_eq!(result["local_exports"][0]["indexed_tapes_without_file"], 1);
+}
+
+#[test]
 fn grep_preserves_known_truncation_when_another_selected_peer_is_unavailable() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = env!("CARGO_BIN_EXE_engram");
