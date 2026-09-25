@@ -605,7 +605,11 @@ fn show_with_selected_peers_reads_and_deduplicates_matching_remote_tapes() {
     assert_eq!(value["location"]["store"], "alpha/default");
     assert_eq!(value["digest"], tape_id);
     assert_eq!(value["id_verified"], true);
-    assert_eq!(value["locations"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        value["locations"].as_array().unwrap().len(),
+        2,
+        "selected-peer show response: {value:#}"
+    );
     assert_eq!(value["federation"]["coverage"], "complete");
     assert_eq!(operation_count(&alpha_operations, "tape_facts"), 1);
     assert_eq!(operation_count(&beta_operations, "tape_facts"), 1);
@@ -663,7 +667,11 @@ fn show_with_local_and_remote_holders_keeps_local_choice_and_only_reads_digests_
         .join(format!("{tape_id}.jsonl.zst"));
     assert_eq!(value["location"]["machine"], "caller");
     assert_eq!(value["path"], local_path.to_str().unwrap());
-    assert_eq!(value["locations"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        value["locations"].as_array().unwrap().len(),
+        3,
+        "local-holder show response: {value:#}"
+    );
     assert_eq!(value["digest"], tape_id);
     assert_eq!(value["federation"]["coverage"], "complete");
     for operations in [&alpha_operations, &beta_operations] {
@@ -707,7 +715,12 @@ fn show_detects_multi_holder_fingerprint_conflict_from_digests_without_read_file
         .args(["show", tape_id, "--peers", "beta,alpha"])
         .output()
         .expect("run conflicting multi-holder show");
-    assert!(!output.status.success());
+    assert!(
+        !output.status.success(),
+        "expected identity conflict; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let error: serde_json::Value = serde_json::from_str(
         String::from_utf8_lossy(&output.stderr)
             .lines()
