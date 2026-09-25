@@ -1,5 +1,5 @@
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use engram::access::client::{PeerRequest, RemoteOwner};
 use engram::config::TopologyPeer;
@@ -917,6 +917,205 @@ fn grep_connects_selected_peers_concurrently_before_scanning() {
         beta_started.exists(),
         "beta peer was not launched concurrently"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn grep_runs_selected_peer_scan_rounds_concurrently() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let script_path = temp.path().join("concurrent-scan-peer.sh");
+    let script = [
+        "#!/bin/sh",
+        "set -eu",
+        "machine=\"$1\"",
+        "mine=\"$2\"",
+        "other=\"$3\"",
+        "while IFS= read -r request; do",
+        r#"  id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"#,
+        r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
+        "  case \"$op\" in",
+        "    open)",
+        r#"      printf '{"id":%s,"data":{"store":"%s/default","status":"ok","db":"/fixture/%s.sqlite","tape_dirs":[],"reader_mode":"live","snapshot_at":"2026-09-25T00:00:00Z"}}\n' "$id" "$machine" "$machine""#,
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"%s","build":"0.2.1","protocol":1,"schema":4,"query_semantics":1,"limits":{"grep_k":10000}}}\n' "$id" "$machine""#,
+        "      ;;",
+        "    grep_scan)",
+        "      touch \"$mine\"",
+        "      i=0",
+        "      while [ ! -e \"$other\" ] && [ \"$i\" -lt 200 ]; do",
+        "        sleep 0.01",
+        "        i=$((i + 1))",
+        "      done",
+        "      if [ ! -e \"$other\" ]; then",
+        r#"        printf '{"id":%s,"end":true,"ok":false,"error":{"code":"scan_was_serial","message":"other selected peer did not start its scan"}}\n' "$id""#,
+        "        continue",
+        "      fi",
+        r#"      printf '{"id":%s,"data":{"type":"match","tape_id":"%s-tape","timestamp":"2026-09-25T00:00:00Z","total_lines":1,"anchor_line":1,"match_count":1,"provenance_match_count":0,"provenance_event_count":1,"refs_up":0,"refs_down":0,"files_touched":[]}}\n' "$id" "$machine""#,
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"total":1,"returned":1,"time_range":{"start":"2026-09-25T00:00:00Z","end":"2026-09-25T00:00:00Z"},"truncated":false}}\n' "$id""#,
+        "      ;;",
+        "    dispatch_rows)",
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{}}\n' "$id""#,
+        "      ;;",
+        "    *) exit 78 ;;",
+        "  esac",
+        "done",
+    ]
+    .join("\n");
+    std::fs::write(&script_path, script).expect("write protocol peer script");
+    let alpha_started = temp.path().join("alpha-scan-started");
+    let beta_started = temp.path().join("beta-scan-started");
+    let peer = |machine: &str, mine: &std::path::Path, other: &std::path::Path| {
+        json!({
+            "command": ["/bin/sh", script_path, machine, mine, other],
+            "engram": binary,
+            "exports": ["default"],
+        })
+    };
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "caller-nonmatch",
+        "{\"t\":\"2026-09-25T00:00:00Z\",\"k\":\"msg.in\",\"content\":\"unrelated\"}\n",
+    );
+    std::fs::write(
+        caller_home.join(".engram/topology.yml"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "self": "caller",
+            "peers": {
+                "alpha": peer("alpha", &alpha_started, &beta_started),
+                "beta": peer("beta", &beta_started, &alpha_started),
+            }
+        }))
+        .expect("serialize topology"),
+    )
+    .expect("write caller topology");
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["grep", "needle-parallel-scan", "--peers", "alpha,beta"])
+        .output()
+        .expect("run concurrent scan grep");
+    assert!(
+        output.status.success(),
+        "concurrent scan grep failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("grep JSON");
+    assert_eq!(result["federation"]["coverage"], "complete");
+    assert_eq!(result["sessions"].as_array().unwrap().len(), 2);
+    assert!(alpha_started.exists(), "alpha scan did not start");
+    assert!(
+        beta_started.exists(),
+        "beta scan did not start while alpha was scanning"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn grep_ctrl_c_cancels_and_aborts_a_selected_peer_scan() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let script_path = temp.path().join("blocking-scan-peer.sh");
+    let scan_started = temp.path().join("peer-scan-started");
+    let script = [
+        "#!/bin/sh",
+        "set -eu",
+        "started=\"$1\"",
+        "while IFS= read -r request; do",
+        r#"  id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"#,
+        r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
+        "  case \"$op\" in",
+        "    open)",
+        r#"      printf '{"id":%s,"data":{"store":"alpha/default","status":"ok","db":"/fixture/alpha.sqlite","tape_dirs":[],"reader_mode":"live","snapshot_at":"2026-09-25T00:00:00Z"}}\n' "$id""#,
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"alpha","build":"0.2.1","protocol":1,"schema":4,"query_semantics":1,"limits":{"grep_k":10000}}}\n' "$id""#,
+        "      ;;",
+        "    grep_scan)",
+        "      touch \"$started\"",
+        "      while IFS= read -r ignored; do :; done",
+        "      exit 0",
+        "      ;;",
+        "    *) exit 78 ;;",
+        "  esac",
+        "done",
+    ]
+    .join("\n");
+    std::fs::write(&script_path, script).expect("write blocking peer script");
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "caller-before-cancel",
+        "{\"t\":\"2026-09-25T00:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-cancel local\"}\n",
+    );
+    std::fs::write(
+        caller_home.join(".engram/topology.yml"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "self": "caller",
+            "peers": {
+                "alpha": {
+                    "command": ["/bin/sh", script_path, scan_started],
+                    "engram": binary,
+                    "exports": ["default"],
+                }
+            }
+        }))
+        .expect("serialize topology"),
+    )
+    .expect("write caller topology");
+
+    let mut child = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["grep", "needle-cancel", "--peers", "alpha"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn peer grep");
+    let start_deadline = Instant::now() + Duration::from_secs(5);
+    while !scan_started.exists() && Instant::now() < start_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(scan_started.exists(), "peer scan did not start");
+    let signal_at = Instant::now();
+    let signal_result = unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+    assert_eq!(signal_result, 0, "send SIGINT to grep caller");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(3);
+    let mut exited = false;
+    while Instant::now() < exit_deadline {
+        if child.try_wait().expect("check caller status").is_some() {
+            exited = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait_with_output();
+        panic!("Ctrl-C did not cancel the peer scan within three seconds");
+    }
+    let output = child
+        .wait_with_output()
+        .expect("collect cancelled grep output");
+    assert!(
+        signal_at.elapsed() < Duration::from_secs(3),
+        "peer cancellation exceeded its deadline"
+    );
+    assert!(
+        output.status.success(),
+        "local matches should survive peer cancellation: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("grep JSON");
+    assert_eq!(result["federation"]["coverage"], "partial");
+    assert_eq!(result["sessions"][0]["tape_id"], "caller-before-cancel");
+    let peer_source = result["federation"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["store"] == "alpha/default")
+        .expect("cancelled peer source");
+    assert_eq!(peer_source["error"]["code"], "cancelled",);
 }
 
 #[test]

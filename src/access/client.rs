@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -104,6 +105,40 @@ impl RemoteOwner {
         peer: &TopologyPeer,
         timeout: Duration,
     ) -> Result<Self, PeerFailure> {
+        Self::connect_inner(machine, caller, peer, timeout, None)
+    }
+
+    pub fn connect_cancellable(
+        machine: &str,
+        caller: &str,
+        peer: &TopologyPeer,
+        timeout: Duration,
+        cancelled: &AtomicBool,
+    ) -> Result<Self, PeerFailure> {
+        Self::connect_inner(machine, caller, peer, timeout, Some(cancelled))
+    }
+
+    fn connect_inner(
+        machine: &str,
+        caller: &str,
+        peer: &TopologyPeer,
+        timeout: Duration,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<Self, PeerFailure> {
+        if let Some(cancelled) = cancelled
+            && cancelled.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(PeerFailure::new(
+                "cancelled",
+                "peer query was cancelled before opening the owner",
+            ));
+        }
+        if timeout.is_zero() {
+            return Err(PeerFailure::new(
+                "timeout",
+                "peer query deadline expired before opening the owner",
+            ));
+        }
         let mut client = PeerClient::spawn(peer)
             .map_err(|error| PeerFailure::new("unavailable", error.to_string()))?;
         let request = PeerRequest::new(
@@ -111,7 +146,10 @@ impl RemoteOwner {
             peer.exports.clone(),
             Value::Object(Default::default()),
         );
-        let mut outcomes = client.round(&[request], timeout);
+        let mut outcomes = match cancelled {
+            Some(cancelled) => client.round_cancellable(&[request], timeout, cancelled),
+            None => client.round(&[request], timeout),
+        };
         let response = outcomes
             .pop()
             .ok_or_else(|| PeerFailure::new("protocol_error", "peer open returned no outcome"))?
@@ -311,6 +349,15 @@ impl RemoteOwner {
         self.client.round(requests, timeout)
     }
 
+    pub fn round_cancellable(
+        &mut self,
+        requests: &[PeerRequest],
+        timeout: Duration,
+        cancelled: &AtomicBool,
+    ) -> Vec<Result<PeerResponse, PeerFailure>> {
+        self.client.round_cancellable(requests, timeout, cancelled)
+    }
+
     pub fn stderr_text(&self) -> String {
         self.client.stderr_text()
     }
@@ -426,9 +473,41 @@ impl PeerClient {
         requests: &[PeerRequest],
         timeout: Duration,
     ) -> Vec<Result<PeerResponse, PeerFailure>> {
+        self.round_inner(requests, timeout, None)
+    }
+
+    pub fn round_cancellable(
+        &mut self,
+        requests: &[PeerRequest],
+        timeout: Duration,
+        cancelled: &AtomicBool,
+    ) -> Vec<Result<PeerResponse, PeerFailure>> {
+        self.round_inner(requests, timeout, Some(cancelled))
+    }
+
+    fn round_inner(
+        &mut self,
+        requests: &[PeerRequest],
+        timeout: Duration,
+        cancelled: Option<&AtomicBool>,
+    ) -> Vec<Result<PeerResponse, PeerFailure>> {
         if requests.is_empty() {
             return Vec::new();
         }
+
+        if let Some(cancelled) = cancelled
+            && cancelled.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.abort();
+            let error = PeerFailure::new("cancelled", "peer request cancelled by caller");
+            return requests.iter().map(|_| Err(error.clone())).collect();
+        }
+        if timeout.is_zero() {
+            self.abort();
+            let error = PeerFailure::new("timeout", "peer request deadline expired");
+            return requests.iter().map(|_| Err(error.clone())).collect();
+        }
+        let started = Instant::now();
 
         if self.input.is_none() {
             return requests
@@ -481,11 +560,21 @@ impl PeerClient {
             return requests.iter().map(|_| Err(error.clone())).collect();
         }
 
-        let started = Instant::now();
         let mut pending = ids.iter().copied().collect::<HashSet<_>>();
         let mut data = HashMap::<u64, Vec<Value>>::new();
         let mut outcomes = HashMap::<u64, Result<PeerResponse, PeerFailure>>::new();
         while !pending.is_empty() {
+            if let Some(cancelled) = cancelled
+                && cancelled.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                fail_pending(
+                    &mut pending,
+                    &mut outcomes,
+                    "cancelled",
+                    "peer request cancelled by caller",
+                );
+                break;
+            }
             let remaining = timeout.saturating_sub(started.elapsed());
             if remaining.is_zero() {
                 fail_pending(
@@ -496,7 +585,12 @@ impl PeerClient {
                 );
                 break;
             }
-            match self.responses.recv_timeout(remaining) {
+            let wait = if cancelled.is_some() {
+                remaining.min(Duration::from_millis(100))
+            } else {
+                remaining
+            };
+            match self.responses.recv_timeout(wait) {
                 Ok(ReaderMessage::Frame(frame, frame_bytes)) => {
                     let Some(id) = frame.get("id").and_then(Value::as_u64) else {
                         fail_pending(
@@ -580,12 +674,14 @@ impl PeerClient {
                     fail_pending(&mut pending, &mut outcomes, "protocol_error", &message);
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    fail_pending(
-                        &mut pending,
-                        &mut outcomes,
-                        "timeout",
-                        "peer request timed out",
-                    );
+                    if started.elapsed() >= timeout {
+                        fail_pending(
+                            &mut pending,
+                            &mut outcomes,
+                            "timeout",
+                            "peer request timed out",
+                        );
+                    }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     fail_pending(
@@ -604,7 +700,10 @@ impl PeerClient {
                 Err(PeerFailure {
                     code,
                     ..
-                }) if matches!(code.as_str(), "timeout" | "protocol_error" | "budget_exceeded")
+                }) if matches!(
+                    code.as_str(),
+                    "timeout" | "cancelled" | "protocol_error" | "budget_exceeded"
+                )
             )
         });
         if abort {
@@ -789,6 +888,59 @@ mod tests {
             assert_eq!(response.data[0]["seen"], index as u64 + 1);
             assert_eq!(response.stats["done"], true);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peer_round_cancellation_aborts_owner_process() {
+        let peer = TopologyPeer {
+            ssh: None,
+            command: Some(vec!["/bin/sh".into(), "-c".into(), "cat >/dev/null".into()]),
+            engram: "/unused".into(),
+            exports: vec![],
+        };
+        let mut client = PeerClient::spawn(&peer).expect("spawn waiting command peer");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&cancelled);
+        let signal_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            signal.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let outcomes = client.round_cancellable(
+            &[PeerRequest::new(
+                "grep_scan",
+                vec!["default".into()],
+                json!({}),
+            )],
+            Duration::from_secs(5),
+            &cancelled,
+        );
+        signal_thread.join().expect("signal cancellation");
+        assert_eq!(outcomes[0].as_ref().unwrap_err().code, "cancelled");
+        let _ = client.child.wait().expect("wait for aborted owner");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_peer_round_aborts_without_writing_a_request() {
+        let peer = TopologyPeer {
+            ssh: None,
+            command: Some(vec!["/bin/sh".into(), "-c".into(), "cat >/dev/null".into()]),
+            engram: "/unused".into(),
+            exports: vec![],
+        };
+        let mut client = PeerClient::spawn(&peer).expect("spawn waiting command peer");
+        let outcomes = client.round(
+            &[PeerRequest::new(
+                "grep_scan",
+                vec!["default".into()],
+                json!({}),
+            )],
+            Duration::ZERO,
+        );
+        assert_eq!(outcomes[0].as_ref().unwrap_err().code, "timeout");
+        let _ = client.child.wait().expect("wait for expired owner");
     }
 
     #[cfg(unix)]

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser, Subcommand};
 use engram::access::client::{
     DEFAULT_DECOMPRESSED_BYTES_PER_TAPE, DEFAULT_READ_FILE_COMPRESSED_BYTES, PeerFailure,
-    PeerRequest, RemoteOwner, decode_base64_chunk,
+    PeerRequest, PeerResponse, RemoteOwner, decode_base64_chunk,
 };
 use engram::config::{
     EffectiveWatchSource, TopologyPeer, ensure_user_config, load_effective_config_read_only,
@@ -53,7 +53,24 @@ use notify::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-const MAX_CONCURRENT_PEER_OPENS: usize = 4;
+const MAX_CONCURRENT_PEERS: usize = 4;
+const PEER_CONNECT_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+const PEER_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const PEER_QUERY_TIMEOUT: Duration = Duration::from_secs(120);
+
+struct PeerRoundJob {
+    machine: String,
+    owner: RemoteOwner,
+    exports: Vec<String>,
+    requests: Vec<PeerRequest>,
+}
+
+struct PeerRoundResult {
+    machine: String,
+    owner: Option<RemoteOwner>,
+    exports: Vec<String>,
+    outcomes: Vec<Result<PeerResponse, PeerFailure>>,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "engram")]
@@ -1341,6 +1358,7 @@ fn one_peer_response(
 fn peer_failure_to_cli(failure: PeerFailure) -> CliError {
     let code = match failure.code.as_str() {
         "unavailable" => "unavailable",
+        "cancelled" => "cancelled",
         "timeout" => "timeout",
         "no_results" => "no_results",
         "invalid_request" => "invalid_request",
@@ -1597,6 +1615,8 @@ fn cmd_explain(
 }
 
 fn cmd_grep(_paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Result<(), CliError> {
+    let query_deadline = Instant::now() + PEER_QUERY_TIMEOUT;
+    let cancelled = Arc::new(AtomicBool::new(false));
     print_context_conspicuity(context);
 
     let indexes = if args.peers.is_some()
@@ -1623,7 +1643,20 @@ fn cmd_grep(_paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Res
     sessions.sort_by(|a, b| compare_grep_sessions(a, b, &grep_rank_by_session));
 
     if args.peers.is_some() {
-        return cmd_grep_with_peer(context, indexes, sessions, grep_rank_by_session, args);
+        let signal_cancelled = Arc::clone(&cancelled);
+        ctrlc::set_handler(move || {
+            signal_cancelled.store(true, Ordering::SeqCst);
+        })
+        .map_err(|error| CliError::new("signal_handler_error", error.to_string()))?;
+        return cmd_grep_with_peer(
+            context,
+            indexes,
+            sessions,
+            grep_rank_by_session,
+            args,
+            query_deadline,
+            cancelled,
+        );
     }
     if sessions.is_empty() {
         return Err(CliError::new("no_results", args.pattern));
@@ -1671,6 +1704,8 @@ fn cmd_grep_with_peer(
     mut sessions: Vec<Value>,
     mut ranks: HashMap<String, GrepRank>,
     args: GrepArgs,
+    query_deadline: Instant,
+    cancelled: Arc<AtomicBool>,
 ) -> Result<(), CliError> {
     let home = home_dir()?;
     let topology = load_topology(&home)
@@ -1752,9 +1787,16 @@ fn cmd_grep_with_peer(
     // incomplete grep_scan keeps the matching scope unknown.
     let mut grep_scan_incomplete = false;
     let mut any_store_truncated = false;
+    let mut peer_store_count = 0usize;
     let mut peer_owners = Vec::new();
-    let mut connections =
-        connect_peers_concurrently(&selected_machines, &topology.self_label, &topology.peers);
+    let mut peer_round_jobs = Vec::new();
+    let mut connections = connect_peers_concurrently(
+        &selected_machines,
+        &topology.self_label,
+        &topology.peers,
+        query_deadline,
+        &cancelled,
+    );
 
     for machine in &selected_machines {
         let peer = topology
@@ -1798,7 +1840,7 @@ fn cmd_grep_with_peer(
                     }));
                 }
             }
-            Ok(mut owner) => {
+            Ok(owner) => {
                 let mut active_exports = Vec::new();
                 for export in &peer.exports {
                     match owner.exports.get(export) {
@@ -1854,6 +1896,9 @@ fn cmd_grep_with_peer(
                     }
                     continue;
                 }
+                if active_exports.is_empty() {
+                    continue;
+                }
                 let requests = active_exports
                     .iter()
                     .map(|export| {
@@ -1869,154 +1914,163 @@ fn cmd_grep_with_peer(
                         )
                     })
                     .collect::<Vec<_>>();
-                let outcomes = owner.round(&requests, Duration::from_secs(30));
-                let mut grep_succeeded = Vec::new();
-                for (index, export) in active_exports.iter().enumerate() {
-                    let Some(outcome) = outcomes.get(index) else {
+                peer_round_jobs.push(PeerRoundJob {
+                    machine: machine.clone(),
+                    owner,
+                    exports: active_exports,
+                    requests,
+                });
+            }
+        }
+    }
+
+    for result in run_peer_rounds_concurrently(peer_round_jobs, query_deadline, &cancelled) {
+        let PeerRoundResult {
+            machine,
+            owner,
+            exports: active_exports,
+            outcomes,
+        } = result;
+        let mut grep_succeeded = Vec::new();
+        for (index, export) in active_exports.iter().enumerate() {
+            let Some(outcome) = outcomes.get(index) else {
+                any_source_failure = true;
+                grep_scan_incomplete = true;
+                mark_source_phase(
+                    &mut source_rows,
+                    &format!("{machine}/{export}"),
+                    "grep_scan",
+                    "protocol_error",
+                    "peer returned no grep_scan outcome",
+                );
+                continue;
+            };
+            let response = match outcome {
+                Ok(response) => response,
+                Err(failure) => {
+                    any_source_failure = true;
+                    grep_scan_incomplete = true;
+                    mark_source_phase(
+                        &mut source_rows,
+                        &format!("{machine}/{export}"),
+                        "grep_scan",
+                        &failure.code,
+                        &failure.message,
+                    );
+                    continue;
+                }
+            };
+            let store_name = format!("{machine}/{export}");
+            let Some(total) = response
+                .stats
+                .get("total")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+            else {
+                any_source_failure = true;
+                grep_scan_incomplete = true;
+                mark_source_phase(
+                    &mut source_rows,
+                    &store_name,
+                    "grep_scan",
+                    "protocol_error",
+                    "grep_scan response has no valid total count",
+                );
+                continue;
+            };
+            let Some(store_truncated) = response.stats.get("truncated").and_then(Value::as_bool)
+            else {
+                any_source_failure = true;
+                grep_scan_incomplete = true;
+                mark_source_phase(
+                    &mut source_rows,
+                    &store_name,
+                    "grep_scan",
+                    "protocol_error",
+                    "grep_scan response has no boolean truncated value",
+                );
+                continue;
+            };
+            let Some(store_time_range) = valid_peer_time_range(&response.stats) else {
+                any_source_failure = true;
+                grep_scan_incomplete = true;
+                mark_source_phase(
+                    &mut source_rows,
+                    &store_name,
+                    "grep_scan",
+                    "protocol_error",
+                    "grep_scan response has no valid time range",
+                );
+                continue;
+            };
+            let mut store_failures = Vec::new();
+            let mut valid_response = true;
+            let mut store_records = Vec::<(Value, GrepRank)>::new();
+            for record in &response.data {
+                match record.get("type").and_then(Value::as_str) {
+                    Some("failure") => {
                         any_source_failure = true;
-                        grep_scan_incomplete = true;
-                        mark_source_phase(
-                            &mut source_rows,
-                            &format!("{machine}/{export}"),
-                            "grep_scan",
-                            "protocol_error",
-                            "peer returned no grep_scan outcome",
-                        );
-                        continue;
-                    };
-                    let response = match outcome {
-                        Ok(response) => response,
-                        Err(failure) => {
-                            any_source_failure = true;
-                            grep_scan_incomplete = true;
-                            mark_source_phase(
-                                &mut source_rows,
-                                &format!("{machine}/{export}"),
-                                "grep_scan",
-                                &failure.code,
-                                &failure.message,
-                            );
-                            continue;
-                        }
-                    };
-                    let store_name = format!("{machine}/{export}");
-                    let Some(total) = response
-                        .stats
-                        .get("total")
-                        .and_then(Value::as_u64)
-                        .and_then(|value| usize::try_from(value).ok())
-                    else {
-                        any_source_failure = true;
-                        grep_scan_incomplete = true;
-                        mark_source_phase(
-                            &mut source_rows,
-                            &store_name,
-                            "grep_scan",
-                            "protocol_error",
-                            "grep_scan response has no valid total count",
-                        );
-                        continue;
-                    };
-                    let Some(store_truncated) =
-                        response.stats.get("truncated").and_then(Value::as_bool)
-                    else {
-                        any_source_failure = true;
-                        grep_scan_incomplete = true;
-                        mark_source_phase(
-                            &mut source_rows,
-                            &store_name,
-                            "grep_scan",
-                            "protocol_error",
-                            "grep_scan response has no boolean truncated value",
-                        );
-                        continue;
-                    };
-                    let Some(store_time_range) = valid_peer_time_range(&response.stats) else {
-                        any_source_failure = true;
-                        grep_scan_incomplete = true;
-                        mark_source_phase(
-                            &mut source_rows,
-                            &store_name,
-                            "grep_scan",
-                            "protocol_error",
-                            "grep_scan response has no valid time range",
-                        );
-                        continue;
-                    };
-                    let mut store_failures = Vec::new();
-                    let mut valid_response = true;
-                    let mut store_records = Vec::<(Value, GrepRank)>::new();
-                    for record in &response.data {
-                        match record.get("type").and_then(Value::as_str) {
-                            Some("failure") => {
-                                any_source_failure = true;
-                                store_failures.push(record.clone());
-                            }
-                            Some("match") => {
-                                match format_peer_grep_session(record, &machine, export, context) {
-                                    Ok((session, rank)) => {
-                                        store_records.push((session, rank));
-                                    }
-                                    Err(error) => {
-                                        any_source_failure = true;
-                                        valid_response = false;
-                                        store_failures.push(json!({
-                                            "error": {"code": error.code, "message": error.message},
-                                        }));
-                                    }
-                                }
-                            }
-                            _ => {
+                        store_failures.push(record.clone());
+                    }
+                    Some("match") => {
+                        match format_peer_grep_session(record, &machine, export, context) {
+                            Ok((session, rank)) => store_records.push((session, rank)),
+                            Err(error) => {
                                 any_source_failure = true;
                                 valid_response = false;
                                 store_failures.push(json!({
-                                "error": {"code": "protocol_error", "message": "unknown grep_scan data record"},
-                            }));
+                                    "error": {"code": error.code, "message": error.message},
+                                }));
                             }
                         }
                     }
-                    source_totals.push(total);
-                    if let Some(source) = source_rows.iter_mut().find(|source| {
-                        source.get("store").and_then(Value::as_str) == Some(store_name.as_str())
-                    }) {
-                        source["grep_scan"] = json!({
-                        "total": total,
-                        "returned": store_records.len(),
-                        "time_range": store_time_range,
-                        "truncated": store_truncated,
-                        });
+                    _ => {
+                        any_source_failure = true;
+                        valid_response = false;
+                        store_failures.push(json!({
+                            "error": {"code": "protocol_error", "message": "unknown grep_scan data record"},
+                        }));
                     }
-                    if !store_failures.is_empty() {
-                        mark_source_failures(
-                            &mut source_rows,
-                            &store_name,
-                            "grep_scan",
-                            &store_failures,
-                        );
-                        source_count_known = false;
-                        grep_scan_incomplete = true;
-                    }
-                    source_time_ranges.push(peer_time_range(&response.stats));
-                    any_store_truncated |= store_truncated || total > k;
-                    if !valid_response {
-                        continue;
-                    }
-                    for (mut session, rank) in store_records {
-                        let tape_id = session["tape_id"].as_str().unwrap_or_default().to_string();
-                        session["locations"] = json!([session["location"].clone()]);
-                        merge_peer_grep_session(
-                            &mut sessions,
-                            &mut ranks,
-                            &mut identity_conflicts,
-                            session,
-                            rank,
-                            &tape_id,
-                        );
-                    }
-                    grep_succeeded.push(export.clone());
                 }
-                peer_owners.push((machine.clone(), owner, grep_succeeded));
             }
+            source_totals.push(total);
+            if let Some(source) = source_rows.iter_mut().find(|source| {
+                source.get("store").and_then(Value::as_str) == Some(store_name.as_str())
+            }) {
+                source["grep_scan"] = json!({
+                    "total": total,
+                    "returned": store_records.len(),
+                    "time_range": store_time_range,
+                    "truncated": store_truncated,
+                });
+            }
+            if !store_failures.is_empty() {
+                mark_source_failures(&mut source_rows, &store_name, "grep_scan", &store_failures);
+                source_count_known = false;
+                grep_scan_incomplete = true;
+            }
+            source_time_ranges.push(peer_time_range(&response.stats));
+            any_store_truncated |= store_truncated || total > k;
+            if !valid_response {
+                continue;
+            }
+            for (mut session, rank) in store_records {
+                let tape_id = session["tape_id"].as_str().unwrap_or_default().to_string();
+                session["locations"] = json!([session["location"].clone()]);
+                merge_peer_grep_session(
+                    &mut sessions,
+                    &mut ranks,
+                    &mut identity_conflicts,
+                    session,
+                    rank,
+                    &tape_id,
+                );
+            }
+            grep_succeeded.push(export.clone());
+        }
+        if let Some(owner) = owner {
+            peer_store_count = peer_store_count.saturating_add(grep_succeeded.len());
+            peer_owners.push((machine, owner, grep_succeeded));
         }
     }
 
@@ -2051,7 +2105,11 @@ fn cmd_grep_with_peer(
                 }
             }
         }
-        for (machine, owner, grep_ok_exports) in &mut peer_owners {
+        let mut dispatch_jobs = Vec::new();
+        for (machine, owner, grep_ok_exports) in peer_owners.drain(..) {
+            if grep_ok_exports.is_empty() {
+                continue;
+            }
             let requests = grep_ok_exports
                 .iter()
                 .map(|export| {
@@ -2062,7 +2120,20 @@ fn cmd_grep_with_peer(
                     )
                 })
                 .collect::<Vec<_>>();
-            let outcomes = owner.round(&requests, Duration::from_secs(30));
+            dispatch_jobs.push(PeerRoundJob {
+                machine,
+                owner,
+                exports: grep_ok_exports,
+                requests,
+            });
+        }
+        for result in run_peer_rounds_concurrently(dispatch_jobs, query_deadline, &cancelled) {
+            let PeerRoundResult {
+                machine,
+                owner: _owner,
+                exports: grep_ok_exports,
+                outcomes,
+            } = result;
             for (index, export) in grep_ok_exports.iter().enumerate() {
                 let store_name = format!("{machine}/{export}");
                 match outcomes.get(index) {
@@ -2257,11 +2328,7 @@ fn cmd_grep_with_peer(
         "lineage": [],
         "dispatch_lineage": [],
         "tombstones": [],
-        "stores_queried": indexes.len()
-            + peer_owners
-                .iter()
-                .map(|(_, _, exports)| exports.len())
-                .sum::<usize>(),
+        "stores_queried": indexes.len() + peer_store_count,
         "returned": returned,
         "total": exact_total,
         "time_range": time_range,
@@ -2325,10 +2392,82 @@ fn select_peers(
     Ok(selected.into_iter().collect())
 }
 
+fn run_peer_rounds_concurrently(
+    jobs: Vec<PeerRoundJob>,
+    deadline: Instant,
+    cancelled: &Arc<AtomicBool>,
+) -> Vec<PeerRoundResult> {
+    let mut pending = jobs.into_iter();
+    let mut results = Vec::new();
+    loop {
+        let batch = pending
+            .by_ref()
+            .take(MAX_CONCURRENT_PEERS)
+            .collect::<Vec<_>>();
+        if batch.is_empty() {
+            break;
+        }
+
+        let batch_results = std::thread::scope(|scope| {
+            let handles = batch
+                .into_iter()
+                .map(|job| {
+                    let machine = job.machine.clone();
+                    let exports = job.exports.clone();
+                    let requests_len = job.requests.len();
+                    let cancelled = Arc::clone(cancelled);
+                    let handle = scope.spawn(move || {
+                        let PeerRoundJob {
+                            mut owner,
+                            requests,
+                            ..
+                        } = job;
+                        let timeout = PEER_OPERATION_TIMEOUT
+                            .min(deadline.saturating_duration_since(Instant::now()));
+                        let outcomes = owner.round_cancellable(&requests, timeout, &cancelled);
+                        (owner, outcomes)
+                    });
+                    (machine, exports, requests_len, handle)
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(
+                    |(machine, exports, requests_len, handle)| match handle.join() {
+                        Ok((owner, outcomes)) => PeerRoundResult {
+                            machine,
+                            owner: Some(owner),
+                            exports,
+                            outcomes,
+                        },
+                        Err(_) => PeerRoundResult {
+                            machine,
+                            owner: None,
+                            exports,
+                            outcomes: (0..requests_len)
+                                .map(|_| {
+                                    Err(PeerFailure {
+                                        code: "unavailable".into(),
+                                        message: "peer request worker panicked".into(),
+                                    })
+                                })
+                                .collect(),
+                        },
+                    },
+                )
+                .collect::<Vec<_>>()
+        });
+        results.extend(batch_results);
+    }
+    results
+}
+
 fn connect_peers_concurrently(
     selected: &[String],
     caller: &str,
     peers: &std::collections::BTreeMap<String, TopologyPeer>,
+    deadline: Instant,
+    cancelled: &Arc<AtomicBool>,
 ) -> HashMap<String, Result<RemoteOwner, PeerFailure>> {
     let jobs = selected
         .iter()
@@ -2341,7 +2480,7 @@ fn connect_peers_concurrently(
         .collect::<Vec<_>>();
     let mut connections = HashMap::with_capacity(jobs.len());
 
-    for batch in jobs.chunks(MAX_CONCURRENT_PEER_OPENS) {
+    for batch in jobs.chunks(MAX_CONCURRENT_PEERS) {
         let results = std::thread::scope(|scope| {
             let handles = batch
                 .iter()
@@ -2349,9 +2488,13 @@ fn connect_peers_concurrently(
                     let machine = machine.clone();
                     let peer = peer.clone();
                     let caller = caller.to_string();
+                    let cancelled = Arc::clone(cancelled);
                     scope.spawn(move || {
-                        let result =
-                            RemoteOwner::connect(&machine, &caller, &peer, Duration::from_secs(5));
+                        let timeout = PEER_CONNECT_OPEN_TIMEOUT
+                            .min(deadline.saturating_duration_since(Instant::now()));
+                        let result = RemoteOwner::connect_cancellable(
+                            &machine, &caller, &peer, timeout, &cancelled,
+                        );
                         (machine, result)
                     })
                 })
@@ -2428,6 +2571,7 @@ fn peer_failure_status(code: &str) -> &'static str {
     match code {
         "incompatible" | "incompatible_semantics" => "incompatible",
         "label_mismatch" => "label_mismatch",
+        "cancelled" => "failed",
         _ => "unavailable",
     }
 }
