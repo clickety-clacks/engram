@@ -81,6 +81,14 @@ fn write_stalled_read_file_fixture(
     root: &std::path::Path,
     request_timeout_ms: u64,
 ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    write_stalled_remote_operation_fixture(root, request_timeout_ms, "read_file")
+}
+
+fn write_stalled_remote_operation_fixture(
+    root: &std::path::Path,
+    request_timeout_ms: u64,
+    blocked_operation: &str,
+) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
     let caller_home = root.join("caller-home");
     let caller_engram = caller_home.join(".engram");
     std::fs::create_dir_all(&caller_engram).expect("caller config directory");
@@ -99,19 +107,40 @@ fn write_stalled_read_file_fixture(
         "set -eu",
         "marker=\"$1\"",
         "request_timeout_ms=\"$2\"",
+        "blocked_operation=\"$3\"",
         "while IFS= read -r request; do",
         r#"  id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"#,
         r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
         "  case \"$op\" in",
         "    open)",
+        "      if [ \"$blocked_operation\" = open ]; then touch \"$marker\"; exec /usr/bin/sleep 60; fi",
         r#"      printf '{"id":%s,"data":{"store":"silent/default","status":"ok","db":"/fixture/owner.sqlite","tape_dirs":[],"reader_mode":"live","snapshot_at":"2026-09-25T00:00:00Z"}}\n' "$id""#,
         r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"silent","build":"@BUILD@","protocol":1,"schema":@SCHEMA@,"query_semantics":@SEMANTICS@,"limits":{"read_file_compressed_bytes":268435456,"decompressed_bytes_per_tape":536870912,"request_timeout_ms":%s}}}\n' "$id" "$request_timeout_ms""#,
         "      ;;",
         "    locate_tapes)",
+        "      if [ \"$blocked_operation\" = locate_tapes ]; then",
+        r#"        printf '{"id":%s,"data":{"tape_id":"fixture-tape","file":{"machine":"silent","path":"/owner/tapes/fixture-tape.jsonl.zst","kind":"tape"},"size_bytes":1}}\n' "$id""#,
+        "        touch \"$marker\"",
+        "        exec /usr/bin/sleep 60",
+        "      fi",
         r#"      printf '{"id":%s,"data":{"tape_id":"fixture-tape","file":{"machine":"silent","path":"/owner/tapes/fixture-tape.jsonl.zst","kind":"tape"},"size_bytes":1}}\n' "$id""#,
         r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"located":1}}\n' "$id""#,
         "      ;;",
         "    read_file)",
+        "      if [ \"$blocked_operation\" != read_file ]; then exit 78; fi",
+        r#"      printf '{"id":%s,"data":{"tape_id":"fixture-tape","offset":0,"bytes_b64":"eA=="}}\n' "$id""#,
+        "      touch \"$marker\"",
+        "      exec /usr/bin/sleep 60",
+        "      ;;",
+        "    dispatch_rows)",
+        "      if [ \"$blocked_operation\" != dispatch_rows ]; then exit 78; fi",
+        r#"      printf '{"id":%s,"data":{"store":"silent/default","tape_id":"fixture-tape","direction":"received","first_turn_index":1,"uuid":"fixture-dispatch"}}\n' "$id""#,
+        "      touch \"$marker\"",
+        "      exec /usr/bin/sleep 60",
+        "      ;;",
+        "    peek_lines)",
+        "      if [ \"$blocked_operation\" != peek_lines ]; then exit 78; fi",
+        r#"      printf '{"id":%s,"data":{"tape_id":"fixture-tape","line":1,"text":"unverified partial window"}}\n' "$id""#,
         "      touch \"$marker\"",
         "      exec /usr/bin/sleep 60",
         "      ;;",
@@ -131,7 +160,7 @@ fn write_stalled_read_file_fixture(
             "self": "caller",
             "peers": {
                 "silent": {
-                    "command": ["/bin/sh", script_path, marker, request_timeout_ms.to_string()],
+                    "command": ["/bin/sh", script_path, marker, request_timeout_ms.to_string(), blocked_operation],
                     "engram": env!("CARGO_BIN_EXE_engram"),
                     "exports": ["default"],
                 }
@@ -509,33 +538,35 @@ fn remote_show_obeys_advertised_request_timeout_for_read_file() {
 }
 
 #[cfg(unix)]
-#[test]
-fn remote_show_ctrl_c_cancels_and_aborts_read_file() {
-    let temp = tempfile::tempdir().expect("tempdir");
+fn interrupt_remote_command(
+    repo: &std::path::Path,
+    caller_home: &std::path::Path,
+    args: &[&str],
+    operation_started: &std::path::Path,
+) -> (std::process::Output, Duration) {
     let binary = env!("CARGO_BIN_EXE_engram");
-    let (caller_home, repo, read_started) = write_stalled_read_file_fixture(temp.path(), 10_000);
     let mut child = Command::new(binary)
-        .current_dir(&repo)
-        .env("HOME", &caller_home)
-        .args(["show", "fixture-tape", "--store", "silent/default"])
+        .current_dir(repo)
+        .env("HOME", caller_home)
+        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn remote show");
+        .expect("spawn remote peer query");
 
     let start_deadline = Instant::now() + Duration::from_secs(5);
-    while !read_started.exists() && Instant::now() < start_deadline {
+    while !operation_started.exists() && Instant::now() < start_deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
-    if !read_started.exists() {
+    if !operation_started.exists() {
         let _ = child.kill();
         let _ = child.wait_with_output();
-        panic!("peer did not receive read_file");
+        panic!("peer did not receive the selected operation");
     }
 
     let signal_at = Instant::now();
     let signal_result = unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
-    assert_eq!(signal_result, 0, "send SIGINT to remote show caller");
+    assert_eq!(signal_result, 0, "send SIGINT to remote peer query");
     let exit_deadline = Instant::now() + Duration::from_secs(3);
     let mut exited = false;
     while Instant::now() < exit_deadline {
@@ -552,22 +583,97 @@ fn remote_show_ctrl_c_cancels_and_aborts_read_file() {
     if !exited {
         let _ = child.kill();
         let _ = child.wait_with_output();
-        panic!("Ctrl-C did not cancel remote read_file within three seconds");
+        panic!("Ctrl-C did not cancel the remote operation within three seconds");
     }
 
     let output = child
         .wait_with_output()
-        .expect("collect cancelled remote show output");
-    assert!(!output.status.success());
-    assert!(
-        signal_at.elapsed() < Duration::from_secs(3),
-        "remote read_file cancellation exceeded its deadline"
-    );
+        .expect("collect cancelled remote query output");
+    (output, signal_at.elapsed())
+}
+
+#[cfg(unix)]
+fn assert_remote_sigint_error(output: &std::process::Output) {
+    assert_eq!(output.status.code(), Some(130), "SIGINT must exit 130");
+    assert!(output.stdout.is_empty(), "cancelled content must not be emitted");
     let stderr = String::from_utf8_lossy(&output.stderr);
     let error: serde_json::Value =
         serde_json::from_str(stderr.lines().last().expect("cancellation error line"))
             .expect("cancellation error JSON");
     assert_eq!(error["error"]["code"], "cancelled");
+    assert!(error["error"]["message"].as_str().unwrap().contains("caller SIGINT"));
+}
+
+#[cfg(unix)]
+#[test]
+fn remote_show_ctrl_c_cancels_and_aborts_read_file() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (caller_home, repo, read_started) = write_stalled_read_file_fixture(temp.path(), 10_000);
+    let (output, elapsed) = interrupt_remote_command(
+        &repo,
+        &caller_home,
+        &["show", "fixture-tape", "--store", "silent/default"],
+        &read_started,
+    );
+    assert!(elapsed < Duration::from_secs(3), "remote read_file cancellation exceeded its deadline");
+    assert_remote_sigint_error(&output);
+}
+
+#[cfg(unix)]
+#[test]
+fn remote_show_ctrl_c_during_locate_returns_130_without_content() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (caller_home, repo, locate_started) =
+        write_stalled_remote_operation_fixture(temp.path(), 10_000, "locate_tapes");
+    let (output, elapsed) = interrupt_remote_command(
+        &repo,
+        &caller_home,
+        &["show", "fixture-tape", "--store", "silent/default"],
+        &locate_started,
+    );
+    assert!(elapsed < Duration::from_secs(3));
+    assert_remote_sigint_error(&output);
+}
+
+#[cfg(unix)]
+#[test]
+fn remote_peek_ctrl_c_during_lines_returns_130_without_partial_window() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (caller_home, repo, peek_started) =
+        write_stalled_remote_operation_fixture(temp.path(), 10_000, "peek_lines");
+    let (output, elapsed) = interrupt_remote_command(
+        &repo,
+        &caller_home,
+        &[
+            "peek",
+            "fixture-tape",
+            "--store",
+            "silent/default",
+            "--start",
+            "1",
+            "--lines",
+            "1",
+        ],
+        &peek_started,
+    );
+    assert!(elapsed < Duration::from_secs(3));
+    assert_remote_sigint_error(&output);
+}
+
+#[cfg(unix)]
+#[test]
+fn remote_peek_ctrl_c_during_dispatch_metadata_returns_130() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (caller_home, repo, dispatch_started) =
+        write_stalled_remote_operation_fixture(temp.path(), 10_000, "dispatch_rows");
+    let (output, elapsed) = interrupt_remote_command(
+        &repo,
+        &caller_home,
+        &["peek", "fixture-tape", "--store", "silent/default"],
+        &dispatch_started,
+    );
+    assert!(elapsed < Duration::from_secs(3));
+    assert_remote_sigint_error(&output);
 }
 
 #[test]

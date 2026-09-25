@@ -57,9 +57,9 @@ const MAX_CONCURRENT_PEERS: usize = 4;
 const PEER_CONNECT_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const PEER_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const PEER_QUERY_TIMEOUT: Duration = Duration::from_secs(120);
-const GREP_TERMINAL_RUNNING: u8 = 0;
-const GREP_TERMINAL_CANCELLED: u8 = 1;
-const GREP_TERMINAL_COMMITTED: u8 = 2;
+const PEER_QUERY_TERMINAL_RUNNING: u8 = 0;
+const PEER_QUERY_TERMINAL_CANCELLED: u8 = 1;
+const PEER_QUERY_TERMINAL_COMMITTED: u8 = 2;
 
 struct PeerRoundJob {
     machine: String,
@@ -1115,11 +1115,30 @@ fn cmd_show_remote(
     raw: bool,
     store_ref: &str,
 ) -> Result<(), CliError> {
+    let (cancelled, terminal_state) = peer_cancellation_flag()?;
+    let result = cmd_show_remote_inner(
+        context,
+        tape_id,
+        raw,
+        store_ref,
+        &cancelled,
+        &terminal_state,
+    );
+    finish_peer_query(result, &terminal_state, "remote show")
+}
+
+fn cmd_show_remote_inner(
+    context: &RuntimeContext,
+    tape_id: &str,
+    raw: bool,
+    store_ref: &str,
+    cancelled: &Arc<AtomicBool>,
+    terminal_state: &AtomicU8,
+) -> Result<(), CliError> {
     let query_deadline = Instant::now() + PEER_QUERY_TIMEOUT;
-    let cancelled = peer_cancellation_flag()?;
     print_context_conspicuity(context);
     let (machine, export, mut owner) =
-        connect_remote_store(store_ref, "remote show", query_deadline, &cancelled)?;
+        connect_remote_store(store_ref, "remote show", query_deadline, cancelled)?;
 
     let locate = one_peer_response(
         &mut owner,
@@ -1130,7 +1149,7 @@ fn cmd_show_remote(
         ),
         "locate_tapes",
         query_deadline,
-        &cancelled,
+        cancelled,
     )?;
     if locate.data.len() != 1
         || locate.data[0].get("tape_id").and_then(Value::as_str) != Some(tape_id)
@@ -1194,7 +1213,7 @@ fn cmd_show_remote(
         ),
         "read_file",
         query_deadline,
-        &cancelled,
+        cancelled,
     )?;
     let capacity = usize::try_from(file_bytes).map_err(|_| {
         CliError::new(
@@ -1266,6 +1285,7 @@ fn cmd_show_remote(
         ));
     }
     if raw {
+        commit_peer_query_terminal(terminal_state, "remote show")?;
         print!("{content}");
         return Ok(());
     }
@@ -1275,7 +1295,7 @@ fn cmd_show_remote(
         .iter()
         .map(|row| compact_event(row.offset, &row.value))
         .collect::<Vec<_>>();
-    print_json(&json!({
+    let payload = json!({
         "tape_id": tape_id,
         "path": null,
         "location": {
@@ -1288,7 +1308,9 @@ fn cmd_show_remote(
         "event_count": events.len(),
         "meta": extract_meta(&events),
         "events": compacted,
-    }))
+    });
+    commit_peer_query_terminal(terminal_state, "remote show")?;
+    print_json(&payload)
 }
 
 fn connect_remote_store(
@@ -1661,13 +1683,13 @@ fn cmd_grep(_paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Res
 
     if args.peers.is_some() {
         let signal_cancelled = Arc::clone(&cancelled);
-        let terminal_state = Arc::new(AtomicU8::new(GREP_TERMINAL_RUNNING));
+        let terminal_state = Arc::new(AtomicU8::new(PEER_QUERY_TERMINAL_RUNNING));
         let signal_terminal_state = Arc::clone(&terminal_state);
         ctrlc::set_handler(move || {
             if signal_terminal_state
                 .compare_exchange(
-                    GREP_TERMINAL_RUNNING,
-                    GREP_TERMINAL_CANCELLED,
+                    PEER_QUERY_TERMINAL_RUNNING,
+                    PEER_QUERY_TERMINAL_CANCELLED,
                     Ordering::SeqCst,
                     Ordering::SeqCst,
                 )
@@ -2411,17 +2433,17 @@ fn cmd_grep_with_peer(
 
 fn commit_grep_terminal(terminal_state: &AtomicU8) -> bool {
     match terminal_state.compare_exchange(
-        GREP_TERMINAL_RUNNING,
-        GREP_TERMINAL_COMMITTED,
+        PEER_QUERY_TERMINAL_RUNNING,
+        PEER_QUERY_TERMINAL_COMMITTED,
         Ordering::SeqCst,
         Ordering::SeqCst,
     ) {
         Ok(_) => false,
-        Err(GREP_TERMINAL_CANCELLED) => {
-            terminal_state.store(GREP_TERMINAL_COMMITTED, Ordering::SeqCst);
+        Err(PEER_QUERY_TERMINAL_CANCELLED) => {
+            terminal_state.store(PEER_QUERY_TERMINAL_COMMITTED, Ordering::SeqCst);
             true
         }
-        Err(GREP_TERMINAL_COMMITTED) => false,
+        Err(PEER_QUERY_TERMINAL_COMMITTED) => false,
         Err(_) => false,
     }
 }
@@ -2660,14 +2682,70 @@ fn peer_operation_timeout(owner: &RemoteOwner, query_deadline: Instant) -> Durat
         .min(query_deadline.saturating_duration_since(Instant::now()))
 }
 
-fn peer_cancellation_flag() -> Result<Arc<AtomicBool>, CliError> {
+fn peer_cancellation_flag() -> Result<(Arc<AtomicBool>, Arc<AtomicU8>), CliError> {
     let cancelled = Arc::new(AtomicBool::new(false));
     let signal_cancelled = Arc::clone(&cancelled);
+    let terminal_state = Arc::new(AtomicU8::new(PEER_QUERY_TERMINAL_RUNNING));
+    let signal_terminal_state = Arc::clone(&terminal_state);
     ctrlc::set_handler(move || {
-        signal_cancelled.store(true, Ordering::SeqCst);
+        if signal_terminal_state
+            .compare_exchange(
+                PEER_QUERY_TERMINAL_RUNNING,
+                PEER_QUERY_TERMINAL_CANCELLED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            signal_cancelled.store(true, Ordering::SeqCst);
+        }
     })
     .map_err(|error| CliError::new("signal_handler_error", error.to_string()))?;
-    Ok(cancelled)
+    Ok((cancelled, terminal_state))
+}
+
+fn caller_sigint_error(command: &str) -> CliError {
+    CliError::new("cancelled", format!("{command} interrupted by caller SIGINT"))
+        .with_exit_code(130)
+}
+
+fn commit_peer_query_terminal(
+    terminal_state: &AtomicU8,
+    command: &str,
+) -> Result<(), CliError> {
+    match terminal_state.compare_exchange(
+        PEER_QUERY_TERMINAL_RUNNING,
+        PEER_QUERY_TERMINAL_COMMITTED,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    ) {
+        Ok(_) | Err(PEER_QUERY_TERMINAL_COMMITTED) => Ok(()),
+        Err(PEER_QUERY_TERMINAL_CANCELLED) => {
+            terminal_state.store(PEER_QUERY_TERMINAL_COMMITTED, Ordering::SeqCst);
+            Err(caller_sigint_error(command))
+        }
+        Err(_) => Ok(()),
+    }
+}
+
+fn finish_peer_query(
+    result: Result<(), CliError>,
+    terminal_state: &AtomicU8,
+    command: &str,
+) -> Result<(), CliError> {
+    match terminal_state.compare_exchange(
+        PEER_QUERY_TERMINAL_RUNNING,
+        PEER_QUERY_TERMINAL_COMMITTED,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    ) {
+        Ok(_) | Err(PEER_QUERY_TERMINAL_COMMITTED) => result,
+        Err(PEER_QUERY_TERMINAL_CANCELLED) => {
+            terminal_state.store(PEER_QUERY_TERMINAL_COMMITTED, Ordering::SeqCst);
+            Err(caller_sigint_error(command))
+        }
+        Err(_) => result,
+    }
 }
 
 fn mark_source_phase(sources: &mut [Value], store: &str, phase: &str, code: &str, message: &str) {
@@ -2996,10 +3074,27 @@ fn cmd_peek_remote(
     args: PeekArgs,
     store_ref: &str,
 ) -> Result<(), CliError> {
+    let (cancelled, terminal_state) = peer_cancellation_flag()?;
+    let result = cmd_peek_remote_inner(
+        context,
+        args,
+        store_ref,
+        &cancelled,
+        &terminal_state,
+    );
+    finish_peer_query(result, &terminal_state, "remote peek")
+}
+
+fn cmd_peek_remote_inner(
+    context: &RuntimeContext,
+    args: PeekArgs,
+    store_ref: &str,
+    cancelled: &Arc<AtomicBool>,
+    terminal_state: &AtomicU8,
+) -> Result<(), CliError> {
     let query_deadline = Instant::now() + PEER_QUERY_TIMEOUT;
-    let cancelled = peer_cancellation_flag()?;
     let (machine, export, mut owner) =
-        connect_remote_store(store_ref, "remote peek", query_deadline, &cancelled)?;
+        connect_remote_store(store_ref, "remote peek", query_deadline, cancelled)?;
     let session_id = args.session_id;
     if args.grep_filter.is_none() && args.start == Some(0) {
         return Err(CliError::new(
@@ -3018,7 +3113,7 @@ fn cmd_peek_remote(
             ),
             "dispatch_rows",
             query_deadline,
-            &cancelled,
+            cancelled,
         )?;
         let mut first_received: Option<(i64, String)> = None;
         for row in rows.data {
@@ -3096,7 +3191,7 @@ fn cmd_peek_remote(
         PeerRequest::new("peek_lines", vec![export], Value::Object(request_args)),
         "peek_lines",
         query_deadline,
-        &cancelled,
+        cancelled,
     )
     .map_err(|error| {
         if error.code == "budget_exceeded" {
@@ -3202,9 +3297,7 @@ fn cmd_peek_remote(
         ));
     }
 
-    emit_query_result(
-        "peek",
-        json!({
+    let payload = json!({
             "query": {
                 "command": "peek",
                 "session_id": session_id,
@@ -3227,8 +3320,9 @@ fn cmd_peek_remote(
                     "store": store_ref,
                 },
             }
-        }),
-    )
+        });
+    commit_peer_query_terminal(terminal_state, "remote peek")?;
+    emit_query_result("peek", payload)
 }
 
 fn repo_paths(cwd: &Path) -> Result<RepoPaths, CliError> {
