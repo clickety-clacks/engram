@@ -1751,8 +1751,9 @@ fn cmd_show_peers_inner(
         }
     }
 
-    // §7.1 chooses a local holder first, then the first configured selected
-    // peer/export. Locate results are already accumulated in that stable order.
+    // §7.1 chooses a local holder first, then the first selected peer/export.
+    // Explicit --peers order is retained by select_peers; `all` uses the
+    // topology's deterministic key order.
     if candidates.is_empty()
         && let Some(locator) = remote_locators.first()
     {
@@ -2277,33 +2278,53 @@ fn show_tape_facts_digest(
             "tape_facts returned identity for a different store or tape",
         ));
     }
-    if row.get("status").and_then(Value::as_str) != Some("ok") {
-        let peer_code = row
-            .get("error")
-            .and_then(|error| error.get("code"))
-            .and_then(Value::as_str)
-            .unwrap_or("peer_error");
-        let message = row
-            .get("error")
-            .and_then(|error| error.get("message"))
-            .and_then(Value::as_str)
-            .unwrap_or("peer could not verify tape identity");
-        return Err(CliError::new(
-            peer_failure_cli_code(peer_code),
-            format!("{peer_code}: {store_ref}: {message}"),
-        ));
-    }
-    let digest = row
-        .get("digest")
-        .and_then(Value::as_str)
-        .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .ok_or_else(|| {
+    let digest = match row.get("digest") {
+        Some(Value::String(digest))
+            if digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            Some(digest.to_ascii_lowercase())
+        }
+        Some(Value::Null) | None => None,
+        _ => {
+            return Err(CliError::new(
+                "protocol_error",
+                "tape_facts returned an invalid SHA-256 digest",
+            ));
+        }
+    };
+    match row.get("status").and_then(Value::as_str) {
+        Some("ok") => digest.ok_or_else(|| {
             CliError::new(
                 "protocol_error",
                 "tape_facts omitted a valid SHA-256 digest",
             )
-        })?;
-    Ok(digest.to_ascii_lowercase())
+        }),
+        // `show` requests only the current tape's content identity. The owner
+        // can know that digest even when unrelated metadata or an ancestor in
+        // the predecessor chain is unavailable, so retain it for holder
+        // comparison without treating that facts failure as an identity miss.
+        Some("failed") if digest.is_some() => Ok(digest.expect("checked digest")),
+        Some("failed") | Some("unavailable") => {
+            let peer_code = row
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_str)
+                .unwrap_or("peer_error");
+            let message = row
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("peer could not verify tape identity");
+            return Err(CliError::new(
+                peer_failure_cli_code(peer_code),
+                format!("{peer_code}: {store_ref}: {message}"),
+            ));
+        }
+        _ => Err(CliError::new(
+            "protocol_error",
+            "tape_facts returned an unknown status",
+        )),
+    }
 }
 
 fn is_sha256_tape_id(tape_id: &str) -> bool {
@@ -3620,7 +3641,8 @@ fn select_peers(
         return Ok(peers.keys().cloned().collect());
     }
 
-    let mut selected = std::collections::BTreeSet::new();
+    let mut selected = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for machine in selection.split(',').map(str::trim) {
         if machine.is_empty() {
             return Err(CliError::new(
@@ -3634,15 +3656,16 @@ fn select_peers(
                 format!("peer `{machine}` is not configured in ~/.engram/topology.yml"),
             ));
         }
-        if !selected.insert(machine.to_string()) {
+        if !seen.insert(machine.to_string()) {
             return Err(CliError::new(
                 "invalid_peer_selection",
                 format!("peer `{machine}` appears more than once in --peers"),
             ));
         }
+        selected.push(machine.to_string());
     }
 
-    Ok(selected.into_iter().collect())
+    Ok(selected)
 }
 
 fn connect_topology_status_peers(
@@ -4642,7 +4665,7 @@ mod tests {
     use notify::event::{CreateKind, RemoveKind};
 
     #[test]
-    fn peer_selection_resolves_lists_and_all_deterministically() {
+    fn peer_selection_preserves_explicit_order_and_all_is_deterministic() {
         let peer = || TopologyPeer {
             ssh: Some("host".into()),
             command: None,
@@ -4656,7 +4679,7 @@ mod tests {
 
         assert_eq!(
             select_peers("beta, alpha", &peers).expect("explicit peer list"),
-            vec!["alpha".to_string(), "beta".to_string()]
+            vec!["beta".to_string(), "alpha".to_string()]
         );
         assert_eq!(
             select_peers("all", &peers).expect("all peers"),

@@ -746,6 +746,7 @@ impl PeerSession {
                     "unavailable",
                     "tape_unavailable",
                     "tape is not present in this export".into(),
+                    None,
                 );
                 failure["summary"] = empty_tape_summary();
                 write_data_limited(output, id, failure, &mut response_bytes, response_limit)?;
@@ -765,6 +766,7 @@ impl PeerSession {
                             "failed",
                             error.code,
                             error.message,
+                            None,
                         ),
                         &mut response_bytes,
                         response_limit,
@@ -772,6 +774,8 @@ impl PeerSession {
                     continue;
                 }
             };
+            let digest =
+                include_digest.then(|| format!("{:x}", Sha256::digest(raw_text.as_bytes())));
             let rows = match parse_jsonl_rows(&raw_text) {
                 Ok(rows) => rows,
                 Err(error) => {
@@ -785,6 +789,7 @@ impl PeerSession {
                             "failed",
                             "invalid_tape",
                             error.message,
+                            digest.as_deref(),
                         ),
                         &mut response_bytes,
                         response_limit,
@@ -805,6 +810,7 @@ impl PeerSession {
                             "failed",
                             error.code,
                             error.message,
+                            digest.as_deref(),
                         ),
                         &mut response_bytes,
                         response_limit,
@@ -1000,6 +1006,7 @@ impl PeerSession {
                                     "failed",
                                     error.code,
                                     error.message,
+                                    digest.as_deref(),
                                 ),
                                 &mut response_bytes,
                                 response_limit,
@@ -1021,6 +1028,7 @@ impl PeerSession {
                                 "failed",
                                 "invalid_tape",
                                 error.message,
+                                digest.as_deref(),
                             ),
                             &mut response_bytes,
                             response_limit,
@@ -1043,6 +1051,7 @@ impl PeerSession {
                                     "failed",
                                     error.code,
                                     error.message,
+                                    digest.as_deref(),
                                 ),
                                 &mut response_bytes,
                                 response_limit,
@@ -1073,8 +1082,7 @@ impl PeerSession {
                     "edit_offset_to_turn": edit_offset_to_turn,
                     "turn_to_offset": turn_to_offset,
                     "recovery_binding": recovery_binding,
-                    "digest": include_digest
-                        .then(|| format!("{:x}", Sha256::digest(raw_text.as_bytes()))),
+                    "digest": digest,
                     "summary": summary,
                 }),
                 &mut response_bytes,
@@ -2329,6 +2337,7 @@ fn tape_facts_failure(
     status: &str,
     code: &'static str,
     message: String,
+    digest: Option<&str>,
 ) -> Value {
     json!({
         "type": "tape_facts",
@@ -2336,7 +2345,7 @@ fn tape_facts_failure(
         "tape_id": tape_id,
         "status": status,
         "indexed": indexed,
-        "digest": null,
+        "digest": digest,
         "error": {"code": code, "message": message},
     })
 }

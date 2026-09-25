@@ -696,8 +696,8 @@ fn show_with_selected_peers_reads_and_deduplicates_matching_remote_tapes() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("show JSON");
     assert_eq!(value["tape_id"], tape_id);
     assert!(value["path"].is_null());
-    assert_eq!(value["location"]["machine"], "alpha");
-    assert_eq!(value["location"]["store"], "alpha/default");
+    assert_eq!(value["location"]["machine"], "beta");
+    assert_eq!(value["location"]["store"], "beta/default");
     assert_eq!(value["digest"], tape_id);
     assert_eq!(value["id_verified"], true);
     assert_eq!(
@@ -708,8 +708,8 @@ fn show_with_selected_peers_reads_and_deduplicates_matching_remote_tapes() {
     assert_eq!(value["federation"]["coverage"], "complete");
     assert_eq!(operation_count(&alpha_operations, "tape_facts"), 1);
     assert_eq!(operation_count(&beta_operations, "tape_facts"), 1);
-    assert_eq!(operation_count(&alpha_operations, "read_file"), 1);
-    assert_eq!(operation_count(&beta_operations, "read_file"), 0);
+    assert_eq!(operation_count(&alpha_operations, "read_file"), 0);
+    assert_eq!(operation_count(&beta_operations, "read_file"), 1);
     assert!(
         value["federation"]["sources"]
             .as_array()
@@ -719,6 +719,52 @@ fn show_with_selected_peers_reads_and_deduplicates_matching_remote_tapes() {
                 && source["status"] == "not_selected")
     );
     assert!(!unselected_marker.exists(), "unselected peer was launched");
+}
+
+#[test]
+fn show_keeps_holder_digest_when_unrelated_tape_facts_metadata_fails() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let tape_id = "fingerprint-without-meta";
+    let content =
+        "{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"no metadata row\"}\n";
+    let mut alpha = write_grep_owner(temp.path(), "alpha", binary, &[(tape_id, content)]);
+    let alpha_operations = log_peer_operations(temp.path(), "alpha", binary, &mut alpha);
+    let mut beta = write_grep_owner(temp.path(), "beta", binary, &[(tape_id, content)]);
+    let beta_operations = log_peer_operations(temp.path(), "beta", binary, &mut beta);
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "caller-other-tape",
+        "{\"t\":\"2026-09-25T11:00:00Z\",\"k\":\"note\",\"content\":\"local tape\"}\n",
+    );
+    std::fs::write(
+        caller_home.join(".engram/topology.yml"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "self": "caller",
+            "peers": {"alpha": alpha, "beta": beta},
+        }))
+        .expect("serialize caller topology"),
+    )
+    .expect("write caller topology");
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["show", tape_id, "--peers", "alpha,beta"])
+        .output()
+        .expect("run show with metadata-invalid duplicate holders");
+    assert!(
+        output.status.success(),
+        "show should use the current tape digest despite unrelated metadata failure: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("show JSON");
+    assert_eq!(value["location"]["machine"], "alpha");
+    assert_eq!(value["locations"].as_array().unwrap().len(), 2);
+    assert_eq!(value["federation"]["coverage"], "complete");
+    assert_eq!(operation_count(&alpha_operations, "read_file"), 1);
+    assert_eq!(operation_count(&beta_operations, "read_file"), 0);
 }
 
 #[test]
