@@ -972,6 +972,66 @@ fn contract_native_sender_shapes_and_normalized_input_follow_actual_parent_acros
 }
 
 #[test]
+fn contract_independent_senders_are_reported_ambiguous_without_a_hop() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir_all(root.join("home")).unwrap();
+
+    for (name, kind) in [
+        ("sender-function.codex.jsonl", "function_call"),
+        ("sender-custom.codex.jsonl", "custom_tool_call"),
+    ] {
+        let sender = root.join(name);
+        fs::write(&sender, native_sender(kind, UUID)).unwrap();
+        cli(root, &["ingest", sender.to_str().unwrap()], None);
+    }
+
+    let receiver = root.join("receiver.codex.jsonl");
+    fs::write(&receiver, rows(false).concat()).unwrap();
+    cli(root, &["ingest", receiver.to_str().unwrap()], None);
+
+    let result = cli(root, &["explain", "--", TEXT], None);
+    assert_eq!(result["dispatch_lineage"], json!([]), "{result}");
+    let ambiguities = result["dispatch_ambiguous"].as_array().unwrap();
+    assert_eq!(ambiguities.len(), 1, "{result}");
+    assert_eq!(ambiguities[0]["received_uuid"], UUID);
+    let db = rusqlite::Connection::open(root.join("home/.engram/index.sqlite")).unwrap();
+    let receiver_tape: String = db
+        .query_row(
+            "SELECT tape_id FROM dispatch_links WHERE uuid = ?1 AND direction = 'received'",
+            [UUID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(ambiguities[0]["received_session"], receiver_tape);
+
+    let mut statement = db
+        .prepare(
+            "SELECT tape_id FROM dispatch_links WHERE uuid = ?1 AND direction = 'sent' ORDER BY tape_id",
+        )
+        .unwrap();
+    let expected_senders = statement
+        .query_map([UUID], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let candidates = ambiguities[0]["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 2, "{result}");
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate["session"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>(),
+        expected_senders,
+        "{result}"
+    );
+    for candidate in candidates {
+        assert_eq!(candidate["sent_turn_index"], 0);
+        assert!(candidate["location"].as_str().is_some(), "{result}");
+    }
+}
+
+#[test]
 fn contract_negative_controls_do_not_manufacture_native_lineage() {
     for claude in [false, true] {
         for control in [
@@ -1063,6 +1123,16 @@ fn contract_negative_controls_do_not_manufacture_native_lineage() {
                 result["dispatch_lineage"].as_array().unwrap().is_empty(),
                 "{control}: {result}"
             );
+            if matches!(
+                control,
+                "missing_sender" | "unrelated_uuid" | "tool_result_sender" | "quoted_guidance"
+            ) {
+                assert_eq!(
+                    result["dispatch_unresolved"][0]["reason"], "no_sender_observed",
+                    "{control}: {result}"
+                );
+                assert_eq!(result["dispatch_unresolved"][0]["uuid"], UUID);
+            }
             let db = rusqlite::Connection::open(root.join("home/.engram/index.sqlite")).unwrap();
             if matches!(
                 control,

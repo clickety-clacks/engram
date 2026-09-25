@@ -1,27 +1,62 @@
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
 use crate::index::{DispatchDirection, DispatchLink, DispatchLinkRow, SqliteIndex};
-use crate::store::tapes::{TapeRow, event_window, load_tape_rows_cached};
+use crate::store::tapes::{TapeRow, event_window, parse_jsonl_rows, read_tape_content, resolve_tape_path};
 use crate::{CliError, RuntimeContext};
 
 const TRANSCRIPT_WINDOW_RADIUS: usize = 2;
+
+#[derive(Default)]
+struct DispatchTapeCache {
+    rows: HashMap<String, Vec<TapeRow>>,
+    paths: HashMap<String, Option<PathBuf>>,
+}
+
+impl DispatchTapeCache {
+    fn load<'a>(
+        &'a mut self,
+        context: &RuntimeContext,
+        tape_id: &str,
+    ) -> Result<&'a Vec<TapeRow>, CliError> {
+        if !self.rows.contains_key(tape_id) {
+            let path = resolve_tape_path(context, tape_id);
+            self.paths.insert(tape_id.to_owned(), path.clone());
+            let rows = if let Some(path) = path {
+                parse_jsonl_rows(&read_tape_content(&path)?)?
+            } else {
+                Vec::new()
+            };
+            self.rows.insert(tape_id.to_owned(), rows);
+        }
+        Ok(self.rows.get(tape_id).expect("cache entry inserted"))
+    }
+
+    fn path(&self, tape_id: &str) -> Option<&Path> {
+        self.paths.get(tape_id).and_then(Option::as_deref)
+    }
+}
 
 pub fn collect_dispatch_upstream_sessions(
     context: &RuntimeContext,
     indexes: &[SqliteIndex],
     sessions: &[Value],
-) -> Result<(Vec<Value>, Vec<Value>), CliError> {
+) -> Result<(Vec<Value>, Vec<Value>, Vec<Value>, Vec<Value>), CliError> {
     let mut chain = Vec::new();
     let mut extras = Vec::new();
+    let mut unresolved = Vec::new();
+    let mut ambiguous = Vec::new();
     let mut seen_tapes = sessions
         .iter()
         .filter_map(|session| session.get("tape_id").and_then(Value::as_str))
         .map(ToOwned::to_owned)
         .collect::<HashSet<_>>();
-    let mut rows_cache = HashMap::<String, Vec<TapeRow>>::new();
+    let mut rows_cache = DispatchTapeCache::default();
     let mut seen_hops = HashSet::new();
+    let mut seen_unresolved = HashSet::new();
+    let mut seen_ambiguous = HashSet::new();
     let mut recovery = crate::ingest::recovery::QueryRecovery::default();
 
     for session in sessions {
@@ -67,16 +102,51 @@ pub fn collect_dispatch_upstream_sessions(
                 &current_tape,
                 current_turn,
             )? {
-                let Some(parent) = sent_dispatch_for_uuid(
+                let candidates = sent_dispatch_candidates(
                     context,
                     &mut rows_cache,
                     indexes,
                     &mut recovery,
                     &received.uuid,
-                )?
-                else {
-                    break;
+                )?;
+                let parent = match candidates.as_slice() {
+                    [] => {
+                        let key = (received_tape.clone(), received.uuid.clone());
+                        if seen_unresolved.insert(key) {
+                            unresolved.push(json!({
+                                "reason": "no_sender_observed",
+                                "uuid": received.uuid,
+                            }));
+                        }
+                        break;
+                    }
+                    [parent] => parent,
+                    _ => {
+                        let key = (received_tape.clone(), received.uuid.clone());
+                        if seen_ambiguous.insert(key) {
+                            let candidates = candidates
+                                .iter()
+                                .map(|(candidate, start)| {
+                                    let location = rows_cache
+                                        .path(&candidate.tape_id)
+                                        .map(|path| path.display().to_string());
+                                    json!({
+                                        "session": candidate.tape_id,
+                                        "sent_turn_index": *start + candidate.first_turn_index,
+                                        "location": location,
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            ambiguous.push(json!({
+                                "received_uuid": received.uuid,
+                                "received_session": received_tape,
+                                "candidates": candidates,
+                            }));
+                        }
+                        break;
+                    }
                 };
+                let (parent, _) = parent;
                 let hop_key = (
                     current_tape.clone(),
                     current_turn,
@@ -90,16 +160,9 @@ pub fn collect_dispatch_upstream_sessions(
                 }
 
                 if seen_hops.insert(hop_key) {
-                    let current_start = message_turn_start(load_tape_rows_cached(
-                        context,
-                        &mut rows_cache,
-                        &current_tape,
-                    )?);
-                    let parent_start = message_turn_start(load_tape_rows_cached(
-                        context,
-                        &mut rows_cache,
-                        &parent.tape_id,
-                    )?);
+                    let current_start = message_turn_start(rows_cache.load(context, &current_tape)?);
+                    let parent_start =
+                        message_turn_start(rows_cache.load(context, &parent.tape_id)?);
                     let mut hop = json!({
                         "session": current_tape,
                         "edit_turn_index": current_start + current_turn,
@@ -125,13 +188,13 @@ pub fn collect_dispatch_upstream_sessions(
                 }
 
                 first_hop = false;
-                current_tape = parent.tape_id;
+                current_tape = parent.tape_id.clone();
                 current_turn = parent.first_turn_index;
             }
         }
     }
 
-    Ok((chain, extras))
+    Ok((chain, extras, unresolved, ambiguous))
 }
 
 fn message_turn_start(rows: &[TapeRow]) -> i64 {
@@ -146,7 +209,7 @@ fn message_turn_start(rows: &[TapeRow]) -> i64 {
 /// Keep both directions: an earlier sent occurrence suppresses a later receive.
 fn first_dispatches_in_history(
     context: &RuntimeContext,
-    cache: &mut HashMap<String, Vec<TapeRow>>,
+    cache: &mut DispatchTapeCache,
     indexes: &[SqliteIndex],
     tape_id: &str,
 ) -> Result<
@@ -160,7 +223,7 @@ fn first_dispatches_in_history(
     let mut first = HashMap::<String, (DispatchLink, String, i64)>::new();
     let mut visited = HashSet::new();
     while visited.insert(tape.clone()) {
-        let rows = load_tape_rows_cached(context, cache, &tape)?;
+        let rows = cache.load(context, &tape)?;
         let start = message_turn_start(rows);
         for index in indexes {
             for link in index.dispatch_links_for_tape(&tape)? {
@@ -193,12 +256,12 @@ fn first_dispatches_in_history(
 
 fn latest_received_in_history(
     context: &RuntimeContext,
-    cache: &mut HashMap<String, Vec<TapeRow>>,
+    cache: &mut DispatchTapeCache,
     indexes: &[SqliteIndex],
     tape_id: &str,
     turn: i64,
 ) -> Result<Option<(DispatchLink, String, i64)>, CliError> {
-    let cutoff = message_turn_start(load_tape_rows_cached(context, cache, tape_id)?) + turn;
+    let cutoff = message_turn_start(cache.load(context, tape_id)?) + turn;
     let mut candidates: Vec<_> = first_dispatches_in_history(context, cache, indexes, tape_id)?
         .0
         .into_values()
@@ -214,16 +277,16 @@ fn latest_received_in_history(
     Ok(candidates.into_iter().next())
 }
 
-fn sent_dispatch_for_uuid(
+fn sent_dispatch_candidates(
     context: &RuntimeContext,
-    cache: &mut HashMap<String, Vec<TapeRow>>,
+    cache: &mut DispatchTapeCache,
     indexes: &[SqliteIndex],
     recovery: &mut crate::ingest::recovery::QueryRecovery,
     uuid: &str,
-) -> Result<Option<DispatchLinkRow>, CliError> {
-    // Examine the latest known occurrence in each continuation, including
-    // received rows, so a same-turn received tie can suppress an older sender.
-    // Separate roots (other sessions/stores) retain the existing selection rule.
+) -> Result<Vec<(DispatchLinkRow, i64)>, CliError> {
+    // Examine the first occurrence in each continuation, including received
+    // rows, so a same-turn receive can suppress an older sender. Independent
+    // roots remain separate candidates; their turn ordinals are incomparable.
     let mut histories = Vec::new();
     let mut seen = HashSet::new();
     for index in indexes {
@@ -263,20 +326,16 @@ fn sent_dispatch_for_uuid(
             ));
         }
     }
-    candidates.sort_by(|(left, ls), (right, rs)| {
-        (rs + right.first_turn_index)
-            .cmp(&(ls + left.first_turn_index))
-            .then_with(|| left.tape_id.cmp(&right.tape_id))
-    });
-    Ok(candidates.into_iter().next().map(|(link, _)| link))
+    candidates.sort_by(|(left, _), (right, _)| left.tape_id.cmp(&right.tape_id));
+    Ok(candidates)
 }
 
-pub(crate) fn build_dispatch_session(
+fn build_dispatch_session(
     context: &RuntimeContext,
-    rows_cache: &mut HashMap<String, Vec<TapeRow>>,
+    rows_cache: &mut DispatchTapeCache,
     link: &DispatchLinkRow,
 ) -> Result<Option<Value>, CliError> {
-    let rows = load_tape_rows_cached(context, rows_cache, &link.tape_id)?;
+    let rows = rows_cache.load(context, &link.tape_id)?;
     let anchor_offset = message_turn_to_event_offset(rows, link.first_turn_index)
         .or_else(|| rows.last().map(|row| row.offset))
         .unwrap_or(0);
@@ -297,13 +356,13 @@ pub(crate) fn build_dispatch_session(
     })))
 }
 
-pub(crate) fn message_turn_before_offset(
+fn message_turn_before_offset(
     context: &RuntimeContext,
-    cache: &mut HashMap<String, Vec<TapeRow>>,
+    cache: &mut DispatchTapeCache,
     tape_id: &str,
     event_offset: u64,
 ) -> Result<i64, CliError> {
-    let rows = load_tape_rows_cached(context, cache, tape_id)?;
+    let rows = cache.load(context, tape_id)?;
     let turn = rows
         .iter()
         .filter(|row| row.offset < event_offset && is_message_row(&row.value))

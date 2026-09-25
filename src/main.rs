@@ -2636,6 +2636,8 @@ fn cmd_explain(
     let query_anchors;
     let mut raw_sessions: Vec<Value>;
     let dispatch_lineage;
+    let mut dispatch_unresolved = Vec::new();
+    let mut dispatch_ambiguous = Vec::new();
     let lineage;
     let mut tombstones = Vec::new();
     let touched_anchors;
@@ -2659,9 +2661,11 @@ fn cmd_explain(
             let touches =
                 collect_touch_evidence(&indexes, &result.direct, &result.touched_anchors)?;
             raw_sessions = build_session_windows(context, touches)?;
-            let (chain, dispatch_sessions) =
+            let (chain, dispatch_sessions, unresolved, ambiguous) =
                 collect_dispatch_upstream_sessions(context, &indexes, &raw_sessions)?;
             dispatch_lineage = chain;
+            dispatch_unresolved.extend(unresolved);
+            dispatch_ambiguous.extend(ambiguous);
             raw_sessions.extend(dispatch_sessions);
             lineage = result.lineage.iter().map(edge_to_json).collect::<Vec<_>>();
             score_by_session = collect_anchor_scores(&indexes, &query_anchors)?;
@@ -2682,9 +2686,11 @@ fn cmd_explain(
             let touches =
                 collect_touch_evidence(&indexes, &result.direct, &result.touched_anchors)?;
             raw_sessions = build_session_windows(context, touches)?;
-            let (chain, dispatch_sessions) =
+            let (chain, dispatch_sessions, unresolved, ambiguous) =
                 collect_dispatch_upstream_sessions(context, &indexes, &raw_sessions)?;
             dispatch_lineage = chain;
+            dispatch_unresolved.extend(unresolved);
+            dispatch_ambiguous.extend(ambiguous);
             raw_sessions.extend(dispatch_sessions);
             lineage = result.lineage.iter().map(edge_to_json).collect::<Vec<_>>();
             score_by_session = collect_anchor_scores(&indexes, &query_anchors)?;
@@ -2712,9 +2718,11 @@ fn cmd_explain(
             let touches =
                 collect_touch_evidence(&indexes, &result.direct, &result.touched_anchors)?;
             raw_sessions = build_session_windows(context, touches)?;
-            let (chain, dispatch_sessions) =
+            let (chain, dispatch_sessions, unresolved, ambiguous) =
                 collect_dispatch_upstream_sessions(context, &indexes, &raw_sessions)?;
             dispatch_lineage = chain;
+            dispatch_unresolved.extend(unresolved);
+            dispatch_ambiguous.extend(ambiguous);
             raw_sessions.extend(dispatch_sessions);
             lineage = result.lineage.iter().map(edge_to_json).collect::<Vec<_>>();
             score_by_session = collect_anchor_scores(&indexes, &query_anchors)?;
@@ -2819,6 +2827,12 @@ fn cmd_explain(
     });
     if let Some(touches) = proof_direct_touches {
         payload["t1772_direct_touches"] = touches;
+    }
+    if !dispatch_unresolved.is_empty() {
+        payload["dispatch_unresolved"] = json!(dispatch_unresolved);
+    }
+    if !dispatch_ambiguous.is_empty() {
+        payload["dispatch_ambiguous"] = json!(dispatch_ambiguous);
     }
     emit_query_result("explain", payload)
 }
