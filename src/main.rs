@@ -3528,11 +3528,7 @@ fn cmd_grep_with_peer(
     } else {
         None
     };
-    let time_range = if grep_scan_incomplete {
-        Value::Null
-    } else {
-        merge_grep_time_ranges(&source_time_ranges)
-    };
+    let time_range = aggregate_grep_time_range(grep_scan_incomplete, &source_time_ranges);
     let page = page_ranked
         .iter()
         .skip(start)
@@ -4208,6 +4204,14 @@ fn merge_grep_time_ranges(ranges: &[Vec<String>]) -> Value {
     }
 }
 
+fn aggregate_grep_time_range(scan_incomplete: bool, ranges: &[Vec<String>]) -> Value {
+    if scan_incomplete {
+        Value::Null
+    } else {
+        merge_grep_time_ranges(ranges)
+    }
+}
+
 fn cmd_peek(_paths: &RepoPaths, context: &RuntimeContext, args: PeekArgs) -> Result<(), CliError> {
     print_context_conspicuity(context);
     if let Some(store_ref) = args.store.clone() {
@@ -4681,6 +4685,15 @@ fn print_context_conspicuity(context: &RuntimeContext) {
 mod tests {
     use super::*;
     use notify::event::{CreateKind, RemoveKind};
+
+    #[test]
+    fn grep_time_range_distinguishes_completed_empty_from_unknown_scope() {
+        let completed_empty = aggregate_grep_time_range(false, &[vec![], vec![]]);
+        let unknown = aggregate_grep_time_range(true, &[vec![]]);
+
+        assert_eq!(completed_empty, json!({"start": null, "end": null}));
+        assert_eq!(unknown, Value::Null);
+    }
 
     #[test]
     fn peer_selection_preserves_explicit_order_and_all_is_deterministic() {
