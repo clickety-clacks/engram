@@ -509,6 +509,132 @@ fn remote_show_reads_only_the_selected_peer_tape_and_verifies_its_digest() {
     );
 }
 
+#[test]
+fn show_with_selected_peers_reads_and_deduplicates_matching_remote_tapes() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let content = "{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"show from selected peers\"}\n";
+    let tape_id = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
+    let alpha = write_grep_owner(temp.path(), "alpha", binary, &[(tape_id.as_str(), content)]);
+    let beta = write_grep_owner(temp.path(), "beta", binary, &[(tape_id.as_str(), content)]);
+    let unselected_marker = temp.path().join("show-unselected-peer-was-started");
+    let unselected = json!({
+        "command": ["/usr/bin/touch", unselected_marker],
+        "engram": "/unused/engram",
+        "exports": ["default"],
+    });
+    let peers = json!({
+        "alpha": alpha,
+        "beta": beta,
+        "not-selected": unselected,
+    });
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "caller-other-tape",
+        "{\"t\":\"2026-09-25T11:00:00Z\",\"k\":\"note\",\"content\":\"local tape\"}\n",
+    );
+    let caller_engram = caller_home.join(".engram");
+    std::fs::write(
+        caller_engram.join("topology.yml"),
+        serde_json::to_vec(&json!({"version": 1, "self": "caller", "peers": peers}))
+            .expect("serialize topology"),
+    )
+    .expect("write caller topology");
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["show", &tape_id, "--peers", "beta,alpha"])
+        .output()
+        .expect("run selected-peer show");
+    assert!(
+        output.status.success(),
+        "selected-peer show failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("show JSON");
+    assert_eq!(value["tape_id"], tape_id);
+    assert!(value["path"].is_null());
+    assert_eq!(value["location"]["machine"], "alpha");
+    assert_eq!(value["location"]["store"], "alpha/default");
+    assert_eq!(value["digest"], tape_id);
+    assert_eq!(value["id_verified"], true);
+    assert_eq!(value["locations"].as_array().unwrap().len(), 2);
+    assert_eq!(value["federation"]["coverage"], "complete");
+    assert!(value["federation"]["sources"].as_array().unwrap().iter().any(
+        |source| source["store"] == "not-selected/default" && source["status"] == "not_selected"
+    ));
+    assert!(!unselected_marker.exists(), "unselected peer was launched");
+}
+
+#[test]
+fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let content = "{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"show partial selected peers\"}\n";
+    let tape_id = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
+    let available = write_grep_owner(temp.path(), "available", binary, &[(tape_id.as_str(), content)]);
+    let offline = json!({
+        "command": ["/usr/bin/false"],
+        "engram": "/unused/engram",
+        "exports": ["default"],
+    });
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "caller-other-tape",
+        "{\"t\":\"2026-09-25T11:00:00Z\",\"k\":\"note\",\"content\":\"local tape\"}\n",
+    );
+    let caller_engram = caller_home.join(".engram");
+    std::fs::write(
+        caller_engram.join("topology.yml"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "self": "caller",
+            "peers": {"available": available, "offline": offline},
+        }))
+        .expect("serialize topology"),
+    )
+    .expect("write caller topology");
+
+    let partial = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["show", &tape_id, "--peers", "available,offline"])
+        .output()
+        .expect("run partial selected-peer show");
+    assert!(
+        partial.status.success(),
+        "partial show should keep the completed tape: {}",
+        String::from_utf8_lossy(&partial.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&partial.stdout).expect("show JSON");
+    assert_eq!(value["tape_id"], tape_id);
+    assert_eq!(value["federation"]["coverage"], "partial");
+    assert!(value["federation"]["sources"].as_array().unwrap().iter().any(
+        |source| source["store"] == "offline/default" && source["status"] == "unavailable"
+    ));
+
+    let required = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "show",
+            &tape_id,
+            "--peers",
+            "available,offline",
+            "--require-complete",
+        ])
+        .output()
+        .expect("run require-complete selected-peer show");
+    assert!(!required.status.success());
+    let stderr = String::from_utf8_lossy(&required.stderr);
+    let error: serde_json::Value = serde_json::from_str(
+        stderr.lines().last().expect("incomplete coverage error line"),
+    )
+    .expect("error JSON");
+    assert_eq!(error["error"]["code"], "incomplete_coverage");
+}
+
 #[cfg(unix)]
 #[test]
 fn remote_show_obeys_advertised_request_timeout_for_read_file() {

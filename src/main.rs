@@ -14,6 +14,8 @@ use engram::access::client::{
     DEFAULT_DECOMPRESSED_BYTES_PER_TAPE, DEFAULT_READ_FILE_COMPRESSED_BYTES, PeerFailure,
     PeerRequest, PeerResponse, RemoteOwner, decode_base64_chunk,
 };
+use engram::access::peer::MAX_BATCH_ITEMS;
+use engram::access::peer::MAX_BATCH_ITEMS;
 use engram::config::{
     EffectiveWatchSource, Topology, TopologyPeer, ensure_user_config,
     load_effective_config_read_only, load_effective_config_with_override, load_frozen_stores,
@@ -154,6 +156,26 @@ struct ShowArgs {
     raw: bool,
     #[arg(long, value_name = "MACHINE/EXPORT")]
     store: Option<String>,
+    #[arg(long, value_name = "PEER")]
+    peers: Option<String>,
+    #[arg(long)]
+    require_complete: bool,
+}
+
+struct ShowCandidate {
+    content: String,
+    digest: String,
+    id_verified: bool,
+    location: Value,
+    remote: bool,
+}
+
+struct RemoteShowLocator {
+    store_ref: String,
+    file_path: String,
+    file_bytes: u64,
+    address: Value,
+    compressed_limit: u64,
 }
 
 #[derive(Args, Debug)]
@@ -279,7 +301,7 @@ fn run() -> Result<(), CliError> {
             cmd_tapes(&paths, &context)
         }
         Command::Show(args) => {
-            let context = if args.store.is_some() {
+            let context = if args.store.is_some() || args.peers.is_some() {
                 resolve_query_runtime_context(&cwd)?
             } else {
                 resolve_runtime_context(&cwd)?
@@ -1100,8 +1122,23 @@ fn cmd_tapes(paths: &RepoPaths, context: &RuntimeContext) -> Result<(), CliError
 }
 
 fn cmd_show(paths: &RepoPaths, context: &RuntimeContext, args: ShowArgs) -> Result<(), CliError> {
+    if args.store.is_some() && args.peers.is_some() {
+        return Err(CliError::new(
+            "invalid_request",
+            "choose either --store or --peers for show",
+        ));
+    }
     if let Some(store) = args.store.as_deref() {
         return cmd_show_remote(context, &args.tape_id, args.raw, store);
+    }
+    if let Some(peers) = args.peers.as_deref() {
+        return cmd_show_peers(
+            context,
+            &args.tape_id,
+            args.raw,
+            peers,
+            args.require_complete,
+        );
     }
     ensure_local_store(paths)?;
     print_context_conspicuity(context);
@@ -1150,6 +1187,635 @@ fn cmd_show_remote(
         &terminal_state,
     );
     finish_peer_query(result, &terminal_state, "remote show")
+}
+
+fn cmd_show_peers(
+    context: &RuntimeContext,
+    tape_id: &str,
+    raw: bool,
+    selection: &str,
+    require_complete: bool,
+) -> Result<(), CliError> {
+    let (cancelled, terminal_state) = peer_cancellation_flag()?;
+    let result = cmd_show_peers_inner(
+        context,
+        tape_id,
+        raw,
+        selection,
+        require_complete,
+        &cancelled,
+        &terminal_state,
+    );
+    finish_peer_query(result, &terminal_state, "federated show")
+}
+
+fn cmd_show_peers_inner(
+    context: &RuntimeContext,
+    tape_id: &str,
+    raw: bool,
+    selection: &str,
+    require_complete: bool,
+    cancelled: &Arc<AtomicBool>,
+    terminal_state: &AtomicU8,
+) -> Result<(), CliError> {
+    let home = home_dir()?;
+    let topology = load_topology(&home)
+        .map_err(|error| CliError::new("config_error", error.to_string()))?
+        .ok_or_else(|| {
+            CliError::new(
+                "topology_missing",
+                "show --peers requires ~/.engram/topology.yml",
+            )
+        })?;
+    let selected = select_peers(selection, &topology.peers)?;
+    eprintln!(
+        "topology: ~/.engram/topology.yml peers={}",
+        selected.join(",")
+    );
+    let query_timeout = Duration::from_millis(
+        topology
+            .limits
+            .get("total_query_deadline_ms")
+            .copied()
+            .unwrap_or(PEER_QUERY_TIMEOUT.as_millis() as u64)
+            .min(PEER_QUERY_TIMEOUT.as_millis() as u64),
+    );
+    let query_deadline = Instant::now() + query_timeout;
+
+    let mut source_rows = local_grep_source_rows(context, &topology.self_label);
+    let mut any_source_failure = false;
+    let mut first_content_error: Option<(String, String)> = None;
+    let mut candidates = Vec::new();
+    if let Some(path) = resolve_tape_path(context, tape_id) {
+        let location = local_grep_location(context, &topology.self_label, tape_id);
+        let local_store = location
+            .get("store")
+            .and_then(Value::as_str)
+            .unwrap_or("local-files")
+            .to_string();
+        if !source_rows
+            .iter()
+            .any(|source| {
+                source.get("store").and_then(Value::as_str) == Some(local_store.as_str())
+            })
+        {
+            source_rows.push(json!({
+                "store": local_store.clone(),
+                "kind": "local_tapes",
+                "status": "ok",
+            }));
+        }
+        match read_tape_content(&path) {
+            Ok(content) => {
+                let digest = format!("{:x}", Sha256::digest(content.as_bytes()));
+                let id_verified = is_sha256_tape_id(tape_id);
+                if id_verified && tape_id.to_ascii_lowercase() != digest {
+                    let message = format!("local tape `{tape_id}` content hashes to `{digest}`");
+                    mark_source_phase(
+                        &mut source_rows,
+                        &local_store,
+                        "read_file",
+                        "id_mismatch",
+                        &message,
+                    );
+                    any_source_failure = true;
+                    first_content_error.get_or_insert(("id_mismatch".into(), message));
+                } else {
+                    candidates.push(ShowCandidate {
+                        content,
+                        digest,
+                        id_verified,
+                        location: json!({
+                            "machine": topology.self_label.clone(),
+                            "store": local_store,
+                            "path": path,
+                        }),
+                        remote: false,
+                    });
+                }
+            }
+            Err(error) => {
+                mark_source_phase(
+                    &mut source_rows,
+                    &local_store,
+                    "read_file",
+                    error.code,
+                    &error.message,
+                );
+                any_source_failure = true;
+                first_content_error.get_or_insert((error.code.into(), error.message));
+            }
+        }
+    }
+
+    for (machine, peer) in &topology.peers {
+        if selected.contains(machine) {
+            if peer.exports.is_empty() {
+                source_rows.push(json!({
+                    "store": format!("{machine}/*"),
+                    "status": "unavailable",
+                    "phase": "open",
+                    "error": {"code":"unavailable", "message":"peer has no selected exports"},
+                }));
+                any_source_failure = true;
+            } else {
+                for export in &peer.exports {
+                    source_rows.push(json!({
+                        "store": format!("{machine}/{export}"),
+                        "status": "pending",
+                    }));
+                }
+            }
+        } else if peer.exports.is_empty() {
+            source_rows.push(json!({
+                "store": format!("{machine}/*"),
+                "status": "not_selected",
+            }));
+        } else {
+            for export in &peer.exports {
+                source_rows.push(json!({
+                    "store": format!("{machine}/{export}"),
+                    "status": "not_selected",
+                }));
+            }
+        }
+    }
+
+    let mut connections = connect_peers_concurrently(
+        &selected,
+        &topology.self_label,
+        &topology.peers,
+        query_deadline,
+        cancelled,
+    );
+    let mut locate_jobs = Vec::new();
+    let mut locate_batches = HashMap::<String, Vec<Vec<String>>>::new();
+    for machine in &selected {
+        let peer = &topology.peers[machine];
+        let Some(connection) = connections.remove(machine) else {
+            let failure = PeerFailure {
+                code: "unavailable".into(),
+                message: "peer connection did not produce a result".into(),
+            };
+            for export in &peer.exports {
+                mark_source_phase(
+                    &mut source_rows,
+                    &format!("{machine}/{export}"),
+                    "open",
+                    &failure.code,
+                    &failure.message,
+                );
+            }
+            any_source_failure = true;
+            continue;
+        };
+        let mut owner = match connection {
+            Ok(owner) => owner,
+            Err(failure) => {
+                for export in &peer.exports {
+                    mark_source_phase(
+                        &mut source_rows,
+                        &format!("{machine}/{export}"),
+                        "open",
+                        &failure.code,
+                        &failure.message,
+                    );
+                }
+                any_source_failure = true;
+                continue;
+            }
+        };
+
+        let mut available_exports = Vec::new();
+        for export_name in &peer.exports {
+            let store_ref = format!("{machine}/{export_name}");
+            match owner.exports.get(export_name) {
+                Some(Ok(export)) => {
+                    if let Some(source) = source_rows.iter_mut().find(|source| {
+                        source.get("store").and_then(Value::as_str) == Some(store_ref.as_str())
+                    }) {
+                        *source = json!({
+                            "store": store_ref,
+                            "status": "ok",
+                            "db": export.db,
+                            "tape_dirs": export.tape_dirs,
+                            "reader_mode": export.reader_mode,
+                            "snapshot_at": export.snapshot_at,
+                        });
+                    }
+                    available_exports.push(export_name.clone());
+                }
+                Some(Err(failure)) => {
+                    mark_source_phase(
+                        &mut source_rows,
+                        &store_ref,
+                        "open",
+                        &failure.code,
+                        &failure.message,
+                    );
+                    any_source_failure = true;
+                }
+                None => {
+                    mark_source_phase(
+                        &mut source_rows,
+                        &store_ref,
+                        "open",
+                        "incompatible",
+                        "peer omitted the configured export",
+                    );
+                    any_source_failure = true;
+                }
+            }
+        }
+        if !available_exports.is_empty() {
+            let batches = available_exports
+                .chunks(MAX_BATCH_ITEMS)
+                .map(|batch| batch.to_vec())
+                .collect::<Vec<_>>();
+            let requests = batches
+                .iter()
+                .map(|batch| {
+                    PeerRequest::new(
+                        "locate_tapes",
+                        batch.clone(),
+                        json!({"tape_ids":[tape_id]}),
+                    )
+                })
+                .collect::<Vec<_>>();
+            locate_batches.insert(machine.clone(), batches);
+            locate_jobs.push(PeerRoundJob {
+                machine: machine.clone(),
+                owner,
+                exports: available_exports,
+                requests,
+            });
+        }
+    }
+
+    let locate_results = run_peer_rounds_concurrently(locate_jobs, query_deadline, cancelled);
+    let mut read_jobs = Vec::new();
+    let mut read_locators = HashMap::<String, Vec<RemoteShowLocator>>::new();
+    for result in locate_results {
+        let machine = result.machine;
+        let batches = locate_batches.remove(&machine).unwrap_or_default();
+        let Some(mut owner) = result.owner else {
+            for export in result.exports {
+                mark_source_phase(
+                    &mut source_rows,
+                    &format!("{machine}/{export}"),
+                    "locate_tapes",
+                    "unavailable",
+                    "peer locate_tapes worker failed",
+                );
+            }
+            any_source_failure = true;
+            continue;
+        };
+        let mut locators = Vec::new();
+        for (batch_index, exports) in batches.iter().enumerate() {
+            let Some(outcome) = result.outcomes.get(batch_index) else {
+                for export in exports {
+                    mark_source_phase(
+                        &mut source_rows,
+                        &format!("{machine}/{export}"),
+                        "locate_tapes",
+                        "protocol_error",
+                        "peer returned no locate_tapes outcome",
+                    );
+                }
+                any_source_failure = true;
+                continue;
+            };
+            let response = match outcome {
+                Ok(response) => response,
+                Err(failure) => {
+                    for export in exports {
+                        mark_source_phase(
+                            &mut source_rows,
+                            &format!("{machine}/{export}"),
+                            "locate_tapes",
+                            &failure.code,
+                            &failure.message,
+                        );
+                    }
+                    any_source_failure = true;
+                    continue;
+                }
+            };
+            let mut by_store = HashMap::<String, &Value>::new();
+            let mut malformed = false;
+            for row in &response.data {
+                let Some(store_ref) = row.get("store").and_then(Value::as_str) else {
+                    malformed = true;
+                    break;
+                };
+                let Some(export_name) = store_ref.strip_prefix(&format!("{machine}/")) else {
+                    malformed = true;
+                    break;
+                };
+                if row.get("indexed").and_then(Value::as_bool).is_none()
+                    || row.get("file").is_none()
+                    || !exports.iter().any(|export| export == export_name)
+                    || row.get("tape_id").and_then(Value::as_str) != Some(tape_id)
+                    || by_store.insert(export_name.to_string(), row).is_some()
+                {
+                    malformed = true;
+                    break;
+                }
+            }
+            if malformed || by_store.len() != exports.len() {
+                for export in exports {
+                    mark_source_phase(
+                        &mut source_rows,
+                        &format!("{machine}/{export}"),
+                        "locate_tapes",
+                        "protocol_error",
+                        "peer returned an incomplete or invalid locate_tapes batch",
+                    );
+                }
+                any_source_failure = true;
+                continue;
+            }
+            for export in exports {
+                let store_ref = format!("{machine}/{export}");
+                let row = by_store[export];
+                let Some(address) = row.get("file").filter(|file| !file.is_null()) else {
+                    if !matches!(row.get("size_bytes"), Some(Value::Null)) {
+                        mark_source_phase(
+                            &mut source_rows,
+                            &store_ref,
+                            "locate_tapes",
+                            "protocol_error",
+                            "peer returned size_bytes without a tape file",
+                        );
+                        any_source_failure = true;
+                    }
+                    continue;
+                };
+                let file_machine = address.get("machine").and_then(Value::as_str);
+                let Some(file_path) = address.get("path").and_then(Value::as_str) else {
+                    mark_source_phase(
+                        &mut source_rows,
+                        &store_ref,
+                        "locate_tapes",
+                        "protocol_error",
+                        "peer file address has no path",
+                    );
+                    any_source_failure = true;
+                    continue;
+                };
+                let file_kind = address.get("kind").and_then(Value::as_str);
+                let Some(file_bytes) = row.get("size_bytes").and_then(Value::as_u64) else {
+                    mark_source_phase(
+                        &mut source_rows,
+                        &store_ref,
+                        "locate_tapes",
+                        "protocol_error",
+                        "peer file result has no size",
+                    );
+                    any_source_failure = true;
+                    continue;
+                };
+                if file_machine != Some(machine.as_str())
+                    || file_kind != Some("tape")
+                    || !Path::new(file_path).is_absolute()
+                {
+                    mark_source_phase(
+                        &mut source_rows,
+                        &store_ref,
+                        "locate_tapes",
+                        "protocol_error",
+                        "peer returned an invalid remote tape address",
+                    );
+                    any_source_failure = true;
+                    continue;
+                }
+                let compressed_limit = owner
+                    .limits
+                    .get("read_file_compressed_bytes")
+                    .copied()
+                    .unwrap_or(DEFAULT_READ_FILE_COMPRESSED_BYTES)
+                    .min(DEFAULT_READ_FILE_COMPRESSED_BYTES);
+                if file_bytes > compressed_limit {
+                    mark_source_phase(
+                        &mut source_rows,
+                        &store_ref,
+                        "read_file",
+                        "budget_exceeded",
+                        &format!(
+                            "remote tape is {file_bytes} compressed bytes; limit is {compressed_limit}"
+                        ),
+                    );
+                    any_source_failure = true;
+                    continue;
+                }
+                locators.push(RemoteShowLocator {
+                    store_ref,
+                    file_path: file_path.to_string(),
+                    file_bytes,
+                    address: address.clone(),
+                    compressed_limit,
+                });
+            }
+        }
+        if !locators.is_empty() {
+            let requests = locators
+                .iter()
+                .map(|locator| {
+                    let export = locator
+                        .store_ref
+                        .split_once('/')
+                        .map(|(_, export)| export)
+                        .unwrap_or_default();
+                    PeerRequest::new(
+                        "read_file",
+                        vec![export.to_string()],
+                        json!({
+                            "address": locator.address,
+                            "max_bytes": locator.compressed_limit,
+                        }),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let exports = locators
+                .iter()
+                .filter_map(|locator| locator.store_ref.split_once('/').map(|(_, export)| export.to_string()))
+                .collect::<Vec<_>>();
+            read_locators.insert(machine.clone(), locators);
+            read_jobs.push(PeerRoundJob {
+                machine,
+                owner,
+                exports,
+                requests,
+            });
+        }
+    }
+
+    let read_results = run_peer_rounds_concurrently(read_jobs, query_deadline, cancelled);
+    for result in read_results {
+        let machine = result.machine;
+        let locators = read_locators.remove(&machine).unwrap_or_default();
+        let decompressed_limit = result
+            .owner
+            .as_ref()
+            .and_then(|owner| owner.limits.get("decompressed_bytes_per_tape").copied())
+            .unwrap_or(DEFAULT_DECOMPRESSED_BYTES_PER_TAPE)
+            .min(DEFAULT_DECOMPRESSED_BYTES_PER_TAPE);
+        if result.owner.is_none() {
+            for locator in locators {
+                mark_source_phase(
+                    &mut source_rows,
+                    &locator.store_ref,
+                    "read_file",
+                    "unavailable",
+                    "peer read_file worker failed",
+                );
+            }
+            any_source_failure = true;
+            continue;
+        }
+        for (index, locator) in locators.into_iter().enumerate() {
+            let Some(outcome) = result.outcomes.get(index) else {
+                mark_source_phase(
+                    &mut source_rows,
+                    &locator.store_ref,
+                    "read_file",
+                    "protocol_error",
+                    "peer returned no read_file outcome",
+                );
+                any_source_failure = true;
+                continue;
+            };
+            let read = match outcome {
+                Ok(response) => response.clone(),
+                Err(failure) => {
+                    mark_source_phase(
+                        &mut source_rows,
+                        &locator.store_ref,
+                        "read_file",
+                        &failure.code,
+                        &failure.message,
+                    );
+                    any_source_failure = true;
+                    continue;
+                }
+            };
+            match decode_remote_tape_response(
+                tape_id,
+                locator.file_bytes,
+                locator.compressed_limit,
+                decompressed_limit,
+                read,
+            ) {
+                Ok((content, digest, id_verified)) => candidates.push(ShowCandidate {
+                    content,
+                    digest,
+                    id_verified,
+                    location: json!({
+                        "machine": machine,
+                        "store": locator.store_ref,
+                        "path": locator.file_path,
+                    }),
+                    remote: true,
+                }),
+                Err(error) => {
+                    if first_content_error.is_none() {
+                        first_content_error = Some((error.code.into(), error.message.clone()));
+                    }
+                    mark_source_phase(
+                        &mut source_rows,
+                        &locator.store_ref,
+                        "read_file",
+                        error.code,
+                        &error.message,
+                    );
+                    any_source_failure = true;
+                }
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        if let Some((code, message)) = first_content_error {
+            return Err(CliError::new(code, message));
+        }
+        if any_source_failure {
+            return Err(CliError::new(
+                "unavailable",
+                format!("no selected source could locate tape `{tape_id}` completely"),
+            ));
+        }
+        return Err(CliError::new(
+            "tape_not_found",
+            format!("tape `{tape_id}` is not present in the selected scope"),
+        ));
+    }
+
+    let expected_digest = &candidates[0].digest;
+    if candidates
+        .iter()
+        .any(|candidate| candidate.digest != *expected_digest)
+    {
+        let stores = candidates
+            .iter()
+            .filter_map(|candidate| candidate.location.get("store").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        return Err(CliError::new(
+            "identity_conflict",
+            format!(
+                "tape `{tape_id}` has different content at selected stores: {}",
+                stores.join(", ")
+            ),
+        ));
+    }
+    if require_complete && any_source_failure {
+        return Err(CliError::new(
+            "incomplete_coverage",
+            format!("show of `{tape_id}` did not reach every selected source"),
+        ));
+    }
+
+    let chosen = candidates.remove(0);
+    let mut locations = vec![chosen.location.clone()];
+    for candidate in &candidates {
+        if !locations.contains(&candidate.location) {
+            locations.push(candidate.location.clone());
+        }
+    }
+    if raw {
+        if any_source_failure {
+            eprintln!("coverage: partial");
+        }
+        commit_peer_query_terminal(terminal_state, "federated show")?;
+        print!("{}", chosen.content);
+        return Ok(());
+    }
+
+    let events = parse_jsonl_events(&chosen.content)?;
+    let rows = parse_jsonl_rows(&chosen.content)?;
+    let compacted = rows
+        .iter()
+        .map(|row| compact_event(row.offset, &row.value))
+        .collect::<Vec<_>>();
+    let payload = json!({
+        "tape_id": tape_id,
+        "path": if chosen.remote { Value::Null } else { chosen.location["path"].clone() },
+        "location": chosen.location,
+        "locations": locations,
+        "digest": chosen.digest,
+        "id_verified": chosen.id_verified,
+        "event_count": events.len(),
+        "meta": extract_meta(&events),
+        "events": compacted,
+        "federation": {
+            "self": topology.self_label,
+            "coverage": if any_source_failure { "partial" } else { "complete" },
+            "sources": source_rows,
+            "identity_conflicts": [],
+        }
+    });
+    commit_peer_query_terminal(terminal_state, "federated show")?;
+    print_json(&payload)
 }
 
 fn cmd_show_remote_inner(
@@ -1240,6 +1906,61 @@ fn cmd_show_remote_inner(
         query_deadline,
         cancelled,
     )?;
+    let decompressed_limit = owner
+        .limits
+        .get("decompressed_bytes_per_tape")
+        .copied()
+        .unwrap_or(DEFAULT_DECOMPRESSED_BYTES_PER_TAPE)
+        .min(DEFAULT_DECOMPRESSED_BYTES_PER_TAPE);
+    let (content, digest, id_verified) = decode_remote_tape_response(
+        tape_id,
+        file_bytes,
+        compressed_limit,
+        decompressed_limit,
+        read,
+    )?;
+    if raw {
+        commit_peer_query_terminal(terminal_state, "remote show")?;
+        print!("{content}");
+        return Ok(());
+    }
+    let events = parse_jsonl_events(&content)?;
+    let rows = parse_jsonl_rows(&content)?;
+    let compacted = rows
+        .iter()
+        .map(|row| compact_event(row.offset, &row.value))
+        .collect::<Vec<_>>();
+    let payload = json!({
+        "tape_id": tape_id,
+        "path": null,
+        "location": {
+            "machine": machine,
+            "store": store_ref,
+            "path": file_path,
+        },
+        "digest": digest,
+        "id_verified": id_verified,
+        "event_count": events.len(),
+        "meta": extract_meta(&events),
+        "events": compacted,
+    });
+    commit_peer_query_terminal(terminal_state, "remote show")?;
+    print_json(&payload)
+}
+
+fn decode_remote_tape_response(
+    tape_id: &str,
+    file_bytes: u64,
+    compressed_limit: u64,
+    decompressed_limit: u64,
+    read: PeerResponse,
+) -> Result<(String, String, bool), CliError> {
+    if file_bytes > compressed_limit {
+        return Err(CliError::new(
+            "budget_exceeded",
+            format!("remote tape is {file_bytes} compressed bytes; limit is {compressed_limit}"),
+        ));
+    }
     let capacity = usize::try_from(file_bytes).map_err(|_| {
         CliError::new(
             "budget_exceeded",
@@ -1288,12 +2009,6 @@ fn cmd_show_remote_inner(
             "peer did not complete the remote tape stream",
         ));
     }
-    let decompressed_limit = owner
-        .limits
-        .get("decompressed_bytes_per_tape")
-        .copied()
-        .unwrap_or(DEFAULT_DECOMPRESSED_BYTES_PER_TAPE)
-        .min(DEFAULT_DECOMPRESSED_BYTES_PER_TAPE);
     let content = match decompress_jsonl_with_limit(&compressed, decompressed_limit) {
         Ok(content) => content,
         Err(error) if error.to_string().starts_with("decompressed tape exceeds ") => {
@@ -1309,33 +2024,7 @@ fn cmd_show_remote_inner(
             format!("remote tape `{tape_id}` content hashes to `{digest}`"),
         ));
     }
-    if raw {
-        commit_peer_query_terminal(terminal_state, "remote show")?;
-        print!("{content}");
-        return Ok(());
-    }
-    let events = parse_jsonl_events(&content)?;
-    let rows = parse_jsonl_rows(&content)?;
-    let compacted = rows
-        .iter()
-        .map(|row| compact_event(row.offset, &row.value))
-        .collect::<Vec<_>>();
-    let payload = json!({
-        "tape_id": tape_id,
-        "path": null,
-        "location": {
-            "machine": machine,
-            "store": store_ref,
-            "path": file_path,
-        },
-        "digest": digest,
-        "id_verified": id_verified,
-        "event_count": events.len(),
-        "meta": extract_meta(&events),
-        "events": compacted,
-    });
-    commit_peer_query_terminal(terminal_state, "remote show")?;
-    print_json(&payload)
+    Ok((content, digest, id_verified))
 }
 
 fn connect_remote_store(
