@@ -5613,21 +5613,19 @@ fn cmd_explain_with_peers_inner(
         args.offset,
         context.explain_default_limit,
     );
-    if sessions.is_empty() && tombstones.is_empty() && lineage.is_empty() {
-        return Err(CliError::new("no_results", target));
-    }
     if any_peer_failure && args.require_complete {
         return Err(CliError::new(
             "incomplete_results",
             "one or more selected explain sources failed; inspect the source phase without --require-complete",
         ));
     }
+    let no_results = sessions.is_empty() && tombstones.is_empty() && lineage.is_empty();
     let complete = !any_peer_failure;
     let chain_metadata = build_chain_metadata(&sessions);
     let payload = json!({
         "query": {
             "command": "explain",
-            "target": target,
+            "target": target.clone(),
             "anchors": query_anchors,
             "grep_filter": args.grep_filter,
             "limit": args.limit,
@@ -5660,6 +5658,12 @@ fn cmd_explain_with_peers_inner(
             "sources": sources,
         },
     });
+    if no_results {
+        if any_peer_failure {
+            emit_query_result("explain", payload)?;
+        }
+        return Err(CliError::new("no_results", target));
+    }
     emit_query_result("explain", payload)
 }
 

@@ -250,6 +250,103 @@ fn write_local_grep_source(
     (caller_home, repo)
 }
 
+fn write_unavailable_explain_fixture(
+    root: &std::path::Path,
+    binary: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let (caller_home, repo) = write_local_grep_source(
+        root,
+        "caller-unmatched-explain",
+        "{\"t\":\"2026-09-25T00:00:00Z\",\"k\":\"note\",\"content\":\"unrelated local fixture\"}\n",
+    );
+    std::fs::write(
+        caller_home.join(".engram/topology.yml"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "self": "caller",
+            "peers": {
+                "offline": {
+                    "command": ["/usr/bin/false"],
+                    "engram": binary,
+                    "exports": ["default"],
+                }
+            }
+        }))
+        .expect("serialize unavailable explain topology"),
+    )
+    .expect("write unavailable explain topology");
+    (caller_home, repo)
+}
+
+#[test]
+fn explain_peer_failure_without_local_matches_emits_partial_sources() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let (caller_home, repo) = write_unavailable_explain_fixture(temp.path(), binary);
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "explain",
+            "unmatched-explain-anchor",
+            "--anchor",
+            "--peers",
+            "offline",
+        ])
+        .output()
+        .expect("run partial explain with no local matches");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no_results"),
+        "unexpected empty-partial error: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("partial explain JSON");
+    assert_eq!(result["query"]["command"], "explain");
+    assert_eq!(result["sessions"], json!([]));
+    assert_eq!(result["federation"]["coverage"], "partial");
+    let offline = result["federation"]["sources"]
+        .as_array()
+        .expect("federated explain sources")
+        .iter()
+        .find(|source| source["store"] == "offline/default")
+        .expect("unavailable peer source");
+    assert_eq!(offline["status"], "unavailable");
+    assert_eq!(offline["phase"], "open");
+    assert!(offline["error"]["code"].is_string());
+}
+
+#[test]
+fn explain_require_complete_peer_failure_precedes_no_results() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let (caller_home, repo) = write_unavailable_explain_fixture(temp.path(), binary);
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "explain",
+            "unmatched-explain-anchor",
+            "--anchor",
+            "--peers",
+            "offline",
+            "--require-complete",
+        ])
+        .output()
+        .expect("run require-complete explain with no local matches");
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("incomplete_results"),
+        "require-complete did not report incomplete coverage: {stderr}"
+    );
+    assert!(!stderr.contains("no_results"));
+}
+
 #[test]
 fn explain_peers_attributes_remote_only_edits_to_their_physical_owner() {
     let temp = tempfile::tempdir().expect("tempdir");
