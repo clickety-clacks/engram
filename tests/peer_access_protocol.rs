@@ -815,6 +815,90 @@ fn grep_merges_multiple_explicit_peers_and_keeps_unselected_peers_idle() {
 }
 
 #[test]
+fn grep_connects_selected_peers_concurrently_before_scanning() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let mut alpha = write_grep_owner(
+        temp.path(),
+        "alpha",
+        binary,
+        &[(
+            "alpha-tape",
+            "{\"t\":\"2026-09-24T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-concurrent alpha\"}\n",
+        )],
+    );
+    let mut beta = write_grep_owner(
+        temp.path(),
+        "beta",
+        binary,
+        &[(
+            "beta-tape",
+            "{\"t\":\"2026-09-24T13:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-concurrent beta\"}\n",
+        )],
+    );
+    let gate = temp.path().join("peer-start-gate.sh");
+    std::fs::write(
+        &gate,
+        "#!/bin/sh\nset -eu\nmine=\"$1\"\nother=\"$2\"\nshift 2\ntouch \"$mine\"\ni=0\nwhile [ \"$i\" -lt 100 ]; do\n  if [ -e \"$other\" ]; then exec \"$@\"; fi\n  sleep 0.01\n  i=$((i + 1))\ndone\nexit 79\n",
+    )
+    .expect("write peer start gate");
+    let alpha_started = temp.path().join("alpha-started");
+    let beta_started = temp.path().join("beta-started");
+    let gated_command = |machine: &str, mine: &std::path::Path, other: &std::path::Path| {
+        let owner_home = temp.path().join(format!("{machine}-home"));
+        json!([
+            "/bin/sh",
+            gate,
+            mine,
+            other,
+            "/usr/bin/env",
+            format!("HOME={}", owner_home.display()),
+            binary,
+            "peer-serve",
+            "--stdio",
+        ])
+    };
+    alpha["command"] = gated_command("alpha", &alpha_started, &beta_started);
+    beta["command"] = gated_command("beta", &beta_started, &alpha_started);
+
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "caller-tape",
+        "{\"t\":\"2026-09-24T11:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-concurrent caller\"}\n",
+    );
+    std::fs::write(
+        caller_home.join(".engram/topology.yml"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "self": "caller",
+            "peers": {"alpha": alpha, "beta": beta}
+        }))
+        .expect("serialize caller topology"),
+    )
+    .expect("caller topology");
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["grep", "needle-concurrent", "--peers", "alpha,beta"])
+        .output()
+        .expect("run concurrent multi-peer grep");
+    assert!(
+        output.status.success(),
+        "concurrent grep failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("grep JSON");
+    assert_eq!(result["federation"]["coverage"], "complete");
+    assert_eq!(result["sessions"].as_array().unwrap().len(), 3);
+    assert!(alpha_started.exists(), "alpha peer was not launched");
+    assert!(
+        beta_started.exists(),
+        "beta peer was not launched concurrently"
+    );
+}
+
+#[test]
 fn grep_keeps_successful_peer_results_when_another_selected_peer_is_unavailable() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = env!("CARGO_BIN_EXE_engram");

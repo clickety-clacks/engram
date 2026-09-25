@@ -53,6 +53,8 @@ use notify::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+const MAX_CONCURRENT_PEER_OPENS: usize = 4;
+
 #[derive(Parser, Debug)]
 #[command(name = "engram")]
 #[command(about = "A local-first causal index over code history")]
@@ -1747,6 +1749,8 @@ fn cmd_grep_with_peer(
     let mut any_source_failure = false;
     let mut any_store_truncated = false;
     let mut peer_owners = Vec::new();
+    let mut connections =
+        connect_peers_concurrently(&selected_machines, &topology.self_label, &topology.peers);
 
     for machine in &selected_machines {
         let peer = topology
@@ -1769,12 +1773,13 @@ fn cmd_grep_with_peer(
             continue;
         }
 
-        match RemoteOwner::connect(
-            machine,
-            &topology.self_label,
-            &peer,
-            Duration::from_millis(5_000),
-        ) {
+        let connection = connections.remove(machine).unwrap_or_else(|| {
+            Err(PeerFailure {
+                code: "unavailable".into(),
+                message: "peer connection worker returned no result".into(),
+            })
+        });
+        match connection {
             Err(failure) => {
                 any_source_failure = true;
                 for export in &peer.exports {
@@ -2284,6 +2289,59 @@ fn select_peers(
     }
 
     Ok(selected.into_iter().collect())
+}
+
+fn connect_peers_concurrently(
+    selected: &[String],
+    caller: &str,
+    peers: &std::collections::BTreeMap<String, TopologyPeer>,
+) -> HashMap<String, Result<RemoteOwner, PeerFailure>> {
+    let jobs = selected
+        .iter()
+        .filter_map(|machine| {
+            peers
+                .get(machine)
+                .filter(|peer| !peer.exports.is_empty())
+                .map(|peer| (machine.clone(), peer.clone()))
+        })
+        .collect::<Vec<_>>();
+    let mut connections = HashMap::with_capacity(jobs.len());
+
+    for batch in jobs.chunks(MAX_CONCURRENT_PEER_OPENS) {
+        let results = std::thread::scope(|scope| {
+            let handles = batch
+                .iter()
+                .map(|(machine, peer)| {
+                    let machine = machine.clone();
+                    let peer = peer.clone();
+                    let caller = caller.to_string();
+                    scope.spawn(move || {
+                        let result =
+                            RemoteOwner::connect(&machine, &caller, &peer, Duration::from_secs(5));
+                        (machine, result)
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .zip(batch)
+                .map(|(handle, (machine, _))| {
+                    handle.join().unwrap_or_else(|_| {
+                        (
+                            machine.clone(),
+                            Err(PeerFailure {
+                                code: "unavailable".into(),
+                                message: "peer connection worker panicked".into(),
+                            }),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+        connections.extend(results);
+    }
+
+    connections
 }
 
 fn local_grep_source_rows(context: &RuntimeContext, machine: &str) -> Vec<Value> {
