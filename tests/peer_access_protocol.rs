@@ -1286,7 +1286,12 @@ fn interrupt_waiting_grep(
 
 #[cfg(unix)]
 fn assert_caller_sigint_result(output: &std::process::Output) -> serde_json::Value {
-    assert_eq!(output.status.code(), Some(130), "SIGINT must exit 130: {}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "SIGINT must exit 130: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).lines().count(),
         1,
@@ -1311,7 +1316,10 @@ fn grep_ctrl_c_cancels_and_aborts_a_selected_peer_scan() {
         false,
     );
     let (output, elapsed) = interrupt_waiting_grep(child, &operation_started);
-    assert!(elapsed < Duration::from_secs(3), "peer cancellation exceeded its deadline");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "peer cancellation exceeded its deadline"
+    );
     let result = assert_caller_sigint_result(&output);
     assert!(
         result["federation"]["coverage"] == "partial",
@@ -1326,8 +1334,14 @@ fn grep_ctrl_c_cancels_and_aborts_a_selected_peer_scan() {
         .expect("cancelled peer source");
     assert_eq!(peer_source["error"]["code"], "cancelled",);
     assert_eq!(peer_source["phase"], "grep_scan");
-    assert_eq!(result["cancellation"]["incomplete_sources"][0]["store"], "alpha/default");
-    assert_eq!(result["cancellation"]["incomplete_sources"][0]["phase"], "grep_scan");
+    assert_eq!(
+        result["cancellation"]["incomplete_sources"][0]["store"],
+        "alpha/default"
+    );
+    assert_eq!(
+        result["cancellation"]["incomplete_sources"][0]["phase"],
+        "grep_scan"
+    );
 }
 
 #[cfg(unix)]

@@ -212,7 +212,9 @@ fn main() -> ExitCode {
                 let payload = error_payload(&err);
                 eprintln!("{payload}");
             }
-            err.exit_code.map(ExitCode::from).unwrap_or(ExitCode::FAILURE)
+            err.exit_code
+                .map(ExitCode::from)
+                .unwrap_or(ExitCode::FAILURE)
         }
     }
 }
