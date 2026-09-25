@@ -1680,20 +1680,11 @@ fn cmd_grep_with_peer(
             )
         })?;
     let selection = args.peers.as_deref().unwrap_or_default();
-    let machine = select_single_peer(selection, &topology.peers)?;
-    eprintln!("topology: ~/.engram/topology.yml peers={machine}");
-    let peer = topology.peers.get(&machine).cloned().ok_or_else(|| {
-        CliError::new(
-            "peer_not_configured",
-            format!("peer `{machine}` is not configured in ~/.engram/topology.yml"),
-        )
-    })?;
-    if peer.exports.is_empty() {
-        return Err(CliError::new(
-            "peer_exports_missing",
-            format!("peer `{machine}` declares no queryable exports"),
-        ));
-    }
+    let selected_machines = select_peers(selection, &topology.peers)?;
+    eprintln!(
+        "topology: ~/.engram/topology.yml peers={}",
+        selected_machines.join(",")
+    );
 
     for session in &mut sessions {
         let session_id = session
@@ -1721,7 +1712,10 @@ fn cmd_grep_with_peer(
         }));
     }
     for (unselected, config) in &topology.peers {
-        if unselected == &machine {
+        if selected_machines
+            .iter()
+            .any(|selected| selected == unselected)
+        {
             continue;
         }
         if config.exports.is_empty() {
@@ -1752,198 +1746,240 @@ fn cmd_grep_with_peer(
     ];
     let mut any_source_failure = false;
     let mut any_store_truncated = false;
-    let mut peer_owner = None;
-    let mut grep_ok_exports = Vec::new();
+    let mut peer_owners = Vec::new();
 
-    match RemoteOwner::connect(
-        &machine,
-        &topology.self_label,
-        &peer,
-        Duration::from_millis(5_000),
-    ) {
-        Err(failure) => {
+    for machine in &selected_machines {
+        let peer = topology
+            .peers
+            .get(machine)
+            .expect("selected peers were resolved from topology")
+            .clone();
+        if peer.exports.is_empty() {
             any_source_failure = true;
-            for export in &peer.exports {
-                source_rows.push(json!({
-                    "store": format!("{machine}/{export}"),
-                    "kind": "peer",
-                    "status": peer_failure_status(&failure.code),
-                    "phase": "open",
-                    "error": {"code": failure.code, "message": failure.message},
-                }));
-            }
+            source_rows.push(json!({
+                "store": format!("{machine}/*"),
+                "kind": "peer",
+                "status": "failed",
+                "phase": "open",
+                "error": {
+                    "code": "peer_exports_missing",
+                    "message": format!("peer `{machine}` declares no queryable exports"),
+                },
+            }));
+            continue;
         }
-        Ok(mut owner) => {
-            let mut active_exports = Vec::new();
-            for export in &peer.exports {
-                match owner.exports.get(export) {
-                    Some(Ok(opened)) => {
-                        source_rows.push(json!({
-                            "store": format!("{machine}/{export}"),
-                            "db": opened.db,
-                            "kind": "peer",
-                            "status": "ok",
-                            "snapshot_at": opened.snapshot_at,
-                            "build": owner.build,
-                            "semantics": owner.query_semantics,
-                        }));
-                        active_exports.push(export.clone());
-                    }
-                    Some(Err(failure)) => {
-                        any_source_failure = true;
-                        source_rows.push(json!({
-                            "store": format!("{machine}/{export}"),
-                            "kind": "peer",
-                            "status": peer_failure_status(&failure.code),
-                            "phase": "open",
-                            "error": {"code": failure.code, "message": failure.message},
-                        }));
-                    }
-                    None => {
-                        any_source_failure = true;
-                        source_rows.push(json!({
+
+        match RemoteOwner::connect(
+            machine,
+            &topology.self_label,
+            &peer,
+            Duration::from_millis(5_000),
+        ) {
+            Err(failure) => {
+                any_source_failure = true;
+                for export in &peer.exports {
+                    source_rows.push(json!({
+                        "store": format!("{machine}/{export}"),
+                        "kind": "peer",
+                        "status": peer_failure_status(&failure.code),
+                        "phase": "open",
+                        "error": {"code": failure.code, "message": failure.message},
+                    }));
+                }
+            }
+            Ok(mut owner) => {
+                let mut active_exports = Vec::new();
+                for export in &peer.exports {
+                    match owner.exports.get(export) {
+                        Some(Ok(opened)) => {
+                            source_rows.push(json!({
+                                "store": format!("{machine}/{export}"),
+                                "db": opened.db,
+                                "kind": "peer",
+                                "status": "ok",
+                                "snapshot_at": opened.snapshot_at,
+                                "build": owner.build,
+                                "semantics": owner.query_semantics,
+                            }));
+                            active_exports.push(export.clone());
+                        }
+                        Some(Err(failure)) => {
+                            any_source_failure = true;
+                            source_rows.push(json!({
+                                "store": format!("{machine}/{export}"),
+                                "kind": "peer",
+                                "status": peer_failure_status(&failure.code),
+                                "phase": "open",
+                                "error": {"code": failure.code, "message": failure.message},
+                            }));
+                        }
+                        None => {
+                            any_source_failure = true;
+                            source_rows.push(json!({
                             "store": format!("{machine}/{export}"),
                             "kind": "peer",
                             "status": "failed",
                             "phase": "open",
                             "error": {"code": "protocol_error", "message": "peer omitted configured export"},
                         }));
+                        }
                     }
                 }
-            }
 
-            let grep_limit = owner.limits.get("grep_k").copied().unwrap_or(10_000);
-            if k as u64 > grep_limit {
-                return Err(CliError::new(
-                    "budget_exceeded",
-                    format!("grep page requires k={k}; peer limit is {grep_limit}"),
-                ));
-            }
-            let requests = active_exports
-                .iter()
-                .map(|export| {
-                    PeerRequest::new(
-                        "grep_scan",
-                        vec![export.clone()],
-                        json!({
-                            "pattern": args.pattern,
-                            "since": args.since,
-                            "until": args.until,
-                            "k": k,
-                        }),
-                    )
-                })
-                .collect::<Vec<_>>();
-            let outcomes = owner.round(&requests, Duration::from_secs(30));
-            let mut grep_succeeded = Vec::new();
-            for (index, export) in active_exports.iter().enumerate() {
-                let Some(outcome) = outcomes.get(index) else {
+                let grep_limit = owner.limits.get("grep_k").copied().unwrap_or(10_000);
+                if k as u64 > grep_limit {
                     any_source_failure = true;
-                    mark_source_phase(
-                        &mut source_rows,
-                        &format!("{machine}/{export}"),
-                        "grep_scan",
-                        "protocol_error",
-                        "peer returned no grep_scan outcome",
-                    );
-                    continue;
-                };
-                let response = match outcome {
-                    Ok(response) => response,
-                    Err(failure) => {
-                        any_source_failure = true;
+                    for export in &active_exports {
                         mark_source_phase(
                             &mut source_rows,
                             &format!("{machine}/{export}"),
                             "grep_scan",
-                            &failure.code,
-                            &failure.message,
+                            "budget_exceeded",
+                            &format!("grep page requires k={k}; peer limit is {grep_limit}"),
                         );
-                        continue;
                     }
-                };
-                let total = match response.stats.get("total").and_then(Value::as_u64) {
-                    Some(value) => value as usize,
-                    None => {
+                    continue;
+                }
+                let requests = active_exports
+                    .iter()
+                    .map(|export| {
+                        PeerRequest::new(
+                            "grep_scan",
+                            vec![export.clone()],
+                            json!({
+                                "pattern": args.pattern,
+                                "since": args.since,
+                                "until": args.until,
+                                "k": k,
+                            }),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let outcomes = owner.round(&requests, Duration::from_secs(30));
+                let mut grep_succeeded = Vec::new();
+                for (index, export) in active_exports.iter().enumerate() {
+                    let Some(outcome) = outcomes.get(index) else {
                         any_source_failure = true;
                         mark_source_phase(
                             &mut source_rows,
                             &format!("{machine}/{export}"),
                             "grep_scan",
                             "protocol_error",
-                            "grep_scan response has no total count",
+                            "peer returned no grep_scan outcome",
                         );
                         continue;
-                    }
-                };
-                let store_name = format!("{machine}/{export}");
-                let mut store_failures = Vec::new();
-                let mut valid_response = true;
-                let mut store_records = Vec::<(Value, GrepRank)>::new();
-                for record in &response.data {
-                    match record.get("type").and_then(Value::as_str) {
-                        Some("failure") => {
+                    };
+                    let response = match outcome {
+                        Ok(response) => response,
+                        Err(failure) => {
                             any_source_failure = true;
-                            store_failures.push(record.clone());
+                            mark_source_phase(
+                                &mut source_rows,
+                                &format!("{machine}/{export}"),
+                                "grep_scan",
+                                &failure.code,
+                                &failure.message,
+                            );
+                            continue;
                         }
-                        Some("match") => {
-                            match format_peer_grep_session(record, &machine, export, context) {
-                                Ok((session, rank)) => {
-                                    store_records.push((session, rank));
-                                }
-                                Err(error) => {
-                                    any_source_failure = true;
-                                    valid_response = false;
-                                    store_failures.push(json!({
-                                        "error": {"code": error.code, "message": error.message},
-                                    }));
+                    };
+                    let total = match response.stats.get("total").and_then(Value::as_u64) {
+                        Some(value) => value as usize,
+                        None => {
+                            any_source_failure = true;
+                            mark_source_phase(
+                                &mut source_rows,
+                                &format!("{machine}/{export}"),
+                                "grep_scan",
+                                "protocol_error",
+                                "grep_scan response has no total count",
+                            );
+                            continue;
+                        }
+                    };
+                    let store_name = format!("{machine}/{export}");
+                    let mut store_failures = Vec::new();
+                    let mut valid_response = true;
+                    let mut store_records = Vec::<(Value, GrepRank)>::new();
+                    for record in &response.data {
+                        match record.get("type").and_then(Value::as_str) {
+                            Some("failure") => {
+                                any_source_failure = true;
+                                store_failures.push(record.clone());
+                            }
+                            Some("match") => {
+                                match format_peer_grep_session(record, &machine, export, context) {
+                                    Ok((session, rank)) => {
+                                        store_records.push((session, rank));
+                                    }
+                                    Err(error) => {
+                                        any_source_failure = true;
+                                        valid_response = false;
+                                        store_failures.push(json!({
+                                            "error": {"code": error.code, "message": error.message},
+                                        }));
+                                    }
                                 }
                             }
-                        }
-                        _ => {
-                            any_source_failure = true;
-                            valid_response = false;
-                            store_failures.push(json!({
+                            _ => {
+                                any_source_failure = true;
+                                valid_response = false;
+                                store_failures.push(json!({
                                 "error": {"code": "protocol_error", "message": "unknown grep_scan data record"},
                             }));
+                            }
                         }
                     }
+                    source_totals.push(total);
+                    let store_time_range = peer_time_range(&response.stats);
+                    if let Some(source) = source_rows.iter_mut().find(|source| {
+                        source.get("store").and_then(Value::as_str) == Some(store_name.as_str())
+                    }) {
+                        source["grep_scan"] = json!({
+                            "total": total,
+                            "returned": store_records.len(),
+                            "time_range": store_time_range,
+                            "truncated": response
+                                .stats
+                                .get("truncated")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(total > k),
+                        });
+                    }
+                    if !store_failures.is_empty() {
+                        mark_source_failures(
+                            &mut source_rows,
+                            &store_name,
+                            "grep_scan",
+                            &store_failures,
+                        );
+                        source_count_known = false;
+                    }
+                    source_time_ranges.push(store_time_range);
+                    any_store_truncated |= response
+                        .stats
+                        .get("truncated")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(total > k);
+                    if !valid_response {
+                        continue;
+                    }
+                    for (mut session, rank) in store_records {
+                        let tape_id = session["tape_id"].as_str().unwrap_or_default().to_string();
+                        session["locations"] = json!([session["location"].clone()]);
+                        merge_peer_grep_session(
+                            &mut sessions,
+                            &mut ranks,
+                            &mut identity_conflicts,
+                            session,
+                            rank,
+                            &tape_id,
+                        );
+                    }
+                    grep_succeeded.push(export.clone());
                 }
-                source_totals.push(total);
-                if !store_failures.is_empty() {
-                    mark_source_failures(
-                        &mut source_rows,
-                        &store_name,
-                        "grep_scan",
-                        &store_failures,
-                    );
-                    source_count_known = false;
-                }
-                source_time_ranges.push(peer_time_range(&response.stats));
-                any_store_truncated |= response
-                    .stats
-                    .get("truncated")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(total > k);
-                if !valid_response {
-                    continue;
-                }
-                for (mut session, rank) in store_records {
-                    let tape_id = session["tape_id"].as_str().unwrap_or_default().to_string();
-                    session["locations"] = json!([session["location"].clone()]);
-                    merge_peer_grep_session(
-                        &mut sessions,
-                        &mut ranks,
-                        &mut identity_conflicts,
-                        session,
-                        rank,
-                        &tape_id,
-                    );
-                }
-                grep_succeeded.push(export.clone());
+                peer_owners.push((machine.clone(), owner, grep_succeeded));
             }
-            grep_ok_exports = grep_succeeded;
-            peer_owner = Some(owner);
         }
     }
 
@@ -1978,7 +2014,7 @@ fn cmd_grep_with_peer(
                 }
             }
         }
-        if let Some(owner) = peer_owner.as_mut() {
+        for (machine, owner, grep_ok_exports) in &mut peer_owners {
             let requests = grep_ok_exports
                 .iter()
                 .map(|export| {
@@ -2178,7 +2214,11 @@ fn cmd_grep_with_peer(
         "lineage": [],
         "dispatch_lineage": [],
         "tombstones": [],
-        "stores_queried": indexes.len() + grep_ok_exports.len(),
+        "stores_queried": indexes.len()
+            + peer_owners
+                .iter()
+                .map(|(_, _, exports)| exports.len())
+                .sum::<usize>(),
         "returned": returned,
         "total": exact_total,
         "time_range": time_range,
@@ -2202,29 +2242,44 @@ fn cmd_grep_with_peer(
     emit_query_result("grep", payload)
 }
 
-fn select_single_peer(
+fn select_peers(
     selection: &str,
     peers: &std::collections::BTreeMap<String, TopologyPeer>,
-) -> Result<String, CliError> {
+) -> Result<Vec<String>, CliError> {
+    let selection = selection.trim();
     if selection == "all" {
-        if peers.len() != 1 {
+        if peers.is_empty() {
             return Err(CliError::new(
-                "unsupported_scope",
-                "this grep federation slice supports `--peers` with one configured peer",
+                "peer_not_configured",
+                "topology has no configured peers",
             ));
         }
-        return peers.keys().next().cloned().ok_or_else(|| {
-            CliError::new("peer_not_configured", "topology has no configured peers")
-        });
+        return Ok(peers.keys().cloned().collect());
     }
-    let selected = selection.split(',').map(str::trim).collect::<Vec<_>>();
-    if selected.len() != 1 || selected[0].is_empty() {
-        return Err(CliError::new(
-            "unsupported_scope",
-            "this grep federation slice supports exactly one selected peer",
-        ));
+
+    let mut selected = std::collections::BTreeSet::new();
+    for machine in selection.split(',').map(str::trim) {
+        if machine.is_empty() {
+            return Err(CliError::new(
+                "invalid_peer_selection",
+                "--peers must be `all` or a comma-separated list of configured peer labels",
+            ));
+        }
+        if !peers.contains_key(machine) {
+            return Err(CliError::new(
+                "peer_not_configured",
+                format!("peer `{machine}` is not configured in ~/.engram/topology.yml"),
+            ));
+        }
+        if !selected.insert(machine.to_string()) {
+            return Err(CliError::new(
+                "invalid_peer_selection",
+                format!("peer `{machine}` appears more than once in --peers"),
+            ));
+        }
     }
-    Ok(selected[0].to_string())
+
+    Ok(selected.into_iter().collect())
 }
 
 fn local_grep_source_rows(context: &RuntimeContext, machine: &str) -> Vec<Value> {
@@ -2918,6 +2973,41 @@ fn print_context_conspicuity(context: &RuntimeContext) {
 mod tests {
     use super::*;
     use notify::event::{CreateKind, RemoveKind};
+
+    #[test]
+    fn peer_selection_resolves_lists_and_all_deterministically() {
+        let peer = || TopologyPeer {
+            ssh: Some("host".into()),
+            command: None,
+            engram: "/usr/bin/engram".into(),
+            exports: vec!["default".into()],
+        };
+        let peers = std::collections::BTreeMap::from([
+            ("alpha".to_string(), peer()),
+            ("beta".to_string(), peer()),
+        ]);
+
+        assert_eq!(
+            select_peers("beta, alpha", &peers).expect("explicit peer list"),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+        assert_eq!(
+            select_peers("all", &peers).expect("all peers"),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+        assert_eq!(
+            select_peers("alpha,alpha", &peers)
+                .expect_err("duplicate peers are ambiguous")
+                .code,
+            "invalid_peer_selection"
+        );
+        assert_eq!(
+            select_peers("missing", &peers)
+                .expect_err("unknown peers are rejected")
+                .code,
+            "peer_not_configured"
+        );
+    }
 
     #[test]
     fn fingerprint_candidates_sort_by_tape_id_then_path() {

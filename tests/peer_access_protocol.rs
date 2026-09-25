@@ -7,6 +7,74 @@ use engram::index::{DispatchDirection, DispatchLink, SqliteIndex};
 use serde_json::json;
 use sha2::Digest;
 
+fn write_grep_owner(
+    root: &std::path::Path,
+    machine: &str,
+    binary: &str,
+    tapes: &[(&str, &str)],
+) -> serde_json::Value {
+    let home = root.join(format!("{machine}-home"));
+    let engram_home = home.join(".engram");
+    let tape_dir = engram_home.join("tapes");
+    std::fs::create_dir_all(&tape_dir).expect("owner tape directory");
+    let db = engram_home.join("index.sqlite");
+    drop(SqliteIndex::open_writer(db.to_str().expect("owner DB path")).expect("owner DB"));
+    for (tape_id, content) in tapes {
+        let compressed = zstd::stream::encode_all(content.as_bytes(), 0).expect("compress tape");
+        std::fs::write(tape_dir.join(format!("{tape_id}.jsonl.zst")), compressed)
+            .expect("write owner tape");
+    }
+    std::fs::write(
+        engram_home.join("topology.yml"),
+        format!(
+            "version: 1\nself: {machine}\nexports:\n  default:\n    db: {}\n    tape_dirs:\n      - {}\n",
+            db.display(),
+            tape_dir.display()
+        ),
+    )
+    .expect("owner topology");
+    json!({
+        "command": [
+            "/usr/bin/env",
+            format!("HOME={}", home.display()),
+            binary,
+            "peer-serve",
+            "--stdio"
+        ],
+        "engram": binary,
+        "exports": ["default"],
+    })
+}
+
+fn write_local_grep_source(
+    root: &std::path::Path,
+    tape_id: &str,
+    content: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let caller_home = root.join("caller-home");
+    let caller_engram = caller_home.join(".engram");
+    std::fs::create_dir_all(&caller_engram).expect("caller home");
+    let repo = root.join("repo");
+    let local_engram = repo.join(".engram");
+    let local_tapes = local_engram.join("tapes");
+    std::fs::create_dir_all(&local_tapes).expect("local tapes");
+    let local_db = local_engram.join("index.sqlite");
+    drop(SqliteIndex::open_writer(local_db.to_str().expect("local DB path")).expect("local DB"));
+    std::fs::write(
+        caller_engram.join("config.yml"),
+        format!(
+            "db: {}\ntapes_dir: {}\n",
+            local_db.display(),
+            local_tapes.display()
+        ),
+    )
+    .expect("caller config");
+    let compressed = zstd::stream::encode_all(content.as_bytes(), 0).expect("compress local tape");
+    std::fs::write(local_tapes.join(format!("{tape_id}.jsonl.zst")), compressed)
+        .expect("write local tape");
+    (caller_home, repo)
+}
+
 #[test]
 fn command_peer_runs_real_peer_serve_against_an_isolated_owner_home() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -650,6 +718,207 @@ fn grep_with_one_selected_peer_merges_local_and_remote_results() {
                 && source["status"] == "not_selected")
     );
     assert!(!unselected_marker.exists(), "unselected peer was launched");
+}
+
+#[test]
+fn grep_merges_multiple_explicit_peers_and_keeps_unselected_peers_idle() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let alpha = write_grep_owner(
+        temp.path(),
+        "alpha",
+        binary,
+        &[(
+            "alpha-tape",
+            "{\"t\":\"2026-09-24T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-multi alpha\"}\n",
+        )],
+    );
+    let beta = write_grep_owner(
+        temp.path(),
+        "beta",
+        binary,
+        &[(
+            "beta-tape",
+            "{\"t\":\"2026-09-24T13:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-multi beta\"}\n",
+        )],
+    );
+    let unselected_marker = temp.path().join("unselected-peer-was-started");
+    let peers = json!({
+        "alpha": alpha,
+        "beta": beta,
+        "not-selected": {
+            "command": ["/usr/bin/touch", unselected_marker],
+            "engram": "/unused/engram",
+            "exports": ["default"],
+        }
+    });
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "caller-tape",
+        "{\"t\":\"2026-09-24T11:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-multi caller\"}\n",
+    );
+    let caller_engram = caller_home.join(".engram");
+    std::fs::write(
+        caller_engram.join("topology.yml"),
+        serde_json::to_vec(&json!({"version": 1, "self": "caller", "peers": peers}))
+            .expect("serialize topology"),
+    )
+    .expect("caller topology");
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["grep", "needle-multi", "--peers", "beta, alpha"])
+        .output()
+        .expect("run multi-peer grep");
+    assert!(
+        output.status.success(),
+        "multi-peer grep failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("grep JSON");
+    let sessions = result["sessions"].as_array().expect("sessions");
+    assert_eq!(sessions.len(), 3);
+    let local = sessions
+        .iter()
+        .find(|session| session["tape_id"] == "caller-tape")
+        .expect("local result");
+    assert_eq!(local["location"]["machine"], "caller");
+    assert_eq!(local["location"]["store"], "caller/local:0");
+    for (tape_id, machine) in [("alpha-tape", "alpha"), ("beta-tape", "beta")] {
+        let session = sessions
+            .iter()
+            .find(|session| session["tape_id"] == tape_id)
+            .expect("peer result");
+        assert_eq!(session["location"]["machine"], machine);
+        assert_eq!(session["location"]["store"], format!("{machine}/default"));
+    }
+    assert_eq!(result["federation"]["coverage"], "complete");
+    assert_eq!(result["stores_queried"], 3);
+    assert_eq!(result["total"], 3);
+    assert_eq!(result["time_range"]["start"], "2026-09-24T11:00:00Z");
+    assert_eq!(result["time_range"]["end"], "2026-09-24T13:00:00Z");
+    let sources = result["federation"]["sources"].as_array().expect("sources");
+    for machine in ["alpha", "beta"] {
+        let source = sources
+            .iter()
+            .find(|source| source["store"] == format!("{machine}/default"))
+            .expect("selected source");
+        assert_eq!(source["status"], "ok");
+        assert_eq!(source["grep_scan"]["total"], 1);
+        assert_eq!(source["grep_scan"]["returned"], 1);
+    }
+    assert!(sources.iter().any(|source| {
+        source["store"] == "not-selected/default" && source["status"] == "not_selected"
+    }));
+    assert!(!unselected_marker.exists(), "unselected peer was launched");
+}
+
+#[test]
+fn grep_keeps_successful_peer_results_when_another_selected_peer_is_unavailable() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let available = write_grep_owner(
+        temp.path(),
+        "available",
+        binary,
+        &[(
+            "available-tape",
+            "{\"t\":\"2026-09-24T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-partial-multi\"}\n",
+        )],
+    );
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "caller-partial-tape",
+        "{\"t\":\"2026-09-24T11:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-partial-multi local\"}\n",
+    );
+    let caller_engram = caller_home.join(".engram");
+    std::fs::write(
+        caller_engram.join("topology.yml"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "self": "caller",
+            "peers": {
+                "available": available,
+                "offline": {
+                    "command": ["/usr/bin/false"],
+                    "engram": binary,
+                    "exports": ["default"],
+                }
+            }
+        }))
+        .expect("serialize topology"),
+    )
+    .expect("caller topology");
+
+    let partial = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "grep",
+            "needle-partial-multi",
+            "--peers",
+            "available,offline",
+        ])
+        .output()
+        .expect("run partial multi-peer grep");
+    assert!(
+        partial.status.success(),
+        "partial grep should keep successful results: {}",
+        String::from_utf8_lossy(&partial.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&partial.stdout).expect("partial JSON");
+    assert_eq!(result["federation"]["coverage"], "partial");
+    assert_eq!(result["sessions"].as_array().unwrap().len(), 2);
+    assert!(
+        result["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|session| session["tape_id"] == "caller-partial-tape")
+    );
+    assert_eq!(result["sessions"][0]["tape_id"], "available-tape");
+    assert_eq!(result["total"], serde_json::Value::Null);
+    assert_eq!(result["total_bounds"]["min"], 2);
+    assert_eq!(result["total_bounds"]["max"], serde_json::Value::Null);
+    assert_eq!(result["time_range"], serde_json::Value::Null);
+    assert_eq!(result["truncated"], serde_json::Value::Null);
+    let sources = result["federation"]["sources"].as_array().expect("sources");
+    let available_source = sources
+        .iter()
+        .find(|source| source["store"] == "available/default")
+        .expect("available source");
+    assert_eq!(available_source["status"], "ok");
+    assert_eq!(available_source["grep_scan"]["total"], 1);
+    assert_eq!(
+        available_source["grep_scan"]["time_range"]["start"],
+        "2026-09-24T12:00:00Z"
+    );
+    let offline_source = sources
+        .iter()
+        .find(|source| source["store"] == "offline/default")
+        .expect("offline source");
+    assert_eq!(offline_source["status"], "unavailable");
+    assert_eq!(offline_source["phase"], "open");
+
+    let required = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "grep",
+            "needle-partial-multi",
+            "--peers",
+            "available,offline",
+            "--require-complete",
+        ])
+        .output()
+        .expect("run require-complete multi-peer grep");
+    assert!(!required.status.success());
+    assert!(
+        String::from_utf8_lossy(&required.stderr).contains("incomplete_coverage"),
+        "unexpected require-complete failure: {}",
+        String::from_utf8_lossy(&required.stderr)
+    );
 }
 
 #[test]
