@@ -2181,6 +2181,126 @@ fn topology_status_reports_handshake_and_unselected_peer_without_starting_it() {
     assert!(!idle_marker.exists(), "unselected peer was launched");
 }
 
+#[cfg(unix)]
+#[test]
+fn topology_status_refills_open_worker_slot_without_waiting_for_slow_peer() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let release_slow_peer = temp.path().join("release-slow-peer");
+
+    let mut slow = write_grep_owner(temp.path(), "a", binary, &[]);
+    let slow_home = slow["command"][1]
+        .as_str()
+        .expect("slow peer HOME assignment")
+        .to_string();
+    let slow_script_path = temp.path().join("wait-for-later-peer.sh");
+    let slow_script = [
+        "#!/bin/sh",
+        "set -eu",
+        "release=\"$1\"",
+        "binary=\"$2\"",
+        "i=0",
+        "while [ ! -e \"$release\" ] && [ \"$i\" -lt 300 ]; do",
+        "  sleep 0.01",
+        "  i=$((i + 1))",
+        "done",
+        "[ -e \"$release\" ] || exit 76",
+        "exec \"$binary\" peer-serve --stdio",
+    ]
+    .join("\n");
+    std::fs::write(&slow_script_path, slow_script).expect("write delayed peer launcher");
+    slow["command"] = json!([
+        "/usr/bin/env",
+        slow_home,
+        "/bin/sh",
+        slow_script_path,
+        release_slow_peer,
+        binary,
+    ]);
+
+    let mut fast = Vec::new();
+    for machine in ["b", "c", "d"] {
+        fast.push(write_grep_owner(temp.path(), machine, binary, &[]));
+    }
+
+    let mut later = write_grep_owner(temp.path(), "e", binary, &[]);
+    let later_home = later["command"][1]
+        .as_str()
+        .expect("later peer HOME assignment")
+        .to_string();
+    let later_script_path = temp.path().join("release-slow-peer.sh");
+    let later_script = [
+        "#!/bin/sh",
+        "set -eu",
+        "release=\"$1\"",
+        "binary=\"$2\"",
+        "touch \"$release\"",
+        "exec \"$binary\" peer-serve --stdio",
+    ]
+    .join("\n");
+    std::fs::write(&later_script_path, later_script).expect("write later peer launcher");
+    later["command"] = json!([
+        "/usr/bin/env",
+        later_home,
+        "/bin/sh",
+        later_script_path,
+        release_slow_peer,
+        binary,
+    ]);
+
+    let caller_home = temp.path().join("caller-home");
+    let caller_engram = caller_home.join(".engram");
+    std::fs::create_dir_all(&caller_engram).expect("caller home");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("caller repo");
+    std::fs::write(
+        caller_engram.join("topology.yml"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "self": "caller",
+            "peers": {
+                "a": slow,
+                "b": fast.remove(0),
+                "c": fast.remove(0),
+                "d": fast.remove(0),
+                "e": later,
+            },
+        }))
+        .expect("serialize topology"),
+    )
+    .expect("write caller topology");
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["topology", "status", "--peers", "all"])
+        .output()
+        .expect("run topology status with a blocked open slot");
+    assert!(
+        output.status.success(),
+        "topology status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("status JSON");
+    assert_eq!(result["status"], "ok", "topology status: {result:#}");
+    assert!(
+        release_slow_peer.exists(),
+        "later peer never released slow peer"
+    );
+    for machine in ["a", "b", "c", "d", "e"] {
+        assert_eq!(
+            result["peers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|peer| peer["machine"] == machine)
+                .unwrap_or_else(|| panic!("missing peer {machine}"))["status"],
+            "ok",
+            "peer {machine} should have opened successfully: {result:#}"
+        );
+    }
+}
+
 #[test]
 fn topology_status_check_exports_counts_indexed_tapes_without_regular_files() {
     let temp = tempfile::tempdir().expect("tempdir");

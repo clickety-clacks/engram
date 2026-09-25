@@ -1,12 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
@@ -1340,13 +1340,8 @@ fn cmd_show_peers_inner(
         }
     }
 
-    let mut connections = connect_peers_concurrently(
-        &selected,
-        &topology.self_label,
-        &topology.peers,
-        query_deadline,
-        cancelled,
-    );
+    let mut connections =
+        connect_peers_concurrently(&selected, &topology, query_deadline, cancelled);
     let mut locate_jobs = Vec::new();
     let mut locate_batches = HashMap::<String, Vec<Vec<String>>>::new();
     for machine in &selected {
@@ -1447,7 +1442,12 @@ fn cmd_show_peers_inner(
         }
     }
 
-    let locate_results = run_peer_rounds_concurrently(locate_jobs, query_deadline, cancelled);
+    let locate_results = run_peer_rounds_concurrently(
+        locate_jobs,
+        query_deadline,
+        cancelled,
+        configured_peer_concurrency(&topology),
+    );
     let mut remote_locators = Vec::<RemoteShowLocator>::new();
     let mut remote_owners = HashMap::<String, RemoteOwner>::new();
     for result in locate_results {
@@ -1684,7 +1684,12 @@ fn cmd_show_peers_inner(
             });
         }
 
-        let fact_results = run_peer_rounds_concurrently(fact_jobs, query_deadline, cancelled);
+        let fact_results = run_peer_rounds_concurrently(
+            fact_jobs,
+            query_deadline,
+            cancelled,
+            configured_peer_concurrency(&topology),
+        );
         for result in fact_results {
             let machine = result.machine;
             let locators = fact_group_locators.remove(&machine).unwrap_or_default();
@@ -2987,13 +2992,8 @@ fn cmd_grep_with_peer(
     let mut peer_store_count = 0usize;
     let mut peer_owners = Vec::new();
     let mut peer_round_jobs = Vec::new();
-    let mut connections = connect_peers_concurrently(
-        &selected_machines,
-        &topology.self_label,
-        &topology.peers,
-        query_deadline,
-        &cancelled,
-    );
+    let mut connections =
+        connect_peers_concurrently(&selected_machines, &topology, query_deadline, &cancelled);
 
     for machine in &selected_machines {
         let peer = topology
@@ -3121,7 +3121,12 @@ fn cmd_grep_with_peer(
         }
     }
 
-    for result in run_peer_rounds_concurrently(peer_round_jobs, query_deadline, &cancelled) {
+    for result in run_peer_rounds_concurrently(
+        peer_round_jobs,
+        query_deadline,
+        &cancelled,
+        configured_peer_concurrency(&topology),
+    ) {
         let PeerRoundResult {
             machine,
             owner,
@@ -3327,7 +3332,12 @@ fn cmd_grep_with_peer(
                 requests,
             });
         }
-        for result in run_peer_rounds_concurrently(dispatch_jobs, query_deadline, &cancelled) {
+        for result in run_peer_rounds_concurrently(
+            dispatch_jobs,
+            query_deadline,
+            &cancelled,
+            configured_peer_concurrency(&topology),
+        ) {
             let PeerRoundResult {
                 machine,
                 owner: _owner,
@@ -3641,187 +3651,195 @@ fn connect_topology_status_peers(
     deadline: Instant,
     cancelled: &Arc<AtomicBool>,
 ) -> HashMap<String, Result<RemoteOwner, PeerFailure>> {
-    let configured_concurrency = topology
-        .limits
-        .get("concurrent_peer_connections")
-        .copied()
-        .unwrap_or(MAX_CONCURRENT_PEERS as u64)
-        .clamp(1, MAX_CONCURRENT_PEERS as u64) as usize;
-    let configured_connect_timeout = Duration::from_millis(
-        topology
-            .limits
-            .get("connect_open_deadline_ms")
-            .copied()
-            .unwrap_or(PEER_CONNECT_OPEN_TIMEOUT.as_millis() as u64)
-            .min(PEER_CONNECT_OPEN_TIMEOUT.as_millis() as u64),
-    );
-    let mut results = HashMap::with_capacity(selected.len());
-    for batch in selected.chunks(configured_concurrency) {
-        let batch_results = std::thread::scope(|scope| {
-            let handles = batch
-                .iter()
-                .map(|machine| {
-                    let machine = machine.clone();
-                    let peer = topology.peers[&machine].clone();
-                    let caller = topology.self_label.clone();
-                    let timeout = configured_connect_timeout
-                        .min(deadline.saturating_duration_since(Instant::now()));
-                    let cancelled = Arc::clone(cancelled);
-                    scope.spawn(move || {
-                        let result = RemoteOwner::connect_cancellable(
-                            &machine, &caller, &peer, timeout, &cancelled,
-                        );
-                        (machine, result)
-                    })
+    let connect_timeout = configured_connect_open_timeout(topology);
+    run_indexed_worker_pool(
+        selected.to_vec(),
+        configured_peer_concurrency(topology),
+        |machine| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let peer = topology.peers[&machine].clone();
+                let timeout =
+                    connect_timeout.min(deadline.saturating_duration_since(Instant::now()));
+                RemoteOwner::connect_cancellable(
+                    &machine,
+                    &topology.self_label,
+                    &peer,
+                    timeout,
+                    cancelled,
+                )
+            }))
+            .unwrap_or_else(|_| {
+                Err(PeerFailure {
+                    code: "unavailable".into(),
+                    message: "peer status worker panicked".into(),
                 })
-                .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .zip(batch)
-                .map(|(handle, machine)| {
-                    handle.join().unwrap_or_else(|_| {
-                        (
-                            machine.clone(),
-                            Err(PeerFailure {
-                                code: "unavailable".into(),
-                                message: "peer status worker panicked".into(),
-                            }),
-                        )
-                    })
-                })
-                .collect::<Vec<_>>()
-        });
-        results.extend(batch_results);
-    }
-    results
+            });
+            (machine, result)
+        },
+    )
+    .into_iter()
+    .collect()
 }
 
 fn run_peer_rounds_concurrently(
     jobs: Vec<PeerRoundJob>,
     deadline: Instant,
     cancelled: &Arc<AtomicBool>,
+    concurrency: usize,
 ) -> Vec<PeerRoundResult> {
-    let mut pending = jobs.into_iter();
-    let mut results = Vec::new();
-    loop {
-        let batch = pending
-            .by_ref()
-            .take(MAX_CONCURRENT_PEERS)
-            .collect::<Vec<_>>();
-        if batch.is_empty() {
-            break;
+    run_indexed_worker_pool(jobs, concurrency, |job| {
+        let PeerRoundJob {
+            machine,
+            mut owner,
+            exports,
+            requests,
+        } = job;
+        let requests_len = requests.len();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let timeout = peer_operation_timeout(&owner, deadline);
+            let outcomes = owner.round_cancellable(&requests, timeout, cancelled);
+            (owner, outcomes)
+        })) {
+            Ok((owner, outcomes)) => PeerRoundResult {
+                machine,
+                owner: Some(owner),
+                exports,
+                outcomes,
+            },
+            Err(_) => PeerRoundResult {
+                machine,
+                owner: None,
+                exports,
+                outcomes: (0..requests_len)
+                    .map(|_| {
+                        Err(PeerFailure {
+                            code: "unavailable".into(),
+                            message: "peer request worker panicked".into(),
+                        })
+                    })
+                    .collect(),
+            },
         }
-
-        let batch_results = std::thread::scope(|scope| {
-            let handles = batch
-                .into_iter()
-                .map(|job| {
-                    let machine = job.machine.clone();
-                    let exports = job.exports.clone();
-                    let requests_len = job.requests.len();
-                    let cancelled = Arc::clone(cancelled);
-                    let handle = scope.spawn(move || {
-                        let PeerRoundJob {
-                            mut owner,
-                            requests,
-                            ..
-                        } = job;
-                        let timeout = peer_operation_timeout(&owner, deadline);
-                        let outcomes = owner.round_cancellable(&requests, timeout, &cancelled);
-                        (owner, outcomes)
-                    });
-                    (machine, exports, requests_len, handle)
-                })
-                .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .map(
-                    |(machine, exports, requests_len, handle)| match handle.join() {
-                        Ok((owner, outcomes)) => PeerRoundResult {
-                            machine,
-                            owner: Some(owner),
-                            exports,
-                            outcomes,
-                        },
-                        Err(_) => PeerRoundResult {
-                            machine,
-                            owner: None,
-                            exports,
-                            outcomes: (0..requests_len)
-                                .map(|_| {
-                                    Err(PeerFailure {
-                                        code: "unavailable".into(),
-                                        message: "peer request worker panicked".into(),
-                                    })
-                                })
-                                .collect(),
-                        },
-                    },
-                )
-                .collect::<Vec<_>>()
-        });
-        results.extend(batch_results);
-    }
-    results
+    })
 }
 
 fn connect_peers_concurrently(
     selected: &[String],
-    caller: &str,
-    peers: &std::collections::BTreeMap<String, TopologyPeer>,
+    topology: &Topology,
     deadline: Instant,
     cancelled: &Arc<AtomicBool>,
 ) -> HashMap<String, Result<RemoteOwner, PeerFailure>> {
     let jobs = selected
         .iter()
         .filter_map(|machine| {
-            peers
+            topology
+                .peers
                 .get(machine)
                 .filter(|peer| !peer.exports.is_empty())
                 .map(|peer| (machine.clone(), peer.clone()))
         })
         .collect::<Vec<_>>();
-    let mut connections = HashMap::with_capacity(jobs.len());
+    let connect_timeout = configured_connect_open_timeout(topology);
+    run_indexed_worker_pool(
+        jobs,
+        configured_peer_concurrency(topology),
+        |(machine, peer)| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let timeout =
+                    connect_timeout.min(deadline.saturating_duration_since(Instant::now()));
+                RemoteOwner::connect_cancellable(
+                    &machine,
+                    &topology.self_label,
+                    &peer,
+                    timeout,
+                    cancelled,
+                )
+            }))
+            .unwrap_or_else(|_| {
+                Err(PeerFailure {
+                    code: "unavailable".into(),
+                    message: "peer connection worker panicked".into(),
+                })
+            });
+            (machine, result)
+        },
+    )
+    .into_iter()
+    .collect()
+}
 
-    for batch in jobs.chunks(MAX_CONCURRENT_PEERS) {
-        let results = std::thread::scope(|scope| {
-            let handles = batch
-                .iter()
-                .map(|(machine, peer)| {
-                    let machine = machine.clone();
-                    let peer = peer.clone();
-                    let caller = caller.to_string();
-                    let cancelled = Arc::clone(cancelled);
-                    scope.spawn(move || {
-                        let timeout = PEER_CONNECT_OPEN_TIMEOUT
-                            .min(deadline.saturating_duration_since(Instant::now()));
-                        let result = RemoteOwner::connect_cancellable(
-                            &machine, &caller, &peer, timeout, &cancelled,
-                        );
-                        (machine, result)
-                    })
-                })
-                .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .zip(batch)
-                .map(|(handle, (machine, _))| {
-                    handle.join().unwrap_or_else(|_| {
-                        (
-                            machine.clone(),
-                            Err(PeerFailure {
-                                code: "unavailable".into(),
-                                message: "peer connection worker panicked".into(),
-                            }),
-                        )
-                    })
-                })
-                .collect::<Vec<_>>()
-        });
-        connections.extend(results);
+fn configured_peer_concurrency(topology: &Topology) -> usize {
+    topology
+        .limits
+        .get("concurrent_peer_connections")
+        .copied()
+        .unwrap_or(MAX_CONCURRENT_PEERS as u64)
+        .clamp(1, MAX_CONCURRENT_PEERS as u64) as usize
+}
+
+fn configured_connect_open_timeout(topology: &Topology) -> Duration {
+    Duration::from_millis(
+        topology
+            .limits
+            .get("connect_open_deadline_ms")
+            .copied()
+            .unwrap_or(PEER_CONNECT_OPEN_TIMEOUT.as_millis() as u64)
+            .min(PEER_CONNECT_OPEN_TIMEOUT.as_millis() as u64),
+    )
+}
+
+// Refill a bounded slot as soon as a job finishes, then restore input order
+// for callers whose output order is part of the query contract.
+fn run_indexed_worker_pool<T, R, F>(jobs: Vec<T>, concurrency: usize, worker: F) -> Vec<R>
+where
+    T: Send,
+    R: Send,
+    F: Fn(T) -> R + Sync,
+{
+    if jobs.is_empty() {
+        return Vec::new();
     }
 
-    connections
+    let job_count = jobs.len();
+    let queue = Mutex::new(
+        jobs.into_iter()
+            .enumerate()
+            .collect::<VecDeque<(usize, T)>>(),
+    );
+    let (sender, receiver) = mpsc::channel::<(usize, R)>();
+    std::thread::scope(|scope| {
+        for _ in 0..concurrency.clamp(1, job_count) {
+            let sender = sender.clone();
+            let queue = &queue;
+            let worker = &worker;
+            scope.spawn(move || {
+                loop {
+                    let next = queue
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .pop_front();
+                    let Some((index, job)) = next else {
+                        break;
+                    };
+                    if sender.send((index, worker(job))).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    drop(sender);
+
+    let mut ordered = std::iter::repeat_with(|| None)
+        .take(job_count)
+        .collect::<Vec<Option<R>>>();
+    for (index, result) in receiver {
+        ordered[index] = Some(result);
+    }
+    ordered
+        .into_iter()
+        .map(|result| result.expect("each bounded worker job returns one result"))
+        .collect()
 }
 
 fn local_grep_source_rows(context: &RuntimeContext, machine: &str) -> Vec<Value> {
@@ -4656,6 +4674,50 @@ mod tests {
                 .code,
             "peer_not_configured"
         );
+    }
+
+    #[test]
+    fn configured_peer_workers_respect_lowered_limit_and_protocol_ceiling() {
+        let topology_with = |concurrency: u64, connect_deadline_ms: u64| Topology {
+            self_label: "caller".into(),
+            exports: std::collections::BTreeMap::new(),
+            peers: std::collections::BTreeMap::new(),
+            limits: std::collections::BTreeMap::from([
+                ("concurrent_peer_connections".into(), concurrency),
+                ("connect_open_deadline_ms".into(), connect_deadline_ms),
+            ]),
+            frozen_stores: Vec::new(),
+        };
+
+        assert_eq!(configured_peer_concurrency(&topology_with(1, 2_000)), 1);
+        assert_eq!(configured_peer_concurrency(&topology_with(3, 2_000)), 3);
+        assert_eq!(configured_peer_concurrency(&topology_with(20, 2_000)), 4);
+        assert_eq!(configured_peer_concurrency(&topology_with(0, 2_000)), 1);
+        assert_eq!(
+            configured_connect_open_timeout(&topology_with(4, 900)),
+            Duration::from_millis(900)
+        );
+        assert_eq!(
+            configured_connect_open_timeout(&topology_with(4, 9_000)),
+            PEER_CONNECT_OPEN_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn bounded_peer_worker_pool_enforces_cap_and_restores_input_order() {
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let maximum = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let results = run_indexed_worker_pool((0..12).collect::<Vec<_>>(), 3, |job| {
+            let running = active.fetch_add(1, Ordering::SeqCst) + 1;
+            maximum.fetch_max(running, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(5));
+            active.fetch_sub(1, Ordering::SeqCst);
+            job
+        });
+
+        assert_eq!(results, (0..12).collect::<Vec<_>>());
+        assert_eq!(maximum.load(Ordering::SeqCst), 3);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
     }
 
     #[test]
