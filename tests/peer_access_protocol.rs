@@ -1006,6 +1006,81 @@ fn grep_keeps_successful_peer_results_when_another_selected_peer_is_unavailable(
 }
 
 #[test]
+fn grep_preserves_known_truncation_when_another_selected_peer_is_unavailable() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let available = write_grep_owner(
+        temp.path(),
+        "available",
+        binary,
+        &[
+            (
+                "available-first",
+                "{\"t\":\"2026-09-24T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-partial-truncated first\"}\n",
+            ),
+            (
+                "available-second",
+                "{\"t\":\"2026-09-24T13:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-partial-truncated second\"}\n",
+            ),
+        ],
+    );
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "caller-partial-truncated",
+        "{\"t\":\"2026-09-24T11:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-partial-truncated local\"}\n",
+    );
+    std::fs::write(
+        caller_home.join(".engram/topology.yml"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "self": "caller",
+            "peers": {
+                "available": available,
+                "offline": {
+                    "command": ["/usr/bin/false"],
+                    "engram": binary,
+                    "exports": ["default"],
+                }
+            }
+        }))
+        .expect("serialize caller topology"),
+    )
+    .expect("caller topology");
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "grep",
+            "needle-partial-truncated",
+            "--peers",
+            "available,offline",
+            "--limit",
+            "1",
+        ])
+        .output()
+        .expect("run partially covered truncated grep");
+    assert!(
+        output.status.success(),
+        "partial grep should keep known results: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("grep JSON");
+    assert_eq!(result["federation"]["coverage"], "partial");
+    assert_eq!(result["truncated"], true);
+    assert_eq!(result["total"], serde_json::Value::Null);
+    assert_eq!(result["total_bounds"]["max"], serde_json::Value::Null);
+    let available_source = result["federation"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["store"] == "available/default")
+        .expect("available source");
+    assert_eq!(available_source["grep_scan"]["total"], 2);
+    assert_eq!(available_source["grep_scan"]["truncated"], true);
+}
+
+#[test]
 fn grep_without_peer_selection_does_not_start_configured_peers() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = env!("CARGO_BIN_EXE_engram");

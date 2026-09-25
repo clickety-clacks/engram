@@ -2199,12 +2199,16 @@ fn cmd_grep_with_peer(
         .cloned()
         .collect::<Vec<_>>();
     let returned = page.len();
-    let truncated = if any_selected_failure {
+    let definitely_truncated =
+        any_store_truncated || args.offset.saturating_add(returned) < page_ranked.len();
+    let truncated = if definitely_truncated {
+        json!(true)
+    } else if any_selected_failure {
         Value::Null
     } else if let Some(total) = exact_total {
         json!(args.offset.saturating_add(returned) < total)
     } else {
-        json!(any_store_truncated || args.offset.saturating_add(returned) < page_ranked.len())
+        json!(false)
     };
     let output_sessions = if args.count { Vec::new() } else { page };
     let mut payload = json!({
