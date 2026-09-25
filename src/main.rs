@@ -2811,7 +2811,7 @@ fn cmd_grep_with_peer(
     // failure must not erase a terminal-success scan, but any missing or
     // incomplete grep_scan keeps the matching scope unknown.
     let mut grep_scan_incomplete = false;
-    let mut any_store_truncated = false;
+    let mut completed_scan_proves_truncated = false;
     let mut peer_store_count = 0usize;
     let mut peer_owners = Vec::new();
     let mut peer_round_jobs = Vec::new();
@@ -3075,7 +3075,10 @@ fn cmd_grep_with_peer(
                 grep_scan_incomplete = true;
             }
             source_time_ranges.push(peer_time_range(&response.stats));
-            any_store_truncated |= store_truncated || total > k;
+            // A terminal-success scan can prove a tail even when another
+            // selected scan is missing. Its positive evidence remains sound
+            // as a lower bound on the merged result set.
+            completed_scan_proves_truncated |= store_truncated || total > k;
             if !valid_response {
                 continue;
             }
@@ -3316,8 +3319,8 @@ fn cmd_grep_with_peer(
         .cloned()
         .collect::<Vec<_>>();
     let returned = page.len();
-    let definitely_truncated =
-        any_store_truncated || args.offset.saturating_add(returned) < page_ranked.len();
+    let known_merged_tail = args.offset.saturating_add(returned) < page_ranked.len();
+    let definitely_truncated = completed_scan_proves_truncated || known_merged_tail;
     let truncated = if definitely_truncated {
         json!(true)
     } else if grep_scan_incomplete {

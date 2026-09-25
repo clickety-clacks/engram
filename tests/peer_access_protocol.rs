@@ -1195,7 +1195,14 @@ fn grep_merges_multiple_explicit_peers_and_keeps_unselected_peers_idle() {
     let output = Command::new(binary)
         .current_dir(&repo)
         .env("HOME", &caller_home)
-        .args(["grep", "needle-multi", "--peers", "beta, alpha"])
+        .args([
+            "grep",
+            "needle-multi",
+            "--peers",
+            "beta, alpha",
+            "--limit",
+            "4",
+        ])
         .output()
         .expect("run multi-peer grep");
     assert!(
@@ -1206,6 +1213,14 @@ fn grep_merges_multiple_explicit_peers_and_keeps_unselected_peers_idle() {
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("grep JSON");
     let sessions = result["sessions"].as_array().expect("sessions");
     assert_eq!(sessions.len(), 4);
+    assert_eq!(result["returned"], 4);
+    assert_eq!(
+        sessions
+            .iter()
+            .map(|session| session["tape_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["beta-tape", "alpha-tape", "shared-tape", "caller-tape"]
+    );
     let local = sessions
         .iter()
         .find(|session| session["tape_id"] == "caller-tape")
@@ -1246,6 +1261,110 @@ fn grep_merges_multiple_explicit_peers_and_keeps_unselected_peers_idle() {
         source["store"] == "not-selected/default" && source["status"] == "not_selected"
     }));
     assert!(!unselected_marker.exists(), "unselected peer was launched");
+
+    let end_page = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "grep",
+            "needle-multi",
+            "--peers",
+            "beta, alpha",
+            "--offset",
+            "2",
+            "--limit",
+            "4",
+        ])
+        .output()
+        .expect("run short complete end page");
+    assert!(
+        end_page.status.success(),
+        "short end page failed: {}",
+        String::from_utf8_lossy(&end_page.stderr)
+    );
+    let end_result: serde_json::Value =
+        serde_json::from_slice(&end_page.stdout).expect("short end-page JSON");
+    assert_eq!(end_result["returned"], 2);
+    assert_eq!(end_result["total"], 4);
+    assert_eq!(end_result["truncated"], false);
+    assert_eq!(end_result["time_range"], result["time_range"]);
+    assert_eq!(
+        end_result["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|session| session["tape_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["shared-tape", "caller-tape"]
+    );
+
+    let bounded = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "grep",
+            "needle-multi",
+            "--peers",
+            "beta, alpha",
+            "--limit",
+            "1",
+        ])
+        .output()
+        .expect("run bounded overlapping peer grep");
+    assert!(
+        bounded.status.success(),
+        "bounded overlapping grep failed: {}",
+        String::from_utf8_lossy(&bounded.stderr)
+    );
+    let bounded_result: serde_json::Value =
+        serde_json::from_slice(&bounded.stdout).expect("bounded grep JSON");
+    assert_eq!(bounded_result["federation"]["coverage"], "complete");
+    assert_eq!(bounded_result["returned"], 1);
+    assert_eq!(bounded_result["total"], serde_json::Value::Null);
+    assert_eq!(bounded_result["total_bounds"]["min"], 3);
+    assert_eq!(bounded_result["total_bounds"]["max"], 5);
+    assert_eq!(bounded_result["truncated"], true);
+    assert_eq!(
+        bounded_result["time_range"]["start"],
+        "2026-09-24T11:00:00Z"
+    );
+    assert_eq!(bounded_result["time_range"]["end"], "2026-09-24T13:00:00Z");
+
+    let bounded_count = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "grep",
+            "needle-multi",
+            "--peers",
+            "beta, alpha",
+            "--count",
+            "--limit",
+            "1",
+        ])
+        .output()
+        .expect("run bounded overlapping peer count");
+    assert!(
+        bounded_count.status.success(),
+        "bounded count grep failed: {}",
+        String::from_utf8_lossy(&bounded_count.stderr)
+    );
+    let bounded_count_result: serde_json::Value =
+        serde_json::from_slice(&bounded_count.stdout).expect("bounded count JSON");
+    assert!(
+        bounded_count_result["sessions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(bounded_count_result["returned"], 1);
+    assert_eq!(bounded_count_result["total_bounds"]["min"], 3);
+    assert_eq!(bounded_count_result["total_bounds"]["max"], 5);
+    assert_eq!(bounded_count_result["truncated"], true);
+    assert_eq!(
+        bounded_count_result["time_range"],
+        bounded_result["time_range"]
+    );
 }
 
 #[test]
@@ -2474,7 +2593,9 @@ fn grep_preserves_known_truncation_when_another_selected_peer_is_unavailable() {
     assert_eq!(result["federation"]["coverage"], "partial");
     assert_eq!(result["truncated"], true);
     assert_eq!(result["total"], serde_json::Value::Null);
+    assert_eq!(result["total_bounds"]["min"], 2);
     assert_eq!(result["total_bounds"]["max"], serde_json::Value::Null);
+    assert_eq!(result["time_range"], serde_json::Value::Null);
     let available_source = result["federation"]["sources"]
         .as_array()
         .unwrap()
@@ -2483,6 +2604,265 @@ fn grep_preserves_known_truncation_when_another_selected_peer_is_unavailable() {
         .expect("available source");
     assert_eq!(available_source["grep_scan"]["total"], 2);
     assert_eq!(available_source["grep_scan"]["truncated"], true);
+    assert_eq!(
+        available_source["grep_scan"]["time_range"]["start"],
+        "2026-09-24T12:00:00Z"
+    );
+
+    let counted = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "grep",
+            "needle-partial-truncated",
+            "--peers",
+            "available,offline",
+            "--count",
+            "--limit",
+            "1",
+        ])
+        .output()
+        .expect("run partial count with proven tail");
+    assert!(
+        counted.status.success(),
+        "partial count should retain known tail evidence: {}",
+        String::from_utf8_lossy(&counted.stderr)
+    );
+    let count_result: serde_json::Value =
+        serde_json::from_slice(&counted.stdout).expect("partial count JSON");
+    assert!(count_result["sessions"].as_array().unwrap().is_empty());
+    assert_eq!(count_result["federation"]["coverage"], "partial");
+    assert_eq!(count_result["returned"], 1);
+    assert_eq!(count_result["total"], serde_json::Value::Null);
+    assert_eq!(count_result["total_bounds"]["max"], serde_json::Value::Null);
+    assert_eq!(count_result["time_range"], serde_json::Value::Null);
+    assert_eq!(count_result["truncated"], true);
+}
+
+#[test]
+fn grep_uses_known_merged_page_to_prove_truncation_with_missing_peer() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "caller-lower-bound-first",
+        "{\"t\":\"2026-09-24T11:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-lower-bound local first\"}\n",
+    );
+    let extra_content = "{\"t\":\"2026-09-24T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-lower-bound local second\"}\n";
+    let compressed = zstd::stream::encode_all(extra_content.as_bytes(), 0).expect("compress tape");
+    std::fs::write(
+        repo.join(".engram/tapes/caller-lower-bound-second.jsonl.zst"),
+        compressed,
+    )
+    .expect("write second local tape");
+    std::fs::write(
+        caller_home.join(".engram/topology.yml"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "self": "caller",
+            "peers": {
+                "offline": {
+                    "command": ["/usr/bin/false"],
+                    "engram": binary,
+                    "exports": ["default"],
+                }
+            }
+        }))
+        .expect("serialize caller topology"),
+    )
+    .expect("write caller topology");
+
+    for extra_args in [vec!["--limit", "1"], vec!["--count", "--limit", "1"]] {
+        let output = Command::new(binary)
+            .current_dir(&repo)
+            .env("HOME", &caller_home)
+            .args(["grep", "needle-lower-bound", "--peers", "offline"])
+            .args(extra_args.iter().copied())
+            .output()
+            .expect("run grep with incomplete selected peer");
+        assert!(
+            output.status.success(),
+            "known local tail should survive missing peer: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("grep JSON");
+        assert_eq!(result["federation"]["coverage"], "partial");
+        assert_eq!(result["returned"], 1);
+        assert_eq!(result["total"], serde_json::Value::Null);
+        assert_eq!(result["total_bounds"]["min"], 2);
+        assert_eq!(result["total_bounds"]["max"], serde_json::Value::Null);
+        assert_eq!(result["time_range"], serde_json::Value::Null);
+        assert_eq!(result["truncated"], true);
+        if extra_args.first().copied() == Some("--count") {
+            assert!(result["sessions"].as_array().unwrap().is_empty());
+        } else {
+            assert_eq!(result["sessions"].as_array().unwrap().len(), 1);
+        }
+    }
+}
+
+#[test]
+fn grep_keeps_empty_completed_scan_facts_but_unknowns_missing_scope() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let empty = write_grep_owner(temp.path(), "empty", binary, &[]);
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "caller-empty-observation",
+        "{\"t\":\"2026-09-24T10:00:00Z\",\"k\":\"msg.in\",\"content\":\"unrelated\"}\n",
+    );
+    std::fs::write(
+        caller_home.join(".engram/topology.yml"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "self": "caller",
+            "peers": {
+                "empty": empty,
+                "offline": {
+                    "command": ["/usr/bin/false"],
+                    "engram": binary,
+                    "exports": ["default"],
+                }
+            }
+        }))
+        .expect("serialize caller topology"),
+    )
+    .expect("write caller topology");
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "grep",
+            "needle-empty-observation",
+            "--peers",
+            "empty,offline",
+            "--count",
+        ])
+        .output()
+        .expect("run empty partial count grep");
+    assert!(
+        !output.status.success(),
+        "empty grep should report no results"
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("partial JSON");
+    assert_eq!(result["federation"]["coverage"], "partial");
+    assert!(result["sessions"].as_array().unwrap().is_empty());
+    assert_eq!(result["returned"], 0);
+    assert_eq!(result["total"], serde_json::Value::Null);
+    assert_eq!(result["total_bounds"]["min"], 0);
+    assert_eq!(result["total_bounds"]["max"], serde_json::Value::Null);
+    assert_eq!(result["time_range"], serde_json::Value::Null);
+    assert_eq!(result["truncated"], serde_json::Value::Null);
+    let sources = result["federation"]["sources"].as_array().unwrap();
+    let empty_source = sources
+        .iter()
+        .find(|source| source["store"] == "empty/default")
+        .expect("completed empty source");
+    assert_eq!(empty_source["status"], "ok");
+    assert_eq!(empty_source["grep_scan"]["total"], 0);
+    assert_eq!(empty_source["grep_scan"]["returned"], 0);
+    assert_eq!(
+        empty_source["grep_scan"]["time_range"],
+        json!({"start": null, "end": null})
+    );
+    assert_eq!(empty_source["grep_scan"]["truncated"], false);
+    let offline_source = sources
+        .iter()
+        .find(|source| source["store"] == "offline/default")
+        .expect("missing source");
+    assert_eq!(offline_source["phase"], "open");
+}
+
+#[test]
+fn grep_discards_match_frames_from_failed_scan_when_aggregating() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "caller-incomplete-frame",
+        "{\"t\":\"2026-09-24T11:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-incomplete-frame local\"}\n",
+    );
+    let script_path = temp.path().join("failed-scan-peer.sh");
+    let script = [
+        "#!/bin/sh",
+        "while IFS= read -r request; do",
+        r#"  id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"#,
+        r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
+        r#"  case "$op" in"#,
+        "    open)",
+        r#"      printf '{"id":%s,"data":{"store":"broken/default","status":"ok","db":"/fixture/broken.sqlite","tape_dirs":[],"reader_mode":"live","snapshot_at":"2026-09-25T14:00:00Z"}}\n' "$id""#,
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"broken","build":"@BUILD@","protocol":1,"schema":@SCHEMA@,"query_semantics":@SEMANTICS@,"limits":{"grep_k":10000}}}\n' "$id""#,
+        "      ;;",
+        "    grep_scan)",
+        r#"      printf '{"id":%s,"data":{"type":"match","tape_id":"must-not-appear","timestamp":"2099-01-01T00:00:00Z","total_lines":1,"anchor_line":1,"match_count":1,"provenance_match_count":0,"provenance_event_count":1,"refs_up":0,"refs_down":0,"files_touched":[]}}\n' "$id""#,
+        r#"      printf '{"id":%s,"end":true,"ok":false,"error":{"code":"injected_scan_failure","message":"scan did not complete"}}\n' "$id""#,
+        "      ;;",
+        "    *)",
+        r#"      printf '{"id":%s,"end":true,"ok":false,"error":{"code":"unexpected_operation","message":"unexpected operation"}}\n' "$id""#,
+        "      ;;",
+        "  esac",
+        "done",
+    ]
+    .join("\n")
+    .replace("@BUILD@", env!("CARGO_PKG_VERSION"))
+    .replace("@SCHEMA@", &SCHEMA_VERSION.to_string())
+    .replace("@SEMANTICS@", &QUERY_SEMANTICS_VERSION.to_string());
+    std::fs::write(&script_path, script).expect("write failed-scan peer");
+    std::fs::write(
+        caller_home.join(".engram/topology.yml"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "self": "caller",
+            "peers": {
+                "broken": {
+                    "command": ["/bin/sh", script_path],
+                    "engram": binary,
+                    "exports": ["default"],
+                }
+            }
+        }))
+        .expect("serialize caller topology"),
+    )
+    .expect("write caller topology");
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "grep",
+            "needle-incomplete-frame",
+            "--peers",
+            "broken",
+            "--limit",
+            "1",
+        ])
+        .output()
+        .expect("run grep with failed terminal frame");
+    assert!(
+        output.status.success(),
+        "local results should survive a failed peer scan: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("grep JSON");
+    assert_eq!(result["federation"]["coverage"], "partial");
+    assert_eq!(result["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(result["sessions"][0]["tape_id"], "caller-incomplete-frame");
+    assert_eq!(result["total"], serde_json::Value::Null);
+    assert_eq!(result["total_bounds"]["min"], 1);
+    assert_eq!(result["total_bounds"]["max"], serde_json::Value::Null);
+    assert_eq!(result["time_range"], serde_json::Value::Null);
+    assert_eq!(result["truncated"], serde_json::Value::Null);
+    let peer_source = result["federation"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["store"] == "broken/default")
+        .expect("failed peer source");
+    assert_eq!(peer_source["status"], "failed");
+    assert_eq!(peer_source["phase"], "grep_scan");
+    assert_eq!(peer_source["error"]["code"], "injected_scan_failure");
+    assert!(peer_source.get("grep_scan").is_none());
 }
 
 #[test]
@@ -2811,6 +3191,7 @@ fn grep_keeps_completed_scan_aggregates_when_dispatch_metadata_fails() {
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("grep JSON");
     assert_eq!(result["federation"]["coverage"], "partial");
     assert_eq!(result["total"], 1);
+    assert!(result.get("total_bounds").is_none());
     assert_eq!(result["time_range"]["start"], "2026-09-24T12:00:00Z");
     assert_eq!(result["time_range"]["end"], "2026-09-24T12:00:00Z");
     assert_eq!(result["truncated"], false);
