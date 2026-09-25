@@ -397,7 +397,7 @@ impl QueryRecovery {
                         return Err(error("recovery context hash mismatch"));
                     }
                     let stored = rows(&raw)
-                        .map_err(|e| error(format!("recovery context JSON is invalid: {e}")))?
+                        .map_err(|e| error(format!("recovery context JSON is invalid: {}", e.message)))?
                         .into_iter()
                         .find(|r| r["k"] == "meta")
                         .ok_or_else(|| error("recovery context meta missing"))?;
