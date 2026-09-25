@@ -3695,9 +3695,8 @@ fn grep_uses_completed_local_count_as_truncation_proof() {
         let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("grep JSON");
         assert_eq!(result["federation"]["coverage"], "complete");
         assert_eq!(result["returned"], 1);
-        assert_eq!(result["total"], serde_json::Value::Null);
-        assert_eq!(result["total_bounds"]["min"], 100);
-        assert_eq!(result["total_bounds"]["max"], 100);
+        assert_eq!(result["total"], 100);
+        assert!(result.get("total_bounds").is_none());
         assert_eq!(result["truncated"], true);
         assert_eq!(
             result["time_range"],

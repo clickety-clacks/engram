@@ -3496,11 +3496,20 @@ fn cmd_grep_with_peer(
     } else {
         "complete"
     };
+    let matched_source_count = source_totals.iter().filter(|total| **total > 0).count();
+    let source_total_sum = source_totals
+        .iter()
+        .fold(0usize, |sum, total| sum.saturating_add(*total));
     let total_exact = source_count_known
         && !grep_scan_incomplete
-        && source_totals.iter().skip(1).all(|total| *total <= k);
+        && (matched_source_count <= 1
+            || source_totals.iter().skip(1).all(|total| *total <= k));
     let exact_total = if total_exact {
-        Some(page_ranked.len())
+        Some(if matched_source_count <= 1 {
+            source_total_sum
+        } else {
+            page_ranked.len()
+        })
     } else {
         None
     };
@@ -3511,11 +3520,7 @@ fn cmd_grep_with_peer(
         .unwrap_or(0)
         .max(page_ranked.len());
     let max_total = if source_count_known && !grep_scan_incomplete {
-        Some(
-            source_totals
-                .iter()
-                .fold(0usize, |sum, value| sum.saturating_add(*value)),
-        )
+        Some(source_total_sum)
     } else {
         None
     };

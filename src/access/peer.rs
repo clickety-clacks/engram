@@ -123,8 +123,37 @@ pub fn serve_stdio(home: &Path) -> Result<(), String> {
         }
     });
 
+    let result = serve_request_frames(
+        frames_rx,
+        &mut output,
+        started,
+        owner_session_max,
+        owner_idle_timeout,
+        |value, id, output| session.handle(value, id, output),
+    );
+
+    let _ = watchdog_stop_tx.send(());
+    let _ = watchdog.join();
+    // On idle expiry stdin may still be open. The peer command exits after
+    // this function returns, which closes the detached reader thread too.
+    drop(reader);
+    result
+}
+
+fn serve_request_frames<W, F>(
+    frames_rx: mpsc::Receiver<Result<Option<Vec<u8>>, String>>,
+    output: &mut W,
+    started: Instant,
+    owner_session_max: Duration,
+    owner_idle_timeout: Duration,
+    mut handle: F,
+) -> Result<(), String>
+where
+    W: Write,
+    F: FnMut(&Value, &Value, &mut W) -> Result<Value, PeerError>,
+{
     let mut last_activity = Instant::now();
-    let result = loop {
+    loop {
         let idle_remaining = owner_idle_timeout.saturating_sub(last_activity.elapsed());
         let session_remaining = owner_session_max.saturating_sub(started.elapsed());
         let wait = idle_remaining.min(session_remaining);
@@ -133,14 +162,14 @@ pub fn serve_stdio(home: &Path) -> Result<(), String> {
                 last_activity = Instant::now();
                 frame
             }
-            Ok(Ok(None)) => break Ok(()),
-            Ok(Err(error)) => break Err(format!("frame_error: {error}")),
-            Err(RecvTimeoutError::Disconnected) => break Ok(()),
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Err(error)) => return Err(format!("frame_error: {error}")),
+            Err(RecvTimeoutError::Disconnected) => return Ok(()),
             Err(RecvTimeoutError::Timeout) => {
                 if owner_idle_timeout <= last_activity.elapsed()
                     || owner_session_max <= started.elapsed()
                 {
-                    break Ok(());
+                    return Ok(());
                 }
                 continue;
             }
@@ -149,7 +178,7 @@ pub fn serve_stdio(home: &Path) -> Result<(), String> {
         let (id, result) = match parsed {
             Ok(value) => {
                 let id = value.get("id").cloned().unwrap_or(Value::Null);
-                let result = session.handle(&value, &id, &mut output);
+                let result = handle(&value, &id, output);
                 (id, result)
             }
             Err(error) => (
@@ -158,10 +187,10 @@ pub fn serve_stdio(home: &Path) -> Result<(), String> {
             ),
         };
         let response = match result {
-            Ok(stats) => write_terminal(&mut output, &id, true, stats, None)
+            Ok(stats) => write_terminal(output, &id, true, stats, None)
                 .map_err(|error| format!("write_error: {error}")),
             Err(error) => write_terminal(
-                &mut output,
+                output,
                 &id,
                 false,
                 Value::Null,
@@ -170,16 +199,12 @@ pub fn serve_stdio(home: &Path) -> Result<(), String> {
             .map_err(|write_error| format!("write_error: {write_error}")),
         };
         if let Err(error) = response {
-            break Err(error);
+            return Err(error);
         }
-    };
-
-    let _ = watchdog_stop_tx.send(());
-    let _ = watchdog.join();
-    // On idle expiry stdin may still be open. The peer command exits after
-    // this function returns, which closes the detached reader thread too.
-    drop(reader);
-    result
+        // A completed response is activity too. Long owner operations must
+        // not leave the next request with an already-expired idle deadline.
+        last_activity = Instant::now();
+    }
 }
 
 fn read_frame<R: BufRead>(input: &mut R) -> io::Result<Option<Vec<u8>>> {
@@ -2509,6 +2534,28 @@ mod tests {
             .to_string()
     }
 
+    struct DelayedFirstFlush {
+        bytes: Vec<u8>,
+        flush_completed: Option<mpsc::Sender<()>>,
+    }
+
+    impl Write for DelayedFirstFlush {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if let Some(completed) = self.flush_completed.take() {
+                thread::sleep(Duration::from_millis(1_200));
+                completed.send(()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "flush waiter disappeared")
+                })?;
+            }
+            Ok(())
+        }
+    }
+
     fn tape_address(machine: &str, path: &Path) -> Value {
         json!({"machine": machine, "path": path, "kind": "tape"})
     }
@@ -2563,6 +2610,57 @@ mod tests {
             }
         }
         String::from_utf8(output).expect("utf8 output")
+    }
+
+    #[test]
+    fn terminal_response_restarts_idle_timeout_after_a_long_owner_operation() {
+        let (frames_tx, frames_rx) = mpsc::channel::<Result<Option<Vec<u8>>, String>>();
+        let (flush_tx, flush_rx) = mpsc::channel();
+        frames_tx
+            .send(Ok(Some(
+                request(1, "test", &[], json!({})).into_bytes(),
+            )))
+            .expect("first request");
+        let producer = thread::spawn(move || {
+            flush_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("first terminal response flush");
+            thread::sleep(Duration::from_millis(200));
+            frames_tx
+                .send(Ok(Some(
+                    request(2, "test", &[], json!({})).into_bytes(),
+                )))
+                .expect("second request should still have a live owner");
+        });
+
+        let mut output = DelayedFirstFlush {
+            bytes: Vec::new(),
+            flush_completed: Some(flush_tx),
+        };
+        let mut handled = 0;
+        serve_request_frames(
+            frames_rx,
+            &mut output,
+            Instant::now(),
+            Duration::from_secs(4),
+            Duration::from_secs(1),
+            |_, id, _| {
+                handled += 1;
+                Ok(json!({"handled": id}))
+            },
+        )
+        .expect("serve requests");
+        producer.join().expect("request producer");
+
+        let frames = String::from_utf8(output.bytes)
+            .expect("UTF-8 protocol output")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("terminal JSON"))
+            .collect::<Vec<_>>();
+        assert_eq!(handled, 2);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0]["id"], 1);
+        assert_eq!(frames[1]["id"], 2);
     }
 
     #[test]

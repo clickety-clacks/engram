@@ -669,6 +669,12 @@ pub fn build_chain_metadata(sessions: &[Value]) -> Vec<Value> {
         }
     }
     let graph = session_chain_graph(ids, edges);
+    if graph.components.iter().all(|component| !component.cycle)
+        && graph.parents.values().all(|parents| parents.len() <= 1)
+    {
+        return build_single_parent_chain_metadata(sessions);
+    }
+
     let mut out = Vec::new();
     for component in &graph.components {
         let mut descendants = component
@@ -682,7 +688,9 @@ pub fn build_chain_metadata(sessions: &[Value]) -> Vec<Value> {
                 let children = graph.children.get(id).cloned().unwrap_or_default();
                 let mut row = json!({
                     "session_id": id,
-                    "depth": graph.depths.get(id).copied().unwrap_or(0),
+                    "depth": session.get("depth").cloned().unwrap_or_else(|| {
+                        json!(graph.depths.get(id).copied().unwrap_or(0))
+                    }),
                     "parent": if parents.len() == 1 {
                         json!(parents.first().expect("one parent"))
                     } else {
@@ -723,6 +731,53 @@ pub fn build_chain_metadata(sessions: &[Value]) -> Vec<Value> {
         out.push(chain);
     }
     out
+}
+
+fn build_single_parent_chain_metadata(sessions: &[Value]) -> Vec<Value> {
+    let mut parent_of = HashMap::<String, String>::new();
+    for session in sessions {
+        if let (Some(id), Some(parent)) = (
+            session.get("session_id").and_then(Value::as_str),
+            session.get("parent").and_then(Value::as_str),
+        ) {
+            parent_of.insert(id.to_string(), parent.to_string());
+        }
+    }
+    let mut by_root = HashMap::<String, Vec<Value>>::new();
+    let mut root_order = Vec::<String>::new();
+    for session in sessions {
+        let Some(id) = session.get("session_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let mut root = id.to_string();
+        while let Some(parent) = parent_of.get(&root) {
+            root = parent.clone();
+        }
+        if !root_order.iter().any(|value| value == &root) {
+            root_order.push(root.clone());
+        }
+        by_root.entry(root).or_default().push(json!({
+            "session_id": id,
+            "depth": session.get("depth").cloned().unwrap_or_else(|| json!(0)),
+            "parent": session.get("parent").cloned().unwrap_or(Value::Null),
+            "children": session.get("children").cloned().unwrap_or_else(|| json!([])),
+        }));
+    }
+    root_order
+        .into_iter()
+        .map(|root| {
+            let mut descendants = by_root.remove(&root).unwrap_or_default();
+            descendants.sort_by(|a, b| {
+                let ad = a.get("depth").and_then(Value::as_u64).unwrap_or(0);
+                let bd = b.get("depth").and_then(Value::as_u64).unwrap_or(0);
+                ad.cmp(&bd)
+            });
+            json!({
+                "root_session_id": root,
+                "descendants": descendants,
+            })
+        })
+        .collect()
 }
 
 struct ChainComponent {
@@ -1302,6 +1357,61 @@ mod chain_graph_tests {
                 .collect::<Vec<_>>(),
             vec![("a", 0), ("b", 0), ("c", 1)]
         );
+    }
+
+    #[test]
+    fn single_parent_chains_keep_ranked_component_and_sibling_order() {
+        let mut sessions = vec![
+            json!({"session_id": "z-root"}),
+            json!({"session_id": "z-child-ranked-first"}),
+            json!({"session_id": "a-root"}),
+            json!({"session_id": "z-child-ranked-second"}),
+            json!({"session_id": "a-child"}),
+        ];
+        let hops = vec![
+            json!({"session": "z-child-ranked-first", "parent_session": "z-root"}),
+            json!({"session": "z-child-ranked-second", "parent_session": "z-root"}),
+            json!({"session": "a-child", "parent_session": "a-root"}),
+        ];
+        annotate_chain_fields(&mut sessions, &hops);
+
+        let chains = build_chain_metadata(&sessions);
+        assert_eq!(
+            chains
+                .iter()
+                .map(|chain| chain["root_session_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["z-root", "a-root"]
+        );
+        assert_eq!(
+            chains[0]["descendants"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|session| session["session_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "z-root",
+                "z-child-ranked-first",
+                "z-child-ranked-second"
+            ]
+        );
+    }
+
+    #[test]
+    fn paged_chain_metadata_keeps_the_annotated_full_graph_depth() {
+        let mut sessions = vec![
+            json!({"session_id": "root"}),
+            json!({"session_id": "child"}),
+        ];
+        let hops = vec![json!({"session": "child", "parent_session": "root"})];
+        annotate_chain_fields(&mut sessions, &hops);
+        let page = vec![sessions[1].clone()];
+
+        let chains = build_chain_metadata(&page);
+        assert_eq!(page[0]["depth"], 1);
+        assert_eq!(chains[0]["descendants"][0]["depth"], page[0]["depth"]);
+        assert_eq!(chains[0]["root_session_id"], "root");
     }
 
     #[test]
