@@ -162,6 +162,103 @@ fn write_local_grep_source(
     (caller_home, repo)
 }
 
+#[test]
+fn explain_peers_attributes_remote_only_edits_to_their_physical_owner() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let source = (1..=24)
+        .map(|line| format!("fn remote_only_{line}() {{ value_{line}(); }}\n"))
+        .collect::<String>();
+    let before = source.replace("remote_only", "before_remote_only");
+    let tape_id = "remote-explain-tape";
+    let events = [
+        json!({"t":"2026-09-25T12:00:00Z","k":"meta","model":"peer-test"}),
+        json!({
+            "t":"2026-09-25T12:01:00Z",
+            "k":"code.edit",
+            "file":"remote-only.rs",
+            "before_range":[1,24],
+            "after_range":[1,24],
+            "before_text":before,
+            "after_text":source,
+        }),
+    ]
+    .iter()
+    .map(serde_json::Value::to_string)
+    .collect::<Vec<_>>()
+    .join("\n")
+        + "\n";
+    let remote = write_grep_owner(temp.path(), "remote-owner", binary, &[(tape_id, &events)]);
+    let owner_home = temp.path().join("remote-owner-home");
+    let owner_db = owner_home.join(".engram/index.sqlite");
+    let index = SqliteIndex::open_writer(owner_db.to_str().expect("owner DB path"))
+        .expect("open owner index");
+    let parsed = engram::tape::event::parse_jsonl_events(&events).expect("parse tape events");
+    index
+        .ingest_tape_events(
+            tape_id,
+            &parsed,
+            engram::index::lineage::LINK_THRESHOLD_DEFAULT,
+        )
+        .expect("index remote-only edit");
+    drop(index);
+
+    let mut remote = remote;
+    let remote_operations = log_peer_operations(temp.path(), "remote-owner", binary, &mut remote);
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "caller-empty-tape",
+        "{\"t\":\"2026-09-25T11:00:00Z\",\"k\":\"note\",\"content\":\"no matching source\"}\n",
+    );
+    std::fs::write(repo.join("remote-only.rs"), &source).expect("write query source");
+    let caller_engram = caller_home.join(".engram");
+    std::fs::write(
+        caller_engram.join("topology.yml"),
+        serde_json::to_vec(&json!({"version":1,"self":"caller","peers":{"remote-owner":remote}}))
+            .expect("serialize caller topology"),
+    )
+    .expect("write caller topology");
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["explain", "remote-only.rs", "--peers", "remote-owner"])
+        .output()
+        .expect("run federated explain");
+    assert!(
+        output.status.success(),
+        "federated explain failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("explain JSON");
+    let session = value["sessions"]
+        .as_array()
+        .expect("sessions")
+        .iter()
+        .find(|session| session["session_id"] == tape_id)
+        .expect("remote-only edit session");
+    assert_eq!(session["location"]["machine"], "remote-owner");
+    assert_eq!(session["location"]["store"], "remote-owner/default");
+    assert_eq!(session["physical_identity"]["tape_id"], tape_id);
+    assert_eq!(
+        session["physical_identity"]["file"]["machine"],
+        "remote-owner"
+    );
+    assert_eq!(
+        session["physical_identity"]["file"]["path"],
+        owner_home
+            .join(".engram/tapes")
+            .join(format!("{tape_id}.jsonl.zst"))
+            .to_str()
+            .expect("owner tape path")
+    );
+    assert_eq!(value["federation"]["coverage"], "complete");
+    assert_eq!(operation_count(&remote_operations, "lookup_anchors"), 1);
+    assert_eq!(operation_count(&remote_operations, "tape_facts"), 1);
+    assert_eq!(operation_count(&remote_operations, "locate_tapes"), 1);
+    assert_eq!(operation_count(&remote_operations, "read_file"), 0);
+}
+
 fn write_stalled_read_file_fixture(
     root: &std::path::Path,
     request_timeout_ms: u64,

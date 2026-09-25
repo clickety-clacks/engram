@@ -210,6 +210,10 @@ struct ExplainArgs {
     forensics: bool,
     #[arg(long, hide = true)]
     pretty: bool,
+    #[arg(long, value_name = "PEER")]
+    peers: Option<String>,
+    #[arg(long)]
+    require_complete: bool,
 }
 
 #[derive(Args, Debug)]
@@ -2631,6 +2635,9 @@ fn cmd_explain(
         .clone()
         .ok_or_else(|| CliError::new("invalid_explain_target", "target is required"))?;
     let target_kind = classify_explain_target(cwd, context, &[], &target, args.anchor)?;
+    if args.peers.is_some() {
+        return cmd_explain_with_peers(cwd, context, target, target_kind, args);
+    }
     let indexes = open_query_indexes(context)?;
 
     let query_anchors;
@@ -2834,6 +2841,660 @@ fn cmd_explain(
     if !dispatch_ambiguous.is_empty() {
         payload["dispatch_ambiguous"] = json!(dispatch_ambiguous);
     }
+    emit_query_result("explain", payload)
+}
+
+fn cmd_explain_with_peers(
+    cwd: &Path,
+    context: &RuntimeContext,
+    target: String,
+    target_kind: ExplainTarget,
+    args: ExplainArgs,
+) -> Result<(), CliError> {
+    let (cancelled, terminal_state) = peer_cancellation_flag()?;
+    let result = cmd_explain_with_peers_inner(
+        cwd,
+        context,
+        target,
+        target_kind,
+        args,
+        &cancelled,
+        &terminal_state,
+    );
+    finish_peer_query(result, &terminal_state, "federated explain")
+}
+
+fn cmd_explain_with_peers_inner(
+    cwd: &Path,
+    context: &RuntimeContext,
+    target: String,
+    target_kind: ExplainTarget,
+    args: ExplainArgs,
+    cancelled: &Arc<AtomicBool>,
+    terminal_state: &Arc<AtomicU8>,
+) -> Result<(), CliError> {
+    let query_deadline = Instant::now() + PEER_QUERY_TIMEOUT;
+    let home = home_dir()?;
+    let topology = load_topology(&home)
+        .map_err(|error| CliError::new("config_error", error.to_string()))?
+        .ok_or_else(|| {
+            CliError::new(
+                "topology_missing",
+                "explain --peers requires ~/.engram/topology.yml",
+            )
+        })?;
+    let selected_machines =
+        select_peers(args.peers.as_deref().unwrap_or_default(), &topology.peers)?;
+    eprintln!(
+        "topology: ~/.engram/topology.yml peers={}",
+        selected_machines.join(",")
+    );
+
+    let query_anchors = match target_kind {
+        ExplainTarget::FileRange { file, start, end } => {
+            derive_anchor_candidates(&read_file_span_variants(&cwd.join(file), start, end)?)
+        }
+        ExplainTarget::FileWhole { file } => {
+            let text = fs::read_to_string(cwd.join(file))
+                .map_err(|error| CliError::io("read_span_error", error))?;
+            derive_anchor_candidates(&[text])
+        }
+        ExplainTarget::Literal(text) => {
+            if args.anchor {
+                vec![text]
+            } else {
+                derive_anchor_candidates(&[text])
+            }
+        }
+    };
+    let indexes = open_query_indexes(context)?;
+    let traversal = ExplainTraversal {
+        min_confidence: args.min_confidence,
+        max_fanout: args.max_fanout,
+        max_edges: args.max_edges,
+        max_depth: args.depth,
+    };
+    let local_result = explain_across_indexes(&indexes, &query_anchors, traversal, args.forensics)?;
+    let local_touches = collect_touch_evidence(
+        &indexes,
+        &local_result.direct,
+        &local_result.touched_anchors,
+    )?;
+    let local_raw_sessions = build_session_windows(context, local_touches)?;
+    let (dispatch_lineage, dispatch_sessions, dispatch_unresolved, dispatch_ambiguous) =
+        collect_dispatch_upstream_sessions(context, &indexes, &local_raw_sessions)?;
+    let mut local_raw_sessions = local_raw_sessions;
+    local_raw_sessions.extend(dispatch_sessions);
+    let local_scores = collect_anchor_scores(&indexes, &query_anchors)?;
+    let mut sessions = format_sessions_for_agent(
+        context,
+        &indexes,
+        local_raw_sessions,
+        &local_scores,
+        args.grep_filter.as_deref(),
+    )?;
+    for session in &mut sessions {
+        if let Some(tape_id) = session
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+        {
+            let location = local_grep_location(context, &topology.self_label, &tape_id);
+            session["location"] = location.clone();
+            session["physical_identity"] = json!({
+                "machine": topology.self_label,
+                "store": location["store"],
+                "tape_id": tape_id,
+                "file": resolve_tape_path(context, &tape_id).map(|path| json!({
+                    "machine": topology.self_label,
+                    "path": path,
+                    "kind": "tape",
+                })),
+            });
+        }
+    }
+
+    let date_filter = DateFilter::parse(args.since.as_deref(), args.until.as_deref())?;
+    let mut sources = local_grep_source_rows(context, &topology.self_label);
+    for (machine, peer) in &topology.peers {
+        if selected_machines.iter().any(|selected| selected == machine) {
+            if peer.exports.is_empty() {
+                sources.push(json!({
+                    "store": format!("{machine}/*"),
+                    "kind": "peer",
+                    "status": "failed",
+                    "phase": "open",
+                    "error": {"code": "peer_exports_missing", "message": "peer declares no queryable exports"},
+                }));
+            }
+        } else if peer.exports.is_empty() {
+            sources.push(json!({"store": format!("{machine}/*"), "status": "not_selected"}));
+        } else {
+            for export in &peer.exports {
+                sources.push(
+                    json!({"store": format!("{machine}/{export}"), "status": "not_selected"}),
+                );
+            }
+        }
+    }
+
+    let mut connections =
+        connect_peers_concurrently(&selected_machines, &topology, query_deadline, cancelled);
+    let mut owners = HashMap::<String, RemoteOwner>::new();
+    let mut lookup_jobs = Vec::new();
+    let mut any_peer_failure = false;
+    for machine in &selected_machines {
+        let peer = topology.peers.get(machine).expect("selected peer exists");
+        let connection = connections.remove(machine).unwrap_or_else(|| {
+            Err(PeerFailure {
+                code: "unavailable".into(),
+                message: "peer connection worker returned no result".into(),
+            })
+        });
+        match connection {
+            Err(failure) => {
+                any_peer_failure = true;
+                for export in &peer.exports {
+                    sources.push(json!({
+                        "store": format!("{machine}/{export}"),
+                        "kind": "peer",
+                        "status": peer_failure_status(&failure.code),
+                        "phase": "open",
+                        "error": {"code": failure.code, "message": failure.message},
+                    }));
+                }
+            }
+            Ok(owner) => {
+                let mut active_exports = Vec::new();
+                for export in &peer.exports {
+                    match owner.exports.get(export) {
+                        Some(Ok(opened)) => {
+                            sources.push(json!({
+                                "store": format!("{machine}/{export}"),
+                                "db": opened.db,
+                                "kind": "peer",
+                                "status": "ok",
+                                "snapshot_at": opened.snapshot_at,
+                                "build": owner.build,
+                                "semantics": owner.query_semantics,
+                            }));
+                            active_exports.push(export.clone());
+                        }
+                        Some(Err(failure)) => {
+                            any_peer_failure = true;
+                            sources.push(json!({
+                                "store": format!("{machine}/{export}"),
+                                "kind": "peer",
+                                "status": peer_failure_status(&failure.code),
+                                "phase": "open",
+                                "error": {"code": failure.code, "message": failure.message},
+                            }));
+                        }
+                        None => {
+                            any_peer_failure = true;
+                            sources.push(json!({
+                                "store": format!("{machine}/{export}"),
+                                "kind": "peer",
+                                "status": "failed",
+                                "phase": "open",
+                                "error": {"code": "protocol_error", "message": "peer omitted configured export"},
+                            }));
+                        }
+                    }
+                }
+                let requests = active_exports
+                    .iter()
+                    .map(|export| {
+                        PeerRequest::new(
+                            "lookup_anchors",
+                            vec![export.clone()],
+                            json!({"anchors": query_anchors, "include_deleted": args.include_deleted}),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if !requests.is_empty() {
+                    lookup_jobs.push(PeerRoundJob {
+                        machine: machine.clone(),
+                        owner,
+                        exports: active_exports,
+                        requests,
+                    });
+                }
+            }
+        }
+    }
+
+    let mut remote_fragments = std::collections::BTreeMap::<(String, String), Vec<Value>>::new();
+    let mut remote_tombstones = Vec::new();
+    let mut remote_facts = std::collections::BTreeMap::<(String, String), Value>::new();
+    let mut remote_locations = std::collections::BTreeMap::<(String, String), Value>::new();
+    let mut facts_by_store =
+        std::collections::BTreeMap::<String, std::collections::BTreeMap<String, Vec<Value>>>::new();
+
+    for result in run_peer_rounds_concurrently(
+        lookup_jobs,
+        query_deadline,
+        cancelled,
+        configured_peer_concurrency(&topology),
+    ) {
+        if let Some(owner) = result.owner {
+            owners.insert(result.machine.clone(), owner);
+        }
+        for (index, outcome) in result.outcomes.into_iter().enumerate() {
+            let export = result.exports.get(index).expect("request/export align");
+            let store = format!("{}/{export}", result.machine);
+            match outcome {
+                Err(failure) => {
+                    any_peer_failure = true;
+                    mark_source_phase(
+                        &mut sources,
+                        &store,
+                        "lookup_anchors",
+                        &failure.code,
+                        &failure.message,
+                    );
+                }
+                Ok(response) => {
+                    for row in response.data {
+                        if row.get("store").and_then(Value::as_str) != Some(store.as_str()) {
+                            any_peer_failure = true;
+                            mark_source_phase(
+                                &mut sources,
+                                &store,
+                                "lookup_anchors",
+                                "protocol_error",
+                                "peer returned an anchor record for a different store",
+                            );
+                            continue;
+                        }
+                        match row.get("type").and_then(Value::as_str) {
+                            Some("anchor_result") => {}
+                            Some("fragment") => {
+                                let Some(tape_id) = row.get("tape_id").and_then(Value::as_str)
+                                else {
+                                    any_peer_failure = true;
+                                    mark_source_phase(
+                                        &mut sources,
+                                        &store,
+                                        "lookup_anchors",
+                                        "protocol_error",
+                                        "peer fragment omitted tape_id",
+                                    );
+                                    continue;
+                                };
+                                let Some(offset) = row.get("event_offset").and_then(Value::as_u64)
+                                else {
+                                    any_peer_failure = true;
+                                    mark_source_phase(
+                                        &mut sources,
+                                        &store,
+                                        "lookup_anchors",
+                                        "protocol_error",
+                                        "peer fragment omitted event_offset",
+                                    );
+                                    continue;
+                                };
+                                facts_by_store
+                                    .entry(store.clone())
+                                    .or_default()
+                                    .entry(tape_id.to_string())
+                                    .or_default()
+                                    .push(json!({
+                                        "tape_id": tape_id,
+                                        "edit_offsets": if row.get("kind").and_then(Value::as_str) == Some("edit") { json!([offset]) } else { json!([]) },
+                                        "anchor_offsets": [offset],
+                                        "grep_filter": args.grep_filter,
+                                        "window_lines": context.peek_default_lines.max(1),
+                                        "include_digest": false,
+                                    }));
+                                remote_fragments
+                                    .entry((store.clone(), tape_id.to_string()))
+                                    .or_default()
+                                    .push(row);
+                            }
+                            Some("tombstone") => remote_tombstones.push(row),
+                            _ => {
+                                any_peer_failure = true;
+                                mark_source_phase(
+                                    &mut sources,
+                                    &store,
+                                    "lookup_anchors",
+                                    "protocol_error",
+                                    "peer returned an unknown anchor record type",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut facts_jobs = Vec::new();
+    for (machine, owner) in owners {
+        let mut requests = Vec::new();
+        let mut exports = Vec::new();
+        for (store, tapes) in &facts_by_store {
+            let Some((store_machine, export)) = store.split_once('/') else {
+                continue;
+            };
+            if store_machine != machine {
+                continue;
+            }
+            let Some(Ok(opened)) = owner.exports.get(export) else {
+                continue;
+            };
+            let mut items = Vec::new();
+            let mut tape_ids = Vec::new();
+            for (tape_id, tape_items) in tapes {
+                let fragments = remote_fragments
+                    .get(&(store.clone(), tape_id.clone()))
+                    .cloned()
+                    .unwrap_or_default();
+                let mut offsets = fragments
+                    .iter()
+                    .filter_map(|fragment| fragment.get("event_offset").and_then(Value::as_u64))
+                    .collect::<Vec<_>>();
+                offsets.sort_unstable();
+                offsets.dedup();
+                let mut edit_offsets = fragments
+                    .iter()
+                    .filter(|fragment| fragment.get("kind").and_then(Value::as_str) == Some("edit"))
+                    .filter_map(|fragment| fragment.get("event_offset").and_then(Value::as_u64))
+                    .collect::<Vec<_>>();
+                edit_offsets.sort_unstable();
+                edit_offsets.dedup();
+                items.push(json!({
+                    "tape_id": tape_id,
+                    "edit_offsets": edit_offsets,
+                    "anchor_offsets": offsets,
+                    "grep_filter": args.grep_filter,
+                    "window_lines": context.peek_default_lines.max(1),
+                    "include_digest": false,
+                }));
+                tape_ids.push(tape_id.clone());
+                let _ = tape_items;
+            }
+            for chunk in items.chunks(MAX_BATCH_ITEMS) {
+                requests.push(PeerRequest::new(
+                    "tape_facts",
+                    vec![export.to_string()],
+                    json!({"items": chunk}),
+                ));
+                exports.push(export.to_string());
+            }
+            let tape_ids = tape_ids
+                .chunks(MAX_BATCH_ITEMS)
+                .map(|chunk| chunk.to_vec())
+                .collect::<Vec<_>>();
+            for chunk in tape_ids {
+                requests.push(PeerRequest::new(
+                    "locate_tapes",
+                    vec![export.to_string()],
+                    json!({"tape_ids": chunk}),
+                ));
+                exports.push(export.to_string());
+            }
+            let _ = opened;
+        }
+        if !requests.is_empty() {
+            facts_jobs.push(PeerRoundJob {
+                machine,
+                owner,
+                exports,
+                requests,
+            });
+        }
+    }
+
+    for result in run_peer_rounds_concurrently(
+        facts_jobs,
+        query_deadline,
+        cancelled,
+        configured_peer_concurrency(&topology),
+    ) {
+        for (index, outcome) in result.outcomes.into_iter().enumerate() {
+            let export = result.exports.get(index).expect("request/export align");
+            let store = format!("{}/{export}", result.machine);
+            match outcome {
+                Err(failure) => {
+                    any_peer_failure = true;
+                    mark_source_phase(
+                        &mut sources,
+                        &store,
+                        "tape_facts",
+                        &failure.code,
+                        &failure.message,
+                    );
+                }
+                Ok(response) => {
+                    for row in response.data {
+                        if row.get("store").and_then(Value::as_str) != Some(store.as_str()) {
+                            any_peer_failure = true;
+                            mark_source_phase(
+                                &mut sources,
+                                &store,
+                                "tape_facts",
+                                "protocol_error",
+                                "peer returned tape metadata for a different store",
+                            );
+                            continue;
+                        }
+                        if row.get("type").and_then(Value::as_str) == Some("tape_facts") {
+                            let Some(tape_id) = row.get("tape_id").and_then(Value::as_str) else {
+                                any_peer_failure = true;
+                                mark_source_phase(
+                                    &mut sources,
+                                    &store,
+                                    "tape_facts",
+                                    "protocol_error",
+                                    "tape_facts response omitted tape_id",
+                                );
+                                continue;
+                            };
+                            if row.get("status").and_then(Value::as_str) != Some("ok") {
+                                any_peer_failure = true;
+                                let code = row
+                                    .get("error")
+                                    .and_then(|error| error.get("code"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("tape_unavailable");
+                                let message = row
+                                    .get("error")
+                                    .and_then(|error| error.get("message"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("owner could not read tape facts");
+                                mark_source_phase(
+                                    &mut sources,
+                                    &store,
+                                    "tape_facts",
+                                    code,
+                                    message,
+                                );
+                            }
+                            remote_facts.insert((store.clone(), tape_id.to_string()), row);
+                        } else if let Some(tape_id) = row.get("tape_id").and_then(Value::as_str) {
+                            if let Some(file) = row.get("file") {
+                                remote_locations
+                                    .insert((store.clone(), tape_id.to_string()), file.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut remote_sessions = Vec::new();
+    let mut remote_scores = HashMap::<String, f32>::new();
+    for ((store, tape_id), fragments) in &remote_fragments {
+        let fact = remote_facts.get(&(store.clone(), tape_id.clone()));
+        let summary = fact
+            .and_then(|row| row.get("summary"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        if args.grep_filter.is_some()
+            && summary
+                .get("grep_filter_hits_window")
+                .and_then(Value::as_bool)
+                == Some(false)
+        {
+            continue;
+        }
+        let distinct_anchors = fragments
+            .iter()
+            .filter_map(|fragment| fragment.get("anchor").and_then(Value::as_str))
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let score = if query_anchors.is_empty() {
+            0.0
+        } else {
+            distinct_anchors as f32 / query_anchors.len() as f32
+        };
+        let key = format!("{store}/{tape_id}");
+        remote_scores.insert(key.clone(), score);
+        let touches = fragments
+            .iter()
+            .map(|fragment| {
+                json!({
+                    "event_offset": fragment["event_offset"],
+                    "kind": fragment["kind"],
+                    "file_path": fragment["file_path"],
+                    "timestamp": fragment["timestamp"],
+                })
+            })
+            .collect::<Vec<_>>();
+        let (machine, export) = store
+            .split_once('/')
+            .unwrap_or((&topology.self_label, "local"));
+        let owner_db = topology
+            .peers
+            .get(machine)
+            .and_then(|_| {
+                sources.iter().find(|source| {
+                    source.get("store").and_then(Value::as_str) == Some(store.as_str())
+                })
+            })
+            .and_then(|source| source.get("db"))
+            .cloned();
+        remote_sessions.push(json!({
+            "session_id": tape_id,
+            "tape_id": tape_id,
+            "store": store,
+            "location": {"machine": machine, "store": store, "export": export},
+            "physical_identity": {
+                "machine": machine,
+                "store": store,
+                "tape_id": tape_id,
+                "db": owner_db,
+                "file": remote_locations.get(&(store.clone(), tape_id.clone())),
+            },
+            "timestamp": summary.get("latest_timestamp").cloned().unwrap_or_else(|| json!("")),
+            "window_start": summary.get("window_start").cloned().unwrap_or_else(|| json!(0)),
+            "window_end": summary.get("window_end").cloned().unwrap_or_else(|| json!(0)),
+            "total_lines": summary.get("total_lines").cloned().unwrap_or_else(|| json!(0)),
+            "confidence": score,
+            "refs_up": 0,
+            "refs_down": 0,
+            "files_touched": summary.get("files_touched").cloned().unwrap_or_else(|| json!([])),
+            "touches": touches,
+            "tape_facts": fact.cloned().unwrap_or(Value::Null),
+        }));
+    }
+    sessions.extend(remote_sessions);
+    sessions.retain(|session| session_matches_date_filter(session, &date_filter));
+    annotate_chain_fields(&mut sessions, &dispatch_lineage);
+    sessions.sort_by(compare_explain_sessions);
+
+    let lineage = local_result
+        .lineage
+        .iter()
+        .map(edge_to_json)
+        .collect::<Vec<_>>();
+    let mut tombstones = Vec::new();
+    if args.include_deleted {
+        let mut seen = std::collections::HashSet::new();
+        for tombstone in remote_tombstones {
+            let key = (
+                tombstone
+                    .get("store")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                tombstone
+                    .get("tape_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                tombstone
+                    .get("event_offset")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+                tombstone
+                    .get("file_path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            );
+            if seen.insert(key) {
+                tombstones.push(tombstone);
+            }
+        }
+    }
+    let (sessions, returned, total, time_range, truncated) = apply_session_truncation(
+        sessions,
+        args.limit,
+        args.offset,
+        context.explain_default_limit,
+    );
+    if sessions.is_empty() && tombstones.is_empty() && lineage.is_empty() {
+        return Err(CliError::new("no_results", target));
+    }
+    if any_peer_failure && args.require_complete {
+        return Err(CliError::new(
+            "incomplete_results",
+            "one or more selected explain sources failed; inspect the source phase without --require-complete",
+        ));
+    }
+    let complete = !any_peer_failure;
+    let chain_metadata = build_chain_metadata(&sessions);
+    let mut payload = json!({
+        "query": {
+            "command": "explain",
+            "target": target,
+            "anchors": query_anchors,
+            "grep_filter": args.grep_filter,
+            "limit": args.limit,
+            "offset": args.offset,
+            "min_confidence": args.min_confidence,
+            "since": args.since,
+            "until": args.until,
+            "count": args.count,
+            "max_fanout": args.max_fanout,
+            "max_edges": args.max_edges,
+            "depth": args.depth,
+            "forensics": args.forensics,
+            "include_deleted": args.include_deleted,
+            "peers": args.peers,
+        },
+        "sessions": sessions,
+        "chains": chain_metadata,
+        "lineage": lineage,
+        "dispatch_lineage": dispatch_lineage,
+        "dispatch_unresolved": dispatch_unresolved,
+        "dispatch_ambiguous": dispatch_ambiguous,
+        "tombstones": tombstones,
+        "stores_queried": indexes.len() + sources.iter().filter(|source| source.get("kind").and_then(Value::as_str) == Some("peer") && source.get("status").and_then(Value::as_str) == Some("ok")).count(),
+        "returned": returned,
+        "total": total,
+        "time_range": time_range,
+        "truncated": truncated,
+        "federation": {
+            "coverage": if complete { "complete" } else { "partial" },
+            "sources": sources,
+        },
+    });
+    let _ = (&mut payload, &remote_scores, terminal_state);
     emit_query_result("explain", payload)
 }
 
