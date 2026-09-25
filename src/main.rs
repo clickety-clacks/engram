@@ -1771,7 +1771,7 @@ fn cmd_show_peers_inner(
                     vec![export],
                     json!({
                         "address": locator.address,
-                        "max_bytes": locator.compressed_limit,
+                        "max_bytes": locator.file_bytes.max(1),
                     }),
                 ),
                 "read_file",
@@ -2021,7 +2021,7 @@ fn cmd_show_remote_inner(
             vec![export.to_string()],
             json!({
                 "address": file,
-                "max_bytes": compressed_limit,
+                "max_bytes": file_bytes.max(1),
             }),
         ),
         "read_file",

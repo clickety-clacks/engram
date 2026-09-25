@@ -517,12 +517,12 @@ impl PeerClient {
         }
         let mut ids = Vec::with_capacity(requests.len());
         let mut frames = Vec::with_capacity(requests.len());
-        let mut file_requests = HashSet::new();
+        let mut file_requests = HashMap::new();
         for request in requests {
             let id = self.next_id;
             self.next_id = self.next_id.saturating_add(1);
             if request.op == "read_file" {
-                file_requests.insert(id);
+                file_requests.insert(id, read_file_response_byte_limit(request));
             }
             let frame = json!({
                 "v": PROTOCOL_VERSION,
@@ -563,6 +563,7 @@ impl PeerClient {
         let mut pending = ids.iter().copied().collect::<HashSet<_>>();
         let mut data = HashMap::<u64, Vec<Value>>::new();
         let mut outcomes = HashMap::<u64, Result<PeerResponse, PeerFailure>>::new();
+        let mut file_response_bytes = HashMap::<u64, usize>::new();
         while !pending.is_empty() {
             if let Some(cancelled) = cancelled
                 && cancelled.load(std::sync::atomic::Ordering::SeqCst)
@@ -610,7 +611,19 @@ impl PeerClient {
                         );
                         break;
                     }
-                    if !file_requests.contains(&id) {
+                    if let Some(limit) = file_requests.get(&id) {
+                        let used = file_response_bytes.entry(id).or_default();
+                        *used = used.saturating_add(frame_bytes);
+                        if *used > *limit {
+                            fail_pending(
+                                &mut pending,
+                                &mut outcomes,
+                                "budget_exceeded",
+                                "peer read_file response exceeds the requested compressed-byte budget",
+                            );
+                            break;
+                        }
+                    } else {
                         self.response_bytes = self.response_bytes.saturating_add(frame_bytes);
                         if self.response_bytes > MAX_NON_FILE_RESPONSE_BYTES {
                             fail_pending(
@@ -764,6 +777,22 @@ fn fail_pending(
     }
 }
 
+fn read_file_response_byte_limit(request: &PeerRequest) -> usize {
+    let compressed_limit = request
+        .args
+        .get("max_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_READ_FILE_COMPRESSED_BYTES)
+        .min(DEFAULT_READ_FILE_COMPRESSED_BYTES);
+    let compressed_limit = usize::try_from(compressed_limit).unwrap_or(usize::MAX);
+    // Base64 expands compressed bytes by at most 4/3. One maximum frame
+    // allows for JSON framing and per-chunk overhead in the owner's stream.
+    compressed_limit
+        .div_ceil(3)
+        .saturating_mul(4)
+        .saturating_add(MAX_FRAME_BYTES)
+}
+
 fn read_responses(stdout: ChildStdout, sender: Sender<ReaderMessage>) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut input = BufReader::new(stdout);
@@ -888,6 +917,36 @@ mod tests {
             assert_eq!(response.data[0]["seen"], index as u64 + 1);
             assert_eq!(response.stats["done"], true);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peer_round_stops_buffering_over_budget_read_file_responses() {
+        let peer = TopologyPeer {
+            ssh: None,
+            command: Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                r#"while IFS= read -r request; do id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); payload=$(printf '%0750000d' 0); printf '{"id":%s,"data":{"padding":"%s"}}\n' "$id" "$payload"; printf '{"id":%s,"data":{"padding":"%s"}}\n' "$id" "$payload"; done"#.into(),
+            ]),
+            engram: "/unused".into(),
+            exports: vec![],
+        };
+        let mut client = PeerClient::spawn(&peer).expect("spawn oversized file peer");
+        let outcomes = client.round(
+            &[PeerRequest::new(
+                "read_file",
+                vec!["default".into()],
+                json!({"max_bytes": 1}),
+            )],
+            Duration::from_secs(5),
+        );
+
+        assert_eq!(outcomes.len(), 1);
+        let failure = outcomes[0]
+            .as_ref()
+            .expect_err("oversized response should be refused before terminal frame");
+        assert_eq!(failure.code, "budget_exceeded");
     }
 
     #[cfg(unix)]
