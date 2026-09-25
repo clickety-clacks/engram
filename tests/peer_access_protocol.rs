@@ -1737,7 +1737,10 @@ fn topology_status_reports_handshake_and_unselected_peer_without_starting_it() {
     assert_eq!(remote["handshake"]["self"], "remote");
     assert_eq!(remote["handshake"]["protocol"], 1);
     assert_eq!(remote["handshake"]["schema"], SCHEMA_VERSION);
-    assert_eq!(remote["handshake"]["query_semantics"], QUERY_SEMANTICS_VERSION);
+    assert_eq!(
+        remote["handshake"]["query_semantics"],
+        QUERY_SEMANTICS_VERSION
+    );
     assert_eq!(remote["exports"][0]["store"], "remote/default");
     assert_eq!(remote["exports"][0]["status"], "ok");
     let idle = peers
@@ -1765,7 +1768,7 @@ fn topology_status_check_exports_counts_indexed_tapes_without_regular_files() {
         .ingest_tape_events("missing", &[], 0.5)
         .expect("index missing tape");
     drop(writer);
-    let tape = zstd::stream::encode_all(b"", 0).expect("compress empty tape");
+    let tape = zstd::stream::encode_all(&b""[..], 0).expect("compress empty tape");
     std::fs::write(tape_dir.join("present.jsonl.zst"), tape).expect("write present tape");
     std::fs::write(
         caller_engram.join("topology.yml"),

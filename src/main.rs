@@ -15,16 +15,17 @@ use engram::access::client::{
     PeerRequest, PeerResponse, RemoteOwner, decode_base64_chunk,
 };
 use engram::config::{
-    EffectiveWatchSource, Topology, TopologyPeer, ensure_user_config, load_effective_config_read_only,
-    load_effective_config_with_override, load_frozen_stores, load_topology,
+    EffectiveWatchSource, Topology, TopologyPeer, ensure_user_config,
+    load_effective_config_read_only, load_effective_config_with_override, load_frozen_stores,
+    load_topology,
 };
 use engram::dispatch::{
     collect_dispatch_upstream_sessions, extract_dispatch_links_from_transcript,
 };
 #[cfg(test)]
 use engram::index::DispatchDirection;
-use engram::index::{ReaderMode, SqliteIndex};
 use engram::index::lineage::LINK_THRESHOLD_DEFAULT;
+use engram::index::{ReaderMode, SqliteIndex};
 use engram::ingest::{extract_meta, git_head, now_iso8601, record_transcript, run_ingest};
 use engram::query::explain::ExplainTraversal;
 #[cfg(test)]
@@ -1510,12 +1511,8 @@ fn cmd_topology_status(args: TopologyStatusArgs) -> Result<(), CliError> {
     } else {
         peer_cancellation_flag()?
     };
-    let mut connections = connect_topology_status_peers(
-        &selected,
-        &topology,
-        query_deadline,
-        &cancelled,
-    );
+    let mut connections =
+        connect_topology_status_peers(&selected, &topology, query_deadline, &cancelled);
 
     let mut peer_rows = Vec::with_capacity(topology.peers.len());
     let mut has_failures = false;
@@ -1632,24 +1629,22 @@ fn check_local_export_coverage(topology: &Topology) -> Vec<Value> {
     topology
         .exports
         .iter()
-        .map(|(name, export)| {
-            match local_export_tape_coverage(export) {
-                Ok((indexed, missing)) => json!({
-                    "store": format!("{}/{name}", topology.self_label),
-                    "status": "ok",
-                    "db": export.db,
-                    "tape_dirs": export.tape_dirs,
-                    "indexed_tape_count": indexed,
-                    "indexed_tapes_without_file": missing,
-                }),
-                Err((code, message)) => json!({
-                    "store": format!("{}/{name}", topology.self_label),
-                    "status": if code == "incompatible" { "incompatible" } else { "unavailable" },
-                    "db": export.db,
-                    "tape_dirs": export.tape_dirs,
-                    "error": {"code": code, "message": message},
-                }),
-            }
+        .map(|(name, export)| match local_export_tape_coverage(export) {
+            Ok((indexed, missing)) => json!({
+                "store": format!("{}/{name}", topology.self_label),
+                "status": "ok",
+                "db": export.db,
+                "tape_dirs": export.tape_dirs,
+                "indexed_tape_count": indexed,
+                "indexed_tapes_without_file": missing,
+            }),
+            Err((code, message)) => json!({
+                "store": format!("{}/{name}", topology.self_label),
+                "status": if code == "incompatible" { "incompatible" } else { "unavailable" },
+                "db": export.db,
+                "tape_dirs": export.tape_dirs,
+                "error": {"code": code, "message": message},
+            }),
         })
         .collect()
 }
@@ -1667,7 +1662,10 @@ fn local_export_tape_coverage(
         } else {
             (
                 "reader_unavailable".to_string(),
-                format!("cannot open Live reader for {}: {error}", export.db.display()),
+                format!(
+                    "cannot open Live reader for {}: {error}",
+                    export.db.display()
+                ),
             )
         };
         (code, message)
@@ -1675,13 +1673,19 @@ fn local_export_tape_coverage(
     index.pin_snapshot().map_err(|error| {
         (
             "reader_unavailable".to_string(),
-            format!("cannot pin Live reader snapshot for {}: {error}", export.db.display()),
+            format!(
+                "cannot pin Live reader snapshot for {}: {error}",
+                export.db.display()
+            ),
         )
     })?;
     let tape_ids = index.tape_ids().map_err(|error| {
         (
             "reader_unavailable".to_string(),
-            format!("cannot enumerate indexed tapes in {}: {error}", export.db.display()),
+            format!(
+                "cannot enumerate indexed tapes in {}: {error}",
+                export.db.display()
+            ),
         )
     })?;
     let mut missing = 0usize;
@@ -1705,7 +1709,10 @@ fn local_export_tape_coverage(
                 Err(error) => {
                     return Err((
                         "tape_inventory_error".to_string(),
-                        format!("cannot inspect tape {tape_id} in {}: {error}", directory.display()),
+                        format!(
+                            "cannot inspect tape {tape_id} in {}: {error}",
+                            directory.display()
+                        ),
                     ));
                 }
             }
@@ -2800,11 +2807,7 @@ fn connect_topology_status_peers(
                     let cancelled = Arc::clone(cancelled);
                     scope.spawn(move || {
                         let result = RemoteOwner::connect_cancellable(
-                            &machine,
-                            &caller,
-                            &peer,
-                            timeout,
-                            &cancelled,
+                            &machine, &caller, &peer, timeout, &cancelled,
                         );
                         (machine, result)
                     })
