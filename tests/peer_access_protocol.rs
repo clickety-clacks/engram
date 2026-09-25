@@ -2176,6 +2176,24 @@ fn peer_tape_facts_verifies_and_returns_native_recovery_binding() {
         facts["edit_offset_to_turn"][0]["recovered_source_offset"],
         3
     );
+
+    let missing_point = owner
+        .round(
+            &[PeerRequest::new(
+                "tape_facts",
+                vec!["default".into()],
+                json!({
+                    "items": [{"tape_id": "legacy-segment", "edit_offsets": [1]}]
+                }),
+            )],
+            Duration::from_secs(5),
+        )
+        .into_iter()
+        .next()
+        .expect("recovery integrity response")
+        .expect_err("missing recovery edit offset must be fatal");
+    assert_eq!(missing_point.code, "native_recovery_error");
+    assert!(missing_point.message.contains("missing from recovery points"));
 }
 
 #[test]

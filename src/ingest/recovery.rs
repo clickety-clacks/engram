@@ -35,8 +35,6 @@ fn error(message: impl Into<String>) -> CliError {
     CliError::new("native_recovery_error", message.into())
 }
 
-const MAX_RECOVERY_LOCATOR_BYTES: u64 = 1024 * 1024;
-
 fn valid_tape_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 255
@@ -46,14 +44,16 @@ fn valid_tape_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
 }
 
-fn read_locator(path: &Path) -> Result<Locator, CliError> {
+fn read_locator(path: &Path, max_bytes: u64) -> Result<Locator, CliError> {
     let metadata =
         fs::symlink_metadata(path).map_err(|e| CliError::io("native_recovery_error", e))?;
     if !metadata.file_type().is_file() {
         return Err(error("recovery locator is not a regular file"));
     }
-    if metadata.len() > MAX_RECOVERY_LOCATOR_BYTES {
-        return Err(error("recovery locator exceeds the 1 MiB limit"));
+    if metadata.len() > max_bytes {
+        return Err(error(format!(
+            "recovery locator exceeds the {max_bytes} byte limit"
+        )));
     }
     let mut options = OpenOptions::new();
     options.read(true);
@@ -66,11 +66,13 @@ fn read_locator(path: &Path) -> Result<Locator, CliError> {
         .open(path)
         .map_err(|e| CliError::io("native_recovery_error", e))?;
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(MAX_RECOVERY_LOCATOR_BYTES.saturating_add(1))
+    file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|e| CliError::io("native_recovery_error", e))?;
-    if bytes.len() as u64 > MAX_RECOVERY_LOCATOR_BYTES {
-        return Err(error("recovery locator exceeds the 1 MiB limit"));
+    if bytes.len() as u64 > max_bytes {
+        return Err(error(format!(
+            "recovery locator exceeds the {max_bytes} byte limit"
+        )));
     }
     serde_json::from_slice(&bytes).map_err(|e| error(format!("recovery locator is invalid: {e}")))
 }
@@ -355,7 +357,12 @@ impl QueryRecovery {
         context: &RuntimeContext,
         tape: &str,
     ) -> Result<Option<&Locator>, CliError> {
-        self.lookup_with_reader(&context.tape_lookup_dirs, tape, read_tape_content)
+        self.lookup_with_reader(
+            &context.tape_lookup_dirs,
+            tape,
+            u64::MAX,
+            read_tape_content,
+        )
     }
 
     /// Resolve and verify one tape's recovery binding with an owner-selected
@@ -365,6 +372,7 @@ impl QueryRecovery {
         &mut self,
         tape_lookup_dirs: &[PathBuf],
         tape: &str,
+        max_locator_bytes: u64,
         mut read_tape: impl FnMut(&Path) -> Result<String, CliError>,
     ) -> Result<Option<&Locator>, CliError> {
         if !self.locators.contains_key(tape) {
@@ -378,7 +386,7 @@ impl QueryRecovery {
                         return Err(CliError::io("native_recovery_error", error));
                     }
                 }
-                let locator = read_locator(&path)?;
+                let locator = read_locator(&path, max_locator_bytes)?;
                 if locator.recovered.tape_id != tape {
                     return Err(error("recovery locator tape mismatch"));
                 }

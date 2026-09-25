@@ -734,17 +734,24 @@ impl PeerSession {
                 }
             };
 
-            let locator =
-                recovery.lookup_with_reader(&export.config.tape_dirs, tape_id, |context_path| {
-                    let Some(size) = self.memoized_file_size(context_path) else {
-                        return Err(crate::CliError::new(
-                            "tape_unavailable",
-                            format!("recovery context is missing: {}", context_path.display()),
-                        ));
-                    };
-                    read_tape_for_query(context_path, size, &self.topology.limits)
-                        .map_err(|error| crate::CliError::new(error.code, error.message))
-                });
+            let locator = recovery.lookup_with_reader(
+                    &export.config.tape_dirs,
+                    tape_id,
+                    response_limit,
+                    |context_path| {
+                        let Some(size) = self.memoized_file_size(context_path) else {
+                            return Err(crate::CliError::new(
+                                "tape_unavailable",
+                                format!(
+                                    "recovery context is missing: {}",
+                                    context_path.display()
+                                ),
+                            ));
+                        };
+                        read_tape_for_query(context_path, size, &self.topology.limits)
+                            .map_err(|error| crate::CliError::new(error.code, error.message))
+                    },
+                );
             let locator = match locator {
                 Ok(locator) => locator,
                 Err(error) => {
