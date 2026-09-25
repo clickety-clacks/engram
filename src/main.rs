@@ -15,7 +15,6 @@ use engram::access::client::{
     PeerRequest, PeerResponse, RemoteOwner, decode_base64_chunk,
 };
 use engram::access::peer::MAX_BATCH_ITEMS;
-use engram::access::peer::MAX_BATCH_ITEMS;
 use engram::config::{
     EffectiveWatchSource, Topology, TopologyPeer, ensure_user_config,
     load_effective_config_read_only, load_effective_config_with_override, load_frozen_stores,
@@ -1244,7 +1243,7 @@ fn cmd_show_peers_inner(
 
     let mut source_rows = local_grep_source_rows(context, &topology.self_label);
     let mut any_source_failure = false;
-    let mut first_content_error: Option<(String, String)> = None;
+    let mut first_content_error: Option<(&'static str, String)> = None;
     let mut candidates = Vec::new();
     if let Some(path) = resolve_tape_path(context, tape_id) {
         let location = local_grep_location(context, &topology.self_label, tape_id);
@@ -1279,7 +1278,7 @@ fn cmd_show_peers_inner(
                         &message,
                     );
                     any_source_failure = true;
-                    first_content_error.get_or_insert(("id_mismatch".into(), message));
+                    first_content_error.get_or_insert(("id_mismatch", message));
                 } else {
                     candidates.push(ShowCandidate {
                         content,
@@ -1303,7 +1302,7 @@ fn cmd_show_peers_inner(
                     &error.message,
                 );
                 any_source_failure = true;
-                first_content_error.get_or_insert((error.code.into(), error.message));
+                first_content_error.get_or_insert((error.code, error.message));
             }
         }
     }
@@ -1720,7 +1719,7 @@ fn cmd_show_peers_inner(
                 }),
                 Err(error) => {
                     if first_content_error.is_none() {
-                        first_content_error = Some((error.code.into(), error.message.clone()));
+                        first_content_error = Some((error.code, error.message.clone()));
                     }
                     mark_source_phase(
                         &mut source_rows,
