@@ -1936,9 +1936,13 @@ fn cmd_grep_with_peer(
                         source.get("store").and_then(Value::as_str) == Some(store_name.as_str())
                     }) {
                         source["grep_scan"] = json!({
-                            "total": total,
-                            "returned": store_records.len(),
-                            "time_range": store_time_range,
+                        "total": total,
+                        "returned": store_records.len(),
+                        "time_range": response
+                            .stats
+                            .get("time_range")
+                            .cloned()
+                            .unwrap_or(Value::Null),
                             "truncated": response
                                 .stats
                                 .get("truncated")
