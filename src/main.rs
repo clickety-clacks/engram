@@ -20,13 +20,16 @@ use engram::config::{
     load_effective_config_read_only, load_effective_config_with_override, load_frozen_stores,
     load_topology,
 };
-use engram::dispatch::{
-    collect_dispatch_upstream_sessions, extract_dispatch_links_from_transcript,
+use engram::dispatch::federated::{
+    Direction as FederatedDispatchDirection, DispatchRow as FederatedDispatchRow,
+    History as FederatedDispatchHistory,
 };
-#[cfg(test)]
-use engram::index::DispatchDirection;
+use engram::dispatch::{
+    build_dispatch_session_for_link, collect_dispatch_upstream_sessions,
+    extract_dispatch_links_from_transcript,
+};
 use engram::index::lineage::LINK_THRESHOLD_DEFAULT;
-use engram::index::{ReaderMode, SqliteIndex};
+use engram::index::{DispatchDirection, ReaderMode, SqliteIndex};
 use engram::ingest::{extract_meta, git_head, now_iso8601, record_transcript, run_ingest};
 use engram::query::explain::ExplainTraversal;
 #[cfg(test)]
@@ -75,6 +78,1950 @@ struct PeerRoundResult {
     owner: Option<RemoteOwner>,
     exports: Vec<String>,
     outcomes: Vec<Result<PeerResponse, PeerFailure>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct FederatedExplainAnchor {
+    anchor: String,
+    store_scope: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct FederatedExplainEdge {
+    key: String,
+    from: FederatedExplainAnchor,
+    to: FederatedExplainAnchor,
+    row: Value,
+    stores: std::collections::BTreeSet<String>,
+}
+
+fn federated_anchor(anchor: &str, store: &str) -> FederatedExplainAnchor {
+    FederatedExplainAnchor {
+        anchor: anchor.to_string(),
+        store_scope: anchor.starts_with("span:").then(|| store.to_string()),
+    }
+}
+
+fn federated_anchor_applies(anchor: &FederatedExplainAnchor, store: &str) -> bool {
+    anchor
+        .store_scope
+        .as_deref()
+        .is_none_or(|scope| scope == store)
+}
+
+fn federated_edge_candidate(store: &str, mut row: Value) -> Option<FederatedExplainEdge> {
+    let from_anchor = row.get("from_anchor")?.as_str()?;
+    let to_anchor = row.get("to_anchor")?.as_str()?;
+    let from = federated_anchor(from_anchor, store);
+    let to = federated_anchor(to_anchor, store);
+    let key = serde_json::to_string(&json!([
+        from.anchor,
+        from.store_scope,
+        to.anchor,
+        to.store_scope,
+        row.get("confidence"),
+        row.get("location_delta"),
+        row.get("cardinality"),
+        row.get("agent_link"),
+        row.get("note"),
+        row.get("stored_class"),
+    ]))
+    .ok()?;
+    row["store"] = json!(store);
+    Some(FederatedExplainEdge {
+        key,
+        from,
+        to,
+        row,
+        stores: std::collections::BTreeSet::from([store.to_string()]),
+    })
+}
+
+fn compare_federated_edges(
+    a: &FederatedExplainEdge,
+    b: &FederatedExplainEdge,
+) -> std::cmp::Ordering {
+    let a_confidence = a.row["confidence"].as_f64().unwrap_or(0.0) as f32;
+    let b_confidence = b.row["confidence"].as_f64().unwrap_or(0.0) as f32;
+    b_confidence
+        .total_cmp(&a_confidence)
+        .then_with(|| a.from.cmp(&b.from))
+        .then_with(|| a.to.cmp(&b.to))
+        .then_with(|| {
+            federated_location_order(a.row["location_delta"].as_str())
+                .cmp(&federated_location_order(b.row["location_delta"].as_str()))
+        })
+        .then_with(|| {
+            federated_cardinality_order(a.row["cardinality"].as_str())
+                .cmp(&federated_cardinality_order(b.row["cardinality"].as_str()))
+        })
+        .then_with(|| {
+            a.row["agent_link"]
+                .as_bool()
+                .cmp(&b.row["agent_link"].as_bool())
+        })
+        .then_with(|| a.row["note"].as_str().cmp(&b.row["note"].as_str()))
+        .then_with(|| a.key.cmp(&b.key))
+}
+
+fn local_explain_store_refs(context: &RuntimeContext, machine: &str) -> Vec<String> {
+    let mut stores = Vec::new();
+    if context.db_path.exists() {
+        stores.push(format!("{machine}/local:0"));
+    }
+    for (index, db) in context.additional_stores.iter().enumerate() {
+        if db.exists() {
+            stores.push(format!("{machine}/local:{}", index + 1));
+        }
+    }
+    stores
+}
+
+fn collect_local_federated_touches(
+    indexes: &[SqliteIndex],
+    local_stores: &[String],
+    query_anchors: &[String],
+    touched_anchors: &[FederatedExplainAnchor],
+) -> Result<Vec<engram::index::lineage::EvidenceFragmentRef>, CliError> {
+    let mut seen = std::collections::HashSet::new();
+    let mut touches = Vec::new();
+    for (index, store) in indexes.iter().zip(local_stores) {
+        let mut anchors = query_anchors.to_vec();
+        anchors.extend(
+            touched_anchors
+                .iter()
+                .filter(|anchor| federated_anchor_applies(anchor, store))
+                .map(|anchor| anchor.anchor.clone()),
+        );
+        anchors.sort();
+        anchors.dedup();
+        for anchor in anchors {
+            for fragment in index.evidence_for_anchor(&anchor)? {
+                let kind = match fragment.kind {
+                    engram::index::lineage::EvidenceKind::Edit => "edit",
+                    engram::index::lineage::EvidenceKind::Read => "read",
+                };
+                let key = format!(
+                    "{store}\0{}\0{}\0{kind}\0{}\0{}",
+                    fragment.tape_id, fragment.event_offset, fragment.file_path, fragment.timestamp,
+                );
+                if seen.insert(key) {
+                    touches.push(fragment);
+                }
+            }
+        }
+    }
+    touches.sort_by(|a, b| {
+        a.timestamp
+            .cmp(&b.timestamp)
+            .then_with(|| a.tape_id.cmp(&b.tape_id))
+            .then_with(|| a.event_offset.cmp(&b.event_offset))
+    });
+    Ok(touches)
+}
+
+fn federated_location_order(value: Option<&str>) -> u8 {
+    match value {
+        Some("same") => 0,
+        Some("adjacent") => 1,
+        Some("moved") => 2,
+        Some("absent") => 3,
+        _ => 4,
+    }
+}
+
+fn federated_cardinality_order(value: Option<&str>) -> u8 {
+    match value {
+        Some("1:1") => 0,
+        Some("1:N") => 1,
+        Some("N:1") => 2,
+        _ => 3,
+    }
+}
+
+fn run_federated_peer_rounds(
+    request_map: std::collections::BTreeMap<String, Vec<(String, PeerRequest)>>,
+    owners: &mut HashMap<String, RemoteOwner>,
+    topology: &Topology,
+    deadline: Instant,
+    cancelled: &Arc<AtomicBool>,
+) -> Vec<(String, String, Result<PeerResponse, PeerFailure>)> {
+    let mut results = Vec::new();
+    let mut jobs = Vec::new();
+    for (machine, requests) in request_map {
+        let Some(owner) = owners.remove(&machine) else {
+            results.extend(requests.into_iter().map(|(export, _)| {
+                (
+                    machine.clone(),
+                    export,
+                    Err(PeerFailure {
+                        code: "unavailable".into(),
+                        message: "peer owner is no longer connected".into(),
+                    }),
+                )
+            }));
+            continue;
+        };
+        let (exports, requests): (Vec<_>, Vec<_>) = requests.into_iter().unzip();
+        jobs.push(PeerRoundJob {
+            machine,
+            owner,
+            exports,
+            requests,
+        });
+    }
+
+    for result in run_peer_rounds_concurrently(
+        jobs,
+        deadline,
+        cancelled,
+        configured_peer_concurrency(topology),
+    ) {
+        if let Some(owner) = result.owner {
+            owners.insert(result.machine.clone(), owner);
+        }
+        for (index, outcome) in result.outcomes.into_iter().enumerate() {
+            if let Some(export) = result.exports.get(index) {
+                results.push((result.machine.clone(), export.clone(), outcome));
+            }
+        }
+    }
+    results
+}
+
+fn peer_item_cap(owner: &RemoteOwner) -> usize {
+    owner
+        .limits
+        .get("items_per_batch")
+        .copied()
+        .unwrap_or(MAX_BATCH_ITEMS as u64)
+        .clamp(1, MAX_BATCH_ITEMS as u64) as usize
+}
+
+fn local_dispatch_tape_facts(
+    context: &RuntimeContext,
+    tape_id: &str,
+    edit_offsets: &[u64],
+    turns: &[i64],
+    include_digest: bool,
+) -> Result<Value, CliError> {
+    engram::dispatch::local_tape_facts(context, tape_id, edit_offsets, turns, include_digest)
+}
+
+fn local_dispatch_rows(
+    indexes: &[SqliteIndex],
+    local_stores: &[String],
+    by_tape: &[String],
+    by_uuid: &[String],
+) -> Result<Vec<FederatedDispatchRow>, CliError> {
+    let mut rows = std::collections::BTreeMap::new();
+    for (index, store) in indexes.iter().zip(local_stores) {
+        for tape_id in by_tape {
+            for row in index.dispatch_links_for_tape(tape_id)? {
+                let direction = match row.direction {
+                    DispatchDirection::Received => FederatedDispatchDirection::Received,
+                    DispatchDirection::Sent => FederatedDispatchDirection::Sent,
+                };
+                rows.entry((
+                    tape_id.clone(),
+                    row.uuid.clone(),
+                    row.first_turn_index,
+                    direction == FederatedDispatchDirection::Received,
+                ))
+                .or_insert(FederatedDispatchRow {
+                    store: store.clone(),
+                    tape_id: tape_id.clone(),
+                    uuid: row.uuid,
+                    first_turn_index: row.first_turn_index,
+                    direction,
+                });
+            }
+        }
+        for uuid in by_uuid {
+            for row in index.dispatch_links_for_uuid(uuid)? {
+                let direction = match row.direction {
+                    DispatchDirection::Received => FederatedDispatchDirection::Received,
+                    DispatchDirection::Sent => FederatedDispatchDirection::Sent,
+                };
+                rows.entry((
+                    row.tape_id.clone(),
+                    row.uuid.clone(),
+                    row.first_turn_index,
+                    direction == FederatedDispatchDirection::Received,
+                ))
+                .or_insert(FederatedDispatchRow {
+                    store: store.clone(),
+                    tape_id: row.tape_id,
+                    uuid: row.uuid,
+                    first_turn_index: row.first_turn_index,
+                    direction,
+                });
+            }
+        }
+    }
+    Ok(rows.into_values().collect())
+}
+
+fn query_federated_dispatch_rows(
+    indexes: &[SqliteIndex],
+    local_stores: &[String],
+    by_tape: &[String],
+    by_uuid: &[String],
+    owners: &mut HashMap<String, RemoteOwner>,
+    topology: &Topology,
+    deadline: Instant,
+    cancelled: &Arc<AtomicBool>,
+    sources: &mut [Value],
+    peer_failed: &mut bool,
+) -> Result<Vec<FederatedDispatchRow>, CliError> {
+    let mut rows = local_dispatch_rows(indexes, local_stores, by_tape, by_uuid)?
+        .into_iter()
+        .map(|row| {
+            (
+                (
+                    row.tape_id.clone(),
+                    row.uuid.clone(),
+                    row.first_turn_index,
+                    row.direction == FederatedDispatchDirection::Received,
+                ),
+                row,
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let by_tape_set = by_tape
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    let by_uuid_set = by_uuid
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    let mut requests = std::collections::BTreeMap::<String, Vec<(String, PeerRequest)>>::new();
+    for (machine, owner) in owners.iter() {
+        for (export, status) in &owner.exports {
+            if status.is_err() {
+                continue;
+            }
+            let cap = peer_item_cap(owner);
+            for chunk in by_tape.chunks(cap) {
+                if !chunk.is_empty() {
+                    requests.entry(machine.clone()).or_default().push((
+                        export.clone(),
+                        PeerRequest::new(
+                            "dispatch_rows",
+                            vec![export.clone()],
+                            json!({"by_tape":chunk}),
+                        ),
+                    ));
+                }
+            }
+            for chunk in by_uuid.chunks(cap) {
+                if !chunk.is_empty() {
+                    requests.entry(machine.clone()).or_default().push((
+                        export.clone(),
+                        PeerRequest::new(
+                            "dispatch_rows",
+                            vec![export.clone()],
+                            json!({"by_uuid":chunk}),
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    for (machine, export, outcome) in
+        run_federated_peer_rounds(requests, owners, topology, deadline, cancelled)
+    {
+        let store = format!("{machine}/{export}");
+        match outcome {
+            Err(failure) => {
+                *peer_failed = true;
+                mark_source_phase(
+                    sources,
+                    &store,
+                    "dispatch_rows",
+                    &failure.code,
+                    &failure.message,
+                );
+            }
+            Ok(response) => {
+                let parsed = match engram::dispatch::federated::dispatch_rows_from_values(
+                    &response.data,
+                    &store,
+                ) {
+                    Ok(rows) => rows,
+                    Err(message) => {
+                        *peer_failed = true;
+                        mark_source_phase(
+                            sources,
+                            &store,
+                            "dispatch_rows",
+                            "protocol_error",
+                            &message,
+                        );
+                        continue;
+                    }
+                };
+                for row in parsed {
+                    if !by_tape_set.contains(&row.tape_id) && !by_uuid_set.contains(&row.uuid) {
+                        *peer_failed = true;
+                        mark_source_phase(
+                            sources,
+                            &store,
+                            "dispatch_rows",
+                            "protocol_error",
+                            "peer returned an unrequested dispatch row",
+                        );
+                        continue;
+                    }
+                    let received = row.direction == FederatedDispatchDirection::Received;
+                    rows.entry((
+                        row.tape_id.clone(),
+                        row.uuid.clone(),
+                        row.first_turn_index,
+                        received,
+                    ))
+                    .or_insert(row);
+                }
+            }
+        }
+    }
+    Ok(rows.into_values().collect())
+}
+
+fn query_remote_tape_facts(
+    requested: &std::collections::BTreeMap<(String, String), Value>,
+    owners: &mut HashMap<String, RemoteOwner>,
+    topology: &Topology,
+    deadline: Instant,
+    cancelled: &Arc<AtomicBool>,
+    sources: &mut [Value],
+    peer_failed: &mut bool,
+) -> HashMap<(String, String), Value> {
+    let mut requests = std::collections::BTreeMap::<String, Vec<(String, PeerRequest)>>::new();
+    let mut expected =
+        std::collections::BTreeMap::<String, std::collections::BTreeSet<String>>::new();
+    for (store, tape_id) in requested.keys() {
+        let Some((machine, export)) = store.split_once('/') else {
+            continue;
+        };
+        let Some(owner) = owners.get(machine) else {
+            continue;
+        };
+        if !owner.exports.get(export).is_some_and(Result::is_ok) {
+            continue;
+        }
+        expected
+            .entry(store.clone())
+            .or_default()
+            .insert(tape_id.clone());
+        let _ = owner;
+    }
+    for store in expected.keys() {
+        let Some((machine, export)) = store.split_once('/') else {
+            continue;
+        };
+        let Some(owner) = owners.get(machine) else {
+            continue;
+        };
+        let cap = peer_item_cap(owner);
+        let items = requested
+            .iter()
+            .filter(|((candidate_store, _), _)| candidate_store == store)
+            .map(|((_, tape_id), item)| {
+                let mut item = item.clone();
+                item["tape_id"] = json!(tape_id);
+                item
+            })
+            .collect::<Vec<_>>();
+        for chunk in items.chunks(cap) {
+            if !chunk.is_empty() {
+                requests.entry(machine.to_string()).or_default().push((
+                    export.to_string(),
+                    PeerRequest::new(
+                        "tape_facts",
+                        vec![export.to_string()],
+                        json!({"items":chunk}),
+                    ),
+                ));
+            }
+        }
+    }
+
+    let mut facts = HashMap::new();
+    for (machine, export, outcome) in
+        run_federated_peer_rounds(requests, owners, topology, deadline, cancelled)
+    {
+        let store = format!("{machine}/{export}");
+        match outcome {
+            Err(failure) => {
+                *peer_failed = true;
+                mark_source_phase(
+                    sources,
+                    &store,
+                    "tape_facts",
+                    &failure.code,
+                    &failure.message,
+                );
+            }
+            Ok(response) => {
+                for row in response.data {
+                    if row.get("store").and_then(Value::as_str) != Some(store.as_str())
+                        || row.get("type").and_then(Value::as_str) != Some("tape_facts")
+                    {
+                        *peer_failed = true;
+                        mark_source_phase(
+                            sources,
+                            &store,
+                            "tape_facts",
+                            "protocol_error",
+                            "peer returned malformed tape facts",
+                        );
+                        continue;
+                    }
+                    let Some(tape_id) = row.get("tape_id").and_then(Value::as_str) else {
+                        *peer_failed = true;
+                        mark_source_phase(
+                            sources,
+                            &store,
+                            "tape_facts",
+                            "protocol_error",
+                            "peer tape facts omitted tape_id",
+                        );
+                        continue;
+                    };
+                    if !expected
+                        .get(&store)
+                        .is_some_and(|tapes| tapes.contains(tape_id))
+                    {
+                        *peer_failed = true;
+                        mark_source_phase(
+                            sources,
+                            &store,
+                            "tape_facts",
+                            "protocol_error",
+                            "peer returned unrequested tape facts",
+                        );
+                        continue;
+                    }
+                    if row.get("status").and_then(Value::as_str) != Some("ok") {
+                        *peer_failed = true;
+                        let code = row
+                            .get("error")
+                            .and_then(|error| error.get("code"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("tape_unavailable");
+                        let message = row
+                            .get("error")
+                            .and_then(|error| error.get("message"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("owner could not read tape facts");
+                        mark_source_phase(sources, &store, "tape_facts", code, message);
+                        continue;
+                    }
+                    facts.insert((store.clone(), tape_id.to_string()), row);
+                }
+            }
+        }
+    }
+    for (store, tapes) in expected {
+        for tape_id in tapes {
+            if !facts.contains_key(&(store.clone(), tape_id.clone())) {
+                *peer_failed = true;
+                mark_source_phase(
+                    sources,
+                    &store,
+                    "tape_facts",
+                    "protocol_error",
+                    "peer omitted requested tape facts",
+                );
+            }
+        }
+    }
+    facts
+}
+
+fn locate_federated_tapes(
+    context: &RuntimeContext,
+    local_stores: &[String],
+    tape_ids: &[String],
+    owners: &mut HashMap<String, RemoteOwner>,
+    topology: &Topology,
+    deadline: Instant,
+    cancelled: &Arc<AtomicBool>,
+    sources: &mut [Value],
+    peer_failed: &mut bool,
+) -> HashMap<String, Vec<Value>> {
+    let mut located = HashMap::<String, Vec<Value>>::new();
+    let mut requests = std::collections::BTreeMap::<String, Vec<(String, PeerRequest)>>::new();
+    let mut expected =
+        std::collections::BTreeMap::<String, std::collections::BTreeSet<String>>::new();
+    for (machine, owner) in owners.iter() {
+        for (export, status) in &owner.exports {
+            if status.is_err() {
+                continue;
+            }
+            let store = format!("{machine}/{export}");
+            expected
+                .entry(store.clone())
+                .or_default()
+                .extend(tape_ids.iter().cloned());
+            for chunk in tape_ids.chunks(peer_item_cap(owner)) {
+                if !chunk.is_empty() {
+                    requests.entry(machine.clone()).or_default().push((
+                        export.clone(),
+                        PeerRequest::new(
+                            "locate_tapes",
+                            vec![export.clone()],
+                            json!({"tape_ids":chunk}),
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    let mut returned = HashMap::<String, std::collections::BTreeSet<String>>::new();
+    for (machine, export, outcome) in
+        run_federated_peer_rounds(requests, owners, topology, deadline, cancelled)
+    {
+        let store = format!("{machine}/{export}");
+        match outcome {
+            Err(failure) => {
+                *peer_failed = true;
+                mark_source_phase(
+                    sources,
+                    &store,
+                    "locate_tapes",
+                    &failure.code,
+                    &failure.message,
+                );
+            }
+            Ok(response) => {
+                for row in response.data {
+                    if row.get("store").and_then(Value::as_str) != Some(store.as_str()) {
+                        *peer_failed = true;
+                        mark_source_phase(
+                            sources,
+                            &store,
+                            "locate_tapes",
+                            "protocol_error",
+                            "peer returned a tape location for a different store",
+                        );
+                        continue;
+                    }
+                    let Some(tape_id) = row.get("tape_id").and_then(Value::as_str) else {
+                        *peer_failed = true;
+                        mark_source_phase(
+                            sources,
+                            &store,
+                            "locate_tapes",
+                            "protocol_error",
+                            "peer tape location omitted tape_id",
+                        );
+                        continue;
+                    };
+                    if !expected
+                        .get(&store)
+                        .is_some_and(|expected| expected.contains(tape_id))
+                    {
+                        *peer_failed = true;
+                        mark_source_phase(
+                            sources,
+                            &store,
+                            "locate_tapes",
+                            "protocol_error",
+                            "peer returned an unrequested tape location",
+                        );
+                        continue;
+                    }
+                    returned
+                        .entry(store.clone())
+                        .or_default()
+                        .insert(tape_id.to_string());
+                    if !row.get("file").is_none_or(Value::is_null) {
+                        located
+                            .entry(tape_id.to_string())
+                            .or_default()
+                            .push(json!({"store":store,"file":row["file"]}));
+                    }
+                }
+            }
+        }
+    }
+    for (store, tape_set) in expected {
+        if returned.get(&store) != Some(&tape_set) {
+            *peer_failed = true;
+            mark_source_phase(
+                sources,
+                &store,
+                "locate_tapes",
+                "protocol_error",
+                "peer omitted one or more requested tape locations",
+            );
+        }
+    }
+    for tape_id in tape_ids {
+        if let Some(path) = resolve_tape_path(context, tape_id)
+            && let Some(store) = local_stores.first()
+        {
+            located.entry(tape_id.clone()).or_default().push(json!({
+                "store":store,
+                "file":{"machine":topology.self_label,"path":path,"kind":"tape"},
+            }));
+        }
+    }
+    for values in located.values_mut() {
+        values.sort_by(|left, right| {
+            let left_local = left["store"]
+                .as_str()
+                .is_some_and(|store| store.starts_with(&format!("{}/local:", topology.self_label)));
+            let right_local = right["store"]
+                .as_str()
+                .is_some_and(|store| store.starts_with(&format!("{}/local:", topology.self_label)));
+            right_local
+                .cmp(&left_local)
+                .then_with(|| left["store"].as_str().cmp(&right["store"].as_str()))
+        });
+        values.dedup_by(|left, right| left["store"] == right["store"]);
+    }
+    located
+}
+
+struct FederatedDispatchResult {
+    lineage: Vec<Value>,
+    local_parent_sessions: Vec<Value>,
+    remote_parent_sessions: Vec<Value>,
+    unresolved: Vec<Value>,
+    ambiguous: Vec<Value>,
+}
+
+#[derive(Clone)]
+struct FederatedSenderCandidate {
+    store: String,
+    file: Option<Value>,
+    facts: Value,
+    history: FederatedDispatchHistory,
+    first: engram::dispatch::federated::FirstOccurrence,
+    digest: Option<String>,
+}
+
+fn collect_federated_dispatch(
+    context: &RuntimeContext,
+    indexes: &[SqliteIndex],
+    local_stores: &[String],
+    topology: &Topology,
+    sessions: &[Value],
+    remote_facts: &mut std::collections::BTreeMap<(String, String), Value>,
+    owners: &mut HashMap<String, RemoteOwner>,
+    sources: &mut [Value],
+    deadline: Instant,
+    cancelled: &Arc<AtomicBool>,
+    peer_failed: &mut bool,
+) -> Result<FederatedDispatchResult, CliError> {
+    let mut result = FederatedDispatchResult {
+        lineage: Vec::new(),
+        local_parent_sessions: Vec::new(),
+        remote_parent_sessions: Vec::new(),
+        unresolved: Vec::new(),
+        ambiguous: Vec::new(),
+    };
+    let mut unresolved_seen = std::collections::HashSet::<(String, String, String)>::new();
+    let mut ambiguous_seen = std::collections::HashSet::<(String, String)>::new();
+    let mut hop_seen =
+        std::collections::HashSet::<(String, String, i64, String, String, String)>::new();
+    let mut parent_seen = std::collections::HashSet::<(String, String)>::new();
+    let max_hops = topology
+        .limits
+        .get("dispatch_hops_per_edit")
+        .copied()
+        .unwrap_or(64)
+        .clamp(1, 64) as usize;
+
+    for session in sessions {
+        let Some(edit_tape) = session
+            .get("tape_id")
+            .or_else(|| session.get("session_id"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let Some(edit_store) = session.get("store").and_then(Value::as_str) else {
+            continue;
+        };
+        let touches = session
+            .get("touches")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let edit_offsets = touches
+            .iter()
+            .filter(|touch| touch.get("kind").and_then(Value::as_str) == Some("edit"))
+            .filter_map(|touch| touch.get("event_offset").and_then(Value::as_u64))
+            .collect::<Vec<_>>();
+        if edit_offsets.is_empty() {
+            continue;
+        }
+
+        let direct_facts = if local_stores.iter().any(|store| store == edit_store) {
+            Some(local_dispatch_tape_facts(
+                context,
+                edit_tape,
+                &edit_offsets,
+                &[],
+                false,
+            )?)
+        } else if let Some(facts) =
+            remote_facts.get(&(edit_store.to_string(), edit_tape.to_string()))
+        {
+            Some(facts.clone())
+        } else {
+            let request = std::collections::BTreeMap::from([(
+                (edit_store.to_string(), edit_tape.to_string()),
+                json!({"edit_offsets":edit_offsets,"turns":[],"include_digest":false}),
+            )]);
+            let received = query_remote_tape_facts(
+                &request,
+                owners,
+                topology,
+                deadline,
+                cancelled,
+                sources,
+                peer_failed,
+            );
+            for (key, value) in received {
+                remote_facts.insert(key, value);
+            }
+            remote_facts
+                .get(&(edit_store.to_string(), edit_tape.to_string()))
+                .cloned()
+        };
+        let Some(direct_facts) = direct_facts else {
+            if unresolved_seen.insert((
+                edit_store.to_string(),
+                edit_tape.to_string(),
+                "tape_unavailable".into(),
+            )) {
+                result.unresolved.push(json!({
+                    "reason":"tape_unavailable",
+                    "session":edit_tape,
+                    "session_location":edit_store,
+                }));
+            }
+            continue;
+        };
+        if direct_facts.get("status").and_then(Value::as_str) != Some("ok") {
+            if unresolved_seen.insert((
+                edit_store.to_string(),
+                edit_tape.to_string(),
+                "tape_unavailable".into(),
+            )) {
+                result.unresolved.push(json!({
+                    "reason":"tape_unavailable",
+                    "session":edit_tape,
+                    "session_location":edit_store,
+                }));
+            }
+            continue;
+        }
+
+        for touch in touches
+            .iter()
+            .filter(|touch| touch.get("kind").and_then(Value::as_str) == Some("edit"))
+        {
+            let Some(edit_offset) = touch.get("event_offset").and_then(Value::as_u64) else {
+                continue;
+            };
+            let edit_turn = direct_facts
+                .get("edit_offset_to_turn")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|row| row.get("event_offset").and_then(Value::as_u64) == Some(edit_offset));
+            let Some(mut cutoff_global_turn) = edit_turn
+                .filter(|row| row.get("present").and_then(Value::as_bool) == Some(true))
+                .and_then(|row| row.get("turn").and_then(Value::as_i64))
+            else {
+                if unresolved_seen.insert((
+                    edit_store.to_string(),
+                    edit_tape.to_string(),
+                    "edit_offset_unavailable".into(),
+                )) {
+                    result.unresolved.push(json!({
+                        "reason":"edit_offset_unavailable",
+                        "session":edit_tape,
+                        "event_offset":edit_offset,
+                        "session_location":edit_store,
+                    }));
+                }
+                continue;
+            };
+
+            let mut current_store = edit_store.to_string();
+            let mut current_tape = edit_tape.to_string();
+            let mut current_facts = direct_facts.clone();
+            if let Some(binding) = direct_facts.get("recovery_binding")
+                && binding.get("verified").and_then(Value::as_bool) == Some(true)
+            {
+                let point = binding
+                    .get("points")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .find(|point| {
+                        point.get("old_offset").and_then(Value::as_u64) == Some(edit_offset)
+                    });
+                let context_tape = binding.get("context_tape").and_then(Value::as_str);
+                let point_turn = point.and_then(|point| point.get("turn").and_then(Value::as_i64));
+                let point_source_offset =
+                    point.and_then(|point| point.get("source_offset").and_then(Value::as_u64));
+                if let (Some(context_tape), Some(point_turn), Some(_point_source_offset)) =
+                    (context_tape, point_turn, point_source_offset)
+                {
+                    current_tape = context_tape.to_string();
+                    cutoff_global_turn = point_turn;
+                    let facts = if local_stores.iter().any(|store| store == &current_store) {
+                        Some(local_dispatch_tape_facts(
+                            context,
+                            &current_tape,
+                            &[],
+                            &[],
+                            false,
+                        )?)
+                    } else if let Some(facts) =
+                        remote_facts.get(&(current_store.clone(), current_tape.clone()))
+                    {
+                        Some(facts.clone())
+                    } else {
+                        let request = std::collections::BTreeMap::from([(
+                            (current_store.clone(), current_tape.clone()),
+                            json!({"edit_offsets":[],"turns":[],"include_digest":false}),
+                        )]);
+                        let received = query_remote_tape_facts(
+                            &request,
+                            owners,
+                            topology,
+                            deadline,
+                            cancelled,
+                            sources,
+                            peer_failed,
+                        );
+                        for (key, value) in received {
+                            remote_facts.insert(key, value);
+                        }
+                        remote_facts
+                            .get(&(current_store.clone(), current_tape.clone()))
+                            .cloned()
+                    };
+                    if let Some(facts) = facts.filter(|facts| {
+                        facts.get("status").and_then(Value::as_str) == Some("ok")
+                            && facts.get("tape_id").and_then(Value::as_str) == Some(context_tape)
+                    }) {
+                        current_facts = facts;
+                    } else {
+                        if unresolved_seen.insert((
+                            edit_store.to_string(),
+                            edit_tape.to_string(),
+                            "recovery_binding_incomplete".into(),
+                        )) {
+                            result.unresolved.push(json!({
+                                "reason":"recovery_binding_incomplete",
+                                "session":edit_tape,
+                                "event_offset":edit_offset,
+                                "session_location":edit_store,
+                            }));
+                        }
+                        continue;
+                    }
+                } else {
+                    if unresolved_seen.insert((
+                        edit_store.to_string(),
+                        edit_tape.to_string(),
+                        "recovery_binding_incomplete".into(),
+                    )) {
+                        result.unresolved.push(json!({
+                            "reason":"recovery_binding_incomplete",
+                            "session":edit_tape,
+                            "event_offset":edit_offset,
+                            "session_location":edit_store,
+                        }));
+                    }
+                    continue;
+                }
+            }
+
+            let mut hops = 0usize;
+            let mut current_history =
+                match FederatedDispatchHistory::from_tape_facts(&current_facts) {
+                    Ok(history) => history,
+                    Err(message) => {
+                        *peer_failed = true;
+                        if unresolved_seen.insert((
+                            current_store.clone(),
+                            current_tape.clone(),
+                            "history_incomplete".into(),
+                        )) {
+                            result.unresolved.push(json!({
+                                "reason":"history_incomplete",
+                                "session":current_tape,
+                                "message":message,
+                                "session_location":current_store,
+                            }));
+                        }
+                        continue;
+                    }
+                };
+            loop {
+                if hops >= max_hops {
+                    if unresolved_seen.insert((
+                        current_store.clone(),
+                        current_tape.clone(),
+                        "hop_limit".into(),
+                    )) {
+                        result.unresolved.push(json!({"reason":"hop_limit","session":current_tape,"session_location":current_store}));
+                    }
+                    break;
+                }
+                if !current_history.complete {
+                    *peer_failed = true;
+                    let missing = current_history.missing.clone();
+                    if unresolved_seen.insert((
+                        current_store.clone(),
+                        current_history.tip.clone(),
+                        "history_incomplete".into(),
+                    )) {
+                        result.unresolved.push(json!({
+                            "reason":"history_incomplete",
+                            "session":current_history.tip,
+                            "missing":missing,
+                            "session_location":current_store,
+                        }));
+                    }
+                    break;
+                }
+                let history_tapes = current_history.tape_ids();
+                let receive_rows = query_federated_dispatch_rows(
+                    indexes,
+                    local_stores,
+                    &history_tapes,
+                    &[],
+                    owners,
+                    topology,
+                    deadline,
+                    cancelled,
+                    sources,
+                    peer_failed,
+                )?;
+                let mut rows_by_tape = HashMap::<String, Vec<FederatedDispatchRow>>::new();
+                for row in receive_rows
+                    .into_iter()
+                    .filter(|row| row.store == current_store)
+                {
+                    rows_by_tape
+                        .entry(row.tape_id.clone())
+                        .or_default()
+                        .push(row);
+                }
+                let Some(received) =
+                    current_history.latest_received_before(&rows_by_tape, cutoff_global_turn)
+                else {
+                    break;
+                };
+                let candidate_rows = query_federated_dispatch_rows(
+                    indexes,
+                    local_stores,
+                    &[],
+                    std::slice::from_ref(&received.row.uuid),
+                    owners,
+                    topology,
+                    deadline,
+                    cancelled,
+                    sources,
+                    peer_failed,
+                )?;
+                let mut tape_ids = candidate_rows
+                    .iter()
+                    .map(|row| row.tape_id.clone())
+                    .collect::<Vec<_>>();
+                tape_ids.sort();
+                tape_ids.dedup();
+                let located = locate_federated_tapes(
+                    context,
+                    local_stores,
+                    &tape_ids,
+                    owners,
+                    topology,
+                    deadline,
+                    cancelled,
+                    sources,
+                    peer_failed,
+                );
+                let mut candidate_items =
+                    std::collections::BTreeMap::<(String, String), Value>::new();
+                let mut row_by_candidate =
+                    HashMap::<(String, String), Vec<FederatedDispatchRow>>::new();
+                for row in candidate_rows
+                    .iter()
+                    .filter(|row| row.uuid == received.row.uuid)
+                {
+                    let key = (row.store.clone(), row.tape_id.clone());
+                    candidate_items.entry(key.clone()).or_insert_with(
+                        || json!({"edit_offsets":[],"turns":[],"include_digest":false}),
+                    );
+                    candidate_items
+                        .get_mut(&key)
+                        .expect("candidate request exists")["turns"]
+                        .as_array_mut()
+                        .expect("turns array")
+                        .push(json!(row.first_turn_index));
+                    row_by_candidate.entry(key).or_default().push(row.clone());
+                }
+                let mut holders_by_tape =
+                    HashMap::<String, std::collections::HashSet<String>>::new();
+                for ((store, tape_id), _) in &candidate_items {
+                    holders_by_tape
+                        .entry(tape_id.clone())
+                        .or_default()
+                        .insert(store.clone());
+                }
+                for ((_, tape_id), item) in &mut candidate_items {
+                    if holders_by_tape
+                        .get(tape_id)
+                        .is_some_and(|holders| holders.len() > 1)
+                    {
+                        item["include_digest"] = json!(true);
+                    }
+                    if let Some(turns) = item.get_mut("turns").and_then(Value::as_array_mut) {
+                        turns.sort_by_key(|turn| turn.as_i64().unwrap_or_default());
+                        turns.dedup();
+                    }
+                }
+                let mut candidate_facts = HashMap::<(String, String), Value>::new();
+                let mut remote_requests = std::collections::BTreeMap::new();
+                for (key @ (store, tape_id), item) in &candidate_items {
+                    if local_stores.iter().any(|local| local == store) {
+                        let turns = item
+                            .get("turns")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_i64)
+                            .collect::<Vec<_>>();
+                        let facts = local_dispatch_tape_facts(
+                            context,
+                            tape_id,
+                            &[],
+                            &turns,
+                            item["include_digest"] == true,
+                        )?;
+                        candidate_facts.insert(key.clone(), facts);
+                    } else {
+                        remote_requests.insert(key.clone(), item.clone());
+                    }
+                }
+                candidate_facts.extend(query_remote_tape_facts(
+                    &remote_requests,
+                    owners,
+                    topology,
+                    deadline,
+                    cancelled,
+                    sources,
+                    peer_failed,
+                ));
+
+                let mut context_requests =
+                    std::collections::BTreeMap::<(String, String), Value>::new();
+                for ((store, tape_id), facts) in &candidate_facts {
+                    if facts.get("status").and_then(Value::as_str) != Some("ok") {
+                        continue;
+                    }
+                    let Some(binding) = facts.get("recovery_binding") else {
+                        continue;
+                    };
+                    if binding.get("verified").and_then(Value::as_bool) != Some(true) {
+                        continue;
+                    }
+                    let context_tape = binding
+                        .get("context_tape")
+                        .and_then(Value::as_str)
+                        .unwrap_or(tape_id);
+                    if context_tape != tape_id {
+                        context_requests
+                            .entry((store.clone(), context_tape.to_string()))
+                            .or_insert_with(
+                                || json!({"edit_offsets":[],"turns":[],"include_digest":false}),
+                            );
+                    }
+                }
+                let mut context_facts = HashMap::<(String, String), Value>::new();
+                for (key @ (store, tape_id), _) in &context_requests {
+                    if local_stores.iter().any(|local| local == store) {
+                        context_facts.insert(
+                            key.clone(),
+                            local_dispatch_tape_facts(context, tape_id, &[], &[], false)?,
+                        );
+                    }
+                }
+                let remote_contexts = context_requests
+                    .iter()
+                    .filter(|((store, _), _)| !local_stores.iter().any(|local| local == store))
+                    .map(|(key, item)| (key.clone(), item.clone()))
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                context_facts.extend(query_remote_tape_facts(
+                    &remote_contexts,
+                    owners,
+                    topology,
+                    deadline,
+                    cancelled,
+                    sources,
+                    peer_failed,
+                ));
+
+                let mut candidates = Vec::<FederatedSenderCandidate>::new();
+                let mut candidate_partial = false;
+                for ((store, tape_id), facts) in &candidate_facts {
+                    let Some(rows) = row_by_candidate.get(&(store.clone(), tape_id.clone())) else {
+                        continue;
+                    };
+                    if facts.get("status").and_then(Value::as_str) != Some("ok") {
+                        candidate_partial = true;
+                        if unresolved_seen.insert((
+                            store.clone(),
+                            tape_id.clone(),
+                            "tape_unavailable".into(),
+                        )) {
+                            result.unresolved.push(json!({
+                                "reason":"tape_unavailable",
+                                "session":tape_id,
+                                "session_location":store,
+                                "candidate_uuid":received.row.uuid,
+                            }));
+                        }
+                        continue;
+                    }
+                    let Ok(mut history) = FederatedDispatchHistory::from_tape_facts(facts) else {
+                        candidate_partial = true;
+                        continue;
+                    };
+                    if !history.complete {
+                        candidate_partial = true;
+                        if unresolved_seen.insert((
+                            store.clone(),
+                            tape_id.clone(),
+                            "history_incomplete".into(),
+                        )) {
+                            result.unresolved.push(json!({"reason":"history_incomplete","session":tape_id,"missing":history.missing,"session_location":store,"candidate_uuid":received.row.uuid}));
+                        }
+                        continue;
+                    }
+                    let mut selected_facts = facts.clone();
+                    let mut selected_store = store.clone();
+                    if let Some(binding) = facts.get("recovery_binding")
+                        && binding.get("verified").and_then(Value::as_bool) == Some(true)
+                    {
+                        let context_tape = binding
+                            .get("context_tape")
+                            .and_then(Value::as_str)
+                            .unwrap_or(tape_id);
+                        if context_tape != tape_id {
+                            let mappings = rows
+                                .iter()
+                                .map(|row| {
+                                    facts
+                                        .get("turn_to_offset")
+                                        .and_then(Value::as_array)
+                                        .into_iter()
+                                        .flatten()
+                                        .find(|value| {
+                                            value.get("turn").and_then(Value::as_i64)
+                                                == Some(row.first_turn_index)
+                                        })
+                                        .and_then(|value| {
+                                            Some((
+                                                value.get("offset")?.as_u64()?,
+                                                value.get("global_turn")?.as_i64()?,
+                                            ))
+                                        })
+                                })
+                                .collect::<Option<Vec<_>>>();
+                            if let Some(mappings) = mappings.filter(|mappings| !mappings.is_empty())
+                            {
+                                let mut expected_by_offset = std::collections::BTreeMap::new();
+                                for (offset, turn) in mappings {
+                                    expected_by_offset.insert(offset, turn);
+                                }
+                                let offsets =
+                                    expected_by_offset.keys().copied().collect::<Vec<_>>();
+                                let binding_item = json!({"edit_offsets":offsets,"turns":[],"include_digest":false});
+                                let extra = if local_stores.iter().any(|local| local == store) {
+                                    Some(local_dispatch_tape_facts(
+                                        context,
+                                        tape_id,
+                                        binding_item["edit_offsets"]
+                                            .as_array()
+                                            .unwrap()
+                                            .iter()
+                                            .filter_map(Value::as_u64)
+                                            .collect::<Vec<_>>()
+                                            .as_slice(),
+                                        &[],
+                                        false,
+                                    )?)
+                                } else {
+                                    query_remote_tape_facts(
+                                        &std::collections::BTreeMap::from([(
+                                            (store.clone(), tape_id.clone()),
+                                            binding_item,
+                                        )]),
+                                        owners,
+                                        topology,
+                                        deadline,
+                                        cancelled,
+                                        sources,
+                                        peer_failed,
+                                    )
+                                    .remove(&(store.clone(), tape_id.clone()))
+                                };
+                                let verified_points = extra.as_ref().is_some_and(|extra| {
+                                    if extra.get("status").and_then(Value::as_str) != Some("ok")
+                                        || extra.get("tape_id").and_then(Value::as_str)
+                                            != Some(tape_id)
+                                        || extra
+                                            .get("recovery_binding")
+                                            .and_then(|binding| binding.get("verified"))
+                                            .and_then(Value::as_bool)
+                                            != Some(true)
+                                        || extra
+                                            .get("recovery_binding")
+                                            .and_then(|binding| binding.get("context_tape"))
+                                            .and_then(Value::as_str)
+                                            != Some(context_tape)
+                                    {
+                                        return false;
+                                    }
+                                    expected_by_offset.iter().all(|(offset, turn)| {
+                                        let edit = extra
+                                            .get("edit_offset_to_turn")
+                                            .and_then(Value::as_array)
+                                            .into_iter()
+                                            .flatten()
+                                            .find(|point| {
+                                                point.get("event_offset").and_then(Value::as_u64)
+                                                    == Some(*offset)
+                                            });
+                                        let recovered_source_offset = edit
+                                            .filter(|point| {
+                                                point.get("present").and_then(Value::as_bool)
+                                                    == Some(true)
+                                            })
+                                            .and_then(|point| {
+                                                point
+                                                    .get("recovered_source_offset")
+                                                    .and_then(Value::as_u64)
+                                            });
+                                        let binding_point = extra
+                                            .get("recovery_binding")
+                                            .and_then(|binding| binding.get("points"))
+                                            .and_then(Value::as_array)
+                                            .into_iter()
+                                            .flatten()
+                                            .find(|point| {
+                                                point.get("old_offset").and_then(Value::as_u64)
+                                                    == Some(*offset)
+                                            });
+                                        edit.and_then(|point| {
+                                            point.get("turn").and_then(Value::as_i64)
+                                        }) == Some(*turn)
+                                            && binding_point.and_then(|point| {
+                                                point.get("turn").and_then(Value::as_i64)
+                                            }) == Some(*turn)
+                                            && binding_point.and_then(|point| {
+                                                point.get("source_offset").and_then(Value::as_u64)
+                                            }) == recovered_source_offset
+                                            && recovered_source_offset.is_some()
+                                    })
+                                });
+                                if !verified_points {
+                                    candidate_partial = true;
+                                    if unresolved_seen.insert((
+                                        store.clone(),
+                                        tape_id.clone(),
+                                        "recovery_binding_incomplete".into(),
+                                    )) {
+                                        result.unresolved.push(json!({"reason":"recovery_binding_incomplete","session":tape_id,"candidate_uuid":received.row.uuid,"session_location":store}));
+                                    }
+                                    continue;
+                                }
+                                if let Some(context_facts) =
+                                    context_facts.get(&(store.clone(), context_tape.to_string()))
+                                {
+                                    match FederatedDispatchHistory::from_tape_facts(context_facts) {
+                                        Ok(context_history) if context_history.complete => {
+                                            history = context_history;
+                                            selected_facts = context_facts.clone();
+                                            selected_store = store.clone();
+                                        }
+                                        _ => {
+                                            candidate_partial = true;
+                                            continue;
+                                        }
+                                    }
+                                } else {
+                                    candidate_partial = true;
+                                    continue;
+                                }
+                            } else {
+                                candidate_partial = true;
+                                if unresolved_seen.insert((
+                                    store.clone(),
+                                    tape_id.clone(),
+                                    "recovery_binding_incomplete".into(),
+                                )) {
+                                    result.unresolved.push(json!({"reason":"recovery_binding_incomplete","session":tape_id,"candidate_uuid":received.row.uuid,"session_location":store}));
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    let rows_for_history = query_federated_dispatch_rows(
+                        indexes,
+                        local_stores,
+                        &history.tape_ids(),
+                        &[],
+                        owners,
+                        topology,
+                        deadline,
+                        cancelled,
+                        sources,
+                        peer_failed,
+                    )?;
+                    let mut by_tape = HashMap::<String, Vec<FederatedDispatchRow>>::new();
+                    for row in rows_for_history
+                        .into_iter()
+                        .filter(|row| row.store == *store)
+                    {
+                        by_tape.entry(row.tape_id.clone()).or_default().push(row);
+                    }
+                    if let Some(first) = history
+                        .first_occurrences(&by_tape)
+                        .remove(&received.row.uuid)
+                        && first.row.direction == FederatedDispatchDirection::Sent
+                    {
+                        let file = located
+                            .get(&first.row.tape_id)
+                            .and_then(|locations| {
+                                locations.iter().find(|location| {
+                                    location.get("store").and_then(Value::as_str)
+                                        == Some(store.as_str())
+                                })
+                            })
+                            .and_then(|location| location.get("file").cloned());
+                        candidates.push(FederatedSenderCandidate {
+                            store: selected_store,
+                            file,
+                            facts: selected_facts.clone(),
+                            history,
+                            first,
+                            digest: selected_facts
+                                .get("digest")
+                                .and_then(Value::as_str)
+                                .map(ToOwned::to_owned),
+                        });
+                    }
+                }
+
+                let all_candidates = candidates;
+                let mut candidates = all_candidates
+                    .iter()
+                    .filter(|candidate| {
+                        !all_candidates.iter().any(|other| {
+                            other.history.tip != candidate.history.tip
+                                && other.history.contains(&candidate.history.tip)
+                        })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                candidates.sort_by(|left, right| {
+                    left.store
+                        .cmp(&right.store)
+                        .then_with(|| left.history.tip.cmp(&right.history.tip))
+                        .then_with(|| left.first.global_turn.cmp(&right.first.global_turn))
+                });
+                let mut merged = Vec::<FederatedSenderCandidate>::new();
+                for candidate in candidates {
+                    if let Some(existing) = merged.iter_mut().find(|existing| {
+                        existing.digest.is_some()
+                            && existing.digest == candidate.digest
+                            && existing.history.tip == candidate.history.tip
+                    }) {
+                        if candidate
+                            .store
+                            .starts_with(&format!("{}/local:", topology.self_label))
+                        {
+                            *existing = candidate;
+                        }
+                    } else {
+                        merged.push(candidate);
+                    }
+                }
+
+                match merged.as_slice() {
+                    [] => {
+                        let unavailable =
+                            sources
+                                .iter()
+                                .filter(|source| {
+                                    source.get("kind").and_then(Value::as_str) == Some("peer")
+                                })
+                                .filter(|source| {
+                                    source.get("status").and_then(Value::as_str).is_some_and(
+                                        |status| status != "ok" && status != "not_selected",
+                                    )
+                                })
+                                .filter_map(|source| source.get("store").and_then(Value::as_str))
+                                .collect::<Vec<_>>();
+                        let reason = if candidate_partial {
+                            "history_incomplete"
+                        } else {
+                            "no_sender_observed"
+                        };
+                        if unresolved_seen.insert((
+                            current_store.clone(),
+                            received.row.uuid.clone(),
+                            reason.into(),
+                        )) {
+                            result.unresolved.push(json!({
+                                "reason":reason,
+                                "uuid":received.row.uuid,
+                                "received_session":current_tape,
+                                "stores_unavailable":unavailable,
+                                "selection_coverage":if candidate_partial || *peer_failed {"partial"} else {"complete"},
+                            }));
+                        }
+                        break;
+                    }
+                    [parent] => {
+                        let parent_tape = parent.first.row.tape_id.clone();
+                        let hop_key = (
+                            current_store.clone(),
+                            current_tape.clone(),
+                            cutoff_global_turn,
+                            received.row.uuid.clone(),
+                            parent.store.clone(),
+                            parent_tape.clone(),
+                        );
+                        if !hop_seen.insert(hop_key) {
+                            break;
+                        }
+                        let mut hop = json!({
+                            "session":current_tape,
+                            "edit_turn_index":cutoff_global_turn,
+                            "received_uuid":received.row.uuid,
+                            "received_turn_index":received.global_turn,
+                            "parent_session":parent_tape,
+                            "parent_sent_turn_index":parent.first.global_turn,
+                            "session_location":current_store,
+                            "parent_location":parent.store,
+                            "selection_coverage":if candidate_partial || *peer_failed {"partial"} else {"complete"},
+                        });
+                        if current_tape != edit_tape {
+                            hop["edit_session"] = json!(edit_tape);
+                            hop["edit_event_offset"] = json!(edit_offset);
+                        }
+                        if received.row.tape_id != current_tape {
+                            hop["received_session"] = json!(received.row.tape_id);
+                        }
+                        result.lineage.push(hop);
+                        let parent_key = (parent.store.clone(), parent_tape.clone());
+                        if parent_seen.insert(parent_key.clone()) {
+                            if local_stores.iter().any(|store| store == &parent.store) {
+                                let link = engram::index::DispatchLinkRow {
+                                    tape_id: parent_tape.clone(),
+                                    uuid: received.row.uuid.clone(),
+                                    first_turn_index: parent.first.row.first_turn_index,
+                                    direction: DispatchDirection::Sent,
+                                };
+                                if let Some(mut parent_session) =
+                                    build_dispatch_session_for_link(context, &link)?
+                                {
+                                    parent_session["store"] = json!(parent.store);
+                                    result.local_parent_sessions.push(parent_session);
+                                }
+                            } else {
+                                let parent_fact = remote_facts
+                                    .get(&(parent.store.clone(), parent_tape.clone()))
+                                    .or_else(|| {
+                                        remote_facts.get(&(
+                                            parent.store.clone(),
+                                            parent.history.tip.clone(),
+                                        ))
+                                    })
+                                    .cloned()
+                                    .unwrap_or_else(|| parent.facts.clone());
+                                let summary = parent_fact
+                                    .get("summary")
+                                    .cloned()
+                                    .unwrap_or_else(|| json!({}));
+                                let (machine, export) =
+                                    parent.store.split_once('/').unwrap_or(("", ""));
+                                result.remote_parent_sessions.push(json!({
+                                    "session_id":parent_tape,
+                                    "tape_id":parent_tape,
+                                    "store":parent.store,
+                                    "location":{"machine":machine,"store":parent.store,"export":export},
+                                    "physical_identity":{"machine":machine,"store":parent.store,"tape_id":parent_tape,"db":null,"file":parent.file},
+                                    "timestamp":summary.get("latest_timestamp").cloned().unwrap_or_else(||json!("")),
+                                    "window_start":summary.get("window_start").cloned().unwrap_or_else(||json!(0)),
+                                    "window_end":summary.get("window_end").cloned().unwrap_or_else(||json!(0)),
+                                    "total_lines":summary.get("total_lines").cloned().unwrap_or_else(||json!(0)),
+                                    "confidence":0.0,
+                                    "refs_up":0,
+                                    "refs_down":0,
+                                    "files_touched":summary.get("files_touched").cloned().unwrap_or_else(||json!([])),
+                                    "touches":[],
+                                    "tape_facts":parent_fact,
+                                    "dispatch":{"uuid":received.row.uuid,"direction":"sent","first_turn_index":parent.first.row.first_turn_index},
+                                }));
+                            }
+                        }
+                        hops += 1;
+                        current_store = parent.store.clone();
+                        current_tape = parent_tape;
+                        cutoff_global_turn = parent.first.global_turn;
+                        current_history = parent.history.clone();
+                    }
+                    _ => {
+                        let rows = merged
+                            .iter()
+                            .map(|candidate| {
+                                json!({
+                                    "session":candidate.first.row.tape_id,
+                                    "sent_turn_index":candidate.first.global_turn,
+                                    "location":candidate.store,
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        if ambiguous_seen.insert((current_store.clone(), received.row.uuid.clone()))
+                        {
+                            result.ambiguous.push(json!({
+                                "received_uuid":received.row.uuid,
+                                "received_session":current_tape,
+                                "candidates":rows,
+                                "selection_coverage":if candidate_partial || *peer_failed {"partial"} else {"complete"},
+                            }));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn collect_federated_lineage(
+    indexes: &[SqliteIndex],
+    local_stores: &[String],
+    roots: Vec<FederatedExplainAnchor>,
+    owners: &mut HashMap<String, RemoteOwner>,
+    topology: &Topology,
+    traversal: ExplainTraversal,
+    include_forensics: bool,
+    deadline: Instant,
+    cancelled: &Arc<AtomicBool>,
+    sources: &mut [Value],
+    peer_failed: &mut bool,
+) -> Result<(Vec<Value>, Vec<FederatedExplainAnchor>), CliError> {
+    let mut frontier = roots.into_iter().collect::<std::collections::BTreeSet<_>>();
+    let mut visited = frontier.clone();
+    let mut seen_edges = std::collections::HashMap::<String, usize>::new();
+    let mut selected_edges = Vec::<FederatedExplainEdge>::new();
+
+    for _depth in 0..traversal.max_depth {
+        if frontier.is_empty() || selected_edges.len() >= traversal.max_edges {
+            break;
+        }
+        let mut candidates_by_node =
+            HashMap::<FederatedExplainAnchor, HashMap<String, FederatedExplainEdge>>::new();
+        for (index, store) in indexes.iter().zip(local_stores) {
+            for node in frontier
+                .iter()
+                .filter(|node| federated_anchor_applies(node, store))
+            {
+                let mut edges = index.inbound_edges(
+                    &node.anchor,
+                    traversal.min_confidence,
+                    include_forensics,
+                )?;
+                edges.extend(index.outbound_edges(
+                    &node.anchor,
+                    traversal.min_confidence,
+                    include_forensics,
+                )?);
+                let bucket = candidates_by_node.entry(node.clone()).or_default();
+                for edge in edges {
+                    let Some(mut candidate) = federated_edge_candidate(store, edge_to_json(&edge))
+                    else {
+                        continue;
+                    };
+                    match bucket.get_mut(&candidate.key) {
+                        Some(existing) => existing.stores.append(&mut candidate.stores),
+                        None => {
+                            bucket.insert(candidate.key.clone(), candidate);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut request_map =
+            std::collections::BTreeMap::<String, Vec<(String, PeerRequest)>>::new();
+        for (machine, owner) in owners.iter() {
+            for (export, status) in &owner.exports {
+                if status.is_err() {
+                    continue;
+                }
+                let store = format!("{machine}/{export}");
+                let mut nodes = frontier
+                    .iter()
+                    .filter(|node| federated_anchor_applies(node, &store))
+                    .map(|node| node.anchor.clone())
+                    .collect::<Vec<_>>();
+                nodes.sort();
+                nodes.dedup();
+                for chunk in nodes.chunks(peer_item_cap(owner)) {
+                    request_map.entry(machine.clone()).or_default().push((
+                        export.clone(),
+                        PeerRequest::new(
+                            "lookup_edges",
+                            vec![export.clone()],
+                            json!({
+                                "nodes": chunk,
+                                "min_confidence": traversal.min_confidence,
+                                "include_forensics": include_forensics,
+                            }),
+                        ),
+                    ));
+                }
+            }
+        }
+        let mut expected_nodes_by_store =
+            HashMap::<String, std::collections::HashSet<String>>::new();
+        for (machine, requests) in &request_map {
+            for (export, request) in requests {
+                let store = format!("{machine}/{export}");
+                if let Some(nodes) = request.args.get("nodes").and_then(Value::as_array) {
+                    expected_nodes_by_store.entry(store).or_default().extend(
+                        nodes
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(ToOwned::to_owned),
+                    );
+                }
+            }
+        }
+        let mut returned_nodes_by_store =
+            HashMap::<String, std::collections::HashSet<String>>::new();
+        for (machine, export, outcome) in
+            run_federated_peer_rounds(request_map, owners, topology, deadline, cancelled)
+        {
+            let store = format!("{machine}/{export}");
+            match outcome {
+                Err(failure) => {
+                    *peer_failed = true;
+                    mark_source_phase(
+                        sources,
+                        &store,
+                        "lookup_edges",
+                        &failure.code,
+                        &failure.message,
+                    );
+                }
+                Ok(response) => {
+                    for mut row in response.data {
+                        if row.get("store").and_then(Value::as_str) != Some(store.as_str()) {
+                            *peer_failed = true;
+                            mark_source_phase(
+                                sources,
+                                &store,
+                                "lookup_edges",
+                                "protocol_error",
+                                "peer returned an edge for a different store",
+                            );
+                            continue;
+                        }
+                        match row.get("type").and_then(Value::as_str) {
+                            Some("node_result") => {
+                                let Some(node) = row.get("node").and_then(Value::as_str) else {
+                                    *peer_failed = true;
+                                    mark_source_phase(
+                                        sources,
+                                        &store,
+                                        "lookup_edges",
+                                        "protocol_error",
+                                        "peer node result omitted queried node",
+                                    );
+                                    continue;
+                                };
+                                if !expected_nodes_by_store
+                                    .get(&store)
+                                    .is_some_and(|expected| expected.contains(node))
+                                    || !returned_nodes_by_store
+                                        .entry(store.clone())
+                                        .or_default()
+                                        .insert(node.to_string())
+                                {
+                                    *peer_failed = true;
+                                    mark_source_phase(
+                                        sources,
+                                        &store,
+                                        "lookup_edges",
+                                        "protocol_error",
+                                        "peer returned an unrequested or duplicate node result",
+                                    );
+                                }
+                                continue;
+                            }
+                            Some("edge") => {}
+                            _ => {
+                                *peer_failed = true;
+                                mark_source_phase(
+                                    sources,
+                                    &store,
+                                    "lookup_edges",
+                                    "protocol_error",
+                                    "peer returned an unknown edge record type",
+                                );
+                                continue;
+                            }
+                        }
+                        let Some(node) = row.get("node").and_then(Value::as_str) else {
+                            *peer_failed = true;
+                            mark_source_phase(
+                                sources,
+                                &store,
+                                "lookup_edges",
+                                "protocol_error",
+                                "peer edge omitted queried node",
+                            );
+                            continue;
+                        };
+                        let node = federated_anchor(node, &store);
+                        if !frontier.contains(&node) {
+                            *peer_failed = true;
+                            mark_source_phase(
+                                sources,
+                                &store,
+                                "lookup_edges",
+                                "protocol_error",
+                                "peer returned an edge for a node outside this frontier",
+                            );
+                            continue;
+                        }
+                        row.as_object_mut()
+                            .expect("edge response is an object")
+                            .remove("type");
+                        row.as_object_mut()
+                            .expect("edge response is an object")
+                            .remove("node");
+                        let Some(mut candidate) = federated_edge_candidate(&store, row) else {
+                            *peer_failed = true;
+                            mark_source_phase(
+                                sources,
+                                &store,
+                                "lookup_edges",
+                                "protocol_error",
+                                "peer edge omitted semantic fields",
+                            );
+                            continue;
+                        };
+                        if candidate.from != node && candidate.to != node {
+                            *peer_failed = true;
+                            mark_source_phase(
+                                sources,
+                                &store,
+                                "lookup_edges",
+                                "protocol_error",
+                                "peer returned an edge that is not adjacent to its queried node",
+                            );
+                            continue;
+                        }
+                        let bucket = candidates_by_node.entry(node).or_default();
+                        match bucket.get_mut(&candidate.key) {
+                            Some(existing) => existing.stores.append(&mut candidate.stores),
+                            None => {
+                                bucket.insert(candidate.key.clone(), candidate);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (store, expected) in &expected_nodes_by_store {
+            if returned_nodes_by_store.get(store) != Some(expected) {
+                *peer_failed = true;
+                mark_source_phase(
+                    sources,
+                    store,
+                    "lookup_edges",
+                    "protocol_error",
+                    "peer omitted one or more queried node results",
+                );
+            }
+        }
+
+        let mut next_frontier = std::collections::BTreeSet::new();
+        let mut stopped = false;
+        for node in &frontier {
+            let Some(bucket) = candidates_by_node.remove(node) else {
+                continue;
+            };
+            let mut candidates = bucket.into_values().collect::<Vec<_>>();
+            candidates.sort_by(compare_federated_edges);
+            let mut fanout = 0usize;
+            for mut candidate in candidates {
+                if let Some(index) = seen_edges.get(&candidate.key).copied() {
+                    selected_edges[index].stores.append(&mut candidate.stores);
+                    continue;
+                }
+                if fanout >= traversal.max_fanout {
+                    break;
+                }
+                if selected_edges.len() >= traversal.max_edges {
+                    stopped = true;
+                    break;
+                }
+                fanout += 1;
+                let next = if candidate.from == *node {
+                    candidate.to.clone()
+                } else {
+                    candidate.from.clone()
+                };
+                seen_edges.insert(candidate.key.clone(), selected_edges.len());
+                if visited.insert(next.clone()) {
+                    next_frontier.insert(next);
+                }
+                selected_edges.push(candidate);
+            }
+            if stopped {
+                break;
+            }
+        }
+        frontier = next_frontier;
+        if stopped {
+            break;
+        }
+    }
+
+    let mut lineage = Vec::with_capacity(selected_edges.len());
+    for mut edge in selected_edges {
+        let stores = edge.stores.iter().cloned().collect::<Vec<_>>();
+        edge.row["store"] = json!(stores.first());
+        edge.row["stores"] = json!(stores);
+        edge.row["from_store"] = json!(edge.from.store_scope.clone());
+        edge.row["to_store"] = json!(edge.to.store_scope.clone());
+        lineage.push(edge.row);
+    }
+    Ok((lineage, visited.into_iter().collect()))
 }
 
 #[derive(Parser, Debug)]
@@ -1427,7 +3374,7 @@ fn cmd_show_peers_inner(
         }
         if !available_exports.is_empty() {
             let batches = available_exports
-                .chunks(MAX_BATCH_ITEMS)
+                .chunks(peer_item_cap(&owner))
                 .map(|batch| batch.to_vec())
                 .collect::<Vec<_>>();
             let requests = batches
@@ -2852,15 +4799,7 @@ fn cmd_explain_with_peers(
     args: ExplainArgs,
 ) -> Result<(), CliError> {
     let (cancelled, terminal_state) = peer_cancellation_flag()?;
-    let result = cmd_explain_with_peers_inner(
-        cwd,
-        context,
-        target,
-        target_kind,
-        args,
-        &cancelled,
-        &terminal_state,
-    );
+    let result = cmd_explain_with_peers_inner(cwd, context, target, target_kind, args, &cancelled);
     finish_peer_query(result, &terminal_state, "federated explain")
 }
 
@@ -2871,7 +4810,6 @@ fn cmd_explain_with_peers_inner(
     target_kind: ExplainTarget,
     args: ExplainArgs,
     cancelled: &Arc<AtomicBool>,
-    terminal_state: &Arc<AtomicU8>,
 ) -> Result<(), CliError> {
     let query_deadline = Instant::now() + PEER_QUERY_TIMEOUT;
     let home = home_dir()?;
@@ -2908,51 +4846,31 @@ fn cmd_explain_with_peers_inner(
         }
     };
     let indexes = open_query_indexes(context)?;
+    let local_stores = local_explain_store_refs(context, &topology.self_label);
+    if local_stores.len() != indexes.len() {
+        return Err(CliError::new(
+            "reader_unavailable",
+            "local explain store descriptors do not align with opened indexes",
+        ));
+    }
     let traversal = ExplainTraversal {
         min_confidence: args.min_confidence,
         max_fanout: args.max_fanout,
         max_edges: args.max_edges,
         max_depth: args.depth,
     };
-    let local_result = explain_across_indexes(&indexes, &query_anchors, traversal, args.forensics)?;
-    let local_touches = collect_touch_evidence(
-        &indexes,
-        &local_result.direct,
-        &local_result.touched_anchors,
-    )?;
-    let local_raw_sessions = build_session_windows(context, local_touches)?;
-    let (dispatch_lineage, dispatch_sessions, dispatch_unresolved, dispatch_ambiguous) =
-        collect_dispatch_upstream_sessions(context, &indexes, &local_raw_sessions)?;
-    let mut local_raw_sessions = local_raw_sessions;
-    local_raw_sessions.extend(dispatch_sessions);
-    let local_scores = collect_anchor_scores(&indexes, &query_anchors)?;
-    let mut sessions = format_sessions_for_agent(
-        context,
-        &indexes,
-        local_raw_sessions,
-        &local_scores,
-        args.grep_filter.as_deref(),
-    )?;
-    for session in &mut sessions {
-        if let Some(tape_id) = session
-            .get("session_id")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-        {
-            let location = local_grep_location(context, &topology.self_label, &tape_id);
-            session["location"] = location.clone();
-            session["physical_identity"] = json!({
-                "machine": topology.self_label,
-                "store": location["store"],
-                "tape_id": tape_id,
-                "file": resolve_tape_path(context, &tape_id).map(|path| json!({
-                    "machine": topology.self_label,
-                    "path": path,
-                    "kind": "tape",
-                })),
-            });
+    let mut roots = Vec::new();
+    for (index, store) in indexes.iter().zip(&local_stores) {
+        for anchor in &query_anchors {
+            roots.extend(
+                index
+                    .matching_window_anchors(anchor)?
+                    .into_iter()
+                    .map(|matched| federated_anchor(&matched, store)),
+            );
         }
     }
+    let local_scores = collect_anchor_scores(&indexes, &query_anchors)?;
 
     let date_filter = DateFilter::parse(args.since.as_deref(), args.until.as_deref())?;
     let mut sources = local_grep_source_rows(context, &topology.self_label);
@@ -3042,21 +4960,23 @@ fn cmd_explain_with_peers_inner(
                         }
                     }
                 }
-                let requests = active_exports
-                    .iter()
-                    .map(|export| {
-                        PeerRequest::new(
+                let mut requests = Vec::new();
+                let mut request_exports = Vec::new();
+                for export in &active_exports {
+                    for chunk in query_anchors.chunks(peer_item_cap(&owner)) {
+                        requests.push(PeerRequest::new(
                             "lookup_anchors",
                             vec![export.clone()],
-                            json!({"anchors": query_anchors, "include_deleted": args.include_deleted}),
-                        )
-                    })
-                    .collect::<Vec<_>>();
+                            json!({"anchors": chunk, "include_deleted": args.include_deleted}),
+                        ));
+                        request_exports.push(export.clone());
+                    }
+                }
                 if !requests.is_empty() {
                     lookup_jobs.push(PeerRoundJob {
                         machine: machine.clone(),
                         owner,
-                        exports: active_exports,
+                        exports: request_exports,
                         requests,
                     });
                 }
@@ -3065,11 +4985,13 @@ fn cmd_explain_with_peers_inner(
     }
 
     let mut remote_fragments = std::collections::BTreeMap::<(String, String), Vec<Value>>::new();
+    let mut remote_fragment_keys = std::collections::HashSet::<String>::new();
+    let mut remote_roots = Vec::<FederatedExplainAnchor>::new();
     let mut remote_tombstones = Vec::new();
     let mut remote_facts = std::collections::BTreeMap::<(String, String), Value>::new();
     let mut remote_locations = std::collections::BTreeMap::<(String, String), Value>::new();
     let mut facts_by_store =
-        std::collections::BTreeMap::<String, std::collections::BTreeMap<String, Vec<Value>>>::new();
+        std::collections::BTreeMap::<String, std::collections::BTreeSet<String>>::new();
 
     for result in run_peer_rounds_concurrently(
         lookup_jobs,
@@ -3108,7 +5030,46 @@ fn cmd_explain_with_peers_inner(
                             continue;
                         }
                         match row.get("type").and_then(Value::as_str) {
-                            Some("anchor_result") => {}
+                            Some("anchor_result") => {
+                                let Some(anchor) = row.get("anchor").and_then(Value::as_str) else {
+                                    any_peer_failure = true;
+                                    mark_source_phase(
+                                        &mut sources,
+                                        &store,
+                                        "lookup_anchors",
+                                        "protocol_error",
+                                        "anchor result omitted its query anchor",
+                                    );
+                                    continue;
+                                };
+                                if !query_anchors.iter().any(|query| query == anchor) {
+                                    any_peer_failure = true;
+                                    mark_source_phase(
+                                        &mut sources,
+                                        &store,
+                                        "lookup_anchors",
+                                        "protocol_error",
+                                        "anchor result named an unrequested query anchor",
+                                    );
+                                    continue;
+                                }
+                                let Some(matched) =
+                                    row.get("matching_window_anchors").and_then(Value::as_array)
+                                else {
+                                    any_peer_failure = true;
+                                    mark_source_phase(
+                                        &mut sources,
+                                        &store,
+                                        "lookup_anchors",
+                                        "protocol_error",
+                                        "anchor result omitted matching-window anchors",
+                                    );
+                                    continue;
+                                };
+                                for anchor in matched.iter().filter_map(Value::as_str) {
+                                    remote_roots.push(federated_anchor(anchor, &store));
+                                }
+                            }
                             Some("fragment") => {
                                 let Some(tape_id) = row.get("tape_id").and_then(Value::as_str)
                                 else {
@@ -3122,7 +5083,7 @@ fn cmd_explain_with_peers_inner(
                                     );
                                     continue;
                                 };
-                                let Some(offset) = row.get("event_offset").and_then(Value::as_u64)
+                                let Some(_offset) = row.get("event_offset").and_then(Value::as_u64)
                                 else {
                                     any_peer_failure = true;
                                     mark_source_phase(
@@ -3137,20 +5098,28 @@ fn cmd_explain_with_peers_inner(
                                 facts_by_store
                                     .entry(store.clone())
                                     .or_default()
-                                    .entry(tape_id.to_string())
-                                    .or_default()
-                                    .push(json!({
-                                        "tape_id": tape_id,
-                                        "edit_offsets": if row.get("kind").and_then(Value::as_str) == Some("edit") { json!([offset]) } else { json!([]) },
-                                        "anchor_offsets": [offset],
-                                        "grep_filter": args.grep_filter,
-                                        "window_lines": context.peek_default_lines.max(1),
-                                        "include_digest": false,
-                                    }));
-                                remote_fragments
-                                    .entry((store.clone(), tape_id.to_string()))
-                                    .or_default()
-                                    .push(row);
+                                    .insert(tape_id.to_string());
+                                let fragment_key = format!(
+                                    "{}\0{}\0{}\0{}\0{}\0{}",
+                                    store,
+                                    tape_id,
+                                    row.get("event_offset")
+                                        .and_then(Value::as_u64)
+                                        .unwrap_or_default(),
+                                    row.get("kind").and_then(Value::as_str).unwrap_or_default(),
+                                    row.get("file_path")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default(),
+                                    row.get("timestamp")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default(),
+                                );
+                                if remote_fragment_keys.insert(fragment_key) {
+                                    remote_fragments
+                                        .entry((store.clone(), tape_id.to_string()))
+                                        .or_default()
+                                        .push(row);
+                                }
                             }
                             Some("tombstone") => remote_tombstones.push(row),
                             _ => {
@@ -3170,8 +5139,162 @@ fn cmd_explain_with_peers_inner(
         }
     }
 
+    roots.extend(remote_roots);
+    let (lineage, visited_anchors) = collect_federated_lineage(
+        &indexes,
+        &local_stores,
+        roots,
+        &mut owners,
+        &topology,
+        traversal,
+        args.forensics,
+        query_deadline,
+        cancelled,
+        &mut sources,
+        &mut any_peer_failure,
+    )?;
+
+    let mut touch_requests =
+        std::collections::BTreeMap::<String, Vec<(String, PeerRequest)>>::new();
+    for (machine, owner) in &owners {
+        for (export, status) in &owner.exports {
+            if status.is_err() {
+                continue;
+            }
+            let store = format!("{machine}/{export}");
+            let mut anchors = query_anchors.clone();
+            anchors.extend(
+                visited_anchors
+                    .iter()
+                    .filter(|anchor| federated_anchor_applies(anchor, &store))
+                    .map(|anchor| anchor.anchor.clone()),
+            );
+            anchors.sort();
+            anchors.dedup();
+            for chunk in anchors.chunks(peer_item_cap(owner)) {
+                touch_requests.entry(machine.clone()).or_default().push((
+                    export.clone(),
+                    PeerRequest::new(
+                        "lookup_anchors",
+                        vec![export.clone()],
+                        json!({
+                            "anchors": chunk,
+                            "include_deleted": args.include_deleted,
+                        }),
+                    ),
+                ));
+            }
+        }
+    }
+    for (machine, export, outcome) in run_federated_peer_rounds(
+        touch_requests,
+        &mut owners,
+        &topology,
+        query_deadline,
+        cancelled,
+    ) {
+        let store = format!("{machine}/{export}");
+        match outcome {
+            Err(failure) => {
+                any_peer_failure = true;
+                mark_source_phase(
+                    &mut sources,
+                    &store,
+                    "lookup_anchors",
+                    &failure.code,
+                    &failure.message,
+                );
+            }
+            Ok(response) => {
+                for row in response.data {
+                    if row.get("store").and_then(Value::as_str) != Some(store.as_str()) {
+                        any_peer_failure = true;
+                        mark_source_phase(
+                            &mut sources,
+                            &store,
+                            "lookup_anchors",
+                            "protocol_error",
+                            "peer returned a touch record for a different store",
+                        );
+                        continue;
+                    }
+                    match row.get("type").and_then(Value::as_str) {
+                        Some("fragment") => {
+                            let (Some(tape_id), Some(_offset)) = (
+                                row.get("tape_id").and_then(Value::as_str),
+                                row.get("event_offset").and_then(Value::as_u64),
+                            ) else {
+                                any_peer_failure = true;
+                                mark_source_phase(
+                                    &mut sources,
+                                    &store,
+                                    "lookup_anchors",
+                                    "protocol_error",
+                                    "peer touch fragment omitted its tape identity or offset",
+                                );
+                                continue;
+                            };
+                            facts_by_store
+                                .entry(store.clone())
+                                .or_default()
+                                .insert(tape_id.to_string());
+                            let fragment_key = format!(
+                                "{}\0{}\0{}\0{}\0{}\0{}",
+                                store,
+                                tape_id,
+                                row.get("event_offset")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or_default(),
+                                row.get("kind").and_then(Value::as_str).unwrap_or_default(),
+                                row.get("file_path")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default(),
+                                row.get("timestamp")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default(),
+                            );
+                            if remote_fragment_keys.insert(fragment_key) {
+                                remote_fragments
+                                    .entry((store.clone(), tape_id.to_string()))
+                                    .or_default()
+                                    .push(row);
+                            }
+                        }
+                        Some("tombstone") => remote_tombstones.push(row),
+                        Some("anchor_result") => {}
+                        _ => {
+                            any_peer_failure = true;
+                            mark_source_phase(
+                                &mut sources,
+                                &store,
+                                "lookup_anchors",
+                                "protocol_error",
+                                "peer returned an unknown touch record type",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let local_touches =
+        collect_local_federated_touches(&indexes, &local_stores, &query_anchors, &visited_anchors)?;
+    let mut local_raw_sessions = build_session_windows(context, local_touches)?;
+    for session in &mut local_raw_sessions {
+        if let Some(tape_id) = session
+            .get("tape_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+        {
+            session["store"] =
+                local_grep_location(context, &topology.self_label, &tape_id)["store"].clone();
+        }
+    }
+    let local_dispatch_inputs = local_raw_sessions.clone();
+
     let mut facts_jobs = Vec::new();
-    for (machine, owner) in owners {
+    for (machine, owner) in std::mem::take(&mut owners) {
         let mut requests = Vec::new();
         let mut exports = Vec::new();
         for (store, tapes) in &facts_by_store {
@@ -3186,7 +5309,7 @@ fn cmd_explain_with_peers_inner(
             };
             let mut items = Vec::new();
             let mut tape_ids = Vec::new();
-            for (tape_id, tape_items) in tapes {
+            for tape_id in tapes {
                 let fragments = remote_fragments
                     .get(&(store.clone(), tape_id.clone()))
                     .cloned()
@@ -3213,9 +5336,8 @@ fn cmd_explain_with_peers_inner(
                     "include_digest": false,
                 }));
                 tape_ids.push(tape_id.clone());
-                let _ = tape_items;
             }
-            for chunk in items.chunks(MAX_BATCH_ITEMS) {
+            for chunk in items.chunks(peer_item_cap(&owner)) {
                 requests.push(PeerRequest::new(
                     "tape_facts",
                     vec![export.to_string()],
@@ -3224,7 +5346,7 @@ fn cmd_explain_with_peers_inner(
                 exports.push(export.to_string());
             }
             let tape_ids = tape_ids
-                .chunks(MAX_BATCH_ITEMS)
+                .chunks(peer_item_cap(&owner))
                 .map(|chunk| chunk.to_vec())
                 .collect::<Vec<_>>();
             for chunk in tape_ids {
@@ -3253,6 +5375,9 @@ fn cmd_explain_with_peers_inner(
         cancelled,
         configured_peer_concurrency(&topology),
     ) {
+        if let Some(owner) = result.owner {
+            owners.insert(result.machine.clone(), owner);
+        }
         for (index, outcome) in result.outcomes.into_iter().enumerate() {
             let export = result.exports.get(index).expect("request/export align");
             let store = format!("{}/{export}", result.machine);
@@ -3326,7 +5451,6 @@ fn cmd_explain_with_peers_inner(
     }
 
     let mut remote_sessions = Vec::new();
-    let mut remote_scores = HashMap::<String, f32>::new();
     for ((store, tape_id), fragments) in &remote_fragments {
         let fact = remote_facts.get(&(store.clone(), tape_id.clone()));
         let summary = fact
@@ -3344,6 +5468,7 @@ fn cmd_explain_with_peers_inner(
         let distinct_anchors = fragments
             .iter()
             .filter_map(|fragment| fragment.get("anchor").and_then(Value::as_str))
+            .filter(|anchor| query_anchors.iter().any(|query| query == *anchor))
             .collect::<std::collections::HashSet<_>>()
             .len();
         let score = if query_anchors.is_empty() {
@@ -3351,8 +5476,6 @@ fn cmd_explain_with_peers_inner(
         } else {
             distinct_anchors as f32 / query_anchors.len() as f32
         };
-        let key = format!("{store}/{tape_id}");
-        remote_scores.insert(key.clone(), score);
         let touches = fragments
             .iter()
             .map(|fragment| {
@@ -3401,16 +5524,59 @@ fn cmd_explain_with_peers_inner(
             "tape_facts": fact.cloned().unwrap_or(Value::Null),
         }));
     }
+    let mut dispatch_inputs = local_dispatch_inputs;
+    dispatch_inputs.extend(remote_sessions.iter().cloned());
+    let dispatch = collect_federated_dispatch(
+        context,
+        &indexes,
+        &local_stores,
+        &topology,
+        &dispatch_inputs,
+        &mut remote_facts,
+        &mut owners,
+        &mut sources,
+        query_deadline,
+        cancelled,
+        &mut any_peer_failure,
+    )?;
+    local_raw_sessions.extend(dispatch.local_parent_sessions);
+    let mut sessions = format_sessions_for_agent(
+        context,
+        &indexes,
+        local_raw_sessions,
+        &local_scores,
+        args.grep_filter.as_deref(),
+    )?;
+    for session in &mut sessions {
+        if let Some(tape_id) = session
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+        {
+            let location = local_grep_location(context, &topology.self_label, &tape_id);
+            session["location"] = location.clone();
+            session["store"] = location["store"].clone();
+            session["physical_identity"] = json!({
+                "machine": topology.self_label,
+                "store": location["store"],
+                "tape_id": tape_id,
+                "file": resolve_tape_path(context, &tape_id).map(|path| json!({
+                    "machine": topology.self_label,
+                    "path": path,
+                    "kind": "tape",
+                })),
+            });
+        }
+    }
+    let dispatch_lineage = dispatch.lineage;
+    let dispatch_unresolved = dispatch.unresolved;
+    let dispatch_ambiguous = dispatch.ambiguous;
     sessions.extend(remote_sessions);
+    sessions.extend(dispatch.remote_parent_sessions);
     sessions.retain(|session| session_matches_date_filter(session, &date_filter));
     annotate_chain_fields(&mut sessions, &dispatch_lineage);
     sessions.sort_by(compare_explain_sessions);
 
-    let lineage = local_result
-        .lineage
-        .iter()
-        .map(edge_to_json)
-        .collect::<Vec<_>>();
     let mut tombstones = Vec::new();
     if args.include_deleted {
         let mut seen = std::collections::HashSet::new();
@@ -3458,7 +5624,7 @@ fn cmd_explain_with_peers_inner(
     }
     let complete = !any_peer_failure;
     let chain_metadata = build_chain_metadata(&sessions);
-    let mut payload = json!({
+    let payload = json!({
         "query": {
             "command": "explain",
             "target": target,
@@ -3494,7 +5660,6 @@ fn cmd_explain_with_peers_inner(
             "sources": sources,
         },
     });
-    let _ = (&mut payload, &remote_scores, terminal_state);
     emit_query_result("explain", payload)
 }
 
@@ -4007,26 +6172,32 @@ fn cmd_grep_with_peer(
             }
         }
         let mut dispatch_jobs = Vec::new();
-        for (machine, owner, grep_ok_exports) in peer_owners.drain(..) {
-            if grep_ok_exports.is_empty() {
-                continue;
+        // A caller cancellation that already interrupted scanning must not
+        // relabel peers whose scans completed while dispatch metadata was
+        // never requested. Their aggregates remain valid; page references
+        // are made unknown below because coverage is partial.
+        if !cancelled.load(Ordering::SeqCst) {
+            for (machine, owner, grep_ok_exports) in peer_owners.drain(..) {
+                if grep_ok_exports.is_empty() {
+                    continue;
+                }
+                let requests = grep_ok_exports
+                    .iter()
+                    .map(|export| {
+                        PeerRequest::new(
+                            "dispatch_rows",
+                            vec![export.clone()],
+                            json!({"by_tape": page_ids.clone()}),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                dispatch_jobs.push(PeerRoundJob {
+                    machine,
+                    owner,
+                    exports: grep_ok_exports,
+                    requests,
+                });
             }
-            let requests = grep_ok_exports
-                .iter()
-                .map(|export| {
-                    PeerRequest::new(
-                        "dispatch_rows",
-                        vec![export.clone()],
-                        json!({"by_tape": page_ids.clone()}),
-                    )
-                })
-                .collect::<Vec<_>>();
-            dispatch_jobs.push(PeerRoundJob {
-                machine,
-                owner,
-                exports: grep_ok_exports,
-                requests,
-            });
         }
         for result in run_peer_rounds_concurrently(
             dispatch_jobs,

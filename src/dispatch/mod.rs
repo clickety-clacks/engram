@@ -2,12 +2,15 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::index::{DispatchDirection, DispatchLink, DispatchLinkRow, SqliteIndex};
 use crate::store::tapes::{
     TapeRow, event_window, parse_jsonl_rows, read_tape_content, resolve_tape_path,
 };
 use crate::{CliError, RuntimeContext};
+
+pub mod federated;
 
 const TRANSCRIPT_WINDOW_RADIUS: usize = 2;
 
@@ -207,6 +210,172 @@ fn message_turn_start(rows: &[TapeRow]) -> i64 {
         .unwrap_or(0)
 }
 
+#[doc(hidden)]
+pub fn local_tape_facts(
+    context: &RuntimeContext,
+    tape_id: &str,
+    edit_offsets: &[u64],
+    turns: &[i64],
+    include_digest: bool,
+) -> Result<Value, CliError> {
+    let mut current = tape_id.to_string();
+    let mut visited = HashSet::new();
+    let mut predecessor_chain = Vec::new();
+    let mut chain_status = "complete";
+    let mut unresolved_predecessor = None::<String>;
+    let mut raw_current = None::<String>;
+    let mut rows_current = None::<Vec<TapeRow>>;
+    const SEGMENT_LIMIT: usize = 256;
+    while visited.insert(current.clone()) {
+        let Some(path) = resolve_tape_path(context, &current) else {
+            if current == tape_id {
+                return Ok(json!({
+                    "type":"tape_facts",
+                    "tape_id":tape_id,
+                    "status":"unavailable",
+                    "chain_status":"missing_tape",
+                }));
+            }
+            chain_status = "missing_predecessor";
+            unresolved_predecessor = Some(current.clone());
+            break;
+        };
+        let raw = read_tape_content(&path)?;
+        let rows = parse_jsonl_rows(&raw)?;
+        let meta = rows
+            .iter()
+            .find(|row| row.value.get("k").and_then(Value::as_str) == Some("meta"))
+            .ok_or_else(|| CliError::new("invalid_tape", "tape is missing its meta row"))?;
+        let continuation = meta.value.get("ingest_continuation");
+        if continuation.is_some_and(|value| !value.is_null() && !value.is_object()) {
+            return Err(CliError::new(
+                "invalid_tape",
+                "ingest_continuation metadata must be an object",
+            ));
+        }
+        let previous = continuation
+            .and_then(|value| value.get("previous_tape_id"))
+            .filter(|value| !value.is_null())
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let turn_start = continuation
+            .and_then(|value| value.get("message_turn_start"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        predecessor_chain.push(json!({
+            "tape_id":current,
+            "previous_tape_id":previous,
+            "message_turn_start":turn_start,
+            "ingest_context_only":meta.value.get("ingest_context_only") == Some(&Value::Bool(true)),
+        }));
+        if current == tape_id {
+            raw_current = Some(raw.clone());
+            rows_current = Some(rows.clone());
+        }
+        let Some(previous) = previous else { break };
+        if predecessor_chain.len() >= SEGMENT_LIMIT {
+            chain_status = "over_limit";
+            unresolved_predecessor = Some(previous);
+            break;
+        }
+        if visited.contains(&previous) {
+            chain_status = "cycle";
+            unresolved_predecessor = Some(previous);
+            break;
+        }
+        current = previous;
+    }
+
+    let rows = rows_current.unwrap_or_default();
+    let turn_start = predecessor_chain
+        .first()
+        .and_then(|segment| segment.get("message_turn_start"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let mut recovery = crate::ingest::recovery::QueryRecovery::default();
+    let locator = recovery.lookup(context, tape_id)?;
+    let edit_offset_to_turn = edit_offsets
+        .iter()
+        .map(|offset| {
+            let present = rows.iter().any(|row| row.offset == *offset);
+            let segment_turn = rows
+                .iter()
+                .filter(|row| row.offset < *offset && is_message_row(&row.value))
+                .count() as i64;
+            let point = locator.and_then(|locator| {
+                locator
+                    .recovered
+                    .points
+                    .iter()
+                    .find(|point| point.old_offset == *offset)
+            });
+            let global_turn = point
+                .map(|point| point.turn)
+                .or_else(|| turn_start.checked_add(segment_turn));
+            json!({
+                "event_offset":offset,
+                "present":present,
+                "segment_turn":if present {Some(segment_turn)} else {None},
+                "turn":if present {global_turn} else {None},
+                "recovered_source_offset":point.map(|point| point.source_offset),
+            })
+        })
+        .collect::<Vec<_>>();
+    let turn_to_offset = turns
+        .iter()
+        .map(|turn| {
+            let offset = message_turn_to_event_offset(&rows, *turn);
+            let recovered_source_offset = locator.and_then(|locator| {
+                locator
+                    .recovered
+                    .points
+                    .iter()
+                    .find(|point| point.turn == *turn)
+                    .map(|point| point.source_offset)
+            });
+            json!({
+                "turn":turn,
+                "offset":offset,
+                "global_turn":turn_start.checked_add(*turn),
+                "recovered_source_offset":recovered_source_offset,
+            })
+        })
+        .collect::<Vec<_>>();
+    let recovery_binding = locator.map(|locator| {
+        json!({
+            "verified":true,
+            "context_tape":locator.context_tape,
+            "points":locator.recovered.points.iter()
+                .filter(|point| edit_offsets.contains(&point.old_offset))
+                .map(|point| json!({
+                    "old_offset":point.old_offset,
+                    "source_offset":point.source_offset,
+                    "turn":point.turn,
+                }))
+                .collect::<Vec<_>>(),
+        })
+    });
+    let digest = include_digest.then(|| {
+        format!(
+            "{:x}",
+            Sha256::digest(raw_current.as_deref().unwrap_or_default().as_bytes())
+        )
+    });
+    Ok(json!({
+        "type":"tape_facts",
+        "tape_id":tape_id,
+        "status":"ok",
+        "segment":predecessor_chain.first(),
+        "predecessor_chain":predecessor_chain,
+        "chain_status":chain_status,
+        "unresolved_predecessor":unresolved_predecessor,
+        "edit_offset_to_turn":edit_offset_to_turn,
+        "turn_to_offset":turn_to_offset,
+        "recovery_binding":recovery_binding,
+        "digest":digest,
+    }))
+}
+
 /// Merge the first occurrence of each UUID across the immutable predecessor
 /// chain before selecting a parent. A later append must not renew a marker.
 /// Keep both directions: an earlier sent occurrence suppresses a later receive.
@@ -357,6 +526,13 @@ fn build_dispatch_session(
             "first_turn_index": link.first_turn_index,
         }
     })))
+}
+
+pub fn build_dispatch_session_for_link(
+    context: &RuntimeContext,
+    link: &DispatchLinkRow,
+) -> Result<Option<Value>, CliError> {
+    build_dispatch_session(context, &mut DispatchTapeCache::default(), link)
 }
 
 fn message_turn_before_offset(

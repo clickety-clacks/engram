@@ -243,6 +243,15 @@ fn read_frame<R: BufRead>(input: &mut R) -> io::Result<Option<Vec<u8>>> {
 }
 
 impl PeerSession {
+    fn batch_cap(&self) -> usize {
+        configured_limit(
+            &self.topology.limits,
+            "items_per_batch",
+            MAX_BATCH_ITEMS as u64,
+        )
+        .clamp(1, MAX_BATCH_ITEMS as u64) as usize
+    }
+
     fn handle<W: Write>(
         &mut self,
         request: &Value,
@@ -413,6 +422,7 @@ impl PeerSession {
                     "owner_idle_timeout_secs",
                     DEFAULT_OWNER_IDLE_TIMEOUT_SECS,
                 ),
+                "items_per_batch": self.batch_cap(),
             },
             "opened": opened,
         }))
@@ -426,7 +436,8 @@ impl PeerSession {
         output: &mut W,
     ) -> Result<Value, PeerError> {
         reject_unknown_keys(args, &["tape_ids"])?;
-        let tape_ids = string_batch(args.get("tape_ids"), "args.tape_ids")?;
+        let tape_ids =
+            string_batch_with_cap(args.get("tape_ids"), "args.tape_ids", self.batch_cap())?;
         for store in stores {
             let export = self.require_open(store)?;
             for tape_id in &tape_ids {
@@ -457,8 +468,8 @@ impl PeerSession {
         output: &mut W,
     ) -> Result<Value, PeerError> {
         reject_unknown_keys(args, &["by_tape", "by_uuid"])?;
-        let by_tape = optional_string_batch(args.get("by_tape"), "args.by_tape")?;
-        let by_uuid = optional_string_batch(args.get("by_uuid"), "args.by_uuid")?;
+        let by_tape = optional_string_batch(args.get("by_tape"), "args.by_tape", self.batch_cap())?;
+        let by_uuid = optional_string_batch(args.get("by_uuid"), "args.by_uuid", self.batch_cap())?;
         if by_tape.is_empty() && by_uuid.is_empty() {
             return Err(PeerError::new(
                 "invalid_request",
@@ -511,7 +522,7 @@ impl PeerSession {
         output: &mut W,
     ) -> Result<Value, PeerError> {
         reject_unknown_keys(args, &["anchors", "include_deleted"])?;
-        let anchors = anchor_batch(args.get("anchors"), "args.anchors")?;
+        let anchors = anchor_batch_with_cap(args.get("anchors"), "args.anchors", self.batch_cap())?;
         let include_deleted = match args.get("include_deleted") {
             None => false,
             Some(Value::Bool(value)) => *value,
@@ -612,7 +623,7 @@ impl PeerSession {
         output: &mut W,
     ) -> Result<Value, PeerError> {
         reject_unknown_keys(args, &["nodes", "min_confidence", "include_forensics"])?;
-        let nodes = anchor_batch(args.get("nodes"), "args.nodes")?;
+        let nodes = anchor_batch_with_cap(args.get("nodes"), "args.nodes", self.batch_cap())?;
         let min_confidence = match args.get("min_confidence") {
             None => 0.5,
             Some(value) => value.as_f64().ok_or_else(|| {
@@ -698,11 +709,11 @@ impl PeerSession {
         let items = args
             .get("items")
             .and_then(Value::as_array)
-            .filter(|items| !items.is_empty() && items.len() <= MAX_BATCH_ITEMS)
+            .filter(|items| !items.is_empty() && items.len() <= self.batch_cap())
             .ok_or_else(|| {
                 PeerError::new(
                     "invalid_request",
-                    format!("args.items must contain 1..={MAX_BATCH_ITEMS} items"),
+                    format!("args.items must contain 1..={} items", self.batch_cap()),
                 )
             })?;
         let export = self.require_open(&stores[0])?;
@@ -743,9 +754,15 @@ impl PeerSession {
                     format!("duplicate tape_facts tape_id `{tape_id}`"),
                 ));
             }
-            let edit_offsets = optional_u64_array(item.get("edit_offsets"), "edit_offsets")?;
-            let turns = optional_nonnegative_i64_array(item.get("turns"), "turns")?;
-            let anchor_offsets = optional_u64_array(item.get("anchor_offsets"), "anchor_offsets")?;
+            let edit_offsets =
+                optional_u64_array(item.get("edit_offsets"), "edit_offsets", self.batch_cap())?;
+            let turns =
+                optional_nonnegative_i64_array(item.get("turns"), "turns", self.batch_cap())?;
+            let anchor_offsets = optional_u64_array(
+                item.get("anchor_offsets"),
+                "anchor_offsets",
+                self.batch_cap(),
+            )?;
             let grep_filter = optional_string(item.get("grep_filter"), "grep_filter")?;
             let window_lines = optional_usize(item.get("window_lines"), "window_lines")?
                 .unwrap_or(30)
@@ -2246,10 +2263,14 @@ fn validate_tape_id(id: &str) -> Result<(), PeerError> {
     Ok(())
 }
 
-fn optional_u64_array(value: Option<&Value>, name: &str) -> Result<Vec<u64>, PeerError> {
+fn optional_u64_array(
+    value: Option<&Value>,
+    name: &str,
+    batch_cap: usize,
+) -> Result<Vec<u64>, PeerError> {
     match value {
         None => Ok(Vec::new()),
-        Some(Value::Array(values)) if values.len() <= MAX_BATCH_ITEMS => values
+        Some(Value::Array(values)) if values.len() <= batch_cap => values
             .iter()
             .map(|value| {
                 value.as_u64().ok_or_else(|| {
@@ -2259,7 +2280,7 @@ fn optional_u64_array(value: Option<&Value>, name: &str) -> Result<Vec<u64>, Pee
             .collect(),
         Some(Value::Array(_)) => Err(PeerError::new(
             "invalid_request",
-            format!("{name} exceeds {MAX_BATCH_ITEMS} items"),
+            format!("{name} exceeds {batch_cap} items"),
         )),
         Some(_) => Err(PeerError::new(
             "invalid_request",
@@ -2271,10 +2292,11 @@ fn optional_u64_array(value: Option<&Value>, name: &str) -> Result<Vec<u64>, Pee
 fn optional_nonnegative_i64_array(
     value: Option<&Value>,
     name: &str,
+    batch_cap: usize,
 ) -> Result<Vec<i64>, PeerError> {
     match value {
         None => Ok(Vec::new()),
-        Some(Value::Array(values)) if values.len() <= MAX_BATCH_ITEMS => values
+        Some(Value::Array(values)) if values.len() <= batch_cap => values
             .iter()
             .map(|value| {
                 value.as_i64().filter(|value| *value >= 0).ok_or_else(|| {
@@ -2287,7 +2309,7 @@ fn optional_nonnegative_i64_array(
             .collect(),
         Some(Value::Array(_)) => Err(PeerError::new(
             "invalid_request",
-            format!("{name} exceeds {MAX_BATCH_ITEMS} items"),
+            format!("{name} exceeds {batch_cap} items"),
         )),
         Some(_) => Err(PeerError::new(
             "invalid_request",
@@ -2376,8 +2398,20 @@ fn string_batch(value: Option<&Value>, label: &str) -> Result<Vec<String>, PeerE
     string_batch_limited(value, label, 255)
 }
 
-fn anchor_batch(value: Option<&Value>, label: &str) -> Result<Vec<String>, PeerError> {
-    string_batch_limited(value, label, MAX_ANCHOR_BYTES)
+fn string_batch_with_cap(
+    value: Option<&Value>,
+    label: &str,
+    batch_cap: usize,
+) -> Result<Vec<String>, PeerError> {
+    string_batch_limited_count(value, label, 255, batch_cap)
+}
+
+fn anchor_batch_with_cap(
+    value: Option<&Value>,
+    label: &str,
+    batch_cap: usize,
+) -> Result<Vec<String>, PeerError> {
+    string_batch_limited_count(value, label, MAX_ANCHOR_BYTES, batch_cap)
 }
 
 fn string_batch_limited(
@@ -2385,13 +2419,22 @@ fn string_batch_limited(
     label: &str,
     max_item_bytes: usize,
 ) -> Result<Vec<String>, PeerError> {
+    string_batch_limited_count(value, label, max_item_bytes, MAX_BATCH_ITEMS)
+}
+
+fn string_batch_limited_count(
+    value: Option<&Value>,
+    label: &str,
+    max_item_bytes: usize,
+    batch_cap: usize,
+) -> Result<Vec<String>, PeerError> {
     let values = value
         .and_then(Value::as_array)
         .ok_or_else(|| PeerError::new("invalid_request", format!("{label} must be an array")))?;
-    if values.is_empty() || values.len() > MAX_BATCH_ITEMS {
+    if values.is_empty() || values.len() > batch_cap {
         return Err(PeerError::new(
             "invalid_request",
-            format!("{label} must contain 1..={MAX_BATCH_ITEMS} items"),
+            format!("{label} must contain 1..={batch_cap} items"),
         ));
     }
     let mut out = Vec::with_capacity(values.len());
@@ -2413,10 +2456,14 @@ fn string_batch_limited(
     Ok(out)
 }
 
-fn optional_string_batch(value: Option<&Value>, label: &str) -> Result<Vec<String>, PeerError> {
+fn optional_string_batch(
+    value: Option<&Value>,
+    label: &str,
+    batch_cap: usize,
+) -> Result<Vec<String>, PeerError> {
     match value {
         None => Ok(Vec::new()),
-        Some(value) => string_batch(Some(value), label),
+        Some(value) => string_batch_with_cap(Some(value), label, batch_cap),
     }
 }
 

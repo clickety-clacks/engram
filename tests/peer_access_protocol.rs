@@ -125,6 +125,94 @@ fn log_peer_operations(
     log_path
 }
 
+fn log_peer_requests_with_chunk_barrier(
+    root: &std::path::Path,
+    machine: &str,
+    binary: &str,
+    peer: &mut serde_json::Value,
+    chunks_per_round: usize,
+    fail_chunk: Option<usize>,
+) -> std::path::PathBuf {
+    let log_path = root.join(format!("{machine}-peer-requests.jsonl"));
+    let pending_path = root.join(format!("{machine}-pending-requests.jsonl"));
+    let responses_path = root.join(format!("{machine}-responses.jsonl"));
+    let fifo_in = root.join(format!("{machine}-peer-in.fifo"));
+    let fifo_out = root.join(format!("{machine}-peer-out.fifo"));
+    let script_path = root.join(format!("{machine}-chunk-barrier-peer.sh"));
+    let owner_home = peer["command"][1]
+        .as_str()
+        .expect("test owner HOME assignment")
+        .to_string();
+    let script = [
+        "#!/bin/sh",
+        "set -eu",
+        "binary=\"$1\"",
+        "log=\"$2\"",
+        "pending=\"$3\"",
+        "responses=\"$4\"",
+        "fifo_in=\"$5\"",
+        "fifo_out=\"$6\"",
+        "chunks_per_round=\"$7\"",
+        "fail_chunk=\"$8\"",
+        "read_responses() { response_file=\"$1\"; : >\"$response_file\"; while IFS= read -r response <&4; do printf '%s\\n' \"$response\" >>\"$response_file\"; case \"$response\" in *'\"end\":true'*) return 0 ;; esac; done; return 1; }",
+        "mkfifo \"$fifo_in\" \"$fifo_out\"",
+        "\"$binary\" peer-serve --stdio <\"$fifo_in\" >\"$fifo_out\" &",
+        "peer_pid=$!",
+        "cleanup() { kill \"$peer_pid\" 2>/dev/null || true; wait \"$peer_pid\" 2>/dev/null || true; rm -f \"$fifo_in\" \"$fifo_out\"; }",
+        "trap cleanup EXIT",
+        "exec 3>\"$fifo_in\"",
+        "exec 4<\"$fifo_out\"",
+        ": >\"$pending\"",
+        ": >\"$pending.ids\"",
+        "edge_requests=0",
+        "while IFS= read -r request; do",
+        "  printf '%s\\n' \"$request\" >>\"$log\"",
+        "  op=$(printf '%s\\n' \"$request\" | sed -n 's/.*\"op\":\"\\([^\"]*\\)\".*/\\1/p')",
+        "  request_id=$(printf '%s\\n' \"$request\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')",
+        "  if [ \"$op\" = lookup_edges ]; then",
+        "    edge_requests=$((edge_requests + 1))",
+        "    if [ \"$edge_requests\" -ge 2 ] && [ \"$edge_requests\" -le $((chunks_per_round + 1)) ]; then",
+        "      printf '%s\\n' \"$request\" >>\"$pending\"",
+        "      printf '%s\\n' \"$request_id\" >>\"$pending.ids\"",
+        "      if [ \"$edge_requests\" -eq $((chunks_per_round + 1)) ]; then",
+        "        cat \"$pending\" >&3",
+        "        : >\"$pending\"",
+        "        response_count=0",
+        "        while IFS= read -r chunk_id; do",
+        "          response_count=$((response_count + 1))",
+        "          read_responses \"$responses.$response_count\" \"$chunk_id\"",
+        "          if [ \"$response_count\" -eq \"$fail_chunk\" ]; then printf '{\\\"id\\\":%s,\\\"end\\\":true,\\\"ok\\\":false,\\\"stats\\\":{},\\\"error\\\":{\\\"code\\\":\\\"synthetic_failure\\\",\\\"message\\\":\\\"injected chunk failure\\\"}}\\n' \"$chunk_id\" >\"$responses.$response_count\"; fi",
+        "        done <\"$pending.ids\"",
+        "        while [ \"$response_count\" -gt 0 ]; do cat \"$responses.$response_count\"; response_count=$((response_count - 1)); done",
+        "        : >\"$pending.ids\"",
+      "      fi",
+        "      continue",
+        "    fi",
+        "  fi",
+        "  printf '%s\\n' \"$request\" >&3",
+        "  read_responses \"$responses.single\" \"$request_id\"",
+        "  cat \"$responses.single\"",
+        "done",
+    ]
+    .join("\n");
+    std::fs::write(&script_path, script).expect("write chunk barrier peer");
+    peer["command"] = json!([
+        "/usr/bin/env",
+        owner_home,
+        "/bin/sh",
+        script_path,
+        binary,
+        log_path,
+        pending_path,
+        responses_path,
+        fifo_in,
+        fifo_out,
+        chunks_per_round.to_string(),
+        fail_chunk.unwrap_or_default().to_string(),
+    ]);
+    log_path
+}
+
 fn operation_count(log_path: &std::path::Path, operation: &str) -> usize {
     std::fs::read_to_string(log_path)
         .unwrap_or_default()
@@ -201,6 +289,48 @@ fn explain_peers_attributes_remote_only_edits_to_their_physical_owner() {
             engram::index::lineage::LINK_THRESHOLD_DEFAULT,
         )
         .expect("index remote-only edit");
+    let after_window = engram::anchor::fingerprint_windows(&source)
+        .into_iter()
+        .next()
+        .expect("source fingerprint window");
+    let after_anchor = after_window.anchor;
+    let before_anchor = engram::anchor::fingerprint_windows(&before)
+        .remove(0)
+        .anchor;
+    index
+        .insert_edge(
+            &engram::index::EdgeSource {
+                source_kind: engram::index::EdgeSourceKind::Edit,
+                tape_id: tape_id.into(),
+                event_offset: 1,
+                pair_ordinal: 99,
+                from_window_ordinal: 0,
+                to_window_ordinal: 0,
+            },
+            &engram::index::lineage::SpanEdge {
+                from_anchor: after_anchor.clone(),
+                to_anchor: before_anchor,
+                confidence: 0.95,
+                location_delta: engram::index::lineage::LocationDelta::Moved,
+                cardinality: engram::index::lineage::Cardinality::OneToOne,
+                agent_link: false,
+                note: Some("synthetic remote lineage edge".into()),
+            },
+        )
+        .expect("insert synthetic owner edge");
+    assert!(
+        index
+            .outbound_edges(&after_anchor, 0.5, false)
+            .expect("query inserted owner edge")
+            .iter()
+            .any(|edge| edge.from_anchor == after_anchor)
+    );
+    assert!(after_window.features.iter().any(|feature| {
+        index
+            .matching_window_anchors(feature)
+            .expect("match source feature")
+            .contains(&after_anchor)
+    }));
     drop(index);
 
     let mut remote = remote;
@@ -253,10 +383,539 @@ fn explain_peers_attributes_remote_only_edits_to_their_physical_owner() {
             .expect("owner tape path")
     );
     assert_eq!(value["federation"]["coverage"], "complete");
-    assert_eq!(operation_count(&remote_operations, "lookup_anchors"), 1);
+    assert_eq!(operation_count(&remote_operations, "lookup_edges"), 2);
+    assert!(
+        value["lineage"]
+            .as_array()
+            .is_some_and(|edges| !edges.is_empty()),
+        "remote lineage edge was not traversed; lookup_edges={} response={value:#}",
+        operation_count(&remote_operations, "lookup_edges")
+    );
+    assert!(value["lineage"].as_array().unwrap().iter().any(|edge| {
+        edge["store"] == "remote-owner/default"
+            && edge["from_anchor"].as_str().is_some()
+            && edge["to_anchor"].as_str().is_some()
+    }));
+    assert_eq!(operation_count(&remote_operations, "lookup_anchors"), 2);
+    assert_eq!(operation_count(&remote_operations, "lookup_edges"), 2);
     assert_eq!(operation_count(&remote_operations, "tape_facts"), 1);
     assert_eq!(operation_count(&remote_operations, "locate_tapes"), 1);
     assert_eq!(operation_count(&remote_operations, "read_file"), 0);
+}
+
+#[test]
+fn explain_peers_folds_a_remote_received_marker_to_one_local_sender() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let uuid = "123e4567-e89b-12d3-a456-426614174000";
+    let source = "fn remotely_edited() { dispatch_marker_is_real(); }\n".repeat(12);
+    let before = source.replace("remotely_edited", "before_remote_edit");
+    let receiver_tape = "remote-receiver-tape";
+    let receiver_events = [
+        json!({"t":"2026-09-25T12:00:00Z","k":"meta","model":"peer-test"}),
+        json!({"t":"2026-09-25T12:01:00Z","k":"msg.in","content":format!("<engram-src id=\"{uuid}\"/>")}),
+        json!({
+            "t":"2026-09-25T12:02:00Z",
+            "k":"code.edit",
+            "file":"handoff.rs",
+            "before_range":[1,12],
+            "after_range":[1,12],
+            "before_text":before,
+            "after_text":source,
+        }),
+    ]
+    .iter()
+    .map(serde_json::Value::to_string)
+    .collect::<Vec<_>>()
+    .join("\n")
+        + "\n";
+    let remote = write_grep_owner(
+        temp.path(),
+        "remote-owner",
+        binary,
+        &[(receiver_tape, &receiver_events)],
+    );
+    let owner_db = temp.path().join("remote-owner-home/.engram/index.sqlite");
+    let owner_index =
+        SqliteIndex::open_writer(owner_db.to_str().expect("owner DB path")).expect("owner index");
+    let receiver_parsed = engram::tape::event::parse_jsonl_events(&receiver_events)
+        .expect("parse remote receiver events");
+    owner_index
+        .ingest_tape_events_with_dispatch(
+            receiver_tape,
+            &receiver_parsed,
+            &[DispatchLink {
+                uuid: uuid.into(),
+                first_turn_index: 0,
+                direction: DispatchDirection::Received,
+            }],
+            engram::index::lineage::LINK_THRESHOLD_DEFAULT,
+        )
+        .expect("index receiver and incoming marker");
+    drop(owner_index);
+
+    let sender_tape = "local-sender-tape";
+    let sender_events = format!(
+        "{{\"t\":\"2026-09-25T11:00:00Z\",\"k\":\"meta\",\"model\":\"local-test\"}}\n{{\"t\":\"2026-09-25T11:01:00Z\",\"k\":\"msg.out\",\"content\":\"<engram-src id=\\\"{uuid}\\\"/>\"}}\n"
+    );
+    let (caller_home, repo) = write_local_grep_source(temp.path(), sender_tape, &sender_events);
+    let caller_db = repo.join(".engram/index.sqlite");
+    let caller_index = SqliteIndex::open_writer(caller_db.to_str().expect("caller DB path"))
+        .expect("caller index");
+    caller_index
+        .insert_dispatch_link(
+            sender_tape,
+            &DispatchLink {
+                uuid: uuid.into(),
+                first_turn_index: 0,
+                direction: DispatchDirection::Sent,
+            },
+        )
+        .expect("index local outgoing marker");
+    drop(caller_index);
+    std::fs::write(repo.join("handoff.rs"), &source).expect("write query source");
+
+    let mut remote = remote;
+    let operations = log_peer_operations(temp.path(), "remote-owner", binary, &mut remote);
+    std::fs::write(
+        caller_home.join(".engram/topology.yml"),
+        serde_json::to_vec(&json!({"version":1,"self":"caller","peers":{"remote-owner":remote}}))
+            .expect("serialize caller topology"),
+    )
+    .expect("write caller topology");
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["explain", "handoff.rs", "--peers", "remote-owner"])
+        .output()
+        .expect("run federated explain");
+    assert!(
+        output.status.success(),
+        "federated explain failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("explain JSON");
+    assert_eq!(value["federation"]["coverage"], "complete");
+    let hop = value["dispatch_lineage"]
+        .as_array()
+        .expect("dispatch lineage")
+        .first()
+        .expect("two-sided handoff");
+    assert_eq!(hop["session"], receiver_tape);
+    assert_eq!(hop["received_uuid"], uuid);
+    assert_eq!(hop["parent_session"], sender_tape);
+    assert_eq!(hop["session_location"], "remote-owner/default");
+    assert_eq!(hop["parent_location"], "caller/local:0");
+    assert_eq!(hop["selection_coverage"], "complete");
+    assert!(value["sessions"].as_array().unwrap().iter().any(|session| {
+        session["session_id"] == sender_tape && session["location"]["store"] == "caller/local:0"
+    }));
+    assert!(operation_count(&operations, "dispatch_rows") >= 2);
+    assert_eq!(operation_count(&operations, "read_file"), 0);
+}
+
+#[test]
+fn explain_peers_reports_missing_sender_owner_without_inventing_a_hop() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let uuid = "123e4567-e89b-12d3-a456-426614174001";
+    let source =
+        "fn remote_edit_without_observed_sender() { marker_is_received_only(); }\n".repeat(8);
+    let before = source.replace(
+        "remote_edit_without_observed_sender",
+        "before_missing_sender",
+    );
+    let receiver_tape = "remote-receiver-without-sender";
+    let receiver_events = [
+        json!({"t":"2026-09-25T12:00:00Z","k":"meta","model":"peer-test"}),
+        json!({"t":"2026-09-25T12:01:00Z","k":"msg.in","content":format!("<engram-src id=\"{uuid}\"/>")}),
+        json!({
+            "t":"2026-09-25T12:02:00Z",
+            "k":"code.edit",
+            "file":"missing-sender.rs",
+            "before_range":[1,8],
+            "after_range":[1,8],
+            "before_text":before,
+            "after_text":source,
+        }),
+    ]
+    .iter()
+    .map(serde_json::Value::to_string)
+    .collect::<Vec<_>>()
+    .join("\n")
+        + "\n";
+    let remote = write_grep_owner(
+        temp.path(),
+        "remote-owner",
+        binary,
+        &[(receiver_tape, &receiver_events)],
+    );
+    let owner_db = temp.path().join("remote-owner-home/.engram/index.sqlite");
+    let owner_index =
+        SqliteIndex::open_writer(owner_db.to_str().expect("owner DB path")).expect("owner index");
+    let receiver_parsed = engram::tape::event::parse_jsonl_events(&receiver_events)
+        .expect("parse remote receiver events");
+    owner_index
+        .ingest_tape_events_with_dispatch(
+            receiver_tape,
+            &receiver_parsed,
+            &[DispatchLink {
+                uuid: uuid.into(),
+                first_turn_index: 0,
+                direction: DispatchDirection::Received,
+            }],
+            engram::index::lineage::LINK_THRESHOLD_DEFAULT,
+        )
+        .expect("index received-only marker");
+    drop(owner_index);
+    let remote = remote;
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "empty-caller-tape",
+        "{\"t\":\"2026-09-25T11:00:00Z\",\"k\":\"note\",\"content\":\"no sender\"}\n",
+    );
+    std::fs::write(repo.join("missing-sender.rs"), &source).expect("write query source");
+    std::fs::write(
+        caller_home.join(".engram/topology.yml"),
+        serde_json::to_vec(&json!({
+            "version":1,
+            "self":"caller",
+            "peers":{
+                "remote-owner":remote,
+                "silent-owner":{"command":["/bin/false"],"engram":"engram","exports":["default"]},
+            }
+        }))
+        .expect("serialize caller topology"),
+    )
+    .expect("write caller topology");
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "explain",
+            "missing-sender.rs",
+            "--peers",
+            "remote-owner,silent-owner",
+        ])
+        .output()
+        .expect("run federated explain");
+    assert!(
+        output.status.success(),
+        "partial explain should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("explain JSON");
+    assert_eq!(value["federation"]["coverage"], "partial");
+    assert!(value["dispatch_lineage"].as_array().unwrap().is_empty());
+    let unresolved = value["dispatch_unresolved"]
+        .as_array()
+        .expect("dispatch unresolved");
+    assert!(
+        unresolved.iter().any(|row| {
+            row["reason"] == "no_sender_observed"
+                && row["uuid"] == uuid
+                && row["stores_unavailable"].as_array().is_some_and(|stores| {
+                    stores.iter().any(|store| store == "silent-owner/default")
+                })
+        }),
+        "missing sender attribution was not preserved: {value:#}"
+    );
+}
+
+#[test]
+fn explain_peers_pipelines_negotiated_edge_chunks_and_keeps_semantic_order() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let source = (1..=24)
+        .map(|line| format!("fn chunk_frontier_{line}() {{ stable_value_{line}(); }}\n"))
+        .collect::<String>();
+    let before = source.replace("chunk_frontier", "before_chunk_frontier");
+    let tape_id = "large-frontier-tape";
+    let events = [
+        json!({"t":"2026-09-25T12:00:00Z","k":"meta","model":"peer-test"}),
+        json!({
+            "t":"2026-09-25T12:01:00Z",
+            "k":"code.edit",
+            "file":"frontier.rs",
+            "before_range":[1,24],
+            "after_range":[1,24],
+            "before_text":before,
+            "after_text":source,
+        }),
+    ]
+    .iter()
+    .map(serde_json::Value::to_string)
+    .collect::<Vec<_>>()
+    .join("\n")
+        + "\n";
+    let mut peer = write_grep_owner(temp.path(), "remote-owner", binary, &[(tape_id, &events)]);
+    let peer_template = peer.clone();
+    let owner_home = temp.path().join("remote-owner-home");
+    let owner_engram = owner_home.join(".engram");
+    let owner_db = owner_engram.join("index.sqlite");
+    let owner_tapes = owner_engram.join("tapes");
+    std::fs::write(
+        owner_engram.join("topology.yml"),
+        format!(
+            "version: 1\nself: remote-owner\nexports:\n  default:\n    db: {}\n    tape_dirs:\n      - {}\nlimits:\n  items_per_batch: 37\n",
+            owner_db.display(),
+            owner_tapes.display()
+        ),
+    )
+    .expect("write lower-cap owner topology");
+
+    let index = SqliteIndex::open_writer(owner_db.to_str().expect("owner DB path"))
+        .expect("open owner index");
+    let parsed = engram::tape::event::parse_jsonl_events(&events).expect("parse edit tape");
+    index
+        .ingest_tape_events(
+            tape_id,
+            &parsed,
+            engram::index::lineage::LINK_THRESHOLD_DEFAULT,
+        )
+        .expect("index remote edit");
+    let root_window = engram::anchor::fingerprint_windows(&source)
+        .into_iter()
+        .next()
+        .expect("source anchor window");
+    let root_anchor = root_window.anchor.clone();
+    let query_anchor = root_window
+        .features
+        .iter()
+        .find(|feature| {
+            index
+                .matching_window_anchors(feature)
+                .is_ok_and(|anchors| anchors == vec![root_anchor.clone()])
+        })
+        .expect("feature uniquely identifies the root window")
+        .clone();
+    for child in (0_u32..140).rev() {
+        index
+            .insert_edge(
+                &engram::index::EdgeSource {
+                    source_kind: engram::index::EdgeSourceKind::SpanLink,
+                    tape_id: tape_id.into(),
+                    event_offset: 1,
+                    pair_ordinal: child,
+                    from_window_ordinal: 0,
+                    to_window_ordinal: i64::from(child),
+                },
+                &engram::index::lineage::SpanEdge {
+                    from_anchor: root_anchor.clone(),
+                    to_anchor: format!("span:child-{child:03}"),
+                    confidence: 0.95,
+                    location_delta: engram::index::lineage::LocationDelta::Adjacent,
+                    cardinality: engram::index::lineage::Cardinality::OneToMany,
+                    agent_link: false,
+                    note: Some("synthetic frontier edge".into()),
+                },
+            )
+            .expect("insert frontier edge");
+    }
+    drop(index);
+
+    let request_log = log_peer_requests_with_chunk_barrier(
+        temp.path(),
+        "remote-owner",
+        binary,
+        &mut peer,
+        4,
+        None,
+    );
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "empty-caller-tape",
+        "{\"t\":\"2026-09-25T11:00:00Z\",\"k\":\"note\",\"content\":\"empty\"}\n",
+    );
+    std::fs::write(
+        caller_home.join(".engram/topology.yml"),
+        serde_json::to_vec(&json!({"version":1,"self":"caller","peers":{"remote-owner":peer}}))
+            .expect("serialize caller topology"),
+    )
+    .expect("write caller topology");
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "explain",
+            query_anchor.as_str(),
+            "--anchor",
+            "--peers",
+            "remote-owner",
+            "--max-fanout",
+            "200",
+            "--max-edges",
+            "200",
+            "--depth",
+            "2",
+        ])
+        .output()
+        .expect("run chunked federated explain");
+    assert!(
+        output.status.success(),
+        "chunked explain failed: {}; peer requests: {}",
+        String::from_utf8_lossy(&output.stderr),
+        std::fs::read_to_string(&request_log).unwrap_or_default()
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("explain JSON");
+    assert_eq!(value["federation"]["coverage"], "complete");
+    let children = value["lineage"]
+        .as_array()
+        .expect("lineage")
+        .iter()
+        .filter_map(|edge| edge["to_anchor"].as_str())
+        .filter(|anchor| anchor.starts_with("span:child-"))
+        .collect::<Vec<_>>();
+    assert_eq!(children.len(), 140, "all children must cross the cap");
+    let mut sorted_children = children.clone();
+    sorted_children.sort_unstable();
+    assert_eq!(
+        children, sorted_children,
+        "semantic order must ignore reversed replies"
+    );
+
+    let requests = std::fs::read_to_string(&request_log)
+        .expect("read peer request trace")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("request JSON"))
+        .filter(|request| request["op"] == "lookup_edges")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        requests.len(),
+        5,
+        "one root request plus four pipelined chunks"
+    );
+    let sizes = requests
+        .iter()
+        .map(|request| {
+            request["args"]["nodes"]
+                .as_array()
+                .expect("node chunk")
+                .len()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(sizes[0], 1, "first logical level has its one root");
+    let mut chunk_sizes = sizes[1..].to_vec();
+    chunk_sizes.sort_unstable();
+    assert_eq!(chunk_sizes, vec![29, 37, 37, 37]);
+    assert!(sizes.iter().all(|size| *size <= 37));
+    assert_eq!(sizes[1..].iter().sum::<usize>(), 140);
+
+    let capped_proxy_root = temp.path().join("capped-proxy");
+    std::fs::create_dir_all(&capped_proxy_root).expect("create capped proxy root");
+    let mut capped_peer = peer_template.clone();
+    let capped_operation_log =
+        log_peer_operations(&capped_proxy_root, "remote-owner", binary, &mut capped_peer);
+    std::fs::write(
+        caller_home.join(".engram/topology.yml"),
+        serde_json::to_vec(
+            &json!({"version":1,"self":"caller","peers":{"remote-owner":capped_peer}}),
+        )
+        .expect("serialize capped caller topology"),
+    )
+    .expect("write capped caller topology");
+    let capped_output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "explain",
+            query_anchor.as_str(),
+            "--anchor",
+            "--peers",
+            "remote-owner",
+            "--max-fanout",
+            "200",
+            "--max-edges",
+            "50",
+            "--depth",
+            "2",
+        ])
+        .output()
+        .expect("run globally capped federated explain");
+    assert!(
+        capped_output.status.success(),
+        "capped explain failed: {}; peer requests: {}",
+        String::from_utf8_lossy(&capped_output.stderr),
+        std::fs::read_to_string(&capped_operation_log).unwrap_or_default()
+    );
+    let capped_value: serde_json::Value =
+        serde_json::from_slice(&capped_output.stdout).expect("capped explain JSON");
+    assert_eq!(
+        capped_value["lineage"]
+            .as_array()
+            .expect("capped lineage")
+            .len(),
+        50,
+        "the traversal edge budget must apply across all chunks"
+    );
+
+    let failed_proxy_root = temp.path().join("failed-proxy");
+    std::fs::create_dir_all(&failed_proxy_root).expect("create failed proxy root");
+    let mut failed_peer = peer_template;
+    let failed_request_log = log_peer_requests_with_chunk_barrier(
+        &failed_proxy_root,
+        "remote-owner",
+        binary,
+        &mut failed_peer,
+        4,
+        Some(2),
+    );
+    std::fs::write(
+        caller_home.join(".engram/topology.yml"),
+        serde_json::to_vec(
+            &json!({"version":1,"self":"caller","peers":{"remote-owner":failed_peer}}),
+        )
+        .expect("serialize failed caller topology"),
+    )
+    .expect("write failed caller topology");
+    let failed_output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "explain",
+            query_anchor.as_str(),
+            "--anchor",
+            "--peers",
+            "remote-owner",
+            "--max-fanout",
+            "200",
+            "--max-edges",
+            "200",
+            "--depth",
+            "2",
+        ])
+        .output()
+        .expect("run explain with failed edge chunk");
+    assert!(
+        failed_output.status.success(),
+        "partial explain should preserve successful evidence: {}",
+        String::from_utf8_lossy(&failed_output.stderr)
+    );
+    let failed_value: serde_json::Value =
+        serde_json::from_slice(&failed_output.stdout).expect("partial explain JSON");
+    assert_eq!(failed_value["federation"]["coverage"], "partial");
+    assert_eq!(
+        failed_value["lineage"]
+            .as_array()
+            .expect("partial lineage")
+            .iter()
+            .filter(|edge| edge["to_anchor"]
+                .as_str()
+                .is_some_and(|anchor| anchor.starts_with("span:child-")))
+            .count(),
+        140,
+        "completed root-level edges remain attributable when a later chunk fails"
+    );
+    let failed_requests = std::fs::read_to_string(failed_request_log)
+        .expect("read failed chunk request trace")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("failed request JSON"))
+        .filter(|request| request["op"] == "lookup_edges")
+        .count();
+    assert_eq!(
+        failed_requests, 5,
+        "all chunks in the failed logical level were sent"
+    );
 }
 
 fn write_stalled_read_file_fixture(
@@ -2082,39 +2741,53 @@ fn spawn_grep_waiting_for_peer(
     local_content: &str,
     blocked_operation: &str,
     require_complete: bool,
-) -> (std::process::Child, std::path::PathBuf) {
+    include_completed_peer_match: bool,
+) -> (
+    std::process::Child,
+    std::path::PathBuf,
+    Option<std::path::PathBuf>,
+) {
     let binary = env!("CARGO_BIN_EXE_engram");
     let script_path = temp.path().join("blocking-peer.sh");
     let operation_started = temp.path().join("peer-operation-started");
+    let followup_request = temp.path().join("unfinished-peer-followup");
+    let completed_peer_scan =
+        include_completed_peer_match.then(|| temp.path().join("completed-peer-scan"));
     let script = [
         "#!/bin/sh",
         "set -eu",
-        "blocked_operation=\"$1\"",
-        "started=\"$2\"",
+        "machine=\"$1\"",
+        "blocked_operation=\"$2\"",
+        "started=\"$3\"",
+        "followup=\"$4\"",
+        "completed=\"$5\"",
+        "completed_stage=\"$6\"",
         "while IFS= read -r request; do",
         r#"  id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"#,
         r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
         "  case \"$op\" in",
         "    open)",
-        r#"      printf '{"id":%s,"data":{"store":"alpha/default","status":"ok","db":"/fixture/alpha.sqlite","tape_dirs":[],"reader_mode":"live","snapshot_at":"2026-09-25T00:00:00Z"}}\n' "$id""#,
-        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"alpha","build":"0.2.1","protocol":1,"schema":4,"query_semantics":1,"limits":{"grep_k":10000}}}\n' "$id""#,
+        r#"      printf '{"id":%s,"data":{"store":"%s/default","status":"ok","db":"/fixture/%s.sqlite","tape_dirs":[],"reader_mode":"live","snapshot_at":"2026-09-25T00:00:00Z"}}\n' "$id" "$machine" "$machine""#,
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"%s","build":"0.2.1","protocol":1,"schema":4,"query_semantics":1,"limits":{"grep_k":10000}}}\n' "$id" "$machine""#,
         "      ;;",
         "    grep_scan)",
         "      if [ \"$blocked_operation\" = grep_scan ]; then",
         "        touch \"$started\"",
-        "        while IFS= read -r ignored; do :; done",
+        "        while IFS= read -r ignored; do touch \"$followup\"; done",
         "        exit 0",
         "      fi",
-        r#"      printf '{"id":%s,"data":{"type":"match","tape_id":"alpha-tape","timestamp":"2026-09-25T00:00:00Z","total_lines":1,"anchor_line":1,"match_count":1,"provenance_match_count":0,"provenance_event_count":1,"refs_up":0,"refs_down":0,"files_touched":[]}}\n' "$id""#,
+        r#"      printf '{"id":%s,"data":{"type":"match","tape_id":"%s-tape","timestamp":"2026-09-25T00:00:00Z","total_lines":1,"anchor_line":1,"match_count":1,"provenance_match_count":0,"provenance_event_count":1,"refs_up":0,"refs_down":0,"files_touched":[]}}\n' "$id" "$machine""#,
         r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"total":1,"returned":1,"time_range":{"start":"2026-09-25T00:00:00Z","end":"2026-09-25T00:00:00Z"},"truncated":false}}\n' "$id""#,
+        "      if [ -n \"$completed\" ] && [ \"$completed_stage\" = grep_scan ]; then touch \"$completed\"; sleep 0.1; fi",
         "      ;;",
         "    dispatch_rows)",
         "      if [ \"$blocked_operation\" = dispatch_rows ]; then",
         "        touch \"$started\"",
-        "        while IFS= read -r ignored; do :; done",
+        "        while IFS= read -r ignored; do touch \"$followup\"; done",
         "        exit 0",
         "      fi",
         r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{}}\n' "$id""#,
+        "      if [ -n \"$completed\" ] && [ \"$completed_stage\" = dispatch_rows ]; then touch \"$completed\"; sleep 0.1; fi",
         "      ;;",
         "    *) exit 78 ;;",
         "  esac",
@@ -2124,28 +2797,61 @@ fn spawn_grep_waiting_for_peer(
     std::fs::write(&script_path, script).expect("write blocking peer script");
     let (caller_home, repo) =
         write_local_grep_source(temp.path(), "caller-before-cancel", local_content);
+    let mut peers = json!({
+        "alpha": {
+            "command": [
+                "/bin/sh",
+                script_path,
+                "alpha",
+                blocked_operation,
+                operation_started,
+                followup_request,
+                "",
+                "none",
+            ],
+            "engram": binary,
+            "exports": ["default"],
+        }
+    });
+    if let Some(completed_peer_scan) = &completed_peer_scan {
+        let beta_started = temp.path().join("beta-operation-started");
+        peers["beta"] = json!({
+            "command": [
+                "/bin/sh",
+                script_path,
+                "beta",
+                "none",
+                beta_started,
+                followup_request,
+                completed_peer_scan,
+                blocked_operation,
+            ],
+            "engram": binary,
+            "exports": ["default"],
+        });
+    }
     std::fs::write(
         caller_home.join(".engram/topology.yml"),
         serde_json::to_vec(&json!({
             "version": 1,
             "self": "caller",
-            "peers": {
-                "alpha": {
-                    "command": ["/bin/sh", script_path, blocked_operation, operation_started],
-                    "engram": binary,
-                    "exports": ["default"],
-                }
-            }
+            "peers": peers,
         }))
         .expect("serialize topology"),
     )
     .expect("write caller topology");
 
     let mut command = Command::new(binary);
-    command
-        .current_dir(&repo)
-        .env("HOME", &caller_home)
-        .args(["grep", pattern, "--peers", "alpha"]);
+    command.current_dir(&repo).env("HOME", &caller_home).args([
+        "grep",
+        pattern,
+        "--peers",
+        if include_completed_peer_match {
+            "alpha,beta"
+        } else {
+            "alpha"
+        },
+    ]);
     if require_complete {
         command.arg("--require-complete");
     }
@@ -2154,19 +2860,30 @@ fn spawn_grep_waiting_for_peer(
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn peer grep");
-    (child, operation_started)
+    (child, operation_started, completed_peer_scan)
 }
 
 #[cfg(unix)]
 fn interrupt_waiting_grep(
     mut child: std::process::Child,
     operation_started: &std::path::Path,
+    completed_peer_scan: Option<&std::path::Path>,
 ) -> (std::process::Output, Duration) {
     let start_deadline = Instant::now() + Duration::from_secs(5);
-    while !operation_started.exists() && Instant::now() < start_deadline {
+    while (!operation_started.exists() || completed_peer_scan.is_some_and(|path| !path.exists()))
+        && Instant::now() < start_deadline
+    {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(operation_started.exists(), "peer operation did not start");
+    if let Some(completed_peer_scan) = completed_peer_scan {
+        assert!(
+            completed_peer_scan.exists(),
+            "second peer did not complete its requested phase"
+        );
+        // Let the caller's response reader consume the terminal frame before SIGINT.
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let signal_at = Instant::now();
     let signal_result = unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
     assert_eq!(signal_result, 0, "send SIGINT to grep caller");
@@ -2215,14 +2932,16 @@ fn assert_caller_sigint_result(output: &std::process::Output) -> serde_json::Val
 #[test]
 fn grep_ctrl_c_cancels_and_aborts_a_selected_peer_scan() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let (child, operation_started) = spawn_grep_waiting_for_peer(
+    let (child, operation_started, completed_peer_scan) = spawn_grep_waiting_for_peer(
         &temp,
         "needle-cancel",
         "{\"t\":\"2026-09-25T00:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-cancel local\"}\n",
         "grep_scan",
         false,
+        true,
     );
-    let (output, elapsed) = interrupt_waiting_grep(child, &operation_started);
+    let (output, elapsed) =
+        interrupt_waiting_grep(child, &operation_started, completed_peer_scan.as_deref());
     assert!(
         elapsed < Duration::from_secs(3),
         "peer cancellation exceeded its deadline"
@@ -2232,7 +2951,20 @@ fn grep_ctrl_c_cancels_and_aborts_a_selected_peer_scan() {
         result["federation"]["coverage"] == "partial",
         "the interrupted scan should make coverage partial"
     );
-    assert_eq!(result["sessions"][0]["tape_id"], "caller-before-cancel");
+    assert!(
+        result["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|session| { session["tape_id"] == "caller-before-cancel" })
+    );
+    assert!(
+        result["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|session| { session["tape_id"] == "beta-tape" })
+    );
     let peer_source = result["federation"]["sources"]
         .as_array()
         .unwrap()
@@ -2249,58 +2981,141 @@ fn grep_ctrl_c_cancels_and_aborts_a_selected_peer_scan() {
         result["cancellation"]["incomplete_sources"][0]["phase"],
         "grep_scan"
     );
+    assert_eq!(
+        result["cancellation"]["incomplete_sources"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let beta = result["federation"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["store"] == "beta/default")
+        .expect("completed peer source");
+    assert!(
+        beta["error"].is_null(),
+        "a completed source must not be labelled cancelled"
+    );
+    assert!(
+        !temp.path().join("unfinished-peer-followup").exists(),
+        "caller sent a later request to an unfinished scan"
+    );
 }
 
 #[cfg(unix)]
 #[test]
 fn grep_ctrl_c_overrides_require_complete_with_exit_130() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let (child, operation_started) = spawn_grep_waiting_for_peer(
+    let (child, operation_started, completed_peer_scan) = spawn_grep_waiting_for_peer(
         &temp,
         "needle-cancel-required",
         "{\"t\":\"2026-09-25T00:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-cancel-required local\"}\n",
         "grep_scan",
         true,
+        true,
     );
-    let (output, elapsed) = interrupt_waiting_grep(child, &operation_started);
+    let (output, elapsed) =
+        interrupt_waiting_grep(child, &operation_started, completed_peer_scan.as_deref());
     assert!(elapsed < Duration::from_secs(3));
     let result = assert_caller_sigint_result(&output);
     assert_eq!(result["federation"]["coverage"], "partial");
-    assert_eq!(result["sessions"][0]["tape_id"], "caller-before-cancel");
+    assert!(
+        result["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|session| { session["tape_id"] == "caller-before-cancel" })
+    );
+    assert!(
+        result["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|session| { session["tape_id"] == "beta-tape" })
+    );
     assert!(!String::from_utf8_lossy(&output.stderr).contains("incomplete_coverage"));
+    assert_eq!(
+        result["cancellation"]["incomplete_sources"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let beta = result["federation"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["store"] == "beta/default")
+        .expect("completed peer source");
+    assert!(
+        beta["error"].is_null(),
+        "a completed source must not be labelled cancelled"
+    );
+    assert_eq!(
+        result["cancellation"]["incomplete_sources"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "incomplete sources: {}",
+        result["cancellation"]["incomplete_sources"]
+    );
+    let beta = result["federation"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["store"] == "beta/default")
+        .expect("completed peer source");
+    assert!(
+        beta["error"].is_null(),
+        "a completed source must not be labelled cancelled"
+    );
+    assert!(
+        !temp.path().join("unfinished-peer-followup").exists(),
+        "caller sent a later request to an unfinished scan"
+    );
 }
 
 #[cfg(unix)]
 #[test]
 fn grep_ctrl_c_without_matches_is_cancelled_not_no_results() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let (child, operation_started) = spawn_grep_waiting_for_peer(
+    let (child, operation_started, completed_peer_scan) = spawn_grep_waiting_for_peer(
         &temp,
         "needle-cancel-empty",
         "{\"t\":\"2026-09-25T00:00:00Z\",\"k\":\"msg.in\",\"content\":\"unrelated local\"}\n",
         "grep_scan",
         false,
+        false,
     );
-    let (output, elapsed) = interrupt_waiting_grep(child, &operation_started);
+    let (output, elapsed) = interrupt_waiting_grep(child, &operation_started, None);
     assert!(elapsed < Duration::from_secs(3));
     let result = assert_caller_sigint_result(&output);
     assert_eq!(result["federation"]["coverage"], "partial");
     assert_eq!(result["sessions"], json!([]));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("no_results"));
+    assert!(completed_peer_scan.is_none());
+    assert!(
+        !temp.path().join("unfinished-peer-followup").exists(),
+        "caller sent a later request to an unfinished scan"
+    );
 }
 
 #[cfg(unix)]
 #[test]
 fn grep_ctrl_c_during_dispatch_keeps_completed_scan_aggregates() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let (child, operation_started) = spawn_grep_waiting_for_peer(
+    let (child, operation_started, completed_peer_scan) = spawn_grep_waiting_for_peer(
         &temp,
         "needle-cancel-metadata",
         "{\"t\":\"2026-09-24T10:00:00Z\",\"k\":\"msg.in\",\"content\":\"unrelated local\"}\n",
         "dispatch_rows",
         false,
+        false,
     );
-    let (output, elapsed) = interrupt_waiting_grep(child, &operation_started);
+    let (output, elapsed) = interrupt_waiting_grep(child, &operation_started, None);
     assert!(elapsed < Duration::from_secs(3));
     let result = assert_caller_sigint_result(&output);
     assert_eq!(result["federation"]["coverage"], "partial");
@@ -2313,6 +3128,11 @@ fn grep_ctrl_c_during_dispatch_keeps_completed_scan_aggregates() {
     let source = result["cancellation"]["incomplete_sources"][0].clone();
     assert_eq!(source["store"], "alpha/default");
     assert_eq!(source["phase"], "dispatch_rows");
+    assert!(completed_peer_scan.is_none());
+    assert!(
+        !temp.path().join("unfinished-peer-followup").exists(),
+        "caller sent a later request after metadata cancellation"
+    );
 }
 
 #[test]
