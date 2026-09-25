@@ -77,6 +77,72 @@ fn write_local_grep_source(
     (caller_home, repo)
 }
 
+fn write_stalled_read_file_fixture(
+    root: &std::path::Path,
+    request_timeout_ms: u64,
+) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let caller_home = root.join("caller-home");
+    let caller_engram = caller_home.join(".engram");
+    std::fs::create_dir_all(&caller_engram).expect("caller config directory");
+    std::fs::write(
+        caller_engram.join("config.yml"),
+        "db: ~/.engram/index.sqlite\ntapes_dir: ~/.engram/tapes\n",
+    )
+    .expect("write caller config");
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).expect("caller repo");
+
+    let marker = root.join("read-file-started");
+    let script_path = root.join("stalled-read-file-peer.sh");
+    let script = [
+        "#!/bin/sh",
+        "set -eu",
+        "marker=\"$1\"",
+        "request_timeout_ms=\"$2\"",
+        "while IFS= read -r request; do",
+        r#"  id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"#,
+        r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
+        "  case \"$op\" in",
+        "    open)",
+        r#"      printf '{"id":%s,"data":{"store":"silent/default","status":"ok","db":"/fixture/owner.sqlite","tape_dirs":[],"reader_mode":"live","snapshot_at":"2026-09-25T00:00:00Z"}}\n' "$id""#,
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"silent","build":"@BUILD@","protocol":1,"schema":@SCHEMA@,"query_semantics":@SEMANTICS@,"limits":{"read_file_compressed_bytes":268435456,"decompressed_bytes_per_tape":536870912,"request_timeout_ms":%s}}}\n' "$id" "$request_timeout_ms""#,
+        "      ;;",
+        "    locate_tapes)",
+        r#"      printf '{"id":%s,"data":{"tape_id":"fixture-tape","file":{"machine":"silent","path":"/owner/tapes/fixture-tape.jsonl.zst","kind":"tape"},"size_bytes":1}}\n' "$id""#,
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"located":1}}\n' "$id""#,
+        "      ;;",
+        "    read_file)",
+        "      touch \"$marker\"",
+        "      exec /usr/bin/sleep 60",
+        "      ;;",
+        "    *) exit 78 ;;",
+        "  esac",
+        "done",
+    ]
+    .join("\n")
+    .replace("@BUILD@", env!("CARGO_PKG_VERSION"))
+    .replace("@SCHEMA@", &SCHEMA_VERSION.to_string())
+    .replace("@SEMANTICS@", &QUERY_SEMANTICS_VERSION.to_string());
+    std::fs::write(&script_path, script).expect("write stalled peer script");
+    std::fs::write(
+        caller_engram.join("topology.yml"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "self": "caller",
+            "peers": {
+                "silent": {
+                    "command": ["/bin/sh", script_path, marker, request_timeout_ms.to_string()],
+                    "engram": env!("CARGO_BIN_EXE_engram"),
+                    "exports": ["default"],
+                }
+            }
+        }))
+        .expect("serialize caller topology"),
+    )
+    .expect("write caller topology");
+    (caller_home, repo, marker)
+}
+
 #[test]
 fn command_peer_runs_real_peer_serve_against_an_isolated_owner_home() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -93,7 +159,7 @@ fn command_peer_runs_real_peer_serve_against_an_isolated_owner_home() {
     std::fs::write(
         engram_home.join("topology.yml"),
         format!(
-            "version: 1\nself: emulated-owner\nexports:\n  default:\n    db: {}\n    tape_dirs:\n      - {}\n",
+            "version: 1\nself: emulated-owner\nexports:\n  default:\n    db: {}\n    tape_dirs:\n      - {}\nlimits:\n  request_timeout_ms: 1234\n",
             db.display(),
             tapes.display()
         ),
@@ -117,6 +183,7 @@ fn command_peer_runs_real_peer_serve_against_an_isolated_owner_home() {
     let mut owner = RemoteOwner::connect("emulated-owner", "caller", &peer, Duration::from_secs(5))
         .expect("real peer handshake");
     assert!(owner.exports["default"].is_ok());
+    assert_eq!(owner.limits.get("request_timeout_ms"), Some(&1_234));
 
     let mut outcomes = owner.round(
         &[PeerRequest::new(
@@ -411,6 +478,94 @@ fn remote_show_reads_only_the_selected_peer_tape_and_verifies_its_digest() {
         opaque_value["location"]["path"],
         opaque_tape.to_str().unwrap()
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn remote_show_obeys_advertised_request_timeout_for_read_file() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let (caller_home, repo, read_started) = write_stalled_read_file_fixture(temp.path(), 100);
+
+    let started = Instant::now();
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["show", "fixture-tape", "--store", "silent/default"])
+        .output()
+        .expect("run remote show with a silent read_file peer");
+    assert!(!output.status.success());
+    assert!(read_started.exists(), "peer did not receive read_file");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "owner request timeout was not applied: {:?}",
+        started.elapsed()
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let error: serde_json::Value = serde_json::from_str(
+        stderr.lines().last().expect("timeout error line"),
+    )
+    .expect("timeout error JSON");
+    assert_eq!(error["error"]["code"], "timeout");
+}
+
+#[cfg(unix)]
+#[test]
+fn remote_show_ctrl_c_cancels_and_aborts_read_file() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let (caller_home, repo, read_started) = write_stalled_read_file_fixture(temp.path(), 10_000);
+    let mut child = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["show", "fixture-tape", "--store", "silent/default"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn remote show");
+
+    let start_deadline = Instant::now() + Duration::from_secs(5);
+    while !read_started.exists() && Instant::now() < start_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !read_started.exists() {
+        let _ = child.kill();
+        let _ = child.wait_with_output();
+        panic!("peer did not receive read_file");
+    }
+
+    let signal_at = Instant::now();
+    let signal_result = unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+    assert_eq!(signal_result, 0, "send SIGINT to remote show caller");
+    let exit_deadline = Instant::now() + Duration::from_secs(3);
+    let mut exited = false;
+    while Instant::now() < exit_deadline {
+        if child.try_wait().expect("check remote show status").is_some() {
+            exited = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait_with_output();
+        panic!("Ctrl-C did not cancel remote read_file within three seconds");
+    }
+
+    let output = child
+        .wait_with_output()
+        .expect("collect cancelled remote show output");
+    assert!(!output.status.success());
+    assert!(
+        signal_at.elapsed() < Duration::from_secs(3),
+        "remote read_file cancellation exceeded its deadline"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let error: serde_json::Value = serde_json::from_str(
+        stderr.lines().last().expect("cancellation error line"),
+    )
+    .expect("cancellation error JSON");
+    assert_eq!(error["error"]["code"], "cancelled");
 }
 
 #[test]

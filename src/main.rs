@@ -1108,8 +1108,15 @@ fn cmd_show_remote(
     raw: bool,
     store_ref: &str,
 ) -> Result<(), CliError> {
+    let query_deadline = Instant::now() + PEER_QUERY_TIMEOUT;
+    let cancelled = peer_cancellation_flag()?;
     print_context_conspicuity(context);
-    let (machine, export, mut owner) = connect_remote_store(store_ref, "remote show")?;
+    let (machine, export, mut owner) = connect_remote_store(
+        store_ref,
+        "remote show",
+        query_deadline,
+        &cancelled,
+    )?;
 
     let locate = one_peer_response(
         &mut owner,
@@ -1119,6 +1126,8 @@ fn cmd_show_remote(
             json!({"tape_ids":[tape_id]}),
         ),
         "locate_tapes",
+        query_deadline,
+        &cancelled,
     )?;
     if locate.data.len() != 1
         || locate.data[0].get("tape_id").and_then(Value::as_str) != Some(tape_id)
@@ -1181,6 +1190,8 @@ fn cmd_show_remote(
             }),
         ),
         "read_file",
+        query_deadline,
+        &cancelled,
     )?;
     let capacity = usize::try_from(file_bytes).map_err(|_| {
         CliError::new(
@@ -1280,6 +1291,8 @@ fn cmd_show_remote(
 fn connect_remote_store(
     store_ref: &str,
     command: &str,
+    query_deadline: Instant,
+    cancelled: &Arc<AtomicBool>,
 ) -> Result<(String, String, RemoteOwner), CliError> {
     let (machine, export) = store_ref
         .split_once('/')
@@ -1322,11 +1335,14 @@ fn connect_remote_store(
     }
     peer.exports = vec![export.to_string()];
 
-    let owner = RemoteOwner::connect(
+    let timeout = PEER_CONNECT_OPEN_TIMEOUT
+        .min(query_deadline.saturating_duration_since(Instant::now()));
+    let owner = RemoteOwner::connect_cancellable(
         machine,
         &topology.self_label,
         &peer,
-        Duration::from_millis(5_000),
+        timeout,
+        cancelled,
     )
     .map_err(peer_failure_to_cli)?;
     owner
@@ -1342,9 +1358,12 @@ fn one_peer_response(
     owner: &mut RemoteOwner,
     request: PeerRequest,
     operation: &str,
+    query_deadline: Instant,
+    cancelled: &Arc<AtomicBool>,
 ) -> Result<engram::access::client::PeerResponse, CliError> {
+    let timeout = peer_operation_timeout(owner, query_deadline);
     owner
-        .round(&[request], Duration::from_secs(30))
+        .round_cancellable(&[request], timeout, cancelled)
         .pop()
         .ok_or_else(|| {
             CliError::new(
@@ -2422,8 +2441,7 @@ fn run_peer_rounds_concurrently(
                             requests,
                             ..
                         } = job;
-                        let timeout = PEER_OPERATION_TIMEOUT
-                            .min(deadline.saturating_duration_since(Instant::now()));
+                        let timeout = peer_operation_timeout(&owner, deadline);
                         let outcomes = owner.round_cancellable(&requests, timeout, &cancelled);
                         (owner, outcomes)
                     });
@@ -2574,6 +2592,27 @@ fn peer_failure_status(code: &str) -> &'static str {
         "cancelled" => "failed",
         _ => "unavailable",
     }
+}
+
+fn peer_operation_timeout(owner: &RemoteOwner, query_deadline: Instant) -> Duration {
+    let advertised_ms = owner
+        .limits
+        .get("request_timeout_ms")
+        .copied()
+        .unwrap_or(PEER_OPERATION_TIMEOUT.as_millis() as u64);
+    Duration::from_millis(advertised_ms)
+        .min(PEER_OPERATION_TIMEOUT)
+        .min(query_deadline.saturating_duration_since(Instant::now()))
+}
+
+fn peer_cancellation_flag() -> Result<Arc<AtomicBool>, CliError> {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let signal_cancelled = Arc::clone(&cancelled);
+    ctrlc::set_handler(move || {
+        signal_cancelled.store(true, Ordering::SeqCst);
+    })
+    .map_err(|error| CliError::new("signal_handler_error", error.to_string()))?;
+    Ok(cancelled)
 }
 
 fn mark_source_phase(sources: &mut [Value], store: &str, phase: &str, code: &str, message: &str) {
@@ -2902,7 +2941,14 @@ fn cmd_peek_remote(
     args: PeekArgs,
     store_ref: &str,
 ) -> Result<(), CliError> {
-    let (machine, export, mut owner) = connect_remote_store(store_ref, "remote peek")?;
+    let query_deadline = Instant::now() + PEER_QUERY_TIMEOUT;
+    let cancelled = peer_cancellation_flag()?;
+    let (machine, export, mut owner) = connect_remote_store(
+        store_ref,
+        "remote peek",
+        query_deadline,
+        &cancelled,
+    )?;
     let session_id = args.session_id;
     if args.grep_filter.is_none() && args.start == Some(0) {
         return Err(CliError::new(
@@ -2920,6 +2966,8 @@ fn cmd_peek_remote(
                 json!({"by_tape":[session_id]}),
             ),
             "dispatch_rows",
+            query_deadline,
+            &cancelled,
         )?;
         let mut first_received: Option<(i64, String)> = None;
         for row in rows.data {
@@ -2996,6 +3044,8 @@ fn cmd_peek_remote(
         &mut owner,
         PeerRequest::new("peek_lines", vec![export], Value::Object(request_args)),
         "peek_lines",
+        query_deadline,
+        &cancelled,
     )
     .map_err(|error| {
         if error.code == "budget_exceeded" {

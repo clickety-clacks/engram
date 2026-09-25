@@ -293,6 +293,11 @@ impl PeerSession {
             "schema": SCHEMA_VERSION,
             "query_semantics": QUERY_SEMANTICS_VERSION,
             "limits": {
+                "request_timeout_ms": configured_limit(
+                    &self.topology.limits,
+                    "request_timeout_ms",
+                    30_000,
+                ),
                 "read_file_compressed_bytes": configured_limit(
                     &self.topology.limits,
                     "read_file_compressed_bytes",
