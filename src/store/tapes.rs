@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -96,22 +95,6 @@ pub fn parse_jsonl_rows(input: &str) -> Result<Vec<TapeRow>, CliError> {
         });
     }
     Ok(rows)
-}
-
-pub(crate) fn load_tape_rows_cached<'a>(
-    context: &RuntimeContext,
-    cache: &'a mut HashMap<String, Vec<TapeRow>>,
-    tape_id: &str,
-) -> Result<&'a Vec<TapeRow>, CliError> {
-    if !cache.contains_key(tape_id) {
-        let Some(tape_path) = resolve_tape_path(context, tape_id) else {
-            cache.insert(tape_id.to_string(), Vec::new());
-            return Ok(cache.get(tape_id).expect("cache entry inserted"));
-        };
-        let content = read_tape_content(&tape_path)?;
-        cache.insert(tape_id.to_string(), parse_jsonl_rows(&content)?);
-    }
-    Ok(cache.get(tape_id).expect("cache entry inserted"))
 }
 
 pub fn print_json(value: &Value) -> Result<(), CliError> {
