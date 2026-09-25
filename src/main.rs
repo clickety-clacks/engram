@@ -2266,9 +2266,7 @@ fn show_tape_facts_digest(
     let digest = row
         .get("digest")
         .and_then(Value::as_str)
-        .filter(|digest| {
-            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-        })
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .ok_or_else(|| {
             CliError::new(
                 "protocol_error",

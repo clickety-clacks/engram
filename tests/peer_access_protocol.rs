@@ -626,7 +626,8 @@ fn show_with_selected_peers_reads_and_deduplicates_matching_remote_tapes() {
 fn show_with_local_and_remote_holders_keeps_local_choice_and_only_reads_digests_remotely() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = env!("CARGO_BIN_EXE_engram");
-    let content = "{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"local show holder\"}\n";
+    let content =
+        "{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"local show holder\"}\n";
     let tape_id = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
     let mut alpha = write_grep_owner(temp.path(), "alpha", binary, &[(tape_id.as_str(), content)]);
     let alpha_operations = log_peer_operations(temp.path(), "alpha", binary, &mut alpha);
@@ -676,8 +677,10 @@ fn show_detects_multi_holder_fingerprint_conflict_from_digests_without_read_file
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = env!("CARGO_BIN_EXE_engram");
     let tape_id = "fingerprint-show-conflict";
-    let alpha_content = "{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"alpha bytes\"}\n";
-    let beta_content = "{\"t\":\"2026-09-25T12:01:00Z\",\"k\":\"msg.in\",\"content\":\"beta bytes\"}\n";
+    let alpha_content =
+        "{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"alpha bytes\"}\n";
+    let beta_content =
+        "{\"t\":\"2026-09-25T12:01:00Z\",\"k\":\"msg.in\",\"content\":\"beta bytes\"}\n";
     let mut alpha = write_grep_owner(temp.path(), "alpha", binary, &[(tape_id, alpha_content)]);
     let alpha_operations = log_peer_operations(temp.path(), "alpha", binary, &mut alpha);
     let mut beta = write_grep_owner(temp.path(), "beta", binary, &[(tape_id, beta_content)]);
