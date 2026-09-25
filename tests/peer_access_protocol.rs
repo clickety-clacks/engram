@@ -3618,6 +3618,100 @@ fn local_show_without_peer_selection_does_not_spawn_configured_peers() {
 }
 
 #[test]
+fn grep_uses_completed_local_count_as_truncation_proof() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "local-nonmatch-count-proof",
+        "{\"t\":\"2026-09-24T10:00:00Z\",\"k\":\"msg.in\",\"content\":\"unrelated\"}\n",
+    );
+    let script_path = temp.path().join("count-proof-peer.sh");
+    let script = [
+        "#!/bin/sh",
+        "while IFS= read -r request; do",
+        r#"  id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"#,
+        r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
+        r#"  case "$op" in"#,
+        "    open)",
+        r#"      printf '{"id":%s,"data":{"store":"alpha/default","status":"ok","db":"/fixture/alpha.sqlite","tape_dirs":[],"reader_mode":"live","snapshot_at":"2026-09-25T14:00:00Z"}}\n' "$id""#,
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"alpha","build":"@BUILD@","protocol":1,"schema":@SCHEMA@,"query_semantics":@SEMANTICS@,"limits":{"grep_k":10000}}}\n' "$id""#,
+        "      ;;",
+        "    grep_scan)",
+        r#"      printf '{"id":%s,"data":{"type":"match","tape_id":"alpha-tape","timestamp":"2026-09-24T12:00:00Z","total_lines":1,"anchor_line":1,"match_count":1,"provenance_match_count":0,"provenance_event_count":1,"refs_up":0,"refs_down":0,"files_touched":[]}}\n' "$id""#,
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"total":100,"returned":1,"time_range":{"start":"2026-09-24T12:00:00Z","end":"2026-09-24T12:00:00Z"},"truncated":false}}\n' "$id""#,
+        "      ;;",
+        "    dispatch_rows)",
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"records":0}}\n' "$id""#,
+        "      ;;",
+        "    *)",
+        r#"      printf '{"id":%s,"end":true,"ok":false,"error":{"code":"unknown_operation","message":"unexpected operation"}}\n' "$id""#,
+        "      ;;",
+        "  esac",
+        "done",
+    ]
+    .join("\n")
+    .replace("@BUILD@", env!("CARGO_PKG_VERSION"))
+    .replace("@SCHEMA@", &SCHEMA_VERSION.to_string())
+    .replace("@SEMANTICS@", &QUERY_SEMANTICS_VERSION.to_string());
+    std::fs::write(&script_path, script).expect("write count-proof peer");
+    std::fs::write(
+        caller_home.join(".engram/topology.yml"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "self": "caller",
+            "peers": {
+                "alpha": {
+                    "command": ["/bin/sh", script_path],
+                    "engram": binary,
+                    "exports": ["default"],
+                }
+            }
+        }))
+        .expect("serialize topology"),
+    )
+    .expect("write caller topology");
+
+    for count in [false, true] {
+        let mut command = Command::new(binary);
+        command.current_dir(&repo).env("HOME", &caller_home).args([
+            "grep",
+            "needle-count-proof",
+            "--peers",
+            "alpha",
+        ]);
+        if count {
+            command.arg("--count");
+        }
+        let output = command
+            .args(["--limit", "1"])
+            .output()
+            .expect("run grep with contradictory peer count and tail flag");
+        assert!(
+            output.status.success(),
+            "completed peer count should prove truncation: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("grep JSON");
+        assert_eq!(result["federation"]["coverage"], "complete");
+        assert_eq!(result["returned"], 1);
+        assert_eq!(result["total"], serde_json::Value::Null);
+        assert_eq!(result["total_bounds"]["min"], 100);
+        assert_eq!(result["total_bounds"]["max"], 100);
+        assert_eq!(result["truncated"], true);
+        assert_eq!(
+            result["time_range"],
+            json!({"start": "2026-09-24T12:00:00Z", "end": "2026-09-24T12:00:00Z"})
+        );
+        if count {
+            assert!(result["sessions"].as_array().unwrap().is_empty());
+        } else {
+            assert_eq!(result["sessions"].as_array().unwrap().len(), 1);
+        }
+    }
+}
+
+#[test]
 fn grep_keeps_completed_scan_aggregates_when_dispatch_metadata_fails() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = env!("CARGO_BIN_EXE_engram");
