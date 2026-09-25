@@ -1138,6 +1138,10 @@ fn collect_federated_dispatch(
                     sources,
                     peer_failed,
                 )?;
+                let candidate_rows = candidate_rows
+                    .into_iter()
+                    .filter(|row| row.direction == FederatedDispatchDirection::Sent)
+                    .collect::<Vec<_>>();
                 let mut tape_ids = candidate_rows
                     .iter()
                     .map(|row| row.tape_id.clone())
@@ -1623,7 +1627,7 @@ fn collect_federated_dispatch(
                             "parent_location":parent.store,
                             "selection_coverage":if candidate_partial || *peer_failed {"partial"} else {"complete"},
                         });
-                        if current_tape != edit_tape {
+                        if hops == 0 && current_tape != edit_tape {
                             hop["edit_session"] = json!(edit_tape);
                             hop["edit_event_offset"] = json!(edit_offset);
                         }
@@ -4085,7 +4089,7 @@ fn decode_remote_tape_response(
     let content = match decompress_jsonl_with_limit(&compressed, decompressed_limit) {
         Ok(content) => content,
         Err(error) if error.to_string().starts_with("decompressed tape exceeds ") => {
-            return Err(CliError::new("budget_exceeded", error.to_string()));
+            return Err(CliError::new("over_limit", error.to_string()));
         }
         Err(error) => return Err(CliError::io("decompress_error", error)),
     };
@@ -4202,7 +4206,8 @@ fn peer_failure_cli_code(peer_code: &str) -> &'static str {
         "tape_unavailable" => "tape_unavailable",
         "invalid_tape" => "invalid_tape",
         "tape_changed" => "tape_changed",
-        "over_limit" | "budget_exceeded" => "budget_exceeded",
+        "over_limit" => "over_limit",
+        "budget_exceeded" => "budget_exceeded",
         "id_mismatch" => "id_mismatch",
         "protocol_error" => "protocol_error",
         "protocol_mismatch" => "protocol_mismatch",
@@ -4985,6 +4990,8 @@ fn cmd_explain_with_peers_inner(
     }
 
     let mut remote_fragments = std::collections::BTreeMap::<(String, String), Vec<Value>>::new();
+    let mut remote_anchor_hits =
+        HashMap::<(String, String), std::collections::HashSet<String>>::new();
     let mut remote_fragment_keys = std::collections::HashSet::<String>::new();
     let mut remote_roots = Vec::<FederatedExplainAnchor>::new();
     let mut remote_tombstones = Vec::new();
@@ -5095,10 +5102,37 @@ fn cmd_explain_with_peers_inner(
                                     );
                                     continue;
                                 };
+                                let Some(query_anchor) = row.get("anchor").and_then(Value::as_str)
+                                else {
+                                    any_peer_failure = true;
+                                    mark_source_phase(
+                                        &mut sources,
+                                        &store,
+                                        "lookup_anchors",
+                                        "protocol_error",
+                                        "peer fragment omitted its query anchor",
+                                    );
+                                    continue;
+                                };
+                                if !query_anchors.iter().any(|anchor| anchor == query_anchor) {
+                                    any_peer_failure = true;
+                                    mark_source_phase(
+                                        &mut sources,
+                                        &store,
+                                        "lookup_anchors",
+                                        "protocol_error",
+                                        "peer fragment named an unrequested query anchor",
+                                    );
+                                    continue;
+                                }
                                 facts_by_store
                                     .entry(store.clone())
                                     .or_default()
                                     .insert(tape_id.to_string());
+                                remote_anchor_hits
+                                    .entry((store.clone(), tape_id.to_string()))
+                                    .or_default()
+                                    .insert(query_anchor.to_string());
                                 let fragment_key = format!(
                                     "{}\0{}\0{}\0{}\0{}\0{}",
                                     store,
@@ -5234,10 +5268,28 @@ fn cmd_explain_with_peers_inner(
                                 );
                                 continue;
                             };
+                            let Some(query_anchor) = row.get("anchor").and_then(Value::as_str)
+                            else {
+                                any_peer_failure = true;
+                                mark_source_phase(
+                                    &mut sources,
+                                    &store,
+                                    "lookup_anchors",
+                                    "protocol_error",
+                                    "peer touch fragment omitted its query anchor",
+                                );
+                                continue;
+                            };
                             facts_by_store
                                 .entry(store.clone())
                                 .or_default()
                                 .insert(tape_id.to_string());
+                            if query_anchors.iter().any(|anchor| anchor == query_anchor) {
+                                remote_anchor_hits
+                                    .entry((store.clone(), tape_id.to_string()))
+                                    .or_default()
+                                    .insert(query_anchor.to_string());
+                            }
                             let fragment_key = format!(
                                 "{}\0{}\0{}\0{}\0{}\0{}",
                                 store,
@@ -5366,6 +5418,8 @@ fn cmd_explain_with_peers_inner(
                 exports,
                 requests,
             });
+        } else {
+            owners.insert(machine, owner);
         }
     }
 
@@ -5465,12 +5519,10 @@ fn cmd_explain_with_peers_inner(
         {
             continue;
         }
-        let distinct_anchors = fragments
-            .iter()
-            .filter_map(|fragment| fragment.get("anchor").and_then(Value::as_str))
-            .filter(|anchor| query_anchors.iter().any(|query| query == *anchor))
-            .collect::<std::collections::HashSet<_>>()
-            .len();
+        let distinct_anchors = remote_anchor_hits
+            .get(&(store.clone(), tape_id.clone()))
+            .map(std::collections::HashSet::len)
+            .unwrap_or_default();
         let score = if query_anchors.is_empty() {
             0.0
         } else {

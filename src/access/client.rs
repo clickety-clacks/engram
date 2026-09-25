@@ -564,6 +564,7 @@ impl PeerClient {
         let mut data = HashMap::<u64, Vec<Value>>::new();
         let mut outcomes = HashMap::<u64, Result<PeerResponse, PeerFailure>>::new();
         let mut file_response_bytes = HashMap::<u64, usize>::new();
+        let mut abort_for_local_budget = false;
         while !pending.is_empty() {
             if let Some(cancelled) = cancelled
                 && cancelled.load(std::sync::atomic::Ordering::SeqCst)
@@ -615,6 +616,7 @@ impl PeerClient {
                         let used = file_response_bytes.entry(id).or_default();
                         *used = used.saturating_add(frame_bytes);
                         if *used > *limit {
+                            abort_for_local_budget = true;
                             fail_pending(
                                 &mut pending,
                                 &mut outcomes,
@@ -626,6 +628,7 @@ impl PeerClient {
                     } else {
                         self.response_bytes = self.response_bytes.saturating_add(frame_bytes);
                         if self.response_bytes > MAX_NON_FILE_RESPONSE_BYTES {
+                            abort_for_local_budget = true;
                             fail_pending(
                                 &mut pending,
                                 &mut outcomes,
@@ -707,18 +710,19 @@ impl PeerClient {
             }
         }
 
-        let abort = outcomes.values().any(|outcome| {
-            matches!(
-                outcome,
-                Err(PeerFailure {
-                    code,
-                    ..
-                }) if matches!(
-                    code.as_str(),
-                    "timeout" | "cancelled" | "protocol_error" | "budget_exceeded"
+        let abort = abort_for_local_budget
+            || outcomes.values().any(|outcome| {
+                matches!(
+                    outcome,
+                    Err(PeerFailure {
+                        code,
+                        ..
+                    }) if matches!(
+                        code.as_str(),
+                        "timeout" | "cancelled" | "protocol_error"
+                    )
                 )
-            )
-        });
+            });
         if abort {
             self.abort();
         }
@@ -947,6 +951,54 @@ mod tests {
             .as_ref()
             .expect_err("oversized response should be refused before terminal frame");
         assert_eq!(failure.code, "budget_exceeded");
+
+        let follow_up = client.round(
+            &[PeerRequest::new("open", vec!["default".into()], json!({}))],
+            Duration::from_secs(5),
+        );
+        assert_eq!(follow_up.len(), 1);
+        assert_eq!(
+            follow_up[0].as_ref().unwrap_err().code,
+            "unavailable",
+            "locally enforced response cap must still abort the peer"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peer_round_keeps_connection_after_terminal_budget_exceeded() {
+        let peer = TopologyPeer {
+            ssh: None,
+            command: Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                r#"while IFS= read -r request; do id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); if [ "$id" = 1 ]; then printf '{"id":%s,"end":true,"ok":false,"error":{"code":"budget_exceeded","message":"owner operation hit its limit"}}\n' "$id"; else printf '{"id":%s,"end":true,"ok":true,"stats":{"id":%s}}\n' "$id" "$id"; fi; done"#.into(),
+            ]),
+            engram: "/unused".into(),
+            exports: vec![],
+        };
+        let mut client = PeerClient::spawn(&peer).expect("spawn budget-aware command peer");
+        let outcomes = client.round(
+            &[
+                PeerRequest::new("lookup_edges", vec!["default".into()], json!({})),
+                PeerRequest::new("lookup_anchors", vec!["default".into()], json!({})),
+            ],
+            Duration::from_secs(5),
+        );
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].as_ref().unwrap_err().code, "budget_exceeded");
+        assert_eq!(outcomes[1].as_ref().unwrap().stats["id"], 2);
+
+        let follow_up = client.round(
+            &[PeerRequest::new(
+                "tape_facts",
+                vec!["default".into()],
+                json!({}),
+            )],
+            Duration::from_secs(5),
+        );
+        assert_eq!(follow_up.len(), 1);
+        assert_eq!(follow_up[0].as_ref().unwrap().stats["id"], 3);
     }
 
     #[cfg(unix)]

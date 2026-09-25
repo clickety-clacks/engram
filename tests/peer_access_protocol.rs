@@ -96,6 +96,7 @@ fn log_peer_operations(
     peer: &mut serde_json::Value,
 ) -> std::path::PathBuf {
     let log_path = root.join(format!("{machine}-peer-operations.log"));
+    let request_log_path = root.join(format!("{machine}-peer-requests.jsonl"));
     let script_path = root.join(format!("{machine}-logged-peer.sh"));
     let owner_home = peer["command"][1]
         .as_str()
@@ -106,9 +107,11 @@ fn log_peer_operations(
         "set -eu",
         "binary=\"$1\"",
         "log=\"$2\"",
+        "requests=\"$3\"",
         "while IFS= read -r request; do",
         r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
         r#"  printf '%s\n' "$op" >> "$log""#,
+        r#"  printf '%s\n' "$request" >> "$requests""#,
         r#"  printf '%s\n' "$request""#,
         "done | \"$binary\" peer-serve --stdio",
     ]
@@ -121,6 +124,7 @@ fn log_peer_operations(
         script_path,
         binary,
         log_path,
+        request_log_path,
     ]);
     log_path
 }
@@ -248,6 +252,273 @@ fn write_local_grep_source(
     std::fs::write(local_tapes.join(format!("{tape_id}.jsonl.zst")), compressed)
         .expect("write local tape");
     (caller_home, repo)
+}
+
+fn set_peer_topology(caller_home: &std::path::Path, peers: serde_json::Value) {
+    std::fs::write(
+        caller_home.join(".engram/topology.yml"),
+        serde_json::to_vec(&json!({"version": 1, "self": "querier", "peers": peers}))
+            .expect("serialize peer topology"),
+    )
+    .expect("write peer topology");
+}
+
+fn jsonl(events: &[serde_json::Value]) -> String {
+    events
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}
+
+fn ingest_owner_test_tape(
+    root: &std::path::Path,
+    machine: &str,
+    tape_id: &str,
+    content: &str,
+    dispatch_links: &[DispatchLink],
+) {
+    let db = root.join(format!("{machine}-home/.engram/index.sqlite"));
+    let index =
+        SqliteIndex::open_writer(db.to_str().expect("owner DB path")).expect("open owner index");
+    let events = engram::tape::event::parse_jsonl_events(content).expect("parse owner events");
+    index
+        .ingest_tape_events_with_dispatch(
+            tape_id,
+            &events,
+            dispatch_links,
+            engram::index::lineage::LINK_THRESHOLD_DEFAULT,
+        )
+        .expect("index owner test tape");
+}
+
+fn install_native_fixture_subset(
+    root: &std::path::Path,
+    fixture: &serde_json::Value,
+    tape_ids: &[&str],
+    file_names: &[&str],
+) {
+    let home = root.join("home");
+    let tape_dir = home.join(".engram/tapes");
+    std::fs::create_dir_all(&tape_dir).expect("native fixture tape directory");
+    std::fs::create_dir_all(root.join(".engram/cursors")).expect("native fixture cursors");
+    std::fs::write(
+        home.join(".engram/config.yml"),
+        "db: ~/.engram/index.sqlite\ntapes_dir: ~/.engram/tapes\n",
+    )
+    .expect("native fixture owner config");
+    let db = home.join(".engram/index.sqlite");
+    let index = SqliteIndex::open_writer(db.to_str().expect("native fixture DB path"))
+        .expect("native fixture DB");
+    for tape_id in tape_ids {
+        let raw = fixture["tapes"][*tape_id]
+            .as_str()
+            .expect("native fixture tape content");
+        assert_eq!(
+            format!("{:x}", sha2::Sha256::digest(raw.as_bytes())),
+            *tape_id,
+            "native fixture tape content must retain its content address"
+        );
+        std::fs::write(
+            tape_dir.join(format!("{tape_id}.jsonl.zst")),
+            zstd::stream::encode_all(raw.as_bytes(), 0).expect("compress fixture tape"),
+        )
+        .expect("write fixture tape");
+        let links = fixture["dispatch_links"]
+            .as_array()
+            .expect("fixture dispatch links")
+            .iter()
+            .filter(|row| row[0] == *tape_id)
+            .map(|row| DispatchLink {
+                uuid: row[1].as_str().expect("fixture UUID").into(),
+                first_turn_index: row[2].as_i64().expect("fixture turn"),
+                direction: if row[3] == "sent" {
+                    DispatchDirection::Sent
+                } else {
+                    DispatchDirection::Received
+                },
+            })
+            .collect::<Vec<_>>();
+        let parsed = engram::tape::event::parse_jsonl_events(raw).expect("parse fixture tape");
+        index
+            .ingest_tape_events_with_dispatch(
+                tape_id,
+                &parsed,
+                &links,
+                engram::index::lineage::LINK_THRESHOLD_DEFAULT,
+            )
+            .expect("index native fixture tape");
+    }
+    drop(index);
+
+    for name in file_names {
+        let raw = fixture["files"][*name]
+            .as_str()
+            .expect("native fixture source file");
+        let input = root.join(name);
+        std::fs::write(&input, raw).expect("write native fixture source");
+        let key = format!(
+            "{:x}",
+            sha2::Sha256::digest(
+                std::fs::canonicalize(&input)
+                    .expect("canonical fixture input")
+                    .to_string_lossy()
+                    .as_bytes()
+            )
+        );
+        let cursor =
+            serde_json::to_vec(&fixture["cursors"][*name]).expect("serialize fixture cursor");
+        std::fs::write(
+            root.join(".engram/cursors").join(format!("{key}.json")),
+            [cursor.as_slice(), b"\n"].concat(),
+        )
+        .expect("write fixture cursor");
+    }
+}
+
+fn run_fixture_ingest(binary: &str, root: &std::path::Path, filename: &str) {
+    let output = Command::new(binary)
+        .current_dir(root)
+        .env("HOME", root.join("home"))
+        .args(["ingest", filename])
+        .output()
+        .expect("run native fixture ingest");
+    assert!(
+        output.status.success(),
+        "native fixture ingest failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn edit_event(file: &str, before_text: &str, after_text: &str) -> serde_json::Value {
+    json!({
+        "t":"2026-09-25T12:02:00Z",
+        "k":"code.edit",
+        "file":file,
+        "before_range":[1,12],
+        "after_range":[1,12],
+        "before_text":before_text,
+        "after_text":after_text,
+    })
+}
+
+fn insert_test_span_edge(
+    index: &SqliteIndex,
+    tape_id: &str,
+    ordinal: u32,
+    from_anchor: &str,
+    to_anchor: &str,
+) {
+    index
+        .insert_edge(
+            &engram::index::EdgeSource {
+                source_kind: engram::index::EdgeSourceKind::SpanLink,
+                tape_id: tape_id.into(),
+                event_offset: 1,
+                pair_ordinal: ordinal,
+                from_window_ordinal: i64::from(ordinal),
+                to_window_ordinal: i64::from(ordinal) + 1,
+            },
+            &engram::index::lineage::SpanEdge {
+                from_anchor: from_anchor.into(),
+                to_anchor: to_anchor.into(),
+                confidence: 0.95,
+                location_delta: engram::index::lineage::LocationDelta::Adjacent,
+                cardinality: engram::index::lineage::Cardinality::OneToOne,
+                agent_link: false,
+                note: Some("federated acceptance fixture".into()),
+            },
+        )
+        .expect("insert synthetic span edge");
+}
+
+fn run_peer_explain(
+    binary: &str,
+    caller_home: &std::path::Path,
+    repo: &std::path::Path,
+    file: &str,
+    peers: &str,
+) -> std::process::Output {
+    Command::new(binary)
+        .current_dir(repo)
+        .env("HOME", caller_home)
+        .args(["explain", file, "--peers", peers])
+        .output()
+        .expect("run federated explain fixture")
+}
+
+fn owner_dispatch_rows(
+    binary: &str,
+    machine: &str,
+    peer_config: &serde_json::Value,
+    uuid: &str,
+) -> Vec<serde_json::Value> {
+    let peer = TopologyPeer {
+        ssh: None,
+        command: Some(
+            peer_config["command"]
+                .as_array()
+                .expect("owner command")
+                .iter()
+                .map(|arg| arg.as_str().expect("command arg").to_string())
+                .collect(),
+        ),
+        engram: binary.to_string(),
+        exports: vec!["default".into()],
+    };
+    let mut owner = RemoteOwner::connect(machine, "querier", &peer, Duration::from_secs(5))
+        .expect("connect fixture owner for dispatch-row check");
+    owner
+        .round(
+            &[PeerRequest::new(
+                "dispatch_rows",
+                vec!["default".into()],
+                json!({"by_uuid":[uuid]}),
+            )],
+            Duration::from_secs(5),
+        )
+        .pop()
+        .expect("dispatch rows outcome")
+        .expect("dispatch rows response")
+        .data
+}
+
+fn explain_reference_projection(mut value: serde_json::Value) -> serde_json::Value {
+    let object = value.as_object_mut().expect("explain payload object");
+    object.remove("federation");
+    for field in ["dispatch_ambiguous", "dispatch_unresolved"] {
+        if object
+            .get(field)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(Vec::is_empty)
+        {
+            object.remove(field);
+        }
+    }
+    if let Some(query) = object
+        .get_mut("query")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        query.remove("peers");
+    }
+    if let Some(sessions) = object
+        .get_mut("sessions")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for session in sessions {
+            if let Some(session) = session.as_object_mut() {
+                session.remove("location");
+                session.remove("locations");
+                session.remove("tape_id");
+                session.remove("physical_identity");
+                session.remove("store");
+                session.remove("tape_facts");
+                session.remove("tape_present_locally");
+            }
+        }
+    }
+    value
 }
 
 fn write_unavailable_explain_fixture(
@@ -501,6 +772,115 @@ fn explain_peers_attributes_remote_only_edits_to_their_physical_owner() {
 }
 
 #[test]
+fn explain_peers_matches_local_multi_store_reference() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let source = "fn parity_target() { let result = alpha + beta; consume(result); }\n".repeat(12);
+    let before = source.replace("parity_target", "before_parity_target");
+    let file = "parity.rs";
+    let remote_id = "parity-remote-tape";
+    let remote_events = jsonl(&[
+        json!({"t":"2026-09-25T12:00:00Z","k":"meta","model":"peer-test"}),
+        edit_event(file, &before, &source),
+    ]);
+    let mut remote = write_grep_owner(
+        temp.path(),
+        "remote-owner",
+        binary,
+        &[(remote_id, &remote_events)],
+    );
+    ingest_owner_test_tape(temp.path(), "remote-owner", remote_id, &remote_events, &[]);
+    let remote_operations = log_peer_operations(temp.path(), "remote-owner", binary, &mut remote);
+
+    let local_id = "local-parity-tape";
+    let local_events = jsonl(&[
+        json!({"t":"2026-09-25T11:00:00Z","k":"meta","model":"peer-test"}),
+        edit_event(file, &before, &source),
+    ]);
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "caller-note-tape",
+        "{\"t\":\"2026-09-25T10:00:00Z\",\"k\":\"note\",\"content\":\"unrelated\"}\n",
+    );
+    std::fs::write(repo.join(file), &source).expect("write parity target");
+    let local_tapes = repo.join(".engram/tapes");
+    std::fs::write(
+        local_tapes.join(format!("{local_id}.jsonl.zst")),
+        zstd::stream::encode_all(local_events.as_bytes(), 0).expect("compress local parity tape"),
+    )
+    .expect("write local parity tape");
+    let local_db = repo.join(".engram/index.sqlite");
+    let index = SqliteIndex::open_writer(local_db.to_str().expect("local DB path"))
+        .expect("open local index");
+    let parsed =
+        engram::tape::event::parse_jsonl_events(&local_events).expect("parse local events");
+    index
+        .ingest_tape_events_with_dispatch(
+            local_id,
+            &parsed,
+            &[],
+            engram::index::lineage::LINK_THRESHOLD_DEFAULT,
+        )
+        .expect("index local parity tape");
+    drop(index);
+
+    let remote_db = temp.path().join("remote-owner-home/.engram/index.sqlite");
+    let local_config = caller_home.join(".engram/config.yml");
+    std::fs::write(
+        &local_config,
+        format!(
+            "db: {}\ntapes_dir: {}\nadditional_stores:\n  - {}\n",
+            local_db.display(),
+            local_tapes.display(),
+            remote_db.display(),
+        ),
+    )
+    .expect("write local reference layout");
+    set_peer_topology(&caller_home, json!({"remote-owner":remote.clone()}));
+    let local = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["explain", file])
+        .output()
+        .expect("run local multi-store reference");
+    assert!(
+        local.status.success(),
+        "local reference failed: {}",
+        String::from_utf8_lossy(&local.stderr)
+    );
+    let local: serde_json::Value =
+        serde_json::from_slice(&local.stdout).expect("local explain JSON");
+
+    std::fs::write(
+        &local_config,
+        format!(
+            "db: {}\ntapes_dir: {}\n",
+            local_db.display(),
+            local_tapes.display()
+        ),
+    )
+    .expect("restore split caller layout");
+    let federated = run_peer_explain(binary, &caller_home, &repo, file, "remote-owner");
+    assert!(
+        federated.status.success(),
+        "federated explain failed: {}",
+        String::from_utf8_lossy(&federated.stderr)
+    );
+    let federated: serde_json::Value =
+        serde_json::from_slice(&federated.stdout).expect("federated explain JSON");
+    assert_eq!(
+        federated["federation"]["coverage"], "complete",
+        "federated parity result: {federated:#}"
+    );
+    assert_eq!(operation_count(&remote_operations, "read_file"), 0);
+    assert_eq!(
+        explain_reference_projection(federated),
+        explain_reference_projection(local),
+        "federated result must match the same local two-store reference after removing physical and federation-only fields"
+    );
+}
+
+#[test]
 fn explain_peers_folds_a_remote_received_marker_to_one_local_sender() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = env!("CARGO_BIN_EXE_engram");
@@ -612,6 +992,656 @@ fn explain_peers_folds_a_remote_received_marker_to_one_local_sender() {
 }
 
 #[test]
+fn explain_peers_finds_two_sided_handoff_when_querier_holds_neither_endpoint() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let uuid = "223e4567-e89b-12d3-a456-426614174010";
+    let file = "remote-handoff.rs";
+    let source =
+        "fn physically_split_edit() { let value = one + two; use_value(value); }\n".repeat(12);
+    let before = source.replace("physically_split_edit", "before_split_edit");
+    let sender_id = "machine-a-sender";
+    let sender_events = jsonl(&[
+        json!({"t":"2026-09-25T11:00:00Z","k":"meta","model":"peer-test"}),
+        json!({"t":"2026-09-25T11:01:00Z","k":"msg.out","content":format!("<engram-src id=\"{uuid}\"/>")}),
+    ]);
+    let receiver_id = "machine-b-receiver";
+    let receiver_events = jsonl(&[
+        json!({"t":"2026-09-25T12:00:00Z","k":"meta","model":"peer-test"}),
+        json!({"t":"2026-09-25T12:01:00Z","k":"msg.in","content":format!("<engram-src id=\"{uuid}\"/>")}),
+        edit_event(file, &before, &source),
+    ]);
+    let mut sender = write_grep_owner(
+        temp.path(),
+        "machine-a",
+        binary,
+        &[(sender_id, &sender_events)],
+    );
+    ingest_owner_test_tape(
+        temp.path(),
+        "machine-a",
+        sender_id,
+        &sender_events,
+        &[DispatchLink {
+            uuid: uuid.into(),
+            first_turn_index: 0,
+            direction: DispatchDirection::Sent,
+        }],
+    );
+    let mut receiver = write_grep_owner(
+        temp.path(),
+        "machine-b",
+        binary,
+        &[(receiver_id, &receiver_events)],
+    );
+    ingest_owner_test_tape(
+        temp.path(),
+        "machine-b",
+        receiver_id,
+        &receiver_events,
+        &[DispatchLink {
+            uuid: uuid.into(),
+            first_turn_index: 0,
+            direction: DispatchDirection::Received,
+        }],
+    );
+    let remote_sender_rows = owner_dispatch_rows(binary, "machine-a", &sender, uuid);
+    assert!(
+        remote_sender_rows
+            .iter()
+            .any(|row| row["tape_id"] == sender_id && row["direction"] == "sent"),
+        "remote sender owner omitted its indexed UUID row: {remote_sender_rows:#?}"
+    );
+    let remote_receiver_rows = owner_dispatch_rows(binary, "machine-b", &receiver, uuid);
+    assert!(
+        remote_receiver_rows
+            .iter()
+            .any(|row| row["tape_id"] == receiver_id && row["direction"] == "received"),
+        "remote receiver owner omitted its indexed UUID row: {remote_receiver_rows:#?}"
+    );
+    let sender_operations = log_peer_operations(temp.path(), "machine-a", binary, &mut sender);
+    let receiver_operations = log_peer_operations(temp.path(), "machine-b", binary, &mut receiver);
+
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "querier-note",
+        "{\"t\":\"2026-09-25T10:00:00Z\",\"k\":\"note\",\"content\":\"querier holds neither handoff endpoint\"}\n",
+    );
+    std::fs::write(repo.join(file), &source).expect("write target source");
+    let shadow_id = "querier-shadow-edit";
+    let shadow_events = jsonl(&[
+        json!({"t":"2026-09-25T10:30:00Z","k":"meta","model":"peer-test"}),
+        edit_event(file, &before, &source),
+    ]);
+    std::fs::write(
+        repo.join(format!(".engram/tapes/{shadow_id}.jsonl.zst")),
+        zstd::stream::encode_all(shadow_events.as_bytes(), 0).expect("compress shadow tape"),
+    )
+    .expect("write shadow tape");
+    let local_index = SqliteIndex::open_writer(
+        repo.join(".engram/index.sqlite")
+            .to_str()
+            .expect("querier DB path"),
+    )
+    .expect("open querier index");
+    let parsed = engram::tape::event::parse_jsonl_events(&shadow_events).expect("parse shadow");
+    local_index
+        .ingest_tape_events_with_dispatch(
+            shadow_id,
+            &parsed,
+            &[],
+            engram::index::lineage::LINK_THRESHOLD_DEFAULT,
+        )
+        .expect("index shadow edit");
+    drop(local_index);
+
+    set_peer_topology(
+        &caller_home,
+        json!({"machine-a":sender.clone(), "machine-b":receiver.clone()}),
+    );
+    let complete = run_peer_explain(binary, &caller_home, &repo, file, "machine-a,machine-b");
+    assert!(
+        complete.status.success(),
+        "two-sided federated explain failed: {}",
+        String::from_utf8_lossy(&complete.stderr)
+    );
+    let complete: serde_json::Value =
+        serde_json::from_slice(&complete.stdout).expect("explain JSON");
+    let [hop] = complete["dispatch_lineage"].as_array().unwrap().as_slice() else {
+        panic!(
+            "expected one physical two-sided hop: {complete:#}\nsender requests:\n{}\nreceiver requests:\n{}",
+            std::fs::read_to_string(temp.path().join("machine-a-peer-requests.jsonl"))
+                .unwrap_or_default(),
+            std::fs::read_to_string(temp.path().join("machine-b-peer-requests.jsonl"))
+                .unwrap_or_default()
+        );
+    };
+    assert_eq!(hop["session"], receiver_id);
+    assert_eq!(hop["parent_session"], sender_id);
+    assert_eq!(hop["received_uuid"], uuid);
+    assert_eq!(hop["session_location"], "machine-b/default");
+    assert_eq!(hop["parent_location"], "machine-a/default");
+    assert!(
+        complete["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|session| {
+                session["session_id"] == receiver_id
+                    && session["physical_identity"]["machine"] == "machine-b"
+            })
+    );
+    assert!(
+        complete["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|session| {
+                session["session_id"] == sender_id
+                    && session["physical_identity"]["machine"] == "machine-a"
+            })
+    );
+    assert_eq!(operation_count(&sender_operations, "read_file"), 0);
+    assert_eq!(operation_count(&receiver_operations, "read_file"), 0);
+
+    set_peer_topology(&caller_home, json!({"machine-b":receiver}));
+    let sender_removed = run_peer_explain(binary, &caller_home, &repo, file, "machine-b");
+    assert!(sender_removed.status.success());
+    let sender_removed: serde_json::Value =
+        serde_json::from_slice(&sender_removed.stdout).expect("sender-removed explain JSON");
+    assert!(
+        sender_removed["dispatch_lineage"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        sender_removed["dispatch_unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| { row["reason"] == "no_sender_observed" && row["uuid"] == uuid })
+    );
+
+    set_peer_topology(&caller_home, json!({"machine-a":sender}));
+    let receiver_removed = run_peer_explain(binary, &caller_home, &repo, file, "machine-a");
+    assert!(receiver_removed.status.success());
+    let receiver_removed: serde_json::Value =
+        serde_json::from_slice(&receiver_removed.stdout).expect("receiver-removed explain JSON");
+    assert!(
+        receiver_removed["dispatch_lineage"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        receiver_removed["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|session| { session["session_id"] == shadow_id })
+    );
+}
+
+#[test]
+fn explain_peers_follows_three_machine_chain_and_excludes_sibling_receiver() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let first_uuid = "323e4567-e89b-12d3-a456-426614174020";
+    let second_uuid = "323e4567-e89b-12d3-a456-426614174021";
+    let file = "three-machine.rs";
+    let source =
+        "fn three_machine_edit() { let answer = left + right; use_answer(answer); }\n".repeat(12);
+    let before = source.replace("three_machine_edit", "before_three_machine_edit");
+
+    let a_id = "machine-a-origin";
+    let a_events = jsonl(&[
+        json!({"t":"2026-09-25T10:00:00Z","k":"meta","model":"peer-test"}),
+        json!({"t":"2026-09-25T10:01:00Z","k":"msg.out","content":format!("<engram-src id=\"{first_uuid}\"/>")}),
+    ]);
+    let mut a = write_grep_owner(temp.path(), "machine-a", binary, &[(a_id, &a_events)]);
+    ingest_owner_test_tape(
+        temp.path(),
+        "machine-a",
+        a_id,
+        &a_events,
+        &[DispatchLink {
+            uuid: first_uuid.into(),
+            first_turn_index: 0,
+            direction: DispatchDirection::Sent,
+        }],
+    );
+
+    let b_id = "machine-b-middle";
+    let b_events = jsonl(&[
+        json!({"t":"2026-09-25T11:00:00Z","k":"meta","model":"peer-test"}),
+        json!({"t":"2026-09-25T11:01:00Z","k":"msg.in","content":format!("<engram-src id=\"{first_uuid}\"/>")}),
+        json!({"t":"2026-09-25T11:02:00Z","k":"msg.out","content":format!("<engram-src id=\"{second_uuid}\"/>")}),
+    ]);
+    let sibling_id = "machine-b-sibling";
+    let sibling_events = jsonl(&[
+        json!({"t":"2026-09-25T11:10:00Z","k":"meta","model":"peer-test"}),
+        json!({"t":"2026-09-25T11:11:00Z","k":"msg.in","content":format!("<engram-src id=\"{first_uuid}\"/>")}),
+    ]);
+    let mut b = write_grep_owner(
+        temp.path(),
+        "machine-b",
+        binary,
+        &[(b_id, &b_events), (sibling_id, &sibling_events)],
+    );
+    ingest_owner_test_tape(
+        temp.path(),
+        "machine-b",
+        b_id,
+        &b_events,
+        &[
+            DispatchLink {
+                uuid: first_uuid.into(),
+                first_turn_index: 0,
+                direction: DispatchDirection::Received,
+            },
+            DispatchLink {
+                uuid: second_uuid.into(),
+                first_turn_index: 1,
+                direction: DispatchDirection::Sent,
+            },
+        ],
+    );
+    ingest_owner_test_tape(
+        temp.path(),
+        "machine-b",
+        sibling_id,
+        &sibling_events,
+        &[DispatchLink {
+            uuid: first_uuid.into(),
+            first_turn_index: 0,
+            direction: DispatchDirection::Received,
+        }],
+    );
+
+    let c_id = "machine-c-receiver";
+    let c_events = jsonl(&[
+        json!({"t":"2026-09-25T12:00:00Z","k":"meta","model":"peer-test"}),
+        json!({"t":"2026-09-25T12:01:00Z","k":"msg.in","content":format!("<engram-src id=\"{second_uuid}\"/>")}),
+        edit_event(file, &before, &source),
+    ]);
+    let mut c = write_grep_owner(temp.path(), "machine-c", binary, &[(c_id, &c_events)]);
+    ingest_owner_test_tape(
+        temp.path(),
+        "machine-c",
+        c_id,
+        &c_events,
+        &[DispatchLink {
+            uuid: second_uuid.into(),
+            first_turn_index: 0,
+            direction: DispatchDirection::Received,
+        }],
+    );
+    let a_operations = log_peer_operations(temp.path(), "machine-a", binary, &mut a);
+    let b_operations = log_peer_operations(temp.path(), "machine-b", binary, &mut b);
+    let c_operations = log_peer_operations(temp.path(), "machine-c", binary, &mut c);
+
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "querier-unrelated",
+        "{\"t\":\"2026-09-25T09:00:00Z\",\"k\":\"note\",\"content\":\"no handoff endpoints here\"}\n",
+    );
+    std::fs::write(repo.join(file), &source).expect("write three-machine target");
+    set_peer_topology(
+        &caller_home,
+        json!({"machine-a":a, "machine-b":b, "machine-c":c}),
+    );
+    let output = run_peer_explain(
+        binary,
+        &caller_home,
+        &repo,
+        file,
+        "machine-a,machine-b,machine-c",
+    );
+    assert!(
+        output.status.success(),
+        "three-machine federated explain failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("explain JSON");
+    assert_eq!(value["federation"]["coverage"], "complete");
+    let hops = value["dispatch_lineage"]
+        .as_array()
+        .expect("dispatch lineage");
+    assert_eq!(hops.len(), 2, "expected A -> B -> C only: {value:#}");
+    let hop_by_session = |session: &str| {
+        hops.iter()
+            .find(|hop| hop["session"] == session)
+            .unwrap_or_else(|| panic!("missing hop for {session}: {value:#}"))
+    };
+    assert_eq!(hop_by_session(c_id)["parent_session"], b_id);
+    assert_eq!(
+        hop_by_session(c_id)["session_location"],
+        "machine-c/default"
+    );
+    assert_eq!(hop_by_session(c_id)["parent_location"], "machine-b/default");
+    assert_eq!(hop_by_session(b_id)["parent_session"], a_id);
+    assert_eq!(
+        hop_by_session(b_id)["session_location"],
+        "machine-b/default"
+    );
+    assert_eq!(hop_by_session(b_id)["parent_location"], "machine-a/default");
+    assert!(
+        value["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|session| { session["session_id"] != sibling_id })
+    );
+    for operations in [&a_operations, &b_operations, &c_operations] {
+        assert_eq!(operation_count(operations, "read_file"), 0);
+    }
+}
+
+#[test]
+fn explain_peers_matches_local_native_split_and_legacy_recovery_with_remote_sender() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/native-upgrade/codex-split.json"))
+            .expect("native split fixture");
+    let sender_file = "sender.codex.jsonl";
+    let receiver_file = "receiver.codex.jsonl";
+    let sender_tape = fixture["cursors"][sender_file]["tape_id"]
+        .as_str()
+        .expect("legacy sender tape");
+    let receiver_current = fixture["cursors"][receiver_file]["tape_id"]
+        .as_str()
+        .expect("legacy receiver tape");
+    let receiver_prefix = fixture["dispatch_links"][0][0]
+        .as_str()
+        .expect("split receiver prefix tape");
+    let tape_ids = [sender_tape, receiver_prefix, receiver_current];
+    let source = "pub fn isolated_handoff_probe() -> u64 { 73849127 }\n";
+    let uuid = fixture["dispatch_links"][0][1]
+        .as_str()
+        .expect("native handoff UUID");
+    let later = json!({
+        "type":"response_item",
+        "timestamp":"2026-09-21T00:00:04Z",
+        "payload":{"type":"message","role":"user","content":[{"type":"input_text","text":format!("<engram-src id=\"{uuid}\"/> later unrelated")} ]},
+    })
+    .to_string()
+        + "\n";
+    let binary = env!("CARGO_BIN_EXE_engram");
+
+    let baseline_root = tempfile::tempdir().expect("local baseline tempdir");
+    install_native_fixture_subset(
+        baseline_root.path(),
+        &fixture,
+        &tape_ids,
+        &[sender_file, receiver_file],
+    );
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(baseline_root.path().join(receiver_file))
+        .expect("open local baseline receiver")
+        .write_all(later.as_bytes())
+        .expect("append local baseline receiver");
+    run_fixture_ingest(binary, baseline_root.path(), receiver_file);
+    run_fixture_ingest(binary, baseline_root.path(), sender_file);
+    let baseline_repo = baseline_root.path().join("repo");
+    std::fs::create_dir_all(&baseline_repo).expect("baseline repo");
+    std::fs::write(baseline_repo.join("probe.rs"), source).expect("write baseline query source");
+    let baseline = Command::new(binary)
+        .current_dir(&baseline_repo)
+        .env("HOME", baseline_root.path().join("home"))
+        .args(["explain", "probe.rs"])
+        .output()
+        .expect("run local native baseline explain");
+    assert!(
+        baseline.status.success(),
+        "local native baseline failed: {}",
+        String::from_utf8_lossy(&baseline.stderr)
+    );
+    let baseline: serde_json::Value =
+        serde_json::from_slice(&baseline.stdout).expect("baseline JSON");
+    assert_eq!(baseline["dispatch_lineage"].as_array().unwrap().len(), 1);
+
+    let sender_root = tempfile::tempdir().expect("remote sender tempdir");
+    install_native_fixture_subset(sender_root.path(), &fixture, &[sender_tape], &[sender_file]);
+    run_fixture_ingest(binary, sender_root.path(), sender_file);
+    let receiver_root = tempfile::tempdir().expect("remote receiver tempdir");
+    install_native_fixture_subset(
+        receiver_root.path(),
+        &fixture,
+        &[receiver_prefix, receiver_current],
+        &[receiver_file],
+    );
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(receiver_root.path().join(receiver_file))
+        .expect("open remote receiver")
+        .write_all(later.as_bytes())
+        .expect("append remote receiver");
+    run_fixture_ingest(binary, receiver_root.path(), receiver_file);
+
+    let configure_native_peer = |root: &std::path::Path, machine: &str| {
+        let owner_home = root.join("home");
+        let engram_home = owner_home.join(".engram");
+        let db = engram_home.join("index.sqlite");
+        let tapes = engram_home.join("tapes");
+        std::fs::write(
+            engram_home.join("topology.yml"),
+            format!(
+                "version: 1\nself: {machine}\nexports:\n  default:\n    db: {}\n    tape_dirs:\n      - {}\n",
+                db.display(),
+                tapes.display()
+            ),
+        )
+        .expect("write native owner topology");
+        json!({
+            "command":["/usr/bin/env", format!("HOME={}", owner_home.display()), binary, "peer-serve", "--stdio"],
+            "engram":binary,
+            "exports":["default"],
+        })
+    };
+    let sender_peer = configure_native_peer(sender_root.path(), "machine-a");
+    let receiver_peer = configure_native_peer(receiver_root.path(), "machine-b");
+    let caller_root = tempfile::tempdir().expect("querier tempdir");
+    let (caller_home, repo) = write_local_grep_source(
+        caller_root.path(),
+        "querier-empty",
+        "{\"t\":\"2026-09-25T09:00:00Z\",\"k\":\"note\",\"content\":\"querier holds neither endpoint\"}\n",
+    );
+    std::fs::write(repo.join("probe.rs"), source).expect("write federated query source");
+    set_peer_topology(
+        &caller_home,
+        json!({"machine-a":sender_peer, "machine-b":receiver_peer}),
+    );
+    let federated = run_peer_explain(
+        binary,
+        &caller_home,
+        &repo,
+        "probe.rs",
+        "machine-a,machine-b",
+    );
+    assert!(
+        federated.status.success(),
+        "federated native explain failed: {}",
+        String::from_utf8_lossy(&federated.stderr)
+    );
+    let federated: serde_json::Value =
+        serde_json::from_slice(&federated.stdout).expect("federated native JSON");
+    assert_eq!(
+        federated["federation"]["coverage"], "complete",
+        "native split owner result: {federated:#}"
+    );
+    let local_hop = &baseline["dispatch_lineage"][0];
+    let remote_hop = federated["dispatch_lineage"]
+        .as_array()
+        .unwrap()
+        .first()
+        .expect("federated recovered handoff");
+    for field in [
+        "session",
+        "edit_session",
+        "edit_event_offset",
+        "received_uuid",
+        "received_turn_index",
+        "edit_turn_index",
+        "parent_session",
+        "parent_sent_turn_index",
+    ] {
+        assert_eq!(remote_hop[field], local_hop[field], "field {field}");
+    }
+    assert_eq!(remote_hop["received_uuid"], uuid);
+    assert_eq!(remote_hop["parent_location"], "machine-a/default");
+    assert_eq!(remote_hop["session_location"], "machine-b/default");
+    let local_sessions = baseline["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|session| session["session_id"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let remote_sessions = federated["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|session| session["session_id"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(remote_sessions, local_sessions);
+}
+
+#[test]
+fn explain_peers_reports_missing_segment_and_missing_tape_without_dropping_sessions() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let uuid = "423e4567-e89b-12d3-a456-426614174030";
+    let file = "incomplete-history.rs";
+    let source = "fn incomplete_history_edit() { let result = red + blue; use_result(result); }\n"
+        .repeat(12);
+    let before = source.replace("incomplete_history_edit", "before_incomplete_history_edit");
+
+    let sender_id = "complete-sender";
+    let sender_events = jsonl(&[
+        json!({"t":"2026-09-25T10:00:00Z","k":"meta","model":"peer-test"}),
+        json!({"t":"2026-09-25T10:01:00Z","k":"msg.out","content":format!("<engram-src id=\"{uuid}\"/>")}),
+    ]);
+    let mut sender = write_grep_owner(
+        temp.path(),
+        "sender-owner",
+        binary,
+        &[(sender_id, &sender_events)],
+    );
+    ingest_owner_test_tape(
+        temp.path(),
+        "sender-owner",
+        sender_id,
+        &sender_events,
+        &[DispatchLink {
+            uuid: uuid.into(),
+            first_turn_index: 0,
+            direction: DispatchDirection::Sent,
+        }],
+    );
+
+    let missing_predecessor_id = "missing-predecessor-receiver";
+    let missing_predecessor_events = jsonl(&[
+        json!({"t":"2026-09-25T12:00:00Z","k":"meta","model":"peer-test","ingest_continuation":{"previous_tape_id":"deleted-predecessor-segment"}}),
+        json!({"t":"2026-09-25T12:01:00Z","k":"msg.in","content":format!("<engram-src id=\"{uuid}\"/>")}),
+        edit_event(file, &before, &source),
+    ]);
+    let missing_tape_id = "missing-file-receiver";
+    let missing_tape_events = jsonl(&[
+        json!({"t":"2026-09-25T12:10:00Z","k":"meta","model":"peer-test"}),
+        json!({"t":"2026-09-25T12:11:00Z","k":"msg.in","content":format!("<engram-src id=\"{uuid}\"/>")}),
+        edit_event(file, &before, &source),
+    ]);
+    let mut receiver = write_grep_owner(
+        temp.path(),
+        "receiver-owner",
+        binary,
+        &[
+            (missing_predecessor_id, &missing_predecessor_events),
+            (missing_tape_id, &missing_tape_events),
+        ],
+    );
+    for (tape_id, events) in [
+        (missing_predecessor_id, &missing_predecessor_events),
+        (missing_tape_id, &missing_tape_events),
+    ] {
+        ingest_owner_test_tape(
+            temp.path(),
+            "receiver-owner",
+            tape_id,
+            events,
+            &[DispatchLink {
+                uuid: uuid.into(),
+                first_turn_index: 0,
+                direction: DispatchDirection::Received,
+            }],
+        );
+    }
+    std::fs::remove_file(
+        temp.path()
+            .join("receiver-owner-home/.engram/tapes")
+            .join(format!("{missing_tape_id}.jsonl.zst")),
+    )
+    .expect("remove indexed tape file");
+    let _sender_operations = log_peer_operations(temp.path(), "sender-owner", binary, &mut sender);
+    let receiver_operations =
+        log_peer_operations(temp.path(), "receiver-owner", binary, &mut receiver);
+
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "querier-unrelated",
+        "{\"t\":\"2026-09-25T09:00:00Z\",\"k\":\"note\",\"content\":\"empty\"}\n",
+    );
+    std::fs::write(repo.join(file), &source).expect("write incomplete-history target");
+    set_peer_topology(
+        &caller_home,
+        json!({"sender-owner":sender, "receiver-owner":receiver}),
+    );
+    let output = run_peer_explain(
+        binary,
+        &caller_home,
+        &repo,
+        file,
+        "sender-owner,receiver-owner",
+    );
+    assert!(
+        output.status.success(),
+        "partial history should remain explainable: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("explain JSON");
+    assert_eq!(value["federation"]["coverage"], "partial");
+    assert!(value["dispatch_lineage"].as_array().unwrap().is_empty());
+    assert!(
+        value["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|session| { session["session_id"] == missing_predecessor_id })
+    );
+    assert!(
+        value["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|session| { session["session_id"] == missing_tape_id })
+    );
+    let unresolved = value["dispatch_unresolved"]
+        .as_array()
+        .expect("unresolved rows");
+    assert!(unresolved.iter().any(|row| {
+        row["reason"] == "history_incomplete"
+            && row["session"] == missing_predecessor_id
+            && row["missing"] == "deleted-predecessor-segment"
+    }));
+    assert!(
+        unresolved.iter().any(|row| {
+            row["reason"] == "tape_unavailable" && row["session"] == missing_tape_id
+        })
+    );
+    assert_eq!(operation_count(&receiver_operations, "read_file"), 0);
+}
+
+#[test]
 fn explain_peers_reports_missing_sender_owner_without_inventing_a_hop() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = env!("CARGO_BIN_EXE_engram");
@@ -716,6 +1746,428 @@ fn explain_peers_reports_missing_sender_owner_without_inventing_a_hop() {
                 })
         }),
         "missing sender attribution was not preserved: {value:#}"
+    );
+}
+
+#[test]
+fn explain_peers_keeps_two_independent_remote_senders_ambiguous() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let uuid = "523e4567-e89b-12d3-a456-426614174040";
+    let file = "ambiguous-handoff.rs";
+    let source =
+        "fn ambiguous_remote_edit() { let output = one + two; use_output(output); }\n".repeat(12);
+    let before = source.replace("ambiguous_remote_edit", "before_ambiguous_remote_edit");
+    let mut peers = serde_json::Map::new();
+    let mut senders = Vec::new();
+    for machine in ["sender-alpha", "sender-beta"] {
+        let tape_id = format!("{machine}-session");
+        let events = jsonl(&[
+            json!({"t":"2026-09-25T11:00:00Z","k":"meta","model":"peer-test"}),
+            json!({"t":"2026-09-25T11:01:00Z","k":"msg.out","content":format!("<engram-src id=\"{uuid}\"/>")}),
+        ]);
+        let peer = write_grep_owner(temp.path(), machine, binary, &[(tape_id.as_str(), &events)]);
+        ingest_owner_test_tape(
+            temp.path(),
+            machine,
+            &tape_id,
+            &events,
+            &[DispatchLink {
+                uuid: uuid.into(),
+                first_turn_index: 0,
+                direction: DispatchDirection::Sent,
+            }],
+        );
+        peers.insert(machine.into(), peer);
+        senders.push(tape_id);
+    }
+
+    let receiver_id = "ambiguous-receiver";
+    let receiver_events = jsonl(&[
+        json!({"t":"2026-09-25T12:00:00Z","k":"meta","model":"peer-test"}),
+        json!({"t":"2026-09-25T12:01:00Z","k":"msg.in","content":format!("<engram-src id=\"{uuid}\"/>")}),
+        edit_event(file, &before, &source),
+    ]);
+    let receiver = write_grep_owner(
+        temp.path(),
+        "receiver",
+        binary,
+        &[(receiver_id, &receiver_events)],
+    );
+    ingest_owner_test_tape(
+        temp.path(),
+        "receiver",
+        receiver_id,
+        &receiver_events,
+        &[DispatchLink {
+            uuid: uuid.into(),
+            first_turn_index: 0,
+            direction: DispatchDirection::Received,
+        }],
+    );
+    peers.insert("receiver".into(), receiver);
+
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "querier-empty",
+        "{\"t\":\"2026-09-25T10:00:00Z\",\"k\":\"note\",\"content\":\"no endpoints\"}\n",
+    );
+    std::fs::write(repo.join(file), &source).expect("write ambiguity target");
+    set_peer_topology(&caller_home, serde_json::Value::Object(peers));
+    let output = run_peer_explain(
+        binary,
+        &caller_home,
+        &repo,
+        file,
+        "sender-alpha,sender-beta,receiver",
+    );
+    assert!(
+        output.status.success(),
+        "ambiguity query failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("explain JSON");
+    assert!(value["dispatch_lineage"].as_array().unwrap().is_empty());
+    let [ambiguity] = value["dispatch_ambiguous"].as_array().unwrap().as_slice() else {
+        panic!("expected one ambiguous marker: {value:#}");
+    };
+    assert_eq!(ambiguity["received_uuid"], uuid);
+    assert_eq!(ambiguity["received_session"], receiver_id);
+    let mut candidates = ambiguity["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|candidate| candidate["session"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    candidates.sort();
+    let mut expected = senders;
+    expected.sort();
+    assert_eq!(candidates, expected);
+}
+
+#[test]
+fn explain_peers_projects_two_remote_task_parents_for_one_session() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let uuid_a = "623e4567-e89b-12d3-a456-426614174050";
+    let uuid_b = "623e4567-e89b-12d3-a456-426614174051";
+    let file = "multi-parent.rs";
+    let source =
+        "fn edits_from_two_tasks() { let answer = red + blue; use_answer(answer); }\n".repeat(12);
+    let before = source.replace("edits_from_two_tasks", "before_multi_parent");
+    let mut peers = serde_json::Map::new();
+    let mut parent_ids = Vec::new();
+    for (machine, uuid) in [("task-alpha", uuid_a), ("task-beta", uuid_b)] {
+        let tape_id = format!("{machine}-sender");
+        let events = jsonl(&[
+            json!({"t":"2026-09-25T10:00:00Z","k":"meta","model":"peer-test"}),
+            json!({"t":"2026-09-25T10:01:00Z","k":"msg.out","content":format!("<engram-src id=\"{uuid}\"/>")}),
+        ]);
+        let peer = write_grep_owner(temp.path(), machine, binary, &[(tape_id.as_str(), &events)]);
+        ingest_owner_test_tape(
+            temp.path(),
+            machine,
+            &tape_id,
+            &events,
+            &[DispatchLink {
+                uuid: uuid.into(),
+                first_turn_index: 0,
+                direction: DispatchDirection::Sent,
+            }],
+        );
+        peers.insert(machine.into(), peer);
+        parent_ids.push(tape_id);
+    }
+
+    let receiver_id = "two-task-receiver";
+    let mut second_edit = edit_event(file, &before, &source);
+    second_edit["t"] = json!("2026-09-25T12:04:00Z");
+    let receiver_events = jsonl(&[
+        json!({"t":"2026-09-25T12:00:00Z","k":"meta","model":"peer-test"}),
+        json!({"t":"2026-09-25T12:01:00Z","k":"msg.in","content":format!("<engram-src id=\"{uuid_a}\"/>")}),
+        edit_event(file, &before, &source),
+        json!({"t":"2026-09-25T12:03:00Z","k":"msg.in","content":format!("<engram-src id=\"{uuid_b}\"/>")}),
+        second_edit,
+    ]);
+    let receiver = write_grep_owner(
+        temp.path(),
+        "receiver",
+        binary,
+        &[(receiver_id, &receiver_events)],
+    );
+    ingest_owner_test_tape(
+        temp.path(),
+        "receiver",
+        receiver_id,
+        &receiver_events,
+        &[
+            DispatchLink {
+                uuid: uuid_a.into(),
+                first_turn_index: 0,
+                direction: DispatchDirection::Received,
+            },
+            DispatchLink {
+                uuid: uuid_b.into(),
+                first_turn_index: 1,
+                direction: DispatchDirection::Received,
+            },
+        ],
+    );
+    peers.insert("receiver".into(), receiver);
+
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "querier-empty",
+        "{\"t\":\"2026-09-25T09:00:00Z\",\"k\":\"note\",\"content\":\"no endpoints\"}\n",
+    );
+    std::fs::write(repo.join(file), &source).expect("write multiple-parent target");
+    set_peer_topology(&caller_home, serde_json::Value::Object(peers));
+    let output = run_peer_explain(
+        binary,
+        &caller_home,
+        &repo,
+        file,
+        "task-alpha,task-beta,receiver",
+    );
+    assert!(
+        output.status.success(),
+        "multiple-parent query failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("explain JSON");
+    let session = value["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["session_id"] == receiver_id)
+        .expect("receiver session");
+    assert_eq!(session["parent"], serde_json::Value::Null);
+    let mut actual = session["parents"]
+        .as_array()
+        .expect("multiple parents")
+        .iter()
+        .map(|parent| parent.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    actual.sort();
+    parent_ids.sort();
+    assert_eq!(actual, parent_ids);
+    assert_eq!(
+        value["dispatch_lineage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|hop| hop["session"] == receiver_id)
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn explain_peers_terminates_mutual_remote_dispatch_cycle() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let uuid_a = "723e4567-e89b-12d3-a456-426614174060";
+    let uuid_b = "723e4567-e89b-12d3-a456-426614174061";
+    let file = "cycle.rs";
+    let source =
+        "fn remote_cycle_edit() { let value = first + second; use_value(value); }\n".repeat(12);
+    let before = source.replace("remote_cycle_edit", "before_remote_cycle_edit");
+    let a_id = "cycle-session-a";
+    let mut a_edit = edit_event(file, &before, &source);
+    a_edit["t"] = json!("2026-09-25T12:03:00Z");
+    let a_events = jsonl(&[
+        json!({"t":"2026-09-25T12:00:00Z","k":"meta","model":"peer-test"}),
+        json!({"t":"2026-09-25T12:01:00Z","k":"msg.in","content":format!("<engram-src id=\"{uuid_b}\"/>")}),
+        json!({"t":"2026-09-25T12:02:00Z","k":"msg.out","content":format!("<engram-src id=\"{uuid_a}\"/>")}),
+        a_edit,
+    ]);
+    let a = write_grep_owner(temp.path(), "cycle-a", binary, &[(a_id, &a_events)]);
+    ingest_owner_test_tape(
+        temp.path(),
+        "cycle-a",
+        a_id,
+        &a_events,
+        &[
+            DispatchLink {
+                uuid: uuid_b.into(),
+                first_turn_index: 0,
+                direction: DispatchDirection::Received,
+            },
+            DispatchLink {
+                uuid: uuid_a.into(),
+                first_turn_index: 1,
+                direction: DispatchDirection::Sent,
+            },
+        ],
+    );
+    let b_id = "cycle-session-b";
+    let b_events = jsonl(&[
+        json!({"t":"2026-09-25T11:00:00Z","k":"meta","model":"peer-test"}),
+        json!({"t":"2026-09-25T11:01:00Z","k":"msg.in","content":format!("<engram-src id=\"{uuid_a}\"/>")}),
+        json!({"t":"2026-09-25T11:02:00Z","k":"msg.out","content":format!("<engram-src id=\"{uuid_b}\"/>")}),
+    ]);
+    let b = write_grep_owner(temp.path(), "cycle-b", binary, &[(b_id, &b_events)]);
+    ingest_owner_test_tape(
+        temp.path(),
+        "cycle-b",
+        b_id,
+        &b_events,
+        &[
+            DispatchLink {
+                uuid: uuid_a.into(),
+                first_turn_index: 0,
+                direction: DispatchDirection::Received,
+            },
+            DispatchLink {
+                uuid: uuid_b.into(),
+                first_turn_index: 1,
+                direction: DispatchDirection::Sent,
+            },
+        ],
+    );
+
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "querier-empty",
+        "{\"t\":\"2026-09-25T09:00:00Z\",\"k\":\"note\",\"content\":\"no endpoints\"}\n",
+    );
+    std::fs::write(repo.join(file), &source).expect("write cycle target");
+    set_peer_topology(&caller_home, json!({"cycle-a":a, "cycle-b":b}));
+    let output = run_peer_explain(binary, &caller_home, &repo, file, "cycle-a,cycle-b");
+    assert!(
+        output.status.success(),
+        "mutual-dispatch query failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("explain JSON");
+    let chains = value["chains"].as_array().expect("chain metadata");
+    assert_eq!(
+        chains.len(),
+        1,
+        "expected one finite cyclic component: {value:#}"
+    );
+    assert_eq!(chains[0]["cycle"], true, "federated result: {value:#}");
+    assert!(chains[0]["descendants"].as_array().unwrap().len() <= 2);
+}
+
+#[test]
+fn explain_peers_qualifies_equal_span_anchors_but_joins_winnow_globally() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let source =
+        "fn anchor_scope_fixture() { let value = north + south; use_value(value); }\n".repeat(12);
+    let before = source.replace("anchor_scope_fixture", "before_anchor_scope_fixture");
+    let root_tape = "span-scope-root-edit";
+    let root_events = jsonl(&[
+        json!({"t":"2026-09-25T12:00:00Z","k":"meta","model":"peer-test"}),
+        edit_event("scope.rs", &before, &source),
+    ]);
+    let alpha = write_grep_owner(temp.path(), "alpha", binary, &[(root_tape, &root_events)]);
+    ingest_owner_test_tape(temp.path(), "alpha", root_tape, &root_events, &[]);
+    let alpha_db = temp.path().join("alpha-home/.engram/index.sqlite");
+    let alpha_index = SqliteIndex::open_writer(alpha_db.to_str().expect("alpha DB path"))
+        .expect("open alpha index");
+    let root_window = engram::anchor::fingerprint_windows(&source)
+        .into_iter()
+        .next()
+        .expect("root fingerprint window");
+    let root_anchor = root_window.anchor.clone();
+    let query_anchor = root_window
+        .features
+        .iter()
+        .find(|feature| {
+            alpha_index
+                .matching_window_anchors(feature)
+                .is_ok_and(|anchors| anchors == vec![root_anchor.clone()])
+        })
+        .expect("feature uniquely identifies the query root")
+        .clone();
+    let shared_span = "span:src/lib.rs:1-12";
+    let shared_winnow = "winnow:shared-across-stores";
+    insert_test_span_edge(&alpha_index, root_tape, 0, &root_anchor, shared_span);
+    insert_test_span_edge(&alpha_index, root_tape, 1, &root_anchor, shared_winnow);
+    insert_test_span_edge(
+        &alpha_index,
+        root_tape,
+        2,
+        shared_span,
+        "winnow:span-child-alpha",
+    );
+    drop(alpha_index);
+
+    let beta_tape = "span-scope-beta-note";
+    let beta_events = jsonl(&[
+        json!({"t":"2026-09-25T11:00:00Z","k":"meta","model":"peer-test"}),
+        json!({"t":"2026-09-25T11:01:00Z","k":"note","content":"edges without a local query touch"}),
+    ]);
+    let beta = write_grep_owner(temp.path(), "beta", binary, &[(beta_tape, &beta_events)]);
+    ingest_owner_test_tape(temp.path(), "beta", beta_tape, &beta_events, &[]);
+    let beta_db = temp.path().join("beta-home/.engram/index.sqlite");
+    let beta_index =
+        SqliteIndex::open_writer(beta_db.to_str().expect("beta DB path")).expect("open beta index");
+    insert_test_span_edge(
+        &beta_index,
+        beta_tape,
+        0,
+        shared_span,
+        "winnow:must-not-cross-store-span",
+    );
+    insert_test_span_edge(
+        &beta_index,
+        beta_tape,
+        1,
+        shared_winnow,
+        "winnow:cross-store-child-beta",
+    );
+    drop(beta_index);
+
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "querier-empty",
+        "{\"t\":\"2026-09-25T10:00:00Z\",\"k\":\"note\",\"content\":\"no indexed query anchor\"}\n",
+    );
+    set_peer_topology(&caller_home, json!({"alpha":alpha, "beta":beta}));
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "explain",
+            query_anchor.as_str(),
+            "--anchor",
+            "--peers",
+            "alpha,beta",
+            "--depth",
+            "4",
+        ])
+        .output()
+        .expect("run span qualification explain");
+    assert!(
+        output.status.success(),
+        "span qualification query failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("explain JSON");
+    assert_eq!(value["federation"]["coverage"], "complete");
+    let lineage = value["lineage"].as_array().expect("lineage");
+    assert!(lineage.iter().any(|edge| {
+        edge["from_anchor"] == root_anchor
+            && edge["to_anchor"] == shared_span
+            && edge["store"] == "alpha/default"
+    }));
+    assert!(lineage.iter().any(|edge| {
+        edge["from_anchor"] == shared_span
+            && edge["to_anchor"] == "winnow:span-child-alpha"
+            && edge["store"] == "alpha/default"
+    }));
+    assert!(lineage.iter().any(|edge| {
+        edge["from_anchor"] == shared_winnow
+            && edge["to_anchor"] == "winnow:cross-store-child-beta"
+            && edge["store"] == "beta/default"
+    }));
+    assert!(
+        lineage
+            .iter()
+            .all(|edge| { edge["to_anchor"] != "winnow:must-not-cross-store-span" })
     );
 }
 
@@ -2238,10 +3690,15 @@ fn grep_with_one_selected_peer_merges_local_and_remote_results() {
         "{\"t\":\"2026-09-24T10:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-federated conflict\"}\n",
         "{\"t\":\"2026-09-24T10:01:00Z\",\"k\":\"msg.in\",\"content\":\"needle-federated conflict again\"}\n",
     );
+    let local_conflict = "{\"t\":\"2026-09-24T10:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-federated conflict\"}\n";
+    let collision_id = format!("{:x}", sha2::Sha256::digest(local_conflict.as_bytes()));
     let compressed = zstd::stream::encode_all(conflicting_content.as_bytes(), 0)
         .expect("compress conflicting tape");
-    std::fs::write(owner_tapes.join("collision-session.jsonl.zst"), compressed)
-        .expect("write conflicting remote tape");
+    std::fs::write(
+        owner_tapes.join(format!("{collision_id}.jsonl.zst")),
+        compressed,
+    )
+    .expect("write conflicting remote tape");
     std::fs::write(
         owner_engram.join("topology.yml"),
         format!(
@@ -2278,11 +3735,13 @@ fn grep_with_one_selected_peer_merges_local_and_remote_results() {
         compressed,
     )
     .expect("write local tape");
-    let local_conflict = "{\"t\":\"2026-09-24T10:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-federated conflict\"}\n";
     let compressed = zstd::stream::encode_all(local_conflict.as_bytes(), 0)
         .expect("compress local conflicting tape");
-    std::fs::write(local_tapes.join("collision-session.jsonl.zst"), compressed)
-        .expect("write local conflicting tape");
+    std::fs::write(
+        local_tapes.join(format!("{collision_id}.jsonl.zst")),
+        compressed,
+    )
+    .expect("write local conflicting tape");
 
     let unselected_marker = temp.path().join("unselected-peer-was-started");
     std::fs::write(
@@ -2343,13 +3802,11 @@ fn grep_with_one_selected_peer_merges_local_and_remote_results() {
     assert!(
         sessions
             .iter()
-            .any(|session| { session["session_id"] == "collision-session@caller/local:0" })
+            .any(|session| { session["session_id"] == format!("{collision_id}@caller/local:0") })
     );
-    assert!(
-        sessions
-            .iter()
-            .any(|session| { session["session_id"] == "collision-session@emulated-owner/default" })
-    );
+    assert!(sessions.iter().any(|session| {
+        session["session_id"] == format!("{collision_id}@emulated-owner/default")
+    }));
     assert_eq!(result["federation"]["coverage"], "complete");
     assert_eq!(result["total"], 4);
     assert!(
@@ -4127,6 +5584,132 @@ fn peer_tape_facts_verifies_and_returns_native_recovery_binding() {
             .message
             .contains("missing from recovery points")
     );
+
+    let locator_path = locator_dir.join("legacy-segment.json");
+    let mut tampered: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&locator_path).expect("read recovery locator"))
+            .expect("parse recovery locator");
+    tampered["recovered"]["points"][0]["turn"] = json!(999);
+    std::fs::write(
+        &locator_path,
+        serde_json::to_vec(&tampered).expect("serialize tampered locator"),
+    )
+    .expect("tamper recovery locator");
+    let tampered_locator = owner
+        .round(
+            &[PeerRequest::new(
+                "tape_facts",
+                vec!["default".into()],
+                json!({
+                    "items": [{"tape_id":"legacy-segment", "edit_offsets":[2]}]
+                }),
+            )],
+            Duration::from_secs(5),
+        )
+        .pop()
+        .expect("tampered locator outcome")
+        .expect_err("tampered legacy locator must fail closed");
+    assert_eq!(tampered_locator.code, "native_recovery_error");
+    assert!(tampered_locator.message.contains("not bound by context"));
+}
+
+#[test]
+fn peer_decompression_caps_are_reported_as_over_limit() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let tape_id = "decompression-cap-tape";
+    let content = format!(
+        "{{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"meta\"}}\n{{\"t\":\"2026-09-25T12:01:00Z\",\"k\":\"note\",\"content\":\"{}\"}}\n",
+        "needle content that is larger than the configured decompression cap".repeat(3)
+    );
+    let peer_config =
+        write_grep_owner(temp.path(), "limited-owner", binary, &[(tape_id, &content)]);
+    let owner_home = temp.path().join("limited-owner-home");
+    let topology_path = owner_home.join(".engram/topology.yml");
+    let topology = std::fs::read_to_string(&topology_path).expect("read owner topology");
+    std::fs::write(
+        &topology_path,
+        format!("{topology}limits:\n  decompressed_bytes_per_tape: 32\n"),
+    )
+    .expect("set owner decompression cap");
+
+    let peer = TopologyPeer {
+        ssh: None,
+        command: Some(
+            peer_config["command"]
+                .as_array()
+                .expect("owner command")
+                .iter()
+                .map(|arg| arg.as_str().expect("command arg").to_string())
+                .collect(),
+        ),
+        engram: binary.to_string(),
+        exports: vec!["default".into()],
+    };
+    let mut owner = RemoteOwner::connect("limited-owner", "querier", &peer, Duration::from_secs(5))
+        .expect("connect limited owner");
+    let facts = owner
+        .round(
+            &[PeerRequest::new(
+                "tape_facts",
+                vec!["default".into()],
+                json!({"items":[{"tape_id":tape_id}]}),
+            )],
+            Duration::from_secs(5),
+        )
+        .pop()
+        .expect("tape facts outcome")
+        .expect("per-tape cap failure is reported in data");
+    assert_eq!(facts.data[0]["status"], "failed");
+    assert_eq!(facts.data[0]["error"]["code"], "over_limit");
+
+    let grep = owner
+        .round(
+            &[PeerRequest::new(
+                "grep_scan",
+                vec!["default".into()],
+                json!({"pattern":"needle", "k":10}),
+            )],
+            Duration::from_secs(5),
+        )
+        .pop()
+        .expect("grep outcome")
+        .expect("per-tape cap failure is reported in data");
+    assert_eq!(grep.data[0]["type"], "failure");
+    assert_eq!(grep.data[0]["error"]["code"], "over_limit");
+    drop(owner);
+
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "caller-empty-tape",
+        "{\"t\":\"2026-09-25T11:00:00Z\",\"k\":\"note\",\"content\":\"empty\"}\n",
+    );
+    set_peer_topology(&caller_home, json!({"limited-owner":peer_config}));
+    let peek = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "peek",
+            tape_id,
+            "--store",
+            "limited-owner/default",
+            "--start",
+            "1",
+            "--lines",
+            "1",
+        ])
+        .output()
+        .expect("run bounded remote peek");
+    assert!(!peek.status.success());
+    assert!(peek.stdout.is_empty());
+    let error: serde_json::Value = serde_json::from_str(
+        String::from_utf8_lossy(&peek.stderr)
+            .lines()
+            .last()
+            .expect("structured over-limit error"),
+    )
+    .expect("over-limit JSON");
+    assert_eq!(error["error"]["code"], "over_limit");
 }
 
 #[test]

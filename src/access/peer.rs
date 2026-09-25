@@ -1931,7 +1931,7 @@ fn scan_tape_for_grep(
         bytes_read = bytes_read.saturating_add(bytes as u64);
         if bytes_read > decompressed_limit {
             return Err(PeerError::new(
-                "budget_exceeded",
+                "over_limit",
                 format!("decompressed tape exceeds {decompressed_limit} byte limit"),
             ));
         }
@@ -2156,7 +2156,7 @@ fn read_tape_for_query(
         configured_limit(limits, "decompressed_bytes_per_tape", 512 * 1024 * 1024);
     decompress_jsonl_with_limit(&compressed, decompressed_limit).map_err(|error| {
         if error.to_string().starts_with("decompressed tape exceeds ") {
-            PeerError::new("budget_exceeded", error.to_string())
+            PeerError::new("over_limit", error.to_string())
         } else {
             PeerError::new("invalid_tape", error.to_string())
         }
