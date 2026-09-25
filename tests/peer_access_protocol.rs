@@ -595,13 +595,21 @@ fn interrupt_remote_command(
 #[cfg(unix)]
 fn assert_remote_sigint_error(output: &std::process::Output) {
     assert_eq!(output.status.code(), Some(130), "SIGINT must exit 130");
-    assert!(output.stdout.is_empty(), "cancelled content must not be emitted");
+    assert!(
+        output.stdout.is_empty(),
+        "cancelled content must not be emitted"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     let error: serde_json::Value =
         serde_json::from_str(stderr.lines().last().expect("cancellation error line"))
             .expect("cancellation error JSON");
     assert_eq!(error["error"]["code"], "cancelled");
-    assert!(error["error"]["message"].as_str().unwrap().contains("caller SIGINT"));
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("caller SIGINT")
+    );
 }
 
 #[cfg(unix)]
@@ -615,7 +623,10 @@ fn remote_show_ctrl_c_cancels_and_aborts_read_file() {
         &["show", "fixture-tape", "--store", "silent/default"],
         &read_started,
     );
-    assert!(elapsed < Duration::from_secs(3), "remote read_file cancellation exceeded its deadline");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "remote read_file cancellation exceeded its deadline"
+    );
     assert_remote_sigint_error(&output);
 }
 

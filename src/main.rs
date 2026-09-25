@@ -2705,14 +2705,14 @@ fn peer_cancellation_flag() -> Result<(Arc<AtomicBool>, Arc<AtomicU8>), CliError
 }
 
 fn caller_sigint_error(command: &str) -> CliError {
-    CliError::new("cancelled", format!("{command} interrupted by caller SIGINT"))
-        .with_exit_code(130)
+    CliError::new(
+        "cancelled",
+        format!("{command} interrupted by caller SIGINT"),
+    )
+    .with_exit_code(130)
 }
 
-fn commit_peer_query_terminal(
-    terminal_state: &AtomicU8,
-    command: &str,
-) -> Result<(), CliError> {
+fn commit_peer_query_terminal(terminal_state: &AtomicU8, command: &str) -> Result<(), CliError> {
     match terminal_state.compare_exchange(
         PEER_QUERY_TERMINAL_RUNNING,
         PEER_QUERY_TERMINAL_COMMITTED,
@@ -3075,13 +3075,7 @@ fn cmd_peek_remote(
     store_ref: &str,
 ) -> Result<(), CliError> {
     let (cancelled, terminal_state) = peer_cancellation_flag()?;
-    let result = cmd_peek_remote_inner(
-        context,
-        args,
-        store_ref,
-        &cancelled,
-        &terminal_state,
-    );
+    let result = cmd_peek_remote_inner(context, args, store_ref, &cancelled, &terminal_state);
     finish_peer_query(result, &terminal_state, "remote peek")
 }
 
@@ -3298,29 +3292,29 @@ fn cmd_peek_remote_inner(
     }
 
     let payload = json!({
-            "query": {
-                "command": "peek",
-                "session_id": session_id,
-                "start": args.start,
-                "lines": args.lines,
-                "before": args.before,
-                "after": args.after,
-                "grep_filter": args.grep_filter,
+        "query": {
+            "command": "peek",
+            "session_id": session_id,
+            "start": args.start,
+            "lines": args.lines,
+            "before": args.before,
+            "after": args.after,
+            "grep_filter": args.grep_filter,
+            "store": store_ref,
+        },
+        "session": {
+            "session_id": session_id,
+            "timestamp": timestamp,
+            "window_start": window_start,
+            "window_end": window_end,
+            "total_lines": total_lines,
+            "content": content,
+            "location": {
+                "machine": machine,
                 "store": store_ref,
             },
-            "session": {
-                "session_id": session_id,
-                "timestamp": timestamp,
-                "window_start": window_start,
-                "window_end": window_end,
-                "total_lines": total_lines,
-                "content": content,
-                "location": {
-                    "machine": machine,
-                    "store": store_ref,
-                },
-            }
-        });
+        }
+    });
     commit_peer_query_terminal(terminal_state, "remote peek")?;
     emit_query_result("peek", payload)
 }
