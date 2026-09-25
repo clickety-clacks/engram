@@ -2986,7 +2986,9 @@ fn grep_ctrl_c_cancels_and_aborts_a_selected_peer_scan() {
             .as_array()
             .unwrap()
             .len(),
-        1
+        1,
+        "incomplete sources: {}",
+        result["cancellation"]["incomplete_sources"]
     );
     let beta = result["federation"]["sources"]
         .as_array()
@@ -3036,23 +3038,6 @@ fn grep_ctrl_c_overrides_require_complete_with_exit_130() {
             .any(|session| { session["tape_id"] == "beta-tape" })
     );
     assert!(!String::from_utf8_lossy(&output.stderr).contains("incomplete_coverage"));
-    assert_eq!(
-        result["cancellation"]["incomplete_sources"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    let beta = result["federation"]["sources"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|source| source["store"] == "beta/default")
-        .expect("completed peer source");
-    assert!(
-        beta["error"].is_null(),
-        "a completed source must not be labelled cancelled"
-    );
     assert_eq!(
         result["cancellation"]["incomplete_sources"]
             .as_array()
