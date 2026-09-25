@@ -2385,6 +2385,7 @@ fn peer_tape_facts_verifies_and_returns_native_recovery_binding() {
         facts["edit_offset_to_turn"][0]["recovered_source_offset"],
         3
     );
+    assert!(facts["digest"].is_null());
 
     let missing_point = owner
         .round(
