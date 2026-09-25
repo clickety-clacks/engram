@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use super::{FileAddress, FileKind, MAX_NON_FILE_RESPONSE_BYTES, MachineRef};
 use crate::config::{Topology, TopologyExport, load_topology};
@@ -632,6 +633,7 @@ impl PeerSession {
                     "anchor_offsets",
                     "grep_filter",
                     "window_lines",
+                    "include_digest",
                 ],
             )?;
             let tape_id = item.get("tape_id").and_then(Value::as_str).ok_or_else(|| {
@@ -651,6 +653,8 @@ impl PeerSession {
             let window_lines = optional_usize(item.get("window_lines"), "window_lines")?
                 .unwrap_or(30)
                 .max(1);
+            let include_digest = optional_bool(item.get("include_digest"), "include_digest")?
+                .unwrap_or(false);
             if window_lines > 10_000 {
                 return Err(PeerError::new(
                     "invalid_request",
@@ -774,7 +778,11 @@ impl PeerSession {
             }
 
             let total_lines = raw_text.lines().count();
-            let anchor_offset = anchor_offsets.iter().min().copied();
+            let anchor_offset = anchor_offsets
+                .iter()
+                .filter(|offset| rows.iter().any(|row| row.offset == **offset))
+                .min()
+                .copied();
             let anchor_line = anchor_offset
                 .and_then(|offset| usize::try_from(offset).ok())
                 .map(|offset| offset.saturating_add(1))
@@ -990,6 +998,8 @@ impl PeerSession {
                     "edit_offset_to_turn": edit_offset_to_turn,
                     "turn_to_offset": turn_to_offset,
                     "recovery_binding": recovery_binding,
+                    "digest": include_digest
+                        .then(|| format!("{:x}", Sha256::digest(raw_text.as_bytes()))),
                     "summary": summary,
                 }),
                 &mut response_bytes,
@@ -1894,6 +1904,19 @@ fn optional_string(value: Option<&Value>, name: &str) -> Result<Option<String>, 
         .transpose()
 }
 
+fn optional_bool(value: Option<&Value>, name: &str) -> Result<Option<bool>, PeerError> {
+    value
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| {
+                    PeerError::new("invalid_request", format!("{name} must be a boolean"))
+                })
+        })
+        .transpose()
+}
+
 fn grep_data_frame_size(id: &Value, record: &Value) -> Result<usize, PeerError> {
     serde_json::to_vec(&json!({"id": id, "data": record}))
         .map(|frame| frame.len().saturating_add(1))
@@ -2240,6 +2263,7 @@ fn tape_facts_failure(
         "tape_id": tape_id,
         "status": status,
         "indexed": indexed,
+        "digest": null,
         "error": {"code": code, "message": message},
     })
 }

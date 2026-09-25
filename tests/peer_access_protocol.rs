@@ -2189,6 +2189,7 @@ fn peer_tape_facts_returns_segment_history_turn_maps_and_bounded_summaries() {
                             "anchor_offsets": [2],
                             "grep_filter": "code.edit",
                             "window_lines": 4,
+                            "include_digest": true,
                         },
                         {"tape_id": "missing-segment"},
                     ]
@@ -2225,6 +2226,10 @@ fn peer_tape_facts_returns_segment_history_turn_maps_and_bounded_summaries() {
     assert_eq!(facts["summary"]["grep_filter_hits_window"], true);
     assert_eq!(facts["summary"]["latest_timestamp"], "2026-09-24T12:02:00Z");
     assert_eq!(facts["summary"]["files_touched"], json!(["src/lib.rs"]));
+    assert_eq!(
+        facts["digest"],
+        format!("{:x}", sha2::Sha256::digest(current.as_bytes()))
+    );
 
     let missing = response
         .data
@@ -2233,8 +2238,73 @@ fn peer_tape_facts_returns_segment_history_turn_maps_and_bounded_summaries() {
         .expect("missing tape outcome");
     assert_eq!(missing["status"], "unavailable");
     assert_eq!(missing["error"]["code"], "tape_unavailable");
+    assert!(missing["digest"].is_null());
     assert_eq!(missing["summary"]["total_lines"], 0);
     assert_eq!(missing["summary"]["files_touched"], json!([]));
+}
+
+#[test]
+fn peer_tape_facts_uses_smallest_resolvable_anchor_offset() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let content = concat!(
+        "{\"k\":\"meta\"}\n",
+        "\n",
+        "{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle anchor\"}\n",
+    );
+    let remote = write_grep_owner(
+        temp.path(),
+        "stale-anchor-owner",
+        binary,
+        &[("stale-anchor-tape", content)],
+    );
+    let peer = TopologyPeer {
+        ssh: None,
+        command: Some(
+            remote["command"]
+                .as_array()
+                .expect("command array")
+                .iter()
+                .map(|arg| arg.as_str().expect("command string").to_string())
+                .collect(),
+        ),
+        engram: binary.to_string(),
+        exports: vec!["default".into()],
+    };
+    let mut owner = RemoteOwner::connect(
+        "stale-anchor-owner",
+        "caller",
+        &peer,
+        Duration::from_secs(5),
+    )
+    .expect("connect owner");
+    let response = owner
+        .round(
+            &[PeerRequest::new(
+                "tape_facts",
+                vec!["default".into()],
+                json!({
+                    "items": [{
+                        "tape_id": "stale-anchor-tape",
+                        "anchor_offsets": [1, 2],
+                        "grep_filter": "needle",
+                        "window_lines": 1,
+                    }]
+                }),
+            )],
+            Duration::from_secs(5),
+        )
+        .into_iter()
+        .next()
+        .expect("tape_facts response")
+        .expect("stale index anchor is resolved against available rows");
+
+    let facts = &response.data[0];
+    assert_eq!(facts["status"], "ok");
+    assert_eq!(facts["summary"]["anchor_line"], 3);
+    assert_eq!(facts["summary"]["window_start"], 3);
+    assert_eq!(facts["summary"]["window_end"], 3);
+    assert_eq!(facts["summary"]["grep_filter_hits_window"], true);
 }
 
 #[test]
