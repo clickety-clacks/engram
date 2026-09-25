@@ -1,8 +1,9 @@
 //! One-time, exact legacy native chronology recovery. Original tapes and evidence
 //! stay untouched; immutable context tapes and small locator files bind old offsets.
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -33,6 +34,48 @@ pub(crate) struct Locator {
 fn error(message: impl Into<String>) -> CliError {
     CliError::new("native_recovery_error", message.into())
 }
+
+const MAX_RECOVERY_LOCATOR_BYTES: u64 = 1024 * 1024;
+
+fn valid_tape_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 255
+        && !id.starts_with('.')
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+}
+
+fn read_locator(path: &Path) -> Result<Locator, CliError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|e| CliError::io("native_recovery_error", e))?;
+    if !metadata.file_type().is_file() {
+        return Err(error("recovery locator is not a regular file"));
+    }
+    if metadata.len() > MAX_RECOVERY_LOCATOR_BYTES {
+        return Err(error("recovery locator exceeds the 1 MiB limit"));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| CliError::io("native_recovery_error", e))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_RECOVERY_LOCATOR_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|e| CliError::io("native_recovery_error", e))?;
+    if bytes.len() as u64 > MAX_RECOVERY_LOCATOR_BYTES {
+        return Err(error("recovery locator exceeds the 1 MiB limit"));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|e| error(format!("recovery locator is invalid: {e}")))
+}
+
 fn directory(context: &RuntimeContext) -> PathBuf {
     context.tapes_dir.join("native-upgrade-v1")
 }
@@ -313,31 +356,55 @@ impl QueryRecovery {
         context: &RuntimeContext,
         tape: &str,
     ) -> Result<Option<&Locator>, CliError> {
+        self.lookup_with_reader(&context.tape_lookup_dirs, tape, read_tape_content)
+    }
+
+    /// Resolve and verify one tape's recovery binding with an owner-selected
+    /// bounded reader. The negative and positive locator result is memoized
+    /// for this QueryRecovery invocation.
+    pub(crate) fn lookup_with_reader(
+        &mut self,
+        tape_lookup_dirs: &[PathBuf],
+        tape: &str,
+        mut read_tape: impl FnMut(&Path) -> Result<String, CliError>,
+    ) -> Result<Option<&Locator>, CliError> {
         if !self.locators.contains_key(tape) {
             let mut found = None;
-            for dir in &context.tape_lookup_dirs {
+            for dir in tape_lookup_dirs {
                 let path = dir.join("native-upgrade-v1").join(format!("{tape}.json"));
-                if !path.exists() {
-                    continue;
+                match fs::symlink_metadata(&path) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(CliError::io("native_recovery_error", error));
+                    }
                 }
-                let locator: Locator = serde_json::from_slice(
-                    &fs::read(path).map_err(|e| CliError::io("read_error", e))?,
-                )?;
+                let locator = read_locator(&path)?;
                 if locator.recovered.tape_id != tape {
                     return Err(error("recovery locator tape mismatch"));
                 }
+                if !valid_tape_id(&locator.context_tape) {
+                    return Err(error("recovery locator context tape ID is invalid"));
+                }
                 if !self.contexts.contains_key(&locator.context_tape) {
-                    let raw =
-                        read_tape_content(&tape_path_for_tapes_dir(dir, &locator.context_tape))?;
+                    let raw = read_tape(&tape_path_for_tapes_dir(dir, &locator.context_tape))
+                        .map_err(|cause| {
+                            error(format!(
+                                "recovery context is unavailable: {}",
+                                cause.message
+                            ))
+                        })?;
                     if tape_id_for_contents(&raw) != locator.context_tape {
                         return Err(error("recovery context hash mismatch"));
                     }
-                    let stored = rows(&raw)?
+                    let stored = rows(&raw)
+                        .map_err(|e| error(format!("recovery context JSON is invalid: {e}")))?
                         .into_iter()
                         .find(|r| r["k"] == "meta")
                         .ok_or_else(|| error("recovery context meta missing"))?;
                     let recoveries: Vec<RecoveredTape> =
-                        serde_json::from_value(stored["native_recovery_v1"].clone())?;
+                        serde_json::from_value(stored["native_recovery_v1"].clone())
+                            .map_err(|e| error(format!("recovery context binding is invalid: {e}")))?;
                     self.contexts
                         .insert(locator.context_tape.clone(), recoveries);
                 }

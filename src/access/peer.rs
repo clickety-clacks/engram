@@ -20,10 +20,10 @@ use crate::index::{
     QUERY_SEMANTICS_VERSION, ReaderMode, SCHEMA_VERSION, SqliteIndex, semantic_edge_key,
 };
 use crate::query::format::{
-    DateFilter, edge_to_json, extract_latest_timestamp_from_rows, is_provenance_row,
-    session_matches_date_filter,
+    DateFilter, collect_files_touched_from_rows, edge_to_json,
+    extract_latest_timestamp_from_rows, is_provenance_row, session_matches_date_filter,
 };
-use crate::store::tapes::parse_jsonl_rows;
+use crate::store::tapes::{TapeRow, parse_jsonl_rows};
 use crate::tape::compress::decompress_jsonl_with_limit;
 
 pub const PROTOCOL_VERSION: u64 = 1;
@@ -193,6 +193,7 @@ impl PeerSession {
             "dispatch_rows" => self.dispatch_rows(&stores, args, id, output),
             "lookup_anchors" => self.lookup_anchors(&stores, args, id, output),
             "lookup_edges" => self.lookup_edges(&stores, args, id, output),
+            "tape_facts" => self.tape_facts(&stores, args, id, output),
             "grep_scan" => self.grep_scan(&stores, args, id, output),
             "peek_lines" => self.peek_lines(&stores, args, id, output),
             "read_file" => self.read_file(&stores, args, id, output),
@@ -580,6 +581,426 @@ impl PeerSession {
             }
         }
         Ok(json!({"records": records}))
+    }
+
+    fn tape_facts<W: Write>(
+        &self,
+        stores: &[String],
+        args: &serde_json::Map<String, Value>,
+        id: &Value,
+        output: &mut W,
+    ) -> Result<Value, PeerError> {
+        reject_unknown_keys(args, &["items"])?;
+        if stores.len() != 1 {
+            return Err(PeerError::new(
+                "invalid_request",
+                "tape_facts requires exactly one store",
+            ));
+        }
+        let items = args
+            .get("items")
+            .and_then(Value::as_array)
+            .filter(|items| !items.is_empty() && items.len() <= MAX_BATCH_ITEMS)
+            .ok_or_else(|| {
+                PeerError::new(
+                    "invalid_request",
+                    format!("args.items must contain 1..={MAX_BATCH_ITEMS} items"),
+                )
+            })?;
+        let export = self.require_open(&stores[0])?;
+        let store_ref = format!("{}/{}", self.topology.self_label, stores[0]);
+        let response_limit = configured_limit(
+            &self.topology.limits,
+            "non_file_response_bytes",
+            MAX_NON_FILE_RESPONSE_BYTES as u64,
+        )
+        .saturating_sub(1024);
+        let mut response_bytes = 0u64;
+        let mut seen_tapes = HashSet::new();
+        let mut recovery = crate::ingest::recovery::QueryRecovery::default();
+
+        for item in items {
+            let item = item.as_object().ok_or_else(|| {
+                PeerError::new("invalid_request", "args.items entries must be objects")
+            })?;
+            reject_unknown_keys(
+                item,
+                &[
+                    "tape_id",
+                    "edit_offsets",
+                    "turns",
+                    "anchor_offsets",
+                    "grep_filter",
+                    "window_lines",
+                ],
+            )?;
+            let tape_id = item
+                .get("tape_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    PeerError::new("invalid_request", "tape_facts item needs a tape_id")
+                })?;
+            validate_tape_id(tape_id)?;
+            if !seen_tapes.insert(tape_id.to_string()) {
+                return Err(PeerError::new(
+                    "invalid_request",
+                    format!("duplicate tape_facts tape_id `{tape_id}`"),
+                ));
+            }
+            let edit_offsets = optional_u64_array(item.get("edit_offsets"), "edit_offsets")?;
+            let turns = optional_nonnegative_i64_array(item.get("turns"), "turns")?;
+            let anchor_offsets =
+                optional_u64_array(item.get("anchor_offsets"), "anchor_offsets")?;
+            let grep_filter = optional_string(item.get("grep_filter"), "grep_filter")?;
+            let window_lines = optional_usize(item.get("window_lines"), "window_lines")?
+                .unwrap_or(30)
+                .max(1);
+            if window_lines > 10_000 {
+                return Err(PeerError::new(
+                    "invalid_request",
+                    "window_lines exceeds 10000",
+                ));
+            }
+
+            let indexed = export.index.has_tape(tape_id)?;
+            let Some((path, compressed_size)) = self.tape_path(&export.config, tape_id) else {
+                let mut failure = tape_facts_failure(
+                    &store_ref,
+                    tape_id,
+                    indexed,
+                    "unavailable",
+                    "tape_unavailable",
+                    "tape is not present in this export".into(),
+                );
+                failure["summary"] = empty_tape_summary();
+                write_data_limited(
+                    output,
+                    id,
+                    failure,
+                    &mut response_bytes,
+                    response_limit,
+                )?;
+                continue;
+            };
+            let raw_text = match read_tape_for_query(&path, compressed_size, &self.topology.limits)
+            {
+                Ok(raw_text) => raw_text,
+                Err(error) => {
+                    write_data_limited(
+                        output,
+                        id,
+                        tape_facts_failure(
+                            &store_ref,
+                            tape_id,
+                            indexed,
+                            "failed",
+                            error.code,
+                            error.message,
+                        ),
+                        &mut response_bytes,
+                        response_limit,
+                    )?;
+                    continue;
+                }
+            };
+            let rows = match parse_jsonl_rows(&raw_text) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    write_data_limited(
+                        output,
+                        id,
+                        tape_facts_failure(
+                            &store_ref,
+                            tape_id,
+                            indexed,
+                            "failed",
+                            "invalid_tape",
+                            error.message,
+                        ),
+                        &mut response_bytes,
+                        response_limit,
+                    )?;
+                    continue;
+                }
+            };
+            let (segment, previous_tape_id) = match tape_segment_metadata(tape_id, &rows) {
+                Ok(segment) => segment,
+                Err(error) => {
+                    write_data_limited(
+                        output,
+                        id,
+                        tape_facts_failure(
+                            &store_ref,
+                            tape_id,
+                            indexed,
+                            "failed",
+                            error.code,
+                            error.message,
+                        ),
+                        &mut response_bytes,
+                        response_limit,
+                    )?;
+                    continue;
+                }
+            };
+
+            let locator = recovery
+                .lookup_with_reader(&export.config.tape_dirs, tape_id, |context_path| {
+                    let Some(size) = self.memoized_file_size(context_path) else {
+                        return Err(crate::CliError::new(
+                            "tape_unavailable",
+                            format!("recovery context is missing: {}", context_path.display()),
+                        ));
+                    };
+                    read_tape_for_query(context_path, size, &self.topology.limits)
+                        .map_err(|error| crate::CliError::new(error.code, error.message))
+                });
+            let locator = match locator {
+                Ok(locator) => locator,
+                Err(error) => {
+                    return Err(PeerError::new(
+                        error.code,
+                        format!("{store_ref}: {}", error.message),
+                    ));
+                }
+            };
+            if let Some(locator) = locator
+                && let Some(offset) = edit_offsets
+                    .iter()
+                    .find(|offset| !locator.recovered.points.iter().any(|point| point.old_offset == **offset))
+            {
+                return Err(PeerError::new(
+                    "native_recovery_error",
+                    format!(
+                        "{store_ref}: edit offset {offset} is missing from recovery points"
+                    ),
+                ));
+            }
+
+            let total_lines = raw_text.lines().count();
+            let anchor_offset = anchor_offsets.iter().min().copied();
+            let anchor_line = anchor_offset
+                .and_then(|offset| usize::try_from(offset).ok())
+                .map(|offset| offset.saturating_add(1))
+                .unwrap_or(1);
+            let default_before = window_lines.saturating_mul(3) / 4;
+            let window_start = anchor_line.saturating_sub(default_before).max(1);
+            let window_end = if total_lines == 0 {
+                0
+            } else {
+                usize::min(
+                    total_lines,
+                    window_start.saturating_add(window_lines).saturating_sub(1),
+                )
+            };
+            let grep_filter_hits_window = grep_filter.as_ref().map(|pattern| {
+                window_end > 0
+                    && raw_text
+                        .lines()
+                        .skip(window_start.saturating_sub(1))
+                        .take(window_end.saturating_sub(window_start).saturating_add(1))
+                        .any(|line| line.contains(pattern))
+            });
+            let summary = json!({
+                "total_lines": total_lines,
+                "anchor_line": anchor_line,
+                "window_start": window_start,
+                "window_end": window_end,
+                "grep_filter_hits_window": grep_filter_hits_window,
+                "latest_timestamp": extract_latest_timestamp_from_rows(&rows),
+                "files_touched": collect_files_touched_from_rows(&rows),
+            });
+
+            let segment_turn_start = segment["message_turn_start"].as_i64().unwrap_or(0);
+            let edit_offset_to_turn = edit_offsets
+                .iter()
+                .map(|offset| {
+                    let present = rows.iter().any(|row| row.offset == *offset);
+                    let segment_turn = rows
+                        .iter()
+                        .filter(|row| {
+                            row.offset < *offset && crate::dispatch::is_message_row(&row.value)
+                        })
+                        .count() as i64;
+                    let point = locator.and_then(|locator| {
+                        locator
+                            .recovered
+                            .points
+                            .iter()
+                            .find(|point| point.old_offset == *offset)
+                    });
+                    let global_turn = point.map(|point| point.turn).or_else(|| {
+                        segment_turn_start.checked_add(segment_turn)
+                    });
+                    json!({
+                        "event_offset": offset,
+                        "present": present,
+                        "segment_turn": if present { Some(segment_turn) } else { None },
+                        "turn": if present { global_turn } else { None },
+                        "recovered_source_offset": point.map(|point| point.source_offset),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let turn_to_offset = turns
+                .iter()
+                .map(|turn| {
+                    let offset = crate::dispatch::message_turn_to_event_offset(&rows, *turn);
+                    let recovered_source_offset = locator.and_then(|locator| {
+                        locator
+                            .recovered
+                            .points
+                            .iter()
+                            .find(|point| point.turn == *turn)
+                            .map(|point| point.source_offset)
+                    });
+                    json!({
+                        "turn": turn,
+                        "offset": offset,
+                        "global_turn": segment_turn_start.checked_add(*turn),
+                        "recovered_source_offset": recovered_source_offset,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let recovery_binding = locator.map(|locator| {
+                json!({
+                    "verified": true,
+                    "context_tape": locator.context_tape,
+                    "points": locator.recovered.points.iter()
+                        .filter(|point| edit_offsets.contains(&point.old_offset))
+                        .map(|point| json!({
+                            "old_offset": point.old_offset,
+                            "source_offset": point.source_offset,
+                            "turn": point.turn,
+                        }))
+                        .collect::<Vec<_>>(),
+                })
+            });
+
+            let mut predecessor_chain = vec![segment.clone()];
+            let mut chain_status = "complete";
+            let mut unresolved_predecessor = None::<String>;
+            let mut visited = HashSet::from([tape_id.to_string()]);
+            let max_segments = configured_limit(
+                &self.topology.limits,
+                "predecessor_segments_per_history",
+                256,
+            )
+            .max(1) as usize;
+            let mut next_id = previous_tape_id;
+            while let Some(previous) = next_id {
+                if predecessor_chain.len() >= max_segments {
+                    chain_status = "over_limit";
+                    unresolved_predecessor = Some(previous);
+                    break;
+                }
+                validate_tape_id(&previous)?;
+                if !visited.insert(previous.clone()) {
+                    chain_status = "cycle";
+                    unresolved_predecessor = Some(previous);
+                    break;
+                }
+                let Some((previous_path, previous_size)) = self.tape_path(&export.config, &previous)
+                else {
+                    chain_status = "missing_predecessor";
+                    unresolved_predecessor = Some(previous);
+                    break;
+                };
+                let previous_text = match read_tape_for_query(
+                    &previous_path,
+                    previous_size,
+                    &self.topology.limits,
+                ) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        write_data_limited(
+                            output,
+                            id,
+                            tape_facts_failure(
+                                &store_ref,
+                                tape_id,
+                                indexed,
+                                "failed",
+                                error.code,
+                                error.message,
+                            ),
+                            &mut response_bytes,
+                            response_limit,
+                        )?;
+                        chain_status = "failed";
+                        break;
+                    }
+                };
+                let previous_rows = match parse_jsonl_rows(&previous_text) {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        write_data_limited(
+                            output,
+                            id,
+                            tape_facts_failure(
+                                &store_ref,
+                                tape_id,
+                                indexed,
+                                "failed",
+                                "invalid_tape",
+                                error.message,
+                            ),
+                            &mut response_bytes,
+                            response_limit,
+                        )?;
+                        chain_status = "failed";
+                        break;
+                    }
+                };
+                let (previous_segment, previous_id) = match tape_segment_metadata(&previous, &previous_rows) {
+                    Ok(segment) => segment,
+                    Err(error) => {
+                        write_data_limited(
+                            output,
+                            id,
+                            tape_facts_failure(
+                                &store_ref,
+                                tape_id,
+                                indexed,
+                                "failed",
+                                error.code,
+                                error.message,
+                            ),
+                            &mut response_bytes,
+                            response_limit,
+                        )?;
+                        chain_status = "failed";
+                        break;
+                    }
+                };
+                predecessor_chain.push(previous_segment);
+                next_id = previous_id;
+            }
+            if chain_status == "failed" {
+                continue;
+            }
+            write_data_limited(
+                output,
+                id,
+                json!({
+                    "type": "tape_facts",
+                    "store": store_ref.clone(),
+                    "tape_id": tape_id,
+                    "status": "ok",
+                    "indexed": indexed,
+                    "segment": segment,
+                    "predecessor_chain": predecessor_chain,
+                    "chain_status": chain_status,
+                    "unresolved_predecessor": unresolved_predecessor,
+                    "edit_offset_to_turn": edit_offset_to_turn,
+                    "turn_to_offset": turn_to_offset,
+                    "recovery_binding": recovery_binding,
+                    "summary": summary,
+                }),
+                &mut response_bytes,
+                response_limit,
+            )?;
+        }
+        Ok(json!({"items": items.len()}))
     }
 
     fn grep_scan<W: Write>(
@@ -1701,6 +2122,133 @@ fn validate_tape_id(id: &str) -> Result<(), PeerError> {
         ));
     }
     Ok(())
+}
+
+fn optional_u64_array(value: Option<&Value>, name: &str) -> Result<Vec<u64>, PeerError> {
+    match value {
+        None => Ok(Vec::new()),
+        Some(Value::Array(values)) if values.len() <= MAX_BATCH_ITEMS => values
+            .iter()
+            .map(|value| {
+                value.as_u64().ok_or_else(|| {
+                    PeerError::new("invalid_request", format!("{name} items must be integers"))
+                })
+            })
+            .collect(),
+        Some(Value::Array(_)) => Err(PeerError::new(
+            "invalid_request",
+            format!("{name} exceeds {MAX_BATCH_ITEMS} items"),
+        )),
+        Some(_) => Err(PeerError::new(
+            "invalid_request",
+            format!("{name} must be an array"),
+        )),
+    }
+}
+
+fn optional_nonnegative_i64_array(
+    value: Option<&Value>,
+    name: &str,
+) -> Result<Vec<i64>, PeerError> {
+    match value {
+        None => Ok(Vec::new()),
+        Some(Value::Array(values)) if values.len() <= MAX_BATCH_ITEMS => values
+            .iter()
+            .map(|value| {
+                value.as_i64().filter(|value| *value >= 0).ok_or_else(|| {
+                    PeerError::new(
+                        "invalid_request",
+                        format!("{name} items must be non-negative integers"),
+                    )
+                })
+            })
+            .collect(),
+        Some(Value::Array(_)) => Err(PeerError::new(
+            "invalid_request",
+            format!("{name} exceeds {MAX_BATCH_ITEMS} items"),
+        )),
+        Some(_) => Err(PeerError::new(
+            "invalid_request",
+            format!("{name} must be an array"),
+        )),
+    }
+}
+
+fn tape_segment_metadata(
+    tape_id: &str,
+    rows: &[TapeRow],
+) -> Result<(Value, Option<String>), PeerError> {
+    let meta = rows
+        .iter()
+        .find(|row| row.value.get("k").and_then(Value::as_str) == Some("meta"))
+        .ok_or_else(|| PeerError::new("invalid_tape", "tape is missing its meta row"))?;
+    let continuation = meta.value.get("ingest_continuation");
+    if continuation.is_some_and(|value| !value.is_null() && !value.is_object()) {
+        return Err(PeerError::new(
+            "invalid_tape",
+            "ingest_continuation metadata must be an object",
+        ));
+    }
+    let previous = continuation
+        .and_then(|value| value.get("previous_tape_id"))
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                PeerError::new(
+                    "invalid_tape",
+                    "previous_tape_id metadata must be a string",
+                )
+            })
+        })
+        .transpose()?;
+    if let Some(previous) = previous.as_deref() {
+        validate_tape_id(previous).map_err(|_| {
+            PeerError::new(
+                "invalid_tape",
+                "previous_tape_id metadata contains an invalid tape ID",
+            )
+        })?;
+    }
+    let segment = json!({
+        "tape_id": tape_id,
+        "previous_tape_id": previous,
+        "message_turn_start": continuation
+            .and_then(|value| value.get("message_turn_start"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        "ingest_context_only": meta.value.get("ingest_context_only") == Some(&Value::Bool(true)),
+    });
+    Ok((segment, previous))
+}
+
+fn empty_tape_summary() -> Value {
+    json!({
+        "total_lines": 0,
+        "anchor_line": 0,
+        "window_start": 0,
+        "window_end": 0,
+        "grep_filter_hits_window": false,
+        "latest_timestamp": "",
+        "files_touched": [],
+    })
+}
+
+fn tape_facts_failure(
+    store: &str,
+    tape_id: &str,
+    indexed: bool,
+    status: &str,
+    code: &'static str,
+    message: String,
+) -> Value {
+    json!({
+        "type": "tape_facts",
+        "store": store,
+        "tape_id": tape_id,
+        "status": status,
+        "indexed": indexed,
+        "error": {"code": code, "message": message},
+    })
 }
 
 fn string_batch(value: Option<&Value>, label: &str) -> Result<Vec<String>, PeerError> {

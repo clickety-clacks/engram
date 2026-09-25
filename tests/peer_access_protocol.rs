@@ -2002,6 +2002,183 @@ fn peer_anchor_and_edge_lookups_preserve_membership_held_and_forensics_data() {
 }
 
 #[test]
+fn peer_tape_facts_returns_segment_history_turn_maps_and_bounded_summaries() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let current = concat!(
+        "{\"k\":\"meta\",\"ingest_continuation\":{\"previous_tape_id\":\"previous-segment\",\"message_turn_start\":2}}\n",
+        "{\"t\":\"2026-09-24T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"question\"}\n",
+        "{\"t\":\"2026-09-24T12:01:00Z\",\"k\":\"code.edit\",\"file\":\"src/lib.rs\",\"content\":\"needle edit\"}\n",
+        "{\"t\":\"2026-09-24T12:02:00Z\",\"k\":\"msg.out\",\"content\":\"answer\"}\n",
+    );
+    let previous = concat!(
+        "{\"k\":\"meta\"}\n",
+        "{\"t\":\"2026-09-24T11:00:00Z\",\"k\":\"msg.in\",\"content\":\"earlier\"}\n",
+    );
+    let remote = write_grep_owner(
+        temp.path(),
+        "facts-owner",
+        binary,
+        &[
+            ("current-segment", current),
+            ("previous-segment", previous),
+        ],
+    );
+    let peer = TopologyPeer {
+        ssh: None,
+        command: Some(
+            remote["command"]
+                .as_array()
+                .expect("command array")
+                .iter()
+                .map(|arg| arg.as_str().expect("command string").to_string())
+                .collect(),
+        ),
+        engram: binary.to_string(),
+        exports: vec!["default".into()],
+    };
+    let mut owner = RemoteOwner::connect("facts-owner", "caller", &peer, Duration::from_secs(5))
+        .expect("connect owner");
+    let response = owner
+        .round(
+            &[PeerRequest::new(
+                "tape_facts",
+                vec!["default".into()],
+                json!({
+                    "items": [
+                        {
+                            "tape_id": "current-segment",
+                            "edit_offsets": [2],
+                            "turns": [0, 1, 2],
+                            "anchor_offsets": [2],
+                            "grep_filter": "code.edit",
+                            "window_lines": 4,
+                        },
+                        {"tape_id": "missing-segment"},
+                    ]
+                }),
+            )],
+            Duration::from_secs(5),
+        )
+        .into_iter()
+        .next()
+        .expect("tape_facts response")
+        .expect("tape_facts succeeds with a per-tape unavailable outcome");
+
+    let facts = response
+        .data
+        .iter()
+        .find(|row| row["tape_id"] == "current-segment")
+        .expect("current tape facts");
+    assert_eq!(facts["status"], "ok");
+    assert_eq!(facts["indexed"], false);
+    assert_eq!(facts["segment"]["previous_tape_id"], "previous-segment");
+    assert_eq!(facts["segment"]["message_turn_start"], 2);
+    assert_eq!(facts["predecessor_chain"].as_array().unwrap().len(), 2);
+    assert_eq!(facts["chain_status"], "complete");
+    assert_eq!(facts["edit_offset_to_turn"][0]["segment_turn"], 1);
+    assert_eq!(facts["edit_offset_to_turn"][0]["turn"], 3);
+    assert_eq!(facts["turn_to_offset"][0]["offset"], 1);
+    assert_eq!(facts["turn_to_offset"][1]["offset"], 3);
+    assert!(facts["turn_to_offset"][2]["offset"].is_null());
+    assert!(facts["recovery_binding"].is_null());
+    assert_eq!(facts["summary"]["total_lines"], 4);
+    assert_eq!(facts["summary"]["anchor_line"], 3);
+    assert_eq!(facts["summary"]["window_start"], 1);
+    assert_eq!(facts["summary"]["window_end"], 4);
+    assert_eq!(facts["summary"]["grep_filter_hits_window"], true);
+    assert_eq!(facts["summary"]["latest_timestamp"], "2026-09-24T12:02:00Z");
+    assert_eq!(facts["summary"]["files_touched"], json!(["src/lib.rs"]));
+
+    let missing = response
+        .data
+        .iter()
+        .find(|row| row["tape_id"] == "missing-segment")
+        .expect("missing tape outcome");
+    assert_eq!(missing["status"], "unavailable");
+    assert_eq!(missing["error"]["code"], "tape_unavailable");
+    assert_eq!(missing["summary"]["total_lines"], 0);
+    assert_eq!(missing["summary"]["files_touched"], json!([]));
+}
+
+#[test]
+fn peer_tape_facts_verifies_and_returns_native_recovery_binding() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let points = json!({
+        "tape_id": "legacy-segment",
+        "points": [{"old_offset": 2, "source_offset": 3, "turn": 2}],
+    });
+    let context = format!(
+        "{{\"k\":\"meta\",\"native_recovery_v1\":[{}]}}\n{{\"t\":\"2026-09-24T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"context\"}}\n",
+        points
+    );
+    let context_id = format!("{:x}", sha2::Sha256::digest(context.as_bytes()));
+    let legacy = concat!(
+        "{\"k\":\"meta\"}\n",
+        "{\"t\":\"2026-09-24T12:01:00Z\",\"k\":\"msg.in\",\"content\":\"old\"}\n",
+        "{\"t\":\"2026-09-24T12:02:00Z\",\"k\":\"code.edit\",\"file\":\"src/main.rs\"}\n",
+    );
+    let _remote = write_grep_owner(
+        temp.path(),
+        "recovery-owner",
+        binary,
+        &[("legacy-segment", legacy), (&context_id, &context)],
+    );
+    let tape_dir = temp.path().join("recovery-owner-home/.engram/tapes");
+    let locator_dir = tape_dir.join("native-upgrade-v1");
+    std::fs::create_dir_all(&locator_dir).expect("recovery locator directory");
+    std::fs::write(
+        locator_dir.join("legacy-segment.json"),
+        serde_json::to_vec(&json!({
+            "context_tape": context_id,
+            "recovered": points,
+        }))
+        .expect("serialize recovery locator"),
+    )
+    .expect("write recovery locator");
+    let caller_home = temp.path().join("recovery-owner-home");
+    let peer_command = vec![
+        "/usr/bin/env".into(),
+        format!("HOME={}", caller_home.display()),
+        binary.into(),
+        "peer-serve".into(),
+        "--stdio".into(),
+    ];
+    let peer = TopologyPeer {
+        ssh: None,
+        command: Some(peer_command),
+        engram: binary.into(),
+        exports: vec!["default".into()],
+    };
+    let mut owner = RemoteOwner::connect("recovery-owner", "caller", &peer, Duration::from_secs(5))
+        .expect("connect owner");
+    let response = owner
+        .round(
+            &[PeerRequest::new(
+                "tape_facts",
+                vec!["default".into()],
+                json!({
+                    "items": [{"tape_id": "legacy-segment", "edit_offsets": [2], "turns": [2]}]
+                }),
+            )],
+            Duration::from_secs(5),
+        )
+        .into_iter()
+        .next()
+        .expect("tape_facts response")
+        .expect("verified recovery binding");
+    let facts = &response.data[0];
+    assert_eq!(facts["status"], "ok");
+    assert_eq!(facts["recovery_binding"]["verified"], true);
+    assert_eq!(facts["recovery_binding"]["context_tape"], context_id);
+    assert_eq!(facts["recovery_binding"]["points"][0]["old_offset"], 2);
+    assert_eq!(facts["recovery_binding"]["points"][0]["source_offset"], 3);
+    assert_eq!(facts["edit_offset_to_turn"][0]["turn"], 2);
+    assert_eq!(facts["edit_offset_to_turn"][0]["recovered_source_offset"], 3);
+}
+
+#[test]
 fn grep_preserves_known_truncation_when_another_selected_peer_is_unavailable() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = env!("CARGO_BIN_EXE_engram");
