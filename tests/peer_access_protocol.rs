@@ -1673,6 +1673,40 @@ fn grep_merges_multiple_explicit_peers_and_keeps_unselected_peers_idle() {
         ["shared-tape", "caller-tape"]
     );
 
+    let counted_end_page = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "grep",
+            "needle-multi",
+            "--peers",
+            "beta, alpha",
+            "--offset",
+            "2",
+            "--limit",
+            "4",
+            "--count",
+        ])
+        .output()
+        .expect("run counted complete end page with duplicate holders");
+    assert!(
+        counted_end_page.status.success(),
+        "counted end page failed: {}",
+        String::from_utf8_lossy(&counted_end_page.stderr)
+    );
+    let counted_end_result: serde_json::Value =
+        serde_json::from_slice(&counted_end_page.stdout).expect("counted end-page JSON");
+    assert!(
+        counted_end_result["sessions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(counted_end_result["returned"], 2);
+    assert_eq!(counted_end_result["total"], 4);
+    assert_eq!(counted_end_result["truncated"], false);
+    assert_eq!(counted_end_result["time_range"], result["time_range"]);
+
     let bounded = Command::new(binary)
         .current_dir(&repo)
         .env("HOME", &caller_home)
@@ -1698,6 +1732,19 @@ fn grep_merges_multiple_explicit_peers_and_keeps_unselected_peers_idle() {
     assert_eq!(bounded_result["total"], serde_json::Value::Null);
     assert_eq!(bounded_result["total_bounds"]["min"], 3);
     assert_eq!(bounded_result["total_bounds"]["max"], 5);
+    let reference_total = result["total"].as_u64().expect("exact reference total");
+    assert!(
+        bounded_result["total_bounds"]["min"]
+            .as_u64()
+            .expect("bounded minimum")
+            <= reference_total
+    );
+    assert!(
+        bounded_result["total_bounds"]["max"]
+            .as_u64()
+            .expect("bounded maximum")
+            >= reference_total
+    );
     assert_eq!(bounded_result["truncated"], true);
     assert_eq!(
         bounded_result["time_range"]["start"],
@@ -1733,8 +1780,21 @@ fn grep_merges_multiple_explicit_peers_and_keeps_unselected_peers_idle() {
             .is_empty()
     );
     assert_eq!(bounded_count_result["returned"], 1);
+    assert_eq!(bounded_count_result["total"], serde_json::Value::Null);
     assert_eq!(bounded_count_result["total_bounds"]["min"], 3);
     assert_eq!(bounded_count_result["total_bounds"]["max"], 5);
+    assert!(
+        bounded_count_result["total_bounds"]["min"]
+            .as_u64()
+            .expect("bounded count minimum")
+            <= reference_total
+    );
+    assert!(
+        bounded_count_result["total_bounds"]["max"]
+            .as_u64()
+            .expect("bounded count maximum")
+            >= reference_total
+    );
     assert_eq!(bounded_count_result["truncated"], true);
     assert_eq!(
         bounded_count_result["time_range"],
@@ -2268,6 +2328,13 @@ fn grep_keeps_successful_peer_results_when_another_selected_peer_is_unavailable(
     let offset_result: serde_json::Value =
         serde_json::from_slice(&offset.stdout).expect("offset grep JSON");
     assert_eq!(offset_result["returned"], 1);
+    assert_eq!(offset_result["total"], serde_json::Value::Null);
+    assert_eq!(offset_result["total_bounds"]["min"], 2);
+    assert_eq!(
+        offset_result["total_bounds"]["max"],
+        serde_json::Value::Null
+    );
+    assert_eq!(offset_result["time_range"], serde_json::Value::Null);
     assert_eq!(offset_result["truncated"], serde_json::Value::Null);
 
     let counted = Command::new(binary)
@@ -2296,6 +2363,45 @@ fn grep_keeps_successful_peer_results_when_another_selected_peer_is_unavailable(
     assert_eq!(count_result["total_bounds"]["max"], serde_json::Value::Null);
     assert_eq!(count_result["time_range"], serde_json::Value::Null);
     assert_eq!(count_result["truncated"], serde_json::Value::Null);
+
+    let offset_counted = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "grep",
+            "needle-partial-multi",
+            "--peers",
+            "available,offline",
+            "--offset",
+            "1",
+            "--limit",
+            "1",
+            "--count",
+        ])
+        .output()
+        .expect("run partial count grep with a nonzero offset");
+    assert!(
+        offset_counted.status.success(),
+        "offset count should retain observed coverage: {}",
+        String::from_utf8_lossy(&offset_counted.stderr)
+    );
+    let offset_count_result: serde_json::Value =
+        serde_json::from_slice(&offset_counted.stdout).expect("offset count JSON");
+    assert!(
+        offset_count_result["sessions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(offset_count_result["returned"], 1);
+    assert_eq!(offset_count_result["total"], serde_json::Value::Null);
+    assert_eq!(offset_count_result["total_bounds"]["min"], 2);
+    assert_eq!(
+        offset_count_result["total_bounds"]["max"],
+        serde_json::Value::Null
+    );
+    assert_eq!(offset_count_result["time_range"], serde_json::Value::Null);
+    assert_eq!(offset_count_result["truncated"], serde_json::Value::Null);
 
     let required = Command::new(binary)
         .current_dir(&repo)
@@ -3129,6 +3235,7 @@ fn grep_preserves_known_truncation_when_another_selected_peer_is_unavailable() {
     assert_eq!(count_result["federation"]["coverage"], "partial");
     assert_eq!(count_result["returned"], 1);
     assert_eq!(count_result["total"], serde_json::Value::Null);
+    assert_eq!(count_result["total_bounds"]["min"], 2);
     assert_eq!(count_result["total_bounds"]["max"], serde_json::Value::Null);
     assert_eq!(count_result["time_range"], serde_json::Value::Null);
     assert_eq!(count_result["truncated"], true);
@@ -3812,4 +3919,34 @@ fn grep_keeps_completed_scan_aggregates_when_dispatch_metadata_fails() {
         .expect("run require-complete grep after metadata failure");
     assert!(!required.status.success());
     assert!(String::from_utf8_lossy(&required.stderr).contains("incomplete_coverage"));
+
+    let counted = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["grep", "needle-after-scan", "--peers", "alpha", "--count"])
+        .output()
+        .expect("run count grep after metadata failure");
+    assert!(
+        counted.status.success(),
+        "count mode should retain completed scan aggregates: {}",
+        String::from_utf8_lossy(&counted.stderr)
+    );
+    let count_result: serde_json::Value =
+        serde_json::from_slice(&counted.stdout).expect("count result from completed scan");
+    assert_eq!(count_result["federation"]["coverage"], "complete");
+    assert!(count_result["sessions"].as_array().unwrap().is_empty());
+    assert_eq!(count_result["returned"], 1);
+    assert_eq!(count_result["total"], 1);
+    assert!(count_result.get("total_bounds").is_none());
+    assert_eq!(count_result["time_range"]["start"], "2026-09-24T12:00:00Z");
+    assert_eq!(count_result["time_range"]["end"], "2026-09-24T12:00:00Z");
+    assert_eq!(count_result["truncated"], false);
+    let count_source = count_result["federation"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["store"] == "alpha/default")
+        .expect("selected peer source in count mode");
+    assert_eq!(count_source["status"], "ok");
+    assert_eq!(count_source["grep_scan"]["total"], 1);
 }
