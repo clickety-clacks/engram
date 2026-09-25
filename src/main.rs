@@ -1747,6 +1747,10 @@ fn cmd_grep_with_peer(
             .collect::<Vec<_>>(),
     ];
     let mut any_source_failure = false;
+    // Grep aggregates are scoped to every selected source. A later metadata
+    // failure must not erase a terminal-success scan, but any missing or
+    // incomplete grep_scan keeps the matching scope unknown.
+    let mut grep_scan_incomplete = false;
     let mut any_store_truncated = false;
     let mut peer_owners = Vec::new();
     let mut connections =
@@ -1760,6 +1764,7 @@ fn cmd_grep_with_peer(
             .clone();
         if peer.exports.is_empty() {
             any_source_failure = true;
+            grep_scan_incomplete = true;
             source_rows.push(json!({
                 "store": format!("{machine}/*"),
                 "kind": "peer",
@@ -1782,6 +1787,7 @@ fn cmd_grep_with_peer(
         match connection {
             Err(failure) => {
                 any_source_failure = true;
+                grep_scan_incomplete = true;
                 for export in &peer.exports {
                     source_rows.push(json!({
                         "store": format!("{machine}/{export}"),
@@ -1810,6 +1816,7 @@ fn cmd_grep_with_peer(
                         }
                         Some(Err(failure)) => {
                             any_source_failure = true;
+                            grep_scan_incomplete = true;
                             source_rows.push(json!({
                                 "store": format!("{machine}/{export}"),
                                 "kind": "peer",
@@ -1820,6 +1827,7 @@ fn cmd_grep_with_peer(
                         }
                         None => {
                             any_source_failure = true;
+                            grep_scan_incomplete = true;
                             source_rows.push(json!({
                             "store": format!("{machine}/{export}"),
                             "kind": "peer",
@@ -1834,6 +1842,7 @@ fn cmd_grep_with_peer(
                 let grep_limit = owner.limits.get("grep_k").copied().unwrap_or(10_000);
                 if k as u64 > grep_limit {
                     any_source_failure = true;
+                    grep_scan_incomplete = true;
                     for export in &active_exports {
                         mark_source_phase(
                             &mut source_rows,
@@ -1865,6 +1874,7 @@ fn cmd_grep_with_peer(
                 for (index, export) in active_exports.iter().enumerate() {
                     let Some(outcome) = outcomes.get(index) else {
                         any_source_failure = true;
+                        grep_scan_incomplete = true;
                         mark_source_phase(
                             &mut source_rows,
                             &format!("{machine}/{export}"),
@@ -1878,6 +1888,7 @@ fn cmd_grep_with_peer(
                         Ok(response) => response,
                         Err(failure) => {
                             any_source_failure = true;
+                            grep_scan_incomplete = true;
                             mark_source_phase(
                                 &mut source_rows,
                                 &format!("{machine}/{export}"),
@@ -1888,21 +1899,52 @@ fn cmd_grep_with_peer(
                             continue;
                         }
                     };
-                    let total = match response.stats.get("total").and_then(Value::as_u64) {
-                        Some(value) => value as usize,
-                        None => {
-                            any_source_failure = true;
-                            mark_source_phase(
-                                &mut source_rows,
-                                &format!("{machine}/{export}"),
-                                "grep_scan",
-                                "protocol_error",
-                                "grep_scan response has no total count",
-                            );
-                            continue;
-                        }
-                    };
                     let store_name = format!("{machine}/{export}");
+                    let Some(total) = response
+                        .stats
+                        .get("total")
+                        .and_then(Value::as_u64)
+                        .and_then(|value| usize::try_from(value).ok())
+                    else {
+                        any_source_failure = true;
+                        grep_scan_incomplete = true;
+                        mark_source_phase(
+                            &mut source_rows,
+                            &store_name,
+                            "grep_scan",
+                            "protocol_error",
+                            "grep_scan response has no valid total count",
+                        );
+                        continue;
+                    };
+                    let Some(store_truncated) = response
+                        .stats
+                        .get("truncated")
+                        .and_then(Value::as_bool)
+                    else {
+                        any_source_failure = true;
+                        grep_scan_incomplete = true;
+                        mark_source_phase(
+                            &mut source_rows,
+                            &store_name,
+                            "grep_scan",
+                            "protocol_error",
+                            "grep_scan response has no boolean truncated value",
+                        );
+                        continue;
+                    };
+                    let Some(store_time_range) = valid_peer_time_range(&response.stats) else {
+                        any_source_failure = true;
+                        grep_scan_incomplete = true;
+                        mark_source_phase(
+                            &mut source_rows,
+                            &store_name,
+                            "grep_scan",
+                            "protocol_error",
+                            "grep_scan response has no valid time range",
+                        );
+                        continue;
+                    };
                     let mut store_failures = Vec::new();
                     let mut valid_response = true;
                     let mut store_records = Vec::<(Value, GrepRank)>::new();
@@ -1936,23 +1978,14 @@ fn cmd_grep_with_peer(
                         }
                     }
                     source_totals.push(total);
-                    let store_time_range = peer_time_range(&response.stats);
                     if let Some(source) = source_rows.iter_mut().find(|source| {
                         source.get("store").and_then(Value::as_str) == Some(store_name.as_str())
                     }) {
                         source["grep_scan"] = json!({
                         "total": total,
                         "returned": store_records.len(),
-                        "time_range": response
-                            .stats
-                            .get("time_range")
-                            .cloned()
-                            .unwrap_or(Value::Null),
-                            "truncated": response
-                                .stats
-                                .get("truncated")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(total > k),
+                        "time_range": store_time_range,
+                        "truncated": store_truncated,
                         });
                     }
                     if !store_failures.is_empty() {
@@ -1963,13 +1996,10 @@ fn cmd_grep_with_peer(
                             &store_failures,
                         );
                         source_count_known = false;
+                        grep_scan_incomplete = true;
                     }
-                    source_time_ranges.push(store_time_range);
-                    any_store_truncated |= response
-                        .stats
-                        .get("truncated")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(total > k);
+                    source_time_ranges.push(peer_time_range(&response.stats));
+                    any_store_truncated |= store_truncated || total > k;
                     if !valid_response {
                         continue;
                     }
@@ -2160,7 +2190,7 @@ fn cmd_grep_with_peer(
     }
 
     let total_exact = source_count_known
-        && !any_selected_failure
+        && !grep_scan_incomplete
         && source_totals.iter().skip(1).all(|total| *total <= k);
     let exact_total = if total_exact {
         Some(page_ranked.len())
@@ -2173,7 +2203,7 @@ fn cmd_grep_with_peer(
         .max()
         .unwrap_or(0)
         .max(page_ranked.len());
-    let max_total = if source_count_known && !any_selected_failure {
+    let max_total = if source_count_known && !grep_scan_incomplete {
         Some(
             source_totals
                 .iter()
@@ -2187,7 +2217,7 @@ fn cmd_grep_with_peer(
     } else {
         None
     };
-    let time_range = if any_selected_failure {
+    let time_range = if grep_scan_incomplete {
         Value::Null
     } else {
         merge_grep_time_ranges(&source_time_ranges)
@@ -2203,11 +2233,13 @@ fn cmd_grep_with_peer(
         any_store_truncated || args.offset.saturating_add(returned) < page_ranked.len();
     let truncated = if definitely_truncated {
         json!(true)
-    } else if any_selected_failure {
+    } else if grep_scan_incomplete {
         Value::Null
     } else if let Some(total) = exact_total {
         json!(args.offset.saturating_add(returned) < total)
     } else {
+        // With all selected scans complete, and no positive tail proof above,
+        // there is no remaining result after the requested page.
         json!(false)
     };
     let output_sessions = if args.count { Vec::new() } else { page };
@@ -2570,6 +2602,18 @@ fn peer_time_range(stats: &Value) -> Vec<String> {
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn valid_peer_time_range(stats: &Value) -> Option<Value> {
+    let range = stats.get("time_range")?;
+    let object = range.as_object()?;
+    let start = object.get("start")?;
+    let end = object.get("end")?;
+    match (start, end) {
+        (Value::Null, Value::Null) | (Value::String(_), Value::String(_)) => {}
+        _ => return None,
+    }
+    Some(range.clone())
 }
 
 fn merge_grep_time_ranges(ranges: &[Vec<String>]) -> Value {

@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use engram::access::client::{PeerRequest, RemoteOwner};
 use engram::config::TopologyPeer;
-use engram::index::{DispatchDirection, DispatchLink, SqliteIndex};
+use engram::index::{
+    DispatchDirection, DispatchLink, QUERY_SEMANTICS_VERSION, SCHEMA_VERSION, SqliteIndex,
+};
 use serde_json::json;
 use sha2::Digest;
 
@@ -728,19 +730,31 @@ fn grep_merges_multiple_explicit_peers_and_keeps_unselected_peers_idle() {
         temp.path(),
         "alpha",
         binary,
-        &[(
-            "alpha-tape",
-            "{\"t\":\"2026-09-24T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-multi alpha\"}\n",
-        )],
+        &[
+            (
+                "alpha-tape",
+                "{\"t\":\"2026-09-24T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-multi alpha\"}\n",
+            ),
+            (
+                "shared-tape",
+                "{\"t\":\"2026-09-24T11:30:00Z\",\"k\":\"msg.in\",\"content\":\"needle-multi shared\"}\n",
+            ),
+        ],
     );
     let beta = write_grep_owner(
         temp.path(),
         "beta",
         binary,
-        &[(
-            "beta-tape",
-            "{\"t\":\"2026-09-24T13:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-multi beta\"}\n",
-        )],
+        &[
+            (
+                "beta-tape",
+                "{\"t\":\"2026-09-24T13:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-multi beta\"}\n",
+            ),
+            (
+                "shared-tape",
+                "{\"t\":\"2026-09-24T11:30:00Z\",\"k\":\"msg.in\",\"content\":\"needle-multi shared\"}\n",
+            ),
+        ],
     );
     let unselected_marker = temp.path().join("unselected-peer-was-started");
     let peers = json!({
@@ -778,7 +792,7 @@ fn grep_merges_multiple_explicit_peers_and_keeps_unselected_peers_idle() {
     );
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("grep JSON");
     let sessions = result["sessions"].as_array().expect("sessions");
-    assert_eq!(sessions.len(), 3);
+    assert_eq!(sessions.len(), 4);
     let local = sessions
         .iter()
         .find(|session| session["tape_id"] == "caller-tape")
@@ -793,9 +807,16 @@ fn grep_merges_multiple_explicit_peers_and_keeps_unselected_peers_idle() {
         assert_eq!(session["location"]["machine"], machine);
         assert_eq!(session["location"]["store"], format!("{machine}/default"));
     }
+    let shared = sessions
+        .iter()
+        .find(|session| session["tape_id"] == "shared-tape")
+        .expect("deduplicated peer result");
+    assert_eq!(shared["locations"].as_array().unwrap().len(), 2);
+    assert_eq!(result["truncated"], false);
+    assert!(result.get("total_bounds").is_none());
     assert_eq!(result["federation"]["coverage"], "complete");
     assert_eq!(result["stores_queried"], 3);
-    assert_eq!(result["total"], 3);
+    assert_eq!(result["total"], 4);
     assert_eq!(result["time_range"]["start"], "2026-09-24T11:00:00Z");
     assert_eq!(result["time_range"]["end"], "2026-09-24T13:00:00Z");
     let sources = result["federation"]["sources"].as_array().expect("sources");
@@ -805,8 +826,8 @@ fn grep_merges_multiple_explicit_peers_and_keeps_unselected_peers_idle() {
             .find(|source| source["store"] == format!("{machine}/default"))
             .expect("selected source");
         assert_eq!(source["status"], "ok");
-        assert_eq!(source["grep_scan"]["total"], 1);
-        assert_eq!(source["grep_scan"]["returned"], 1);
+        assert_eq!(source["grep_scan"]["total"], 2);
+        assert_eq!(source["grep_scan"]["returned"], 2);
     }
     assert!(sources.iter().any(|source| {
         source["store"] == "not-selected/default" && source["status"] == "not_selected"
@@ -984,6 +1005,58 @@ fn grep_keeps_successful_peer_results_when_another_selected_peer_is_unavailable(
         .expect("offline source");
     assert_eq!(offline_source["status"], "unavailable");
     assert_eq!(offline_source["phase"], "open");
+
+    let offset = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "grep",
+            "needle-partial-multi",
+            "--peers",
+            "available,offline",
+            "--offset",
+            "1",
+            "--limit",
+            "1",
+        ])
+        .output()
+        .expect("run partial grep with nonzero offset");
+    assert!(
+        offset.status.success(),
+        "offset grep should retain observed page: {}",
+        String::from_utf8_lossy(&offset.stderr)
+    );
+    let offset_result: serde_json::Value =
+        serde_json::from_slice(&offset.stdout).expect("offset grep JSON");
+    assert_eq!(offset_result["returned"], 1);
+    assert_eq!(offset_result["truncated"], serde_json::Value::Null);
+
+    let counted = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "grep",
+            "needle-partial-multi",
+            "--peers",
+            "available,offline",
+            "--count",
+        ])
+        .output()
+        .expect("run partial count grep");
+    assert!(
+        counted.status.success(),
+        "partial count should retain its aggregate payload: {}",
+        String::from_utf8_lossy(&counted.stderr)
+    );
+    let count_result: serde_json::Value =
+        serde_json::from_slice(&counted.stdout).expect("count grep JSON");
+    assert!(count_result["sessions"].as_array().unwrap().is_empty());
+    assert_eq!(count_result["returned"], 2);
+    assert_eq!(count_result["total"], serde_json::Value::Null);
+    assert_eq!(count_result["total_bounds"]["min"], 2);
+    assert_eq!(count_result["total_bounds"]["max"], serde_json::Value::Null);
+    assert_eq!(count_result["time_range"], serde_json::Value::Null);
+    assert_eq!(count_result["truncated"], serde_json::Value::Null);
 
     let required = Command::new(binary)
         .current_dir(&repo)
@@ -1261,4 +1334,107 @@ fn local_show_without_peer_selection_does_not_spawn_configured_peers() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!marker.exists(), "local show spawned a configured peer");
+}
+
+#[test]
+fn grep_keeps_completed_scan_aggregates_when_dispatch_metadata_fails() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "local-nonmatch",
+        "{\"t\":\"2026-09-24T10:00:00Z\",\"k\":\"msg.in\",\"content\":\"unrelated\"}\n",
+    );
+    let script_path = temp.path().join("metadata-failure-peer.sh");
+    let script = [
+        "#!/bin/sh",
+        "while IFS= read -r request; do",
+        r#"  id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"#,
+        r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
+        r#"  case "$op" in"#,
+        "    open)",
+        r#"      printf '{"id":%s,"data":{"store":"alpha/default","status":"ok","db":"/fixture/alpha.sqlite","tape_dirs":[],"reader_mode":"live","snapshot_at":"2026-09-25T14:00:00Z"}}\n' "$id""#,
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"alpha","build":"@BUILD@","protocol":1,"schema":@SCHEMA@,"query_semantics":@SEMANTICS@,"limits":{"grep_k":10000}}}\n' "$id""#,
+        "      ;;",
+        "    grep_scan)",
+        r#"      printf '{"id":%s,"data":{"type":"match","tape_id":"alpha-tape","timestamp":"2026-09-24T12:00:00Z","total_lines":1,"anchor_line":1,"match_count":1,"provenance_match_count":0,"provenance_event_count":1,"refs_up":0,"refs_down":0,"files_touched":[]}}\n' "$id""#,
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"total":1,"returned":1,"time_range":{"start":"2026-09-24T12:00:00Z","end":"2026-09-24T12:00:00Z"},"truncated":false}}\n' "$id""#,
+        "      ;;",
+        "    dispatch_rows)",
+        r#"      printf '{"id":%s,"end":true,"ok":false,"error":{"code":"injected_failure","message":"dispatch metadata unavailable"}}\n' "$id""#,
+        "      ;;",
+        "    *)",
+        r#"      printf '{"id":%s,"end":true,"ok":false,"error":{"code":"unknown_operation","message":"unexpected operation"}}\n' "$id""#,
+        "      ;;",
+        "  esac",
+        "done",
+    ]
+    .join("\n")
+    .replace("@BUILD@", env!("CARGO_PKG_VERSION"))
+    .replace("@SCHEMA@", &SCHEMA_VERSION.to_string())
+    .replace("@SEMANTICS@", &QUERY_SEMANTICS_VERSION.to_string());
+    std::fs::write(&script_path, script).expect("write injected peer");
+    let topology = json!({
+        "version": 1,
+        "self": "caller",
+        "peers": {
+            "alpha": {
+                "command": ["/bin/sh", script_path],
+                "engram": binary,
+                "exports": ["default"],
+            }
+        }
+    });
+    std::fs::write(
+        caller_home.join(".engram/topology.yml"),
+        serde_json::to_vec(&topology).expect("serialize caller topology"),
+    )
+    .expect("write caller topology");
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["grep", "needle-after-scan", "--peers", "alpha"])
+        .output()
+        .expect("run grep with failed metadata phase");
+    assert!(
+        output.status.success(),
+        "partial metadata failure should retain matching results: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("grep JSON");
+    assert_eq!(result["federation"]["coverage"], "partial");
+    assert_eq!(result["total"], 1);
+    assert_eq!(result["time_range"]["start"], "2026-09-24T12:00:00Z");
+    assert_eq!(result["time_range"]["end"], "2026-09-24T12:00:00Z");
+    assert_eq!(result["truncated"], false);
+    assert_eq!(result["sessions"][0]["refs_up"], serde_json::Value::Null);
+    let source = result["federation"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["store"] == "alpha/default")
+        .expect("selected peer source");
+    assert_eq!(source["status"], "failed");
+    assert_eq!(source["phase"], "dispatch_rows");
+    assert_eq!(source["grep_scan"]["total"], 1);
+    assert_eq!(
+        source["grep_scan"]["time_range"]["start"],
+        "2026-09-24T12:00:00Z"
+    );
+
+    let required = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "grep",
+            "needle-after-scan",
+            "--peers",
+            "alpha",
+            "--require-complete",
+        ])
+        .output()
+        .expect("run require-complete grep after metadata failure");
+    assert!(!required.status.success());
+    assert!(String::from_utf8_lossy(&required.stderr).contains("incomplete_coverage"));
 }
