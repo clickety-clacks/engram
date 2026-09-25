@@ -502,10 +502,9 @@ fn remote_show_obeys_advertised_request_timeout_for_read_file() {
         started.elapsed()
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let error: serde_json::Value = serde_json::from_str(
-        stderr.lines().last().expect("timeout error line"),
-    )
-    .expect("timeout error JSON");
+    let error: serde_json::Value =
+        serde_json::from_str(stderr.lines().last().expect("timeout error line"))
+            .expect("timeout error JSON");
     assert_eq!(error["error"]["code"], "timeout");
 }
 
@@ -540,7 +539,11 @@ fn remote_show_ctrl_c_cancels_and_aborts_read_file() {
     let exit_deadline = Instant::now() + Duration::from_secs(3);
     let mut exited = false;
     while Instant::now() < exit_deadline {
-        if child.try_wait().expect("check remote show status").is_some() {
+        if child
+            .try_wait()
+            .expect("check remote show status")
+            .is_some()
+        {
             exited = true;
             break;
         }
@@ -561,10 +564,9 @@ fn remote_show_ctrl_c_cancels_and_aborts_read_file() {
         "remote read_file cancellation exceeded its deadline"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let error: serde_json::Value = serde_json::from_str(
-        stderr.lines().last().expect("cancellation error line"),
-    )
-    .expect("cancellation error JSON");
+    let error: serde_json::Value =
+        serde_json::from_str(stderr.lines().last().expect("cancellation error line"))
+            .expect("cancellation error JSON");
     assert_eq!(error["error"]["code"], "cancelled");
 }
 

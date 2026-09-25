@@ -1111,12 +1111,8 @@ fn cmd_show_remote(
     let query_deadline = Instant::now() + PEER_QUERY_TIMEOUT;
     let cancelled = peer_cancellation_flag()?;
     print_context_conspicuity(context);
-    let (machine, export, mut owner) = connect_remote_store(
-        store_ref,
-        "remote show",
-        query_deadline,
-        &cancelled,
-    )?;
+    let (machine, export, mut owner) =
+        connect_remote_store(store_ref, "remote show", query_deadline, &cancelled)?;
 
     let locate = one_peer_response(
         &mut owner,
@@ -1335,16 +1331,11 @@ fn connect_remote_store(
     }
     peer.exports = vec![export.to_string()];
 
-    let timeout = PEER_CONNECT_OPEN_TIMEOUT
-        .min(query_deadline.saturating_duration_since(Instant::now()));
-    let owner = RemoteOwner::connect_cancellable(
-        machine,
-        &topology.self_label,
-        &peer,
-        timeout,
-        cancelled,
-    )
-    .map_err(peer_failure_to_cli)?;
+    let timeout =
+        PEER_CONNECT_OPEN_TIMEOUT.min(query_deadline.saturating_duration_since(Instant::now()));
+    let owner =
+        RemoteOwner::connect_cancellable(machine, &topology.self_label, &peer, timeout, cancelled)
+            .map_err(peer_failure_to_cli)?;
     owner
         .exports
         .get(export)
@@ -2943,12 +2934,8 @@ fn cmd_peek_remote(
 ) -> Result<(), CliError> {
     let query_deadline = Instant::now() + PEER_QUERY_TIMEOUT;
     let cancelled = peer_cancellation_flag()?;
-    let (machine, export, mut owner) = connect_remote_store(
-        store_ref,
-        "remote peek",
-        query_deadline,
-        &cancelled,
-    )?;
+    let (machine, export, mut owner) =
+        connect_remote_store(store_ref, "remote peek", query_deadline, &cancelled)?;
     let session_id = args.session_id;
     if args.grep_filter.is_none() && args.start == Some(0) {
         return Err(CliError::new(
