@@ -1489,6 +1489,79 @@ fn grep_unavailable_peer_is_partial_and_require_complete_fails() {
 }
 
 #[test]
+fn grep_peer_that_never_answers_is_partial_and_require_complete_fails() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "caller-no-response",
+        "{\"t\":\"2026-09-24T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-peer-no-response local\"}\n",
+    );
+    std::fs::write(
+        caller_home.join(".engram/topology.yml"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "self": "caller",
+            "peers": {
+                "silent": {
+                    "command": ["/usr/bin/sleep", "60"],
+                    "engram": binary,
+                    "exports": ["default"],
+                }
+            }
+        }))
+        .expect("serialize topology"),
+    )
+    .expect("write topology");
+
+    let partial = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["grep", "needle-peer-no-response", "--peers", "silent"])
+        .output()
+        .expect("run grep with a peer that never answers");
+    assert!(
+        partial.status.success(),
+        "partial grep should retain local results: {}",
+        String::from_utf8_lossy(&partial.stderr)
+    );
+    let result: serde_json::Value =
+        serde_json::from_slice(&partial.stdout).expect("partial grep JSON");
+    assert_eq!(result["federation"]["coverage"], "partial");
+    assert_eq!(result["sessions"][0]["tape_id"], "caller-no-response");
+    assert_eq!(result["total"], serde_json::Value::Null);
+    assert_eq!(result["total_bounds"]["max"], serde_json::Value::Null);
+    let silent = result["federation"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["store"] == "silent/default")
+        .expect("silent peer source");
+    assert_eq!(silent["status"], "unavailable");
+    assert_eq!(silent["phase"], "open");
+    assert_eq!(silent["error"]["code"], "timeout");
+
+    let required = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "grep",
+            "needle-peer-no-response",
+            "--peers",
+            "silent",
+            "--require-complete",
+        ])
+        .output()
+        .expect("run require-complete grep with a peer that never answers");
+    assert!(!required.status.success());
+    assert!(
+        String::from_utf8_lossy(&required.stderr).contains("incomplete_coverage"),
+        "unexpected require-complete error: {}",
+        String::from_utf8_lossy(&required.stderr)
+    );
+}
+
+#[test]
 fn local_show_without_peer_selection_does_not_spawn_configured_peers() {
     let temp = tempfile::tempdir().expect("tempdir");
     let caller_home = temp.path().join("caller-home");
