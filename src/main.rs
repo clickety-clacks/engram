@@ -1721,6 +1721,33 @@ fn cmd_show_peers_inner(
         }
     }
 
+    if candidates.is_empty()
+        && remote_locators.len() > 1
+        && remote_locators
+            .iter()
+            .all(|locator| remote_digests.contains_key(&locator.store_ref))
+    {
+        let first_digest = &remote_digests[&remote_locators[0].store_ref];
+        if remote_locators
+            .iter()
+            .any(|locator| {
+                remote_digests[&locator.store_ref].as_str() != first_digest.as_str()
+            })
+        {
+            let stores = remote_locators
+                .iter()
+                .map(|locator| locator.store_ref.as_str())
+                .collect::<Vec<_>>();
+            return Err(CliError::new(
+                "identity_conflict",
+                format!(
+                    "tape `{tape_id}` has different content at selected stores: {}",
+                    stores.join(", ")
+                ),
+            ));
+        }
+    }
+
     // §7.1 chooses a local holder first, then the first configured selected
     // peer/export. Locate results are already accumulated in that stable order.
     if candidates.is_empty()
