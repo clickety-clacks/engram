@@ -169,7 +169,9 @@ struct ShowCandidate {
     remote: bool,
 }
 
+#[derive(Clone)]
 struct RemoteShowLocator {
+    machine: String,
     store_ref: String,
     file_path: String,
     file_bytes: u64,
@@ -1446,8 +1448,8 @@ fn cmd_show_peers_inner(
     }
 
     let locate_results = run_peer_rounds_concurrently(locate_jobs, query_deadline, cancelled);
-    let mut read_jobs = Vec::new();
-    let mut read_locators = HashMap::<String, Vec<RemoteShowLocator>>::new();
+    let mut remote_locators = Vec::<RemoteShowLocator>::new();
+    let mut remote_owners = HashMap::<String, RemoteOwner>::new();
     for result in locate_results {
         let machine = result.machine;
         let batches = locate_batches.remove(&machine).unwrap_or_default();
@@ -1603,6 +1605,7 @@ fn cmd_show_peers_inner(
                     continue;
                 }
                 locators.push(RemoteShowLocator {
+                    machine: machine.clone(),
                     store_ref,
                     file_path: file_path.to_string(),
                     file_bytes,
@@ -1611,7 +1614,41 @@ fn cmd_show_peers_inner(
                 });
             }
         }
-        if !locators.is_empty() {
+        remote_locators.extend(locators);
+        remote_owners.insert(machine, owner);
+    }
+
+    let multiple_holders = candidates.len() + remote_locators.len() > 1;
+    let mut remote_digests = HashMap::<String, String>::new();
+    if multiple_holders && !remote_locators.is_empty() {
+        let mut fact_groups = Vec::<(String, Vec<RemoteShowLocator>)>::new();
+        for locator in &remote_locators {
+            if let Some((_, group)) = fact_groups
+                .iter_mut()
+                .find(|(machine, _)| machine == &locator.machine)
+            {
+                group.push(locator.clone());
+            } else {
+                fact_groups.push((locator.machine.clone(), vec![locator.clone()]));
+            }
+        }
+
+        let mut fact_group_locators = HashMap::<String, Vec<RemoteShowLocator>>::new();
+        let mut fact_jobs = Vec::new();
+        for (machine, locators) in fact_groups {
+            let Some(owner) = remote_owners.remove(&machine) else {
+                for locator in locators {
+                    mark_source_phase(
+                        &mut source_rows,
+                        &locator.store_ref,
+                        "tape_facts",
+                        "unavailable",
+                        "peer connection was not retained for tape identity checks",
+                    );
+                }
+                any_source_failure = true;
+                continue;
+            };
             let requests = locators
                 .iter()
                 .map(|locator| {
@@ -1621,11 +1658,10 @@ fn cmd_show_peers_inner(
                         .map(|(_, export)| export)
                         .unwrap_or_default();
                     PeerRequest::new(
-                        "read_file",
+                        "tape_facts",
                         vec![export.to_string()],
                         json!({
-                            "address": locator.address,
-                            "max_bytes": locator.compressed_limit,
+                            "items": [{"tape_id": tape_id, "include_digest": true}],
                         }),
                     )
                 })
@@ -1639,80 +1675,101 @@ fn cmd_show_peers_inner(
                         .map(|(_, export)| export.to_string())
                 })
                 .collect::<Vec<_>>();
-            read_locators.insert(machine.clone(), locators);
-            read_jobs.push(PeerRoundJob {
+            fact_group_locators.insert(machine.clone(), locators);
+            fact_jobs.push(PeerRoundJob {
                 machine,
                 owner,
                 exports,
                 requests,
             });
         }
+
+        let fact_results = run_peer_rounds_concurrently(fact_jobs, query_deadline, cancelled);
+        for result in fact_results {
+            let machine = result.machine;
+            let locators = fact_group_locators.remove(&machine).unwrap_or_default();
+            if let Some(owner) = result.owner {
+                remote_owners.insert(machine.clone(), owner);
+            }
+            for (index, locator) in locators.iter().enumerate() {
+                let fact_result = match result.outcomes.get(index) {
+                    Some(Ok(response)) => {
+                        show_tape_facts_digest(response, &locator.store_ref, tape_id)
+                    }
+                    Some(Err(failure)) => Err(peer_failure_to_cli(failure.clone())),
+                    None => Err(CliError::new(
+                        "protocol_error",
+                        "peer returned no tape_facts outcome",
+                    )),
+                };
+                match fact_result {
+                    Ok(digest) => {
+                        remote_digests.insert(locator.store_ref.clone(), digest);
+                    }
+                    Err(error) => {
+                        mark_source_phase(
+                            &mut source_rows,
+                            &locator.store_ref,
+                            "tape_facts",
+                            error.code,
+                            &error.message,
+                        );
+                        any_source_failure = true;
+                    }
+                }
+            }
+        }
     }
 
-    let read_results = run_peer_rounds_concurrently(read_jobs, query_deadline, cancelled);
-    for result in read_results {
-        let machine = result.machine;
-        let locators = read_locators.remove(&machine).unwrap_or_default();
-        let decompressed_limit = result
-            .owner
-            .as_ref()
-            .and_then(|owner| owner.limits.get("decompressed_bytes_per_tape").copied())
-            .unwrap_or(DEFAULT_DECOMPRESSED_BYTES_PER_TAPE)
-            .min(DEFAULT_DECOMPRESSED_BYTES_PER_TAPE);
-        if result.owner.is_none() {
-            for locator in locators {
-                mark_source_phase(
-                    &mut source_rows,
-                    &locator.store_ref,
+    // §7.1 chooses a local holder first, then the first configured selected
+    // peer/export. Locate results are already accumulated in that stable order.
+    if candidates.is_empty()
+        && let Some(locator) = remote_locators.first()
+    {
+        if let Some(mut owner) = remote_owners.remove(&locator.machine) {
+            let export = locator
+                .store_ref
+                .split_once('/')
+                .map(|(_, export)| export)
+                .unwrap_or_default()
+                .to_string();
+            let read = one_peer_response(
+                &mut owner,
+                PeerRequest::new(
                     "read_file",
-                    "unavailable",
-                    "peer read_file worker failed",
-                );
-            }
-            any_source_failure = true;
-            continue;
-        }
-        for (index, locator) in locators.into_iter().enumerate() {
-            let Some(outcome) = result.outcomes.get(index) else {
-                mark_source_phase(
-                    &mut source_rows,
-                    &locator.store_ref,
-                    "read_file",
-                    "protocol_error",
-                    "peer returned no read_file outcome",
-                );
-                any_source_failure = true;
-                continue;
-            };
-            let read = match outcome {
-                Ok(response) => response.clone(),
-                Err(failure) => {
-                    mark_source_phase(
-                        &mut source_rows,
-                        &locator.store_ref,
-                        "read_file",
-                        &failure.code,
-                        &failure.message,
-                    );
-                    any_source_failure = true;
-                    continue;
-                }
-            };
-            match decode_remote_tape_response(
-                tape_id,
-                locator.file_bytes,
-                locator.compressed_limit,
-                decompressed_limit,
-                read,
-            ) {
+                    vec![export],
+                    json!({
+                        "address": locator.address,
+                        "max_bytes": locator.compressed_limit,
+                    }),
+                ),
+                "read_file",
+                query_deadline,
+                cancelled,
+            );
+            let decompressed_limit = owner
+                .limits
+                .get("decompressed_bytes_per_tape")
+                .copied()
+                .unwrap_or(DEFAULT_DECOMPRESSED_BYTES_PER_TAPE)
+                .min(DEFAULT_DECOMPRESSED_BYTES_PER_TAPE);
+            match read.and_then(|response| {
+                decode_remote_tape_response(
+                    tape_id,
+                    locator.file_bytes,
+                    locator.compressed_limit,
+                    decompressed_limit,
+                    response,
+                )
+            }) {
                 Ok((content, digest, id_verified)) => candidates.push(ShowCandidate {
                     content,
                     digest,
                     id_verified,
                     location: json!({
-                        "machine": machine,
-                        "store": locator.store_ref,
-                        "path": locator.file_path,
+                        "machine": locator.machine.clone(),
+                        "store": locator.store_ref.clone(),
+                        "path": locator.file_path.clone(),
                     }),
                     remote: true,
                 }),
@@ -1730,6 +1787,17 @@ fn cmd_show_peers_inner(
                     any_source_failure = true;
                 }
             }
+        } else {
+            let message = "peer connection was not retained for the chosen tape holder";
+            mark_source_phase(
+                &mut source_rows,
+                &locator.store_ref,
+                "read_file",
+                "unavailable",
+                message,
+            );
+            first_content_error.get_or_insert(("unavailable", message.to_string()));
+            any_source_failure = true;
         }
     }
 
@@ -1749,15 +1817,48 @@ fn cmd_show_peers_inner(
         ));
     }
 
-    let expected_digest = &candidates[0].digest;
-    if candidates
-        .iter()
-        .any(|candidate| candidate.digest != *expected_digest)
-    {
-        let stores = candidates
-            .iter()
-            .filter_map(|candidate| candidate.location.get("store").and_then(Value::as_str))
-            .collect::<Vec<_>>();
+    let chosen = candidates.remove(0);
+    let mut locations = vec![chosen.location.clone()];
+    let chosen_store = chosen
+        .location
+        .get("store")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut conflicting_stores = Vec::new();
+    for locator in &remote_locators {
+        if locator.store_ref == chosen_store {
+            if remote_digests
+                .get(&locator.store_ref)
+                .is_some_and(|digest| digest != &chosen.digest)
+            {
+                return Err(CliError::new(
+                    "tape_changed",
+                    format!(
+                        "tape `{tape_id}` changed at `{}` between identity check and read",
+                        locator.store_ref
+                    ),
+                ));
+            }
+            continue;
+        }
+        match remote_digests.get(&locator.store_ref) {
+            Some(digest) if digest == &chosen.digest => {
+                let location = json!({
+                    "machine": locator.machine.clone(),
+                    "store": locator.store_ref.clone(),
+                    "path": locator.file_path.clone(),
+                });
+                if !locations.contains(&location) {
+                    locations.push(location);
+                }
+            }
+            Some(_) => conflicting_stores.push(locator.store_ref.as_str()),
+            None => {}
+        }
+    }
+    if !conflicting_stores.is_empty() {
+        let mut stores = vec![chosen_store];
+        stores.extend(conflicting_stores);
         return Err(CliError::new(
             "identity_conflict",
             format!(
@@ -1771,14 +1872,6 @@ fn cmd_show_peers_inner(
             "incomplete_coverage",
             format!("show of `{tape_id}` did not reach every selected source"),
         ));
-    }
-
-    let chosen = candidates.remove(0);
-    let mut locations = vec![chosen.location.clone()];
-    for candidate in &candidates {
-        if !locations.contains(&candidate.location) {
-            locations.push(candidate.location.clone());
-        }
     }
     if raw {
         if any_source_failure {
@@ -2107,7 +2200,14 @@ fn one_peer_response(
 }
 
 fn peer_failure_to_cli(failure: PeerFailure) -> CliError {
-    let code = match failure.code.as_str() {
+    CliError::new(
+        peer_failure_cli_code(&failure.code),
+        format!("{}: {}", failure.code, failure.message),
+    )
+}
+
+fn peer_failure_cli_code(peer_code: &str) -> &'static str {
+    match peer_code {
         "unavailable" => "unavailable",
         "cancelled" => "cancelled",
         "timeout" => "timeout",
@@ -2125,8 +2225,57 @@ fn peer_failure_to_cli(failure: PeerFailure) -> CliError {
         "protocol_error" => "protocol_error",
         "protocol_mismatch" => "protocol_mismatch",
         _ => "peer_error",
+    }
+}
+
+fn show_tape_facts_digest(
+    response: &PeerResponse,
+    store_ref: &str,
+    tape_id: &str,
+) -> Result<String, CliError> {
+    let [row] = response.data.as_slice() else {
+        return Err(CliError::new(
+            "protocol_error",
+            "tape_facts returned an unexpected number of items",
+        ));
     };
-    CliError::new(code, format!("{}: {}", failure.code, failure.message))
+    if row.get("store").and_then(Value::as_str) != Some(store_ref)
+        || row.get("tape_id").and_then(Value::as_str) != Some(tape_id)
+    {
+        return Err(CliError::new(
+            "protocol_error",
+            "tape_facts returned identity for a different store or tape",
+        ));
+    }
+    if row.get("status").and_then(Value::as_str) != Some("ok") {
+        let peer_code = row
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_str)
+            .unwrap_or("peer_error");
+        let message = row
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("peer could not verify tape identity");
+        return Err(CliError::new(
+            peer_failure_cli_code(peer_code),
+            format!("{peer_code}: {store_ref}: {message}"),
+        ));
+    }
+    let digest = row
+        .get("digest")
+        .and_then(Value::as_str)
+        .filter(|digest| {
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .ok_or_else(|| {
+            CliError::new(
+                "protocol_error",
+                "tape_facts omitted a valid SHA-256 digest",
+            )
+        })?;
+    Ok(digest.to_ascii_lowercase())
 }
 
 fn is_sha256_tape_id(tape_id: &str) -> bool {

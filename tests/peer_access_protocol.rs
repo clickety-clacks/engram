@@ -48,6 +48,50 @@ fn write_grep_owner(
     })
 }
 
+fn log_peer_operations(
+    root: &std::path::Path,
+    machine: &str,
+    binary: &str,
+    peer: &mut serde_json::Value,
+) -> std::path::PathBuf {
+    let log_path = root.join(format!("{machine}-peer-operations.log"));
+    let script_path = root.join(format!("{machine}-logged-peer.sh"));
+    let owner_home = peer["command"][1]
+        .as_str()
+        .expect("test owner HOME assignment")
+        .to_string();
+    let script = [
+        "#!/bin/sh",
+        "set -eu",
+        "binary=\"$1\"",
+        "log=\"$2\"",
+        "while IFS= read -r request; do",
+        r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
+        r#"  printf '%s\n' "$op" >> "$log""#,
+        r#"  printf '%s\n' "$request""#,
+        "done | \"$binary\" peer-serve --stdio",
+    ]
+    .join("\n");
+    std::fs::write(&script_path, script).expect("write logging peer wrapper");
+    peer["command"] = json!([
+        "/usr/bin/env",
+        owner_home,
+        "/bin/sh",
+        script_path,
+        binary,
+        log_path,
+    ]);
+    log_path
+}
+
+fn operation_count(log_path: &std::path::Path, operation: &str) -> usize {
+    std::fs::read_to_string(log_path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| *line == operation)
+        .count()
+}
+
 fn write_local_grep_source(
     root: &std::path::Path,
     tape_id: &str,
@@ -515,8 +559,10 @@ fn show_with_selected_peers_reads_and_deduplicates_matching_remote_tapes() {
     let binary = env!("CARGO_BIN_EXE_engram");
     let content = "{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"show from selected peers\"}\n";
     let tape_id = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
-    let alpha = write_grep_owner(temp.path(), "alpha", binary, &[(tape_id.as_str(), content)]);
-    let beta = write_grep_owner(temp.path(), "beta", binary, &[(tape_id.as_str(), content)]);
+    let mut alpha = write_grep_owner(temp.path(), "alpha", binary, &[(tape_id.as_str(), content)]);
+    let alpha_operations = log_peer_operations(temp.path(), "alpha", binary, &mut alpha);
+    let mut beta = write_grep_owner(temp.path(), "beta", binary, &[(tape_id.as_str(), content)]);
+    let beta_operations = log_peer_operations(temp.path(), "beta", binary, &mut beta);
     let unselected_marker = temp.path().join("show-unselected-peer-was-started");
     let unselected = json!({
         "command": ["/usr/bin/touch", unselected_marker],
@@ -561,6 +607,10 @@ fn show_with_selected_peers_reads_and_deduplicates_matching_remote_tapes() {
     assert_eq!(value["id_verified"], true);
     assert_eq!(value["locations"].as_array().unwrap().len(), 2);
     assert_eq!(value["federation"]["coverage"], "complete");
+    assert_eq!(operation_count(&alpha_operations, "tape_facts"), 1);
+    assert_eq!(operation_count(&beta_operations, "tape_facts"), 1);
+    assert_eq!(operation_count(&alpha_operations, "read_file"), 1);
+    assert_eq!(operation_count(&beta_operations, "read_file"), 0);
     assert!(
         value["federation"]["sources"]
             .as_array()
@@ -570,6 +620,103 @@ fn show_with_selected_peers_reads_and_deduplicates_matching_remote_tapes() {
                 && source["status"] == "not_selected")
     );
     assert!(!unselected_marker.exists(), "unselected peer was launched");
+}
+
+#[test]
+fn show_with_local_and_remote_holders_keeps_local_choice_and_only_reads_digests_remotely() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let content = "{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"local show holder\"}\n";
+    let tape_id = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
+    let mut alpha = write_grep_owner(temp.path(), "alpha", binary, &[(tape_id.as_str(), content)]);
+    let alpha_operations = log_peer_operations(temp.path(), "alpha", binary, &mut alpha);
+    let mut beta = write_grep_owner(temp.path(), "beta", binary, &[(tape_id.as_str(), content)]);
+    let beta_operations = log_peer_operations(temp.path(), "beta", binary, &mut beta);
+    let (caller_home, repo) = write_local_grep_source(temp.path(), &tape_id, content);
+    let caller_engram = caller_home.join(".engram");
+    std::fs::write(
+        caller_engram.join("topology.yml"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "self": "caller",
+            "peers": {"alpha": alpha, "beta": beta},
+        }))
+        .expect("serialize caller topology"),
+    )
+    .expect("write caller topology");
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["show", &tape_id, "--peers", "beta,alpha"])
+        .output()
+        .expect("run local-first selected-peer show");
+    assert!(
+        output.status.success(),
+        "local-first show failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("show JSON");
+    let local_path = repo
+        .join(".engram/tapes")
+        .join(format!("{tape_id}.jsonl.zst"));
+    assert_eq!(value["location"]["machine"], "caller");
+    assert_eq!(value["path"], local_path.to_str().unwrap());
+    assert_eq!(value["locations"].as_array().unwrap().len(), 3);
+    assert_eq!(value["digest"], tape_id);
+    assert_eq!(value["federation"]["coverage"], "complete");
+    for operations in [&alpha_operations, &beta_operations] {
+        assert_eq!(operation_count(operations, "tape_facts"), 1);
+        assert_eq!(operation_count(operations, "read_file"), 0);
+    }
+}
+
+#[test]
+fn show_detects_multi_holder_fingerprint_conflict_from_digests_without_read_file() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let tape_id = "fingerprint-show-conflict";
+    let alpha_content = "{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"alpha bytes\"}\n";
+    let beta_content = "{\"t\":\"2026-09-25T12:01:00Z\",\"k\":\"msg.in\",\"content\":\"beta bytes\"}\n";
+    let mut alpha = write_grep_owner(temp.path(), "alpha", binary, &[(tape_id, alpha_content)]);
+    let alpha_operations = log_peer_operations(temp.path(), "alpha", binary, &mut alpha);
+    let mut beta = write_grep_owner(temp.path(), "beta", binary, &[(tape_id, beta_content)]);
+    let beta_operations = log_peer_operations(temp.path(), "beta", binary, &mut beta);
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "caller-other-tape",
+        "{\"t\":\"2026-09-25T11:00:00Z\",\"k\":\"note\",\"content\":\"local tape\"}\n",
+    );
+    std::fs::write(
+        caller_home.join(".engram/topology.yml"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "self": "caller",
+            "peers": {"alpha": alpha, "beta": beta},
+        }))
+        .expect("serialize caller topology"),
+    )
+    .expect("write caller topology");
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["show", tape_id, "--peers", "beta,alpha"])
+        .output()
+        .expect("run conflicting multi-holder show");
+    assert!(!output.status.success());
+    let error: serde_json::Value = serde_json::from_str(
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .last()
+            .expect("identity conflict error"),
+    )
+    .expect("structured show error");
+    assert_eq!(error["error"]["code"], "identity_conflict");
+    for operations in [&alpha_operations, &beta_operations] {
+        assert_eq!(operation_count(operations, "tape_facts"), 1);
+        assert_eq!(operation_count(operations, "read_file"), 0);
+    }
 }
 
 #[test]
