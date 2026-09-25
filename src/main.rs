@@ -1366,7 +1366,7 @@ fn cmd_show_peers_inner(
             any_source_failure = true;
             continue;
         };
-        let mut owner = match connection {
+        let owner = match connection {
             Ok(owner) => owner,
             Err(failure) => {
                 for export in &peer.exports {
@@ -1451,7 +1451,7 @@ fn cmd_show_peers_inner(
     for result in locate_results {
         let machine = result.machine;
         let batches = locate_batches.remove(&machine).unwrap_or_default();
-        let Some(mut owner) = result.owner else {
+        let Some(owner) = result.owner else {
             for export in result.exports {
                 mark_source_phase(
                     &mut source_rows,
