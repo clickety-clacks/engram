@@ -158,10 +158,7 @@ where
         let session_remaining = owner_session_max.saturating_sub(started.elapsed());
         let wait = idle_remaining.min(session_remaining);
         let request = match frames_rx.recv_timeout(wait) {
-            Ok(Ok(Some(frame))) => {
-                last_activity = Instant::now();
-                frame
-            }
+            Ok(Ok(Some(frame))) => frame,
             Ok(Ok(None)) => return Ok(()),
             Ok(Err(error)) => return Err(format!("frame_error: {error}")),
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
