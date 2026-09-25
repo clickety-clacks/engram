@@ -10,7 +10,10 @@ use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
 use std::time::SystemTime;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -33,6 +36,8 @@ pub const MAX_BATCH_ITEMS: usize = 128;
 const MAX_ANCHOR_BYTES: usize = 16 * 1024;
 pub const MAX_READ_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const READ_FILE_CHUNK_BYTES: usize = 720 * 1024;
+const DEFAULT_OWNER_SESSION_MAX_SECS: u64 = 120;
+const DEFAULT_OWNER_IDLE_TIMEOUT_SECS: u64 = 15;
 
 const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -74,21 +79,71 @@ pub fn serve_stdio(home: &Path) -> Result<(), String> {
     let topology = load_topology(home)
         .map_err(|error| format!("topology_error: {error}"))?
         .ok_or_else(|| "topology_missing: expected ~/.engram/topology.yml".to_string())?;
+    let owner_session_max = Duration::from_secs(configured_limit(
+        &topology.limits,
+        "owner_session_max_secs",
+        DEFAULT_OWNER_SESSION_MAX_SECS,
+    ));
+    let owner_idle_timeout = Duration::from_secs(configured_limit(
+        &topology.limits,
+        "owner_idle_timeout_secs",
+        DEFAULT_OWNER_IDLE_TIMEOUT_SECS,
+    ));
     let mut session = PeerSession {
         topology,
         opened: BTreeMap::new(),
         tape_file_sizes: RefCell::new(HashMap::new()),
     };
-    let stdin = io::stdin();
     let stdout = io::stdout();
-    let mut input = BufReader::new(stdin.lock());
     let mut output = io::BufWriter::new(stdout.lock());
+    let started = Instant::now();
+    let (watchdog_stop_tx, watchdog_stop_rx) = mpsc::channel();
+    let watchdog = thread::spawn(move || {
+        if matches!(
+            watchdog_stop_rx.recv_timeout(owner_session_max),
+            Err(RecvTimeoutError::Timeout)
+        ) {
+            // This endpoint is a short-lived child process. A hard exit closes
+            // any pinned SQLite readers even if an owner operation is still
+            // running and cannot observe a caller-side cancellation.
+            std::process::exit(0);
+        }
+    });
 
-    loop {
-        let request = match read_frame(&mut input) {
-            Ok(Some(frame)) => frame,
-            Ok(None) => return Ok(()),
-            Err(error) => return Err(format!("frame_error: {error}")),
+    let (frames_tx, frames_rx) = mpsc::channel::<Result<Option<Vec<u8>>, String>>();
+    let reader = thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut input = BufReader::new(stdin.lock());
+        loop {
+            let result = read_frame(&mut input).map_err(|error| error.to_string());
+            let finished = !matches!(result, Ok(Some(_)));
+            if frames_tx.send(result).is_err() || finished {
+                break;
+            }
+        }
+    });
+
+    let mut last_activity = Instant::now();
+    let result = loop {
+        let idle_remaining = owner_idle_timeout.saturating_sub(last_activity.elapsed());
+        let session_remaining = owner_session_max.saturating_sub(started.elapsed());
+        let wait = idle_remaining.min(session_remaining);
+        let request = match frames_rx.recv_timeout(wait) {
+            Ok(Ok(Some(frame))) => {
+                last_activity = Instant::now();
+                frame
+            }
+            Ok(Ok(None)) => break Ok(()),
+            Ok(Err(error)) => break Err(format!("frame_error: {error}")),
+            Err(RecvTimeoutError::Disconnected) => break Ok(()),
+            Err(RecvTimeoutError::Timeout) => {
+                if owner_idle_timeout <= last_activity.elapsed()
+                    || owner_session_max <= started.elapsed()
+                {
+                    break Ok(());
+                }
+                continue;
+            }
         };
         let parsed = serde_json::from_slice::<Value>(&request);
         let (id, result) = match parsed {
@@ -102,9 +157,9 @@ pub fn serve_stdio(home: &Path) -> Result<(), String> {
                 Err(PeerError::new("invalid_json", error.to_string())),
             ),
         };
-        match result {
+        let response = match result {
             Ok(stats) => write_terminal(&mut output, &id, true, stats, None)
-                .map_err(|error| format!("write_error: {error}"))?,
+                .map_err(|error| format!("write_error: {error}")),
             Err(error) => write_terminal(
                 &mut output,
                 &id,
@@ -112,9 +167,19 @@ pub fn serve_stdio(home: &Path) -> Result<(), String> {
                 Value::Null,
                 Some(json!({"code": error.code, "message": error.message})),
             )
-            .map_err(|write_error| format!("write_error: {write_error}"))?,
+            .map_err(|write_error| format!("write_error: {write_error}")),
+        };
+        if let Err(error) = response {
+            break Err(error);
         }
-    }
+    };
+
+    let _ = watchdog_stop_tx.send(());
+    let _ = watchdog.join();
+    // On idle expiry stdin may still be open. The peer command exits after
+    // this function returns, which closes the detached reader thread too.
+    drop(reader);
+    result
 }
 
 fn read_frame<R: BufRead>(input: &mut R) -> io::Result<Option<Vec<u8>>> {
@@ -315,6 +380,16 @@ impl PeerSession {
                     &self.topology.limits,
                     "decompressed_bytes_per_tape",
                     512 * 1024 * 1024,
+                ),
+                "owner_session_max_secs": configured_limit(
+                    &self.topology.limits,
+                    "owner_session_max_secs",
+                    DEFAULT_OWNER_SESSION_MAX_SECS,
+                ),
+                "owner_idle_timeout_secs": configured_limit(
+                    &self.topology.limits,
+                    "owner_idle_timeout_secs",
+                    DEFAULT_OWNER_IDLE_TIMEOUT_SECS,
                 ),
             },
             "opened": opened,

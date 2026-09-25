@@ -1,4 +1,5 @@
-use std::process::{Command, Stdio};
+use std::io::Write;
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use engram::access::client::{PeerRequest, RemoteOwner};
@@ -46,6 +47,46 @@ fn write_grep_owner(
         "engram": binary,
         "exports": ["default"],
     })
+}
+
+fn spawn_peer_serve_with_limits(
+    home: &std::path::Path,
+    session_max_secs: u64,
+    idle_timeout_secs: u64,
+) -> Child {
+    let engram_home = home.join(".engram");
+    std::fs::create_dir_all(&engram_home).expect("owner home");
+    std::fs::write(
+        engram_home.join("topology.yml"),
+        format!(
+            "version: 1\nself: bounded-owner\nexports: {{}}\nlimits:\n  owner_session_max_secs: {session_max_secs}\n  owner_idle_timeout_secs: {idle_timeout_secs}\n"
+        ),
+    )
+    .expect("owner topology");
+    Command::new(env!("CARGO_BIN_EXE_engram"))
+        .arg("peer-serve")
+        .arg("--stdio")
+        .env("HOME", home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn owner peer process")
+}
+
+fn wait_for_peer_exit(child: &mut Child, timeout: Duration) -> std::process::ExitStatus {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().expect("poll peer process") {
+            return status;
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("peer process exceeded its owner-side session bound");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn log_peer_operations(
@@ -232,7 +273,7 @@ fn command_peer_runs_real_peer_serve_against_an_isolated_owner_home() {
     std::fs::write(
         engram_home.join("topology.yml"),
         format!(
-            "version: 1\nself: emulated-owner\nexports:\n  default:\n    db: {}\n    tape_dirs:\n      - {}\nlimits:\n  request_timeout_ms: 1234\n",
+            "version: 1\nself: emulated-owner\nexports:\n  default:\n    db: {}\n    tape_dirs:\n      - {}\nlimits:\n  request_timeout_ms: 1234\n  owner_session_max_secs: 60\n  owner_idle_timeout_secs: 7\n",
             db.display(),
             tapes.display()
         ),
@@ -257,6 +298,8 @@ fn command_peer_runs_real_peer_serve_against_an_isolated_owner_home() {
         .expect("real peer handshake");
     assert!(owner.exports["default"].is_ok());
     assert_eq!(owner.limits.get("request_timeout_ms"), Some(&1_234));
+    assert_eq!(owner.limits.get("owner_session_max_secs"), Some(&60));
+    assert_eq!(owner.limits.get("owner_idle_timeout_secs"), Some(&7));
 
     let mut outcomes = owner.round(
         &[PeerRequest::new(
@@ -284,6 +327,55 @@ fn command_peer_runs_real_peer_serve_against_an_isolated_owner_home() {
         owner.exports["default"].as_ref().unwrap().db,
         db.to_str().expect("UTF-8 DB path")
     );
+}
+
+#[test]
+fn peer_serve_exits_on_owner_idle_timeout_with_stdin_still_open() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut child = spawn_peer_serve_with_limits(temp.path(), 5, 1);
+    let started = Instant::now();
+    let status = wait_for_peer_exit(&mut child, Duration::from_secs(3));
+    let elapsed = started.elapsed();
+
+    assert_eq!(status.code(), Some(0));
+    assert!(elapsed >= Duration::from_millis(900));
+    assert!(elapsed < Duration::from_secs(2));
+}
+
+#[test]
+fn peer_serve_enforces_owner_session_max_during_continuous_requests() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut child = spawn_peer_serve_with_limits(temp.path(), 1, 5);
+    let mut input = child.stdin.take().expect("peer stdin");
+    let started = Instant::now();
+    let mut request_id = 1u64;
+
+    let status = loop {
+        let request = json!({
+            "v": 1,
+            "id": request_id,
+            "op": "open",
+            "stores": [],
+            "args": {},
+        });
+        request_id += 1;
+        let _ = writeln!(input, "{request}");
+        let _ = input.flush();
+        if let Some(status) = child.try_wait().expect("poll peer process") {
+            break status;
+        }
+        if started.elapsed() >= Duration::from_secs(3) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("peer process exceeded its owner session maximum");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let elapsed = started.elapsed();
+
+    assert_eq!(status.code(), Some(0));
+    assert!(elapsed >= Duration::from_millis(900));
+    assert!(elapsed < Duration::from_secs(2));
 }
 
 #[test]
