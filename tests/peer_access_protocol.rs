@@ -774,7 +774,7 @@ fn show_keeps_holder_digest_when_predecessor_chain_metadata_fails() {
     let tape_id = "fingerprint-with-bad-predecessor";
     let previous_id = "previous-segment";
     let current = concat!(
-        "{\"k\":\"meta\",\"ingest_continuation\":{\"previous_tape_id\":\"previous-segment\"}}\n",
+        "{\"t\":\"2026-09-25T11:59:00Z\",\"k\":\"meta\",\"ingest_continuation\":{\"previous_tape_id\":\"previous-segment\"}}\n",
         "{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"current tape\"}\n",
     );
     let bad_previous =
