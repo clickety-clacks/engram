@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use crate::index::{DispatchDirection, DispatchLink, DispatchLinkRow, SqliteIndex};
-use crate::store::tapes::{TapeRow, event_window, parse_jsonl_rows, read_tape_content, resolve_tape_path};
+use crate::store::tapes::{
+    TapeRow, event_window, parse_jsonl_rows, read_tape_content, resolve_tape_path,
+};
 use crate::{CliError, RuntimeContext};
 
 const TRANSCRIPT_WINDOW_RADIUS: usize = 2;
@@ -160,7 +162,8 @@ pub fn collect_dispatch_upstream_sessions(
                 }
 
                 if seen_hops.insert(hop_key) {
-                    let current_start = message_turn_start(rows_cache.load(context, &current_tape)?);
+                    let current_start =
+                        message_turn_start(rows_cache.load(context, &current_tape)?);
                     let parent_start =
                         message_turn_start(rows_cache.load(context, &parent.tape_id)?);
                     let mut hop = json!({
