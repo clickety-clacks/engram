@@ -19,6 +19,8 @@ pub mod tape;
 pub struct CliError {
     pub code: &'static str,
     pub message: String,
+    pub exit_code: Option<u8>,
+    pub report_error: bool,
 }
 
 impl CliError {
@@ -26,7 +28,19 @@ impl CliError {
         Self {
             code,
             message: message.into(),
+            exit_code: None,
+            report_error: true,
         }
+    }
+
+    pub fn with_exit_code(mut self, exit_code: u8) -> Self {
+        self.exit_code = Some(exit_code);
+        self
+    }
+
+    pub fn without_error_report(mut self) -> Self {
+        self.report_error = false;
+        self
     }
 
     pub fn io(code: &'static str, err: io::Error) -> Self {

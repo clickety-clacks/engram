@@ -1169,16 +1169,21 @@ fn grep_runs_selected_peer_scan_rounds_concurrently() {
 }
 
 #[cfg(unix)]
-#[test]
-fn grep_ctrl_c_cancels_and_aborts_a_selected_peer_scan() {
-    let temp = tempfile::tempdir().expect("tempdir");
+fn spawn_grep_waiting_for_peer(
+    temp: &tempfile::TempDir,
+    pattern: &str,
+    local_content: &str,
+    blocked_operation: &str,
+    require_complete: bool,
+) -> (std::process::Child, std::path::PathBuf) {
     let binary = env!("CARGO_BIN_EXE_engram");
-    let script_path = temp.path().join("blocking-scan-peer.sh");
-    let scan_started = temp.path().join("peer-scan-started");
+    let script_path = temp.path().join("blocking-peer.sh");
+    let operation_started = temp.path().join("peer-operation-started");
     let script = [
         "#!/bin/sh",
         "set -eu",
-        "started=\"$1\"",
+        "blocked_operation=\"$1\"",
+        "started=\"$2\"",
         "while IFS= read -r request; do",
         r#"  id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"#,
         r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
@@ -1188,9 +1193,21 @@ fn grep_ctrl_c_cancels_and_aborts_a_selected_peer_scan() {
         r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"alpha","build":"0.2.1","protocol":1,"schema":4,"query_semantics":1,"limits":{"grep_k":10000}}}\n' "$id""#,
         "      ;;",
         "    grep_scan)",
-        "      touch \"$started\"",
-        "      while IFS= read -r ignored; do :; done",
-        "      exit 0",
+        "      if [ \"$blocked_operation\" = grep_scan ]; then",
+        "        touch \"$started\"",
+        "        while IFS= read -r ignored; do :; done",
+        "        exit 0",
+        "      fi",
+        r#"      printf '{"id":%s,"data":{"type":"match","tape_id":"alpha-tape","timestamp":"2026-09-25T00:00:00Z","total_lines":1,"anchor_line":1,"match_count":1,"provenance_match_count":0,"provenance_event_count":1,"refs_up":0,"refs_down":0,"files_touched":[]}}\n' "$id""#,
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"total":1,"returned":1,"time_range":{"start":"2026-09-25T00:00:00Z","end":"2026-09-25T00:00:00Z"},"truncated":false}}\n' "$id""#,
+        "      ;;",
+        "    dispatch_rows)",
+        "      if [ \"$blocked_operation\" = dispatch_rows ]; then",
+        "        touch \"$started\"",
+        "        while IFS= read -r ignored; do :; done",
+        "        exit 0",
+        "      fi",
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{}}\n' "$id""#,
         "      ;;",
         "    *) exit 78 ;;",
         "  esac",
@@ -1198,11 +1215,8 @@ fn grep_ctrl_c_cancels_and_aborts_a_selected_peer_scan() {
     ]
     .join("\n");
     std::fs::write(&script_path, script).expect("write blocking peer script");
-    let (caller_home, repo) = write_local_grep_source(
-        temp.path(),
-        "caller-before-cancel",
-        "{\"t\":\"2026-09-25T00:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-cancel local\"}\n",
-    );
+    let (caller_home, repo) =
+        write_local_grep_source(temp.path(), "caller-before-cancel", local_content);
     std::fs::write(
         caller_home.join(".engram/topology.yml"),
         serde_json::to_vec(&json!({
@@ -1210,7 +1224,7 @@ fn grep_ctrl_c_cancels_and_aborts_a_selected_peer_scan() {
             "self": "caller",
             "peers": {
                 "alpha": {
-                    "command": ["/bin/sh", script_path, scan_started],
+                    "command": ["/bin/sh", script_path, blocked_operation, operation_started],
                     "engram": binary,
                     "exports": ["default"],
                 }
@@ -1220,19 +1234,32 @@ fn grep_ctrl_c_cancels_and_aborts_a_selected_peer_scan() {
     )
     .expect("write caller topology");
 
-    let mut child = Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .current_dir(&repo)
         .env("HOME", &caller_home)
-        .args(["grep", "needle-cancel", "--peers", "alpha"])
+        .args(["grep", pattern, "--peers", "alpha"]);
+    if require_complete {
+        command.arg("--require-complete");
+    }
+    let child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn peer grep");
+    (child, operation_started)
+}
+
+#[cfg(unix)]
+fn interrupt_waiting_grep(
+    mut child: std::process::Child,
+    operation_started: &std::path::Path,
+) -> (std::process::Output, Duration) {
     let start_deadline = Instant::now() + Duration::from_secs(5);
-    while !scan_started.exists() && Instant::now() < start_deadline {
+    while !operation_started.exists() && Instant::now() < start_deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(scan_started.exists(), "peer scan did not start");
+    assert!(operation_started.exists(), "peer operation did not start");
     let signal_at = Instant::now();
     let signal_result = unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
     assert_eq!(signal_result, 0, "send SIGINT to grep caller");
@@ -1249,22 +1276,47 @@ fn grep_ctrl_c_cancels_and_aborts_a_selected_peer_scan() {
     if !exited {
         let _ = child.kill();
         let _ = child.wait_with_output();
-        panic!("Ctrl-C did not cancel the peer scan within three seconds");
+        panic!("Ctrl-C did not cancel the peer operation within three seconds");
     }
     let output = child
         .wait_with_output()
         .expect("collect cancelled grep output");
-    assert!(
-        signal_at.elapsed() < Duration::from_secs(3),
-        "peer cancellation exceeded its deadline"
+    (output, signal_at.elapsed())
+}
+
+#[cfg(unix)]
+fn assert_caller_sigint_result(output: &std::process::Output) -> serde_json::Value {
+    assert_eq!(output.status.code(), Some(130), "SIGINT must exit 130: {}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().count(),
+        1,
+        "emit one structured result"
     );
-    assert!(
-        output.status.success(),
-        "local matches should survive peer cancellation: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("\"error\""));
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("grep JSON");
-    assert_eq!(result["federation"]["coverage"], "partial");
+    assert_eq!(result["cancellation"]["status"], "cancelled");
+    assert_eq!(result["cancellation"]["source"], "caller_sigint");
+    result
+}
+
+#[cfg(unix)]
+#[test]
+fn grep_ctrl_c_cancels_and_aborts_a_selected_peer_scan() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (child, operation_started) = spawn_grep_waiting_for_peer(
+        &temp,
+        "needle-cancel",
+        "{\"t\":\"2026-09-25T00:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-cancel local\"}\n",
+        "grep_scan",
+        false,
+    );
+    let (output, elapsed) = interrupt_waiting_grep(child, &operation_started);
+    assert!(elapsed < Duration::from_secs(3), "peer cancellation exceeded its deadline");
+    let result = assert_caller_sigint_result(&output);
+    assert!(
+        result["federation"]["coverage"] == "partial",
+        "the interrupted scan should make coverage partial"
+    );
     assert_eq!(result["sessions"][0]["tape_id"], "caller-before-cancel");
     let peer_source = result["federation"]["sources"]
         .as_array()
@@ -1273,6 +1325,73 @@ fn grep_ctrl_c_cancels_and_aborts_a_selected_peer_scan() {
         .find(|source| source["store"] == "alpha/default")
         .expect("cancelled peer source");
     assert_eq!(peer_source["error"]["code"], "cancelled",);
+    assert_eq!(peer_source["phase"], "grep_scan");
+    assert_eq!(result["cancellation"]["incomplete_sources"][0]["store"], "alpha/default");
+    assert_eq!(result["cancellation"]["incomplete_sources"][0]["phase"], "grep_scan");
+}
+
+#[cfg(unix)]
+#[test]
+fn grep_ctrl_c_overrides_require_complete_with_exit_130() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (child, operation_started) = spawn_grep_waiting_for_peer(
+        &temp,
+        "needle-cancel-required",
+        "{\"t\":\"2026-09-25T00:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-cancel-required local\"}\n",
+        "grep_scan",
+        true,
+    );
+    let (output, elapsed) = interrupt_waiting_grep(child, &operation_started);
+    assert!(elapsed < Duration::from_secs(3));
+    let result = assert_caller_sigint_result(&output);
+    assert_eq!(result["federation"]["coverage"], "partial");
+    assert_eq!(result["sessions"][0]["tape_id"], "caller-before-cancel");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("incomplete_coverage"));
+}
+
+#[cfg(unix)]
+#[test]
+fn grep_ctrl_c_without_matches_is_cancelled_not_no_results() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (child, operation_started) = spawn_grep_waiting_for_peer(
+        &temp,
+        "needle-cancel-empty",
+        "{\"t\":\"2026-09-25T00:00:00Z\",\"k\":\"msg.in\",\"content\":\"unrelated local\"}\n",
+        "grep_scan",
+        false,
+    );
+    let (output, elapsed) = interrupt_waiting_grep(child, &operation_started);
+    assert!(elapsed < Duration::from_secs(3));
+    let result = assert_caller_sigint_result(&output);
+    assert_eq!(result["federation"]["coverage"], "partial");
+    assert_eq!(result["sessions"], json!([]));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("no_results"));
+}
+
+#[cfg(unix)]
+#[test]
+fn grep_ctrl_c_during_dispatch_keeps_completed_scan_aggregates() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (child, operation_started) = spawn_grep_waiting_for_peer(
+        &temp,
+        "needle-cancel-metadata",
+        "{\"t\":\"2026-09-24T10:00:00Z\",\"k\":\"msg.in\",\"content\":\"unrelated local\"}\n",
+        "dispatch_rows",
+        false,
+    );
+    let (output, elapsed) = interrupt_waiting_grep(child, &operation_started);
+    assert!(elapsed < Duration::from_secs(3));
+    let result = assert_caller_sigint_result(&output);
+    assert_eq!(result["federation"]["coverage"], "partial");
+    assert_eq!(result["total"], 1);
+    assert_eq!(result["time_range"]["start"], "2026-09-25T00:00:00Z");
+    assert_eq!(result["time_range"]["end"], "2026-09-25T00:00:00Z");
+    assert_eq!(result["truncated"], false);
+    assert_eq!(result["sessions"][0]["tape_id"], "alpha-tape");
+    assert_eq!(result["sessions"][0]["refs_up"], serde_json::Value::Null);
+    let source = result["cancellation"]["incomplete_sources"][0].clone();
+    assert_eq!(source["store"], "alpha/default");
+    assert_eq!(source["phase"], "dispatch_rows");
 }
 
 #[test]
@@ -1685,6 +1804,7 @@ fn grep_peer_that_never_answers_is_partial_and_require_complete_fails() {
     let result: serde_json::Value =
         serde_json::from_slice(&partial.stdout).expect("partial grep JSON");
     assert_eq!(result["federation"]["coverage"], "partial");
+    assert!(result.get("cancellation").is_none());
     assert_eq!(result["sessions"][0]["tape_id"], "caller-no-response");
     assert_eq!(result["total"], serde_json::Value::Null);
     assert_eq!(result["total_bounds"]["max"], serde_json::Value::Null);

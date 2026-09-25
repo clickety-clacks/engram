@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -57,6 +57,9 @@ const MAX_CONCURRENT_PEERS: usize = 4;
 const PEER_CONNECT_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const PEER_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const PEER_QUERY_TIMEOUT: Duration = Duration::from_secs(120);
+const GREP_TERMINAL_RUNNING: u8 = 0;
+const GREP_TERMINAL_CANCELLED: u8 = 1;
+const GREP_TERMINAL_COMMITTED: u8 = 2;
 
 struct PeerRoundJob {
     machine: String,
@@ -205,9 +208,11 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            let payload = error_payload(&err);
-            eprintln!("{payload}");
-            ExitCode::FAILURE
+            if err.report_error {
+                let payload = error_payload(&err);
+                eprintln!("{payload}");
+            }
+            err.exit_code.map(ExitCode::from).unwrap_or(ExitCode::FAILURE)
         }
     }
 }
@@ -1654,8 +1659,20 @@ fn cmd_grep(_paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Res
 
     if args.peers.is_some() {
         let signal_cancelled = Arc::clone(&cancelled);
+        let terminal_state = Arc::new(AtomicU8::new(GREP_TERMINAL_RUNNING));
+        let signal_terminal_state = Arc::clone(&terminal_state);
         ctrlc::set_handler(move || {
-            signal_cancelled.store(true, Ordering::SeqCst);
+            if signal_terminal_state
+                .compare_exchange(
+                    GREP_TERMINAL_RUNNING,
+                    GREP_TERMINAL_CANCELLED,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                signal_cancelled.store(true, Ordering::SeqCst);
+            }
         })
         .map_err(|error| CliError::new("signal_handler_error", error.to_string()))?;
         return cmd_grep_with_peer(
@@ -1666,6 +1683,7 @@ fn cmd_grep(_paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Res
             args,
             query_deadline,
             cancelled,
+            terminal_state,
         );
     }
     if sessions.is_empty() {
@@ -1716,6 +1734,7 @@ fn cmd_grep_with_peer(
     args: GrepArgs,
     query_deadline: Instant,
     cancelled: Arc<AtomicBool>,
+    terminal_state: Arc<AtomicU8>,
 ) -> Result<(), CliError> {
     let home = home_dir()?;
     let topology = load_topology(&home)
@@ -2261,13 +2280,6 @@ fn cmd_grep_with_peer(
     } else {
         "complete"
     };
-    if args.require_complete && any_selected_failure {
-        return Err(CliError::new(
-            "incomplete_coverage",
-            "grep --require-complete rejected one or more failed peer sources",
-        ));
-    }
-
     let total_exact = source_count_known
         && !grep_scan_incomplete
         && source_totals.iter().skip(1).all(|total| *total <= k);
@@ -2346,12 +2358,45 @@ fn cmd_grep_with_peer(
         "federation": {
             "self": topology.self_label,
             "coverage": coverage,
-            "sources": source_rows,
+            "sources": source_rows.clone(),
             "identity_conflicts": identity_conflicts,
         },
     });
     if let Some(bounds) = total_bounds {
         payload["total_bounds"] = bounds;
+    }
+
+    let caller_cancelled = commit_grep_terminal(&terminal_state);
+    if caller_cancelled {
+        let incomplete_sources = source_rows
+            .iter()
+            .filter(|source| source.get("phase").is_some())
+            .map(|source| {
+                json!({
+                    "store": source.get("store").cloned().unwrap_or(Value::Null),
+                    "status": source.get("status").cloned().unwrap_or(Value::Null),
+                    "phase": source.get("phase").cloned().unwrap_or(Value::Null),
+                    "error": source.get("error").cloned().unwrap_or(Value::Null),
+                })
+            })
+            .collect::<Vec<_>>();
+        payload["cancellation"] = json!({
+            "status": "cancelled",
+            "source": "caller_sigint",
+            "incomplete_sources": incomplete_sources,
+        });
+        emit_query_result("grep", payload)?;
+        return Err(
+            CliError::new("cancelled", "federated grep interrupted by caller SIGINT")
+                .with_exit_code(130)
+                .without_error_report(),
+        );
+    }
+    if args.require_complete && any_selected_failure {
+        return Err(CliError::new(
+            "incomplete_coverage",
+            "grep --require-complete rejected one or more failed peer sources",
+        ));
     }
     if returned == 0 {
         if any_selected_failure {
@@ -2360,6 +2405,23 @@ fn cmd_grep_with_peer(
         return Err(CliError::new("no_results", args.pattern));
     }
     emit_query_result("grep", payload)
+}
+
+fn commit_grep_terminal(terminal_state: &AtomicU8) -> bool {
+    match terminal_state.compare_exchange(
+        GREP_TERMINAL_RUNNING,
+        GREP_TERMINAL_COMMITTED,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    ) {
+        Ok(_) => false,
+        Err(GREP_TERMINAL_CANCELLED) => {
+            terminal_state.store(GREP_TERMINAL_COMMITTED, Ordering::SeqCst);
+            true
+        }
+        Err(GREP_TERMINAL_COMMITTED) => false,
+        Err(_) => false,
+    }
 }
 
 fn select_peers(
