@@ -3064,6 +3064,18 @@ fn command_peer_runs_real_peer_serve_against_an_isolated_owner_home() {
     std::fs::create_dir_all(&tapes).expect("tape directory");
     let db = engram_home.join("index.sqlite");
     drop(SqliteIndex::open_writer(db.to_str().expect("UTF-8 DB path")).expect("create fixture DB"));
+    let wal = db.with_extension("sqlite-wal");
+    let shm = db.with_extension("sqlite-shm");
+    for sidecar in [&wal, &shm] {
+        if sidecar.exists() {
+            std::fs::remove_file(sidecar).expect("clear closed fixture sidecar");
+        }
+    }
+    assert!(!wal.exists(), "snapshot fixture starts without a WAL");
+    assert!(
+        !shm.exists(),
+        "snapshot fixture starts without shared memory"
+    );
 
     let tape_id = "fixture-1";
     let tape = tapes.join(format!("{tape_id}.jsonl.zst"));
@@ -3099,6 +3111,36 @@ fn command_peer_runs_real_peer_serve_against_an_isolated_owner_home() {
     assert_eq!(owner.limits.get("owner_session_max_secs"), Some(&60));
     assert_eq!(owner.limits.get("owner_idle_timeout_secs"), Some(&7));
 
+    let writer = SqliteIndex::open_writer(db.to_str().expect("UTF-8 DB path"))
+        .expect("open concurrent writer after owner snapshot");
+    writer
+        .insert_dispatch_link(
+            tape_id,
+            &DispatchLink {
+                uuid: "visible-after-owner-exit".into(),
+                first_turn_index: 9,
+                direction: DispatchDirection::Sent,
+            },
+        )
+        .expect("commit concurrent row while peer session stays open");
+    drop(writer);
+    let pinned_rows = owner
+        .round(
+            &[PeerRequest::new(
+                "dispatch_rows",
+                vec!["default".into()],
+                json!({"by_tape":[tape_id]}),
+            )],
+            Duration::from_secs(5),
+        )
+        .pop()
+        .expect("dispatch rows outcome")
+        .expect("read from pinned owner snapshot");
+    assert!(
+        pinned_rows.data.is_empty(),
+        "an open owner query must retain the pre-writer snapshot"
+    );
+
     let mut outcomes = owner.round(
         &[PeerRequest::new(
             "locate_tapes",
@@ -3124,6 +3166,31 @@ fn command_peer_runs_real_peer_serve_against_an_isolated_owner_home() {
     assert_eq!(
         owner.exports["default"].as_ref().unwrap().db,
         db.to_str().expect("UTF-8 DB path")
+    );
+    drop(owner);
+
+    let checkpoint = rusqlite::Connection::open(&db)
+        .expect("open checkpoint connection after peer exit")
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .expect("checkpoint after caller drops remote owner");
+    assert_eq!(
+        checkpoint.0, 0,
+        "caller cancellation/exit must release the owner's read transaction"
+    );
+    let fresh = SqliteIndex::open_reader(db.to_str().expect("UTF-8 DB path"))
+        .expect("fresh snapshot after peer exit");
+    assert_eq!(
+        fresh
+            .dispatch_links_for_uuid("visible-after-owner-exit")
+            .expect("fresh dispatch rows")[0]
+            .uuid,
+        "visible-after-owner-exit"
     );
 }
 
