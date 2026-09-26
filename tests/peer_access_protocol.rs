@@ -3080,6 +3080,9 @@ fn command_peer_runs_real_peer_serve_against_an_isolated_owner_home() {
     let tape_id = "fixture-1";
     let tape = tapes.join(format!("{tape_id}.jsonl.zst"));
     std::fs::write(&tape, b"compressed fixture placeholder").expect("tape fixture");
+    let large_tape = tapes.join("large-fixture.jsonl.zst");
+    let large_file_bytes = 32 * 1024 * 1024;
+    std::fs::write(&large_tape, vec![b'x'; large_file_bytes]).expect("large read fixture");
     std::fs::write(
         engram_home.join("topology.yml"),
         format!(
@@ -3106,6 +3109,17 @@ fn command_peer_runs_real_peer_serve_against_an_isolated_owner_home() {
 
     let mut owner = RemoteOwner::connect("emulated-owner", "caller", &peer, Duration::from_secs(5))
         .expect("real peer handshake");
+    let large_tape_path = large_tape.to_str().expect("UTF-8 large tape path");
+    let large_read_request = || {
+        PeerRequest::new(
+            "read_file",
+            vec!["default".into()],
+            json!({
+                "address":{"machine":"emulated-owner","path":large_tape_path,"kind":"tape"},
+                "max_bytes":large_file_bytes,
+            }),
+        )
+    };
     assert!(owner.exports["default"].is_ok());
     assert_eq!(owner.limits.get("request_timeout_ms"), Some(&1_234));
     assert_eq!(owner.limits.get("owner_session_max_secs"), Some(&60));
@@ -3231,17 +3245,10 @@ fn command_peer_runs_real_peer_serve_against_an_isolated_owner_home() {
     );
     let started = Instant::now();
     let deadline_error = deadline_owner
-        .round(
-            &[PeerRequest::new(
-                "dispatch_rows",
-                vec!["default".into()],
-                json!({"by_tape":[tape_id]}),
-            )],
-            Duration::ZERO,
-        )
+        .round(&[large_read_request()], Duration::from_millis(1))
         .pop()
         .expect("deadline outcome")
-        .expect_err("expired deadline must abort the owner session");
+        .expect_err("in-flight read_file deadline must abort the owner session");
     assert_eq!(deadline_error.code, "timeout");
     drop(deadline_owner);
     assert!(
@@ -3285,23 +3292,40 @@ fn command_peer_runs_real_peer_serve_against_an_isolated_owner_home() {
             .all(|row| row["uuid"] != "visible-after-cancel"),
         "cancellable owner must retain the pre-writer snapshot"
     );
-    let cancelled = std::sync::atomic::AtomicBool::new(true);
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let request_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let caller_cancel = std::sync::Arc::clone(&cancelled);
+    let signal_request_started = std::sync::Arc::clone(&request_started);
+    let cancellation_request = large_read_request();
     let started = Instant::now();
-    let cancellation_error = cancelled_owner
-        .round_cancellable(
-            &[PeerRequest::new(
-                "dispatch_rows",
-                vec!["default".into()],
-                json!({"by_tape":[tape_id]}),
-            )],
-            Duration::from_secs(5),
-            &cancelled,
-        )
-        .pop()
-        .expect("cancellation outcome")
-        .expect_err("caller cancellation must abort the owner session");
+    let cancel_waiter = std::thread::spawn(move || {
+        signal_request_started.store(true, std::sync::atomic::Ordering::SeqCst);
+        let result = cancelled_owner
+            .round_cancellable(
+                &[cancellation_request],
+                Duration::from_secs(5),
+                &caller_cancel,
+            )
+            .pop()
+            .expect("cancellation outcome");
+        drop(cancelled_owner);
+        result
+    });
+    let signal_deadline = Instant::now() + Duration::from_secs(3);
+    while !request_started.load(std::sync::atomic::Ordering::SeqCst)
+        && Instant::now() < signal_deadline
+    {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(request_started.load(std::sync::atomic::Ordering::SeqCst));
+    // The large response remains in flight while the caller cancellation arrives.
+    std::thread::sleep(Duration::from_millis(20));
+    cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+    let cancellation_error = cancel_waiter
+        .join()
+        .expect("cancelled owner request thread")
+        .expect_err("caller cancellation must abort the in-flight owner session");
     assert_eq!(cancellation_error.code, "cancelled");
-    drop(cancelled_owner);
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "caller cancellation did not release the owner within the session bound"
