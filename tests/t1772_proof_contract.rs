@@ -1,3 +1,4 @@
+// The proof harness requires Unix process, signal, and file-metadata APIs.
 #![cfg(unix)]
 
 use std::path::Path;

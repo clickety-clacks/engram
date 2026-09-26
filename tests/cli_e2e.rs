@@ -550,6 +550,8 @@ fn explain_forensics_and_agent_links_behave_as_specified() {
     assert_eq!(lineage[0]["agent_link"], true);
 }
 
+// This command-capture fixture invokes the POSIX shell at /bin/sh.
+#[cfg(unix)]
 #[test]
 fn record_command_captures_tool_events_and_exit_status() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -765,6 +767,8 @@ fn record_recovers_when_tape_file_exists_but_index_missing() {
     );
 }
 
+// This command-capture fixture invokes the POSIX shell at /bin/sh.
+#[cfg(unix)]
 #[test]
 fn record_command_captures_tool_events_and_persists_tape() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -786,6 +790,8 @@ fn record_command_captures_tool_events_and_persists_tape() {
     assert!(raw.contains("\"stdout\":\"hello\""), "raw={raw}");
 }
 
+// This failed-command fixture invokes the POSIX shell at /bin/sh.
+#[cfg(unix)]
 #[test]
 fn record_command_keeps_trace_for_failed_process() {
     let temp = tempfile::tempdir().expect("tempdir");

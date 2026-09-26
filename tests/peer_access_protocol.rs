@@ -1,3 +1,6 @@
+// Peer fixtures use POSIX shells/FIFOs and test peer serving, which Windows reports as unsupported.
+#![cfg(unix)]
+
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};

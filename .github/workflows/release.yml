@@ -209,10 +209,5 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Smoke-test local Windows commands
-        if: runner.os == 'Windows'
-        run: cargo test --locked --test windows_local_smoke -- --nocapture
-
-      - name: Verify Windows peer transport refusal
-        if: runner.os == 'Windows'
-        run: cargo test --locked --lib access::transport::tests -- --nocapture
+      - name: Run all locked tests, including the Windows local smoke
+        run: cargo test --locked --target ${{ matrix.target }}
