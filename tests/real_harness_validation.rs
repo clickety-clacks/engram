@@ -15,7 +15,16 @@ fn canonical_text(path: &Path) -> String {
 }
 
 fn repo_dash_key(path: &Path) -> String {
-    canonical_text(path).replace('/', "-")
+    let text = canonical_text(path);
+    #[cfg(windows)]
+    {
+        let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
+        text.replace('\\', "-").replace('/', "-").replace(':', "-")
+    }
+    #[cfg(not(windows))]
+    {
+        text.replace('/', "-")
+    }
 }
 
 fn repo_hash(path: &Path) -> String {
@@ -49,17 +58,14 @@ fn assert_importable_with_adapter(adapter: AdapterId, transcript_path: &Path) {
 
 fn codex_session_for_cwd(cwd: &Path) -> String {
     format!(
-        concat!(
-            "{{\"timestamp\":\"2026-02-22T00:00:00Z\",\"type\":\"session_meta\",",
-            "\"payload\":{{\"cwd\":\"{}\",\"git\":{{\"commit_hash\":\"abc123\"}}}}}}\n",
-            "{{\"timestamp\":\"2026-02-22T00:00:01Z\",\"type\":\"response_item\",",
-            "\"payload\":{{\"type\":\"function_call\",\"name\":\"exec_command\",",
-            "\"call_id\":\"call_1\",\"arguments\":\"{{\\\"cmd\\\":\\\"echo hi\\\"}}\"}}}}\n",
-            "{{\"timestamp\":\"2026-02-22T00:00:02Z\",\"type\":\"response_item\",",
-            "\"payload\":{{\"type\":\"function_call_output\",\"call_id\":\"call_1\",",
-            "\"output\":\"Process exited with code 0\\nOutput:\\nhi\"}}}}\n"
-        ),
-        cwd.to_string_lossy()
+        "{}\n{}\n{}\n",
+        serde_json::json!({
+            "timestamp": "2026-02-22T00:00:00Z",
+            "type": "session_meta",
+            "payload": {"cwd": cwd.to_string_lossy(), "git": {"commit_hash": "abc123"}}
+        }),
+        r#"{"timestamp":"2026-02-22T00:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call_1","arguments":"{\"cmd\":\"echo hi\"}"}}"#,
+        r#"{"timestamp":"2026-02-22T00:00:02Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"Process exited with code 0\nOutput:\nhi"}}"#,
     )
 }
 

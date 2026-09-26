@@ -732,6 +732,13 @@ mod tests {
     };
     use std::path::Path;
 
+    fn yaml_scalar(value: &str) -> String {
+        serde_yaml::to_string(value)
+            .expect("serialize YAML scalar")
+            .trim()
+            .to_owned()
+    }
+
     #[test]
     fn expands_tilde_paths() {
         let expanded = expand_tilde("~/sessions", Path::new("/home/tester"));
@@ -798,6 +805,7 @@ mod tests {
     #[test]
     fn supports_additional_stores_resolution() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let absolute_store = dir.path().join("nfs/team/index.sqlite");
         let home = dir.path().join("home");
         let workspace = home.join("workspace");
         std::fs::create_dir_all(workspace.join(".engram")).expect("workspace cfg dir");
@@ -809,7 +817,10 @@ mod tests {
         .expect("home config");
         std::fs::write(
             workspace.join(".engram/config.yml"),
-            "db: .engram/index.sqlite\nadditional_stores:\n  - /nfs/team/index.sqlite\n  - ../shared/engram.sqlite\n",
+            format!(
+                "db: .engram/index.sqlite\nadditional_stores:\n  - {}\n  - ../shared/engram.sqlite\n",
+                yaml_scalar(&absolute_store.to_string_lossy())
+            ),
         )
         .expect("workspace config");
 
@@ -817,10 +828,7 @@ mod tests {
         assert_eq!(cfg.db, workspace.join(".engram/index.sqlite"));
         assert_eq!(cfg.tapes_dir, workspace.join(".engram/tapes"));
         assert_eq!(cfg.additional_stores.len(), 2);
-        assert_eq!(
-            cfg.additional_stores[0],
-            Path::new("/nfs/team/index.sqlite").to_path_buf()
-        );
+        assert_eq!(cfg.additional_stores[0], absolute_store);
         assert_eq!(cfg.additional_stores[1], home.join("shared/engram.sqlite"));
     }
 
@@ -864,6 +872,8 @@ mod tests {
     fn nearest_config_wins_when_it_specifies_key() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
+        let workspace_db = root.join("workspace.sqlite");
+        let workspace_store = root.join("workspace-store.sqlite");
         let home = root.join("home");
         let workspace = home.join("workspace");
         let repo = workspace.join("repo");
@@ -877,7 +887,11 @@ mod tests {
         .expect("home config");
         std::fs::write(
             workspace.join(".engram/config.yml"),
-            "db: /tmp/workspace.sqlite\nadditional_stores:\n  - /tmp/workspace-store.sqlite\n",
+            format!(
+                "db: {}\nadditional_stores:\n  - {}\n",
+                yaml_scalar(&workspace_db.to_string_lossy()),
+                yaml_scalar(&workspace_store.to_string_lossy())
+            ),
         )
         .expect("workspace config");
         std::fs::write(repo.join(".engram/config.yml"), "additional_stores: []\n")
@@ -885,7 +899,7 @@ mod tests {
 
         let cfg = load_effective_config(&repo, &home).expect("resolved");
         assert_eq!(cfg.path, repo.join(".engram/config.yml"));
-        assert_eq!(cfg.db, Path::new("/tmp/workspace.sqlite").to_path_buf());
+        assert_eq!(cfg.db, workspace_db);
         assert_eq!(cfg.tapes_dir, repo.join(".engram/tapes"));
         assert!(cfg.additional_stores.is_empty());
     }

@@ -432,6 +432,20 @@ fn sha256_hex(input: &str) -> String {
     out
 }
 
+fn repository_path_key(path: &Path) -> String {
+    let path = canonicalize_or_normalize(path);
+    let text = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
+        text.replace('\\', "-").replace('/', "-").replace(':', "-")
+    }
+    #[cfg(not(windows))]
+    {
+        text.replace('/', "-")
+    }
+}
+
 fn read_first_matching_codex_cwd(path: &Path) -> Option<PathBuf> {
     let file = fs::File::open(path).ok()?;
     let reader = BufReader::new(file);
@@ -479,8 +493,7 @@ fn discover_codex_sessions(repo_path: &Path, home_dir: &Path) -> Vec<PathBuf> {
 }
 
 fn discover_claude_sessions(repo_path: &Path, home_dir: &Path) -> Vec<PathBuf> {
-    let repo = canonicalize_or_normalize(repo_path);
-    let key = repo.to_string_lossy().replace('/', "-");
+    let key = repository_path_key(repo_path);
     let project_root = home_dir.join(".claude").join("projects").join(key);
     if !project_root.exists() {
         return Vec::new();
@@ -539,24 +552,26 @@ fn read_matches_repo_hint(path: &Path, repo_path: &Path) -> bool {
         let Ok(row) = serde_json::from_str::<Value>(trimmed) else {
             continue;
         };
-        if value_contains_repo_path_hint(&row, &repo_text) {
+        if value_contains_repo_path_hint(&row, &repo, &repo_text) {
             return true;
         }
     }
     false
 }
 
-fn value_contains_repo_path_hint(value: &Value, repo_text: &str) -> bool {
+fn value_contains_repo_path_hint(value: &Value, repo_path: &Path, repo_text: &str) -> bool {
     match value {
         Value::String(text) => {
-            text == repo_text
+            let candidate = Path::new(text);
+            (candidate.is_absolute() && path_matches_repo_scope(candidate, repo_path))
+                || text == repo_text
                 || text.starts_with(repo_text)
                 || repo_text.starts_with(text)
                 || text.contains(repo_text)
         }
         Value::Array(items) => items
             .iter()
-            .any(|item| value_contains_repo_path_hint(item, repo_text)),
+            .any(|item| value_contains_repo_path_hint(item, repo_path, repo_text)),
         Value::Object(map) => map
             .iter()
             .filter(|(key, _)| {
@@ -566,7 +581,7 @@ fn value_contains_repo_path_hint(value: &Value, repo_text: &str) -> bool {
                     || lower.contains("workspace")
                     || lower.contains("path")
             })
-            .any(|(_, nested)| value_contains_repo_path_hint(nested, repo_text)),
+            .any(|(_, nested)| value_contains_repo_path_hint(nested, repo_path, repo_text)),
         _ => false,
     }
 }
@@ -578,7 +593,7 @@ fn discover_openclaw_sessions(repo_path: &Path, home_dir: &Path) -> Vec<PathBuf>
     }
     let repo = canonicalize_or_normalize(repo_path);
     let repo_text = repo.to_string_lossy().to_string();
-    let repo_dash = repo_text.replace('/', "-");
+    let repo_dash = repository_path_key(&repo);
     let repo_hash = sha256_hex(&repo_text);
     let mut out = Vec::new();
     for candidate in list_files_by_extension_recursive(&sessions_root, "jsonl") {
@@ -719,17 +734,61 @@ fn cursor_workspace_storage_roots(home_dir: &Path) -> Vec<PathBuf> {
     sorted_unique(roots)
 }
 
+fn percent_decode_file_uri_path(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = *bytes.get(index + 1)?;
+            let low = *bytes.get(index + 2)?;
+            let digit = |byte: u8| match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                b'A'..=b'F' => Some(byte - b'A' + 10),
+                _ => None,
+            };
+            decoded.push((digit(high)? << 4) | digit(low)?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn file_uri_path(rest: &str) -> Option<PathBuf> {
+    let decoded = percent_decode_file_uri_path(rest)?;
+    #[cfg(windows)]
+    {
+        let decoded = decoded.strip_prefix('/').unwrap_or(&decoded);
+        let bytes = decoded.as_bytes();
+        if bytes.len() < 3
+            || !bytes[0].is_ascii_alphabetic()
+            || bytes[1] != b':'
+            || !matches!(bytes[2], b'/' | b'\\')
+        {
+            return None;
+        }
+        Some(PathBuf::from(decoded.replace('/', "\\")))
+    }
+    #[cfg(not(windows))]
+    {
+        decoded.starts_with('/').then(|| PathBuf::from(decoded))
+    }
+}
+
 fn normalize_workspace_manifest_path(raw: &str) -> Option<PathBuf> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
     }
-    let without_scheme = if let Some(rest) = trimmed.strip_prefix("file://") {
-        rest
+    let candidate = if let Some(rest) = trimmed.strip_prefix("file://") {
+        file_uri_path(rest)?
     } else {
-        trimmed
+        PathBuf::from(trimmed)
     };
-    let candidate = PathBuf::from(without_scheme);
     if !candidate.is_absolute() {
         return None;
     }
@@ -1549,8 +1608,10 @@ mod tests {
         let home = temp.path().join("home");
         let repo = temp.path().join("repo");
         let other_repo = temp.path().join("other-repo");
+        let unrelated_repo = temp.path().join("unrelated-repo");
         fs::create_dir_all(&repo).expect("repo");
         fs::create_dir_all(&other_repo).expect("other repo");
+        fs::create_dir_all(&unrelated_repo).expect("unrelated repo");
         let canonical_repo = super::canonicalize_or_normalize(&repo);
         let workspace_root = home.join("Library/Application Support/Cursor/User/workspaceStorage");
         let matching_dir = workspace_root.join("aaa");
@@ -1559,12 +1620,18 @@ mod tests {
         fs::create_dir_all(&other_dir).expect("other dir");
         fs::write(
             matching_dir.join("workspace.json"),
-            format!("{{\"folder\":\"{}\"}}\n", canonical_repo.to_string_lossy()),
+            format!(
+                "{}\n",
+                serde_json::json!({"folder": canonical_repo.to_string_lossy()})
+            ),
         )
         .expect("matching workspace");
         fs::write(
             other_dir.join("workspace.json"),
-            "{\"folder\":\"/tmp/other\"}\n",
+            format!(
+                "{}\n",
+                serde_json::json!({"folder": super::canonicalize_or_normalize(&unrelated_repo).to_string_lossy()})
+            ),
         )
         .expect("other workspace");
         let state = matching_dir.join("state.vscdb");
@@ -1581,7 +1648,7 @@ mod tests {
     fn cursor_discovery_supports_file_uri_manifest_path() {
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path().join("home");
-        let repo = temp.path().join("repo");
+        let repo = temp.path().join("repo with spaces");
         let other_repo = temp.path().join("other-repo");
         fs::create_dir_all(&repo).expect("repo");
         fs::create_dir_all(&other_repo).expect("other repo");
@@ -1589,12 +1656,22 @@ mod tests {
         let workspace_dir =
             home.join("Library/Application Support/Cursor/User/workspaceStorage/abc");
         fs::create_dir_all(&workspace_dir).expect("workspace dir");
+        let repo_text = canonical_repo.to_string_lossy();
+        #[cfg(windows)]
+        let uri_path = repo_text
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&repo_text)
+            .replace('\\', "/");
+        #[cfg(not(windows))]
+        let uri_path = repo_text.to_string();
+        let uri_path = uri_path.replace(' ', "%20");
+        #[cfg(windows)]
+        let workspace_uri = format!("file:///{}", uri_path);
+        #[cfg(not(windows))]
+        let workspace_uri = format!("file://{}", uri_path);
         fs::write(
             workspace_dir.join("workspace.json"),
-            format!(
-                "{{\"workspaceUri\":\"file://{}\"}}\n",
-                canonical_repo.to_string_lossy()
-            ),
+            format!("{}\n", serde_json::json!({"workspaceUri": workspace_uri})),
         )
         .expect("workspace json");
         let state = workspace_dir.join("state.vscdb");
@@ -1612,8 +1689,10 @@ mod tests {
         let home = temp.path().join("home");
         let repo = temp.path().join("repo");
         let other_repo = temp.path().join("other-repo");
+        let unrelated_repo = temp.path().join("unrelated-repo");
         fs::create_dir_all(&repo).expect("repo");
         fs::create_dir_all(&other_repo).expect("other repo");
+        fs::create_dir_all(&unrelated_repo).expect("unrelated repo");
         let canonical_repo = super::canonicalize_or_normalize(&repo);
         let workspace_dir =
             home.join("Library/Application Support/Cursor/User/workspaceStorage/backup");
@@ -1621,8 +1700,8 @@ mod tests {
         fs::write(
             workspace_dir.join("workspace.json"),
             format!(
-                "{{\"workspacePath\":\"{}\"}}\n",
-                canonical_repo.to_string_lossy()
+                "{}\n",
+                serde_json::json!({"workspacePath": canonical_repo.to_string_lossy()})
             ),
         )
         .expect("workspace json");
@@ -1735,8 +1814,10 @@ mod tests {
         let home = temp.path().join("home");
         let repo = temp.path().join("repo");
         let other_repo = temp.path().join("other-repo");
+        let unrelated_repo = temp.path().join("unrelated-repo");
         fs::create_dir_all(&repo).expect("repo");
         fs::create_dir_all(&other_repo).expect("other repo");
+        fs::create_dir_all(&unrelated_repo).expect("unrelated repo");
         let codex_root = home.join(".codex/sessions/2026/03/10");
         fs::create_dir_all(&codex_root).expect("codex root");
         let matching = codex_root.join("matching.jsonl");
@@ -1744,14 +1825,17 @@ mod tests {
         fs::write(
             &matching,
             format!(
-                "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{}\"}}}}\n",
-                repo.to_string_lossy()
+                "{}\n",
+                serde_json::json!({"type": "session_meta", "payload": {"cwd": repo.to_string_lossy()}})
             ),
         )
         .expect("matching");
         fs::write(
             &other,
-            "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/tmp/other\"}}\n",
+            format!(
+                "{}\n",
+                serde_json::json!({"type": "session_meta", "payload": {"cwd": super::canonicalize_or_normalize(&unrelated_repo).to_string_lossy()}})
+            ),
         )
         .expect("other");
 
@@ -1800,7 +1884,7 @@ mod tests {
         fs::create_dir_all(&repo).expect("repo");
         fs::create_dir_all(&other_repo).expect("other repo");
         let canonical_repo = super::canonicalize_or_normalize(&repo);
-        let repo_dash = canonical_repo.to_string_lossy().replace('/', "-");
+        let repo_dash = super::repository_path_key(&canonical_repo);
         let sessions = home.join(".openclaw/sessions");
         let by_path = sessions.join(&repo_dash).join("a.jsonl");
         let by_content = sessions.join("misc").join("b.jsonl");
@@ -1811,8 +1895,8 @@ mod tests {
         fs::write(
             &by_content,
             format!(
-                "{{\"type\":\"meta\",\"cwd\":\"{}\"}}\n",
-                canonical_repo.to_string_lossy()
+                "{}\n",
+                serde_json::json!({"type": "meta", "cwd": repo.to_string_lossy()})
             ),
         )
         .expect("by content");
