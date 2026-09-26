@@ -6596,9 +6596,9 @@ fn run_peer_rounds_concurrently(
             let outcomes = owner.round_cancellable(&requests, timeout, cancelled);
             (owner, outcomes)
         })) {
-            Ok((owner, outcomes)) => PeerRoundResult {
+            Ok((mut owner, outcomes)) => PeerRoundResult {
                 machine,
-                owner: Some(owner),
+                owner: owner.is_connected().then_some(owner),
                 exports,
                 outcomes,
             },

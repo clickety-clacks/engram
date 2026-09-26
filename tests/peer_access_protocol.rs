@@ -402,6 +402,136 @@ fn operation_count(log_path: &std::path::Path, operation: &str) -> usize {
         .count()
 }
 
+#[cfg(unix)]
+#[test]
+fn peer_round_discards_incomplete_frames_after_one_frame_for_each_operation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let script_path = temp.path().join("drop-after-one-frame-peer.sh");
+    let script = [
+        "#!/bin/sh",
+        "set -eu",
+        "drop_op=\"$1\"",
+        "operation_log=\"$2\"",
+        "while IFS= read -r request; do",
+        r#"  id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"#,
+        r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
+        r#"  printf '%s\n' "$op" >> "$operation_log""#,
+        "  if [ \"$op\" = open ]; then",
+        "    if [ \"$drop_op\" = open ]; then",
+        r#"      printf '{"id":%s,"data":{"store":"matrix/default","status":"ok","db":"/fixture/matrix.sqlite","tape_dirs":[],"reader_mode":"live","snapshot_at":"2026-09-25T00:00:00Z"}}\n' "$id""#,
+        "      exit 0",
+        "    fi",
+        r#"    printf '{"id":%s,"data":{"store":"matrix/default","status":"ok","db":"/fixture/matrix.sqlite","tape_dirs":[],"reader_mode":"live","snapshot_at":"2026-09-25T00:00:00Z"}}\n' "$id""#,
+        r#"    printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"matrix","build":"@BUILD@","protocol":1,"schema":@SCHEMA@,"query_semantics":@SEMANTICS@,"limits":{}}}\n' "$id""#,
+        "    continue",
+        "  fi",
+        "  if [ \"$op\" = \"$drop_op\" ]; then",
+        r#"    printf '{"id":%s,"data":{"partial":true,"op":"%s"}}\n' "$id" "$op""#,
+        "    exit 0",
+        "  fi",
+        r#"  printf '{"id":%s,"data":{"completed":true,"op":"%s"}}\n' "$id" "$op""#,
+        r#"  printf '{"id":%s,"end":true,"ok":true,"stats":{"completed":true}}\n' "$id""#,
+        "done",
+    ]
+    .join("\n")
+    .replace("@BUILD@", env!("CARGO_PKG_VERSION"))
+    .replace("@SCHEMA@", &SCHEMA_VERSION.to_string())
+    .replace("@SEMANTICS@", &QUERY_SEMANTICS_VERSION.to_string());
+    std::fs::write(&script_path, script).expect("write drop-after-frame peer");
+
+    let operations = [
+        "open",
+        "lookup_anchors",
+        "lookup_edges",
+        "dispatch_rows",
+        "locate_tapes",
+        "tape_facts",
+        "grep_scan",
+        "peek_lines",
+        "read_file",
+    ];
+    for operation in operations {
+        let operation_log = temp.path().join(format!("{operation}-operations.log"));
+        let peer = TopologyPeer {
+            ssh: None,
+            command: Some(vec![
+                "/bin/sh".into(),
+                script_path.to_string_lossy().into_owned(),
+                operation.into(),
+                operation_log.to_string_lossy().into_owned(),
+            ]),
+            engram: binary.into(),
+            exports: vec!["default".into()],
+        };
+
+        if operation == "open" {
+            let error =
+                match RemoteOwner::connect("matrix", "caller", &peer, Duration::from_secs(2)) {
+                    Err(error) => error,
+                    Ok(_) => panic!("open accepted a response without its terminal frame"),
+                };
+            assert_eq!(error.code, "unavailable");
+            assert_eq!(
+                std::fs::read_to_string(&operation_log)
+                    .expect("open operation log")
+                    .lines()
+                    .collect::<Vec<_>>(),
+                vec!["open"]
+            );
+            continue;
+        }
+
+        let mut owner = RemoteOwner::connect("matrix", "caller", &peer, Duration::from_secs(2))
+            .unwrap_or_else(|error| panic!("open failed before {operation}: {error:?}"));
+        let completed_operation = if operation == "lookup_anchors" {
+            "lookup_edges"
+        } else {
+            "lookup_anchors"
+        };
+        let outcomes = owner.round(
+            &[
+                PeerRequest::new(completed_operation, vec!["default".into()], json!({})),
+                PeerRequest::new(operation, vec!["default".into()], json!({})),
+            ],
+            Duration::from_secs(2),
+        );
+        assert_eq!(outcomes.len(), 2);
+        let completed = outcomes[0].as_ref().unwrap_or_else(|error| {
+            panic!("completed operation was lost before {operation}: {error:?}")
+        });
+        assert_eq!(completed.data[0]["completed"], true);
+        assert_eq!(completed.data[0]["op"], completed_operation);
+        assert_eq!(
+            outcomes[1].as_ref().unwrap_err().code,
+            "unavailable",
+            "{operation} must fail when the peer omits its terminal frame"
+        );
+        assert!(
+            !owner.is_connected(),
+            "{operation} disconnect must retire the owner for later phases"
+        );
+        let follow_up = owner.round(
+            &[PeerRequest::new(
+                "followup_probe",
+                vec!["default".into()],
+                json!({}),
+            )],
+            Duration::from_secs(2),
+        );
+        assert_eq!(follow_up[0].as_ref().unwrap_err().code, "unavailable");
+        let expected = vec!["open", completed_operation, operation];
+        assert_eq!(
+            std::fs::read_to_string(&operation_log)
+                .expect("operation log")
+                .lines()
+                .collect::<Vec<_>>(),
+            expected,
+            "the failed owner must not receive another phase after {operation}"
+        );
+    }
+}
+
 fn write_local_grep_source(
     root: &std::path::Path,
     tape_id: &str,
@@ -733,15 +863,18 @@ fn scripted_anchor_validation_peer(
     scenario: &str,
 ) -> serde_json::Value {
     let script_path = root.join(format!("{machine}-anchor-validation-peer.sh"));
+    let operation_log = root.join(format!("{machine}-anchor-validation-operations.log"));
     let script = [
         "#!/bin/sh",
         "set -eu",
         "machine=\"$1\"",
         "scenario=\"$2\"",
+        "operation_log=\"$3\"",
         "lookup_count=0",
         "while IFS= read -r request; do",
         r#"  id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"#,
         r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
+        r#"  printf '%s\n' "$op" >> "$operation_log""#,
         "  case \"$op\" in",
         "    open)",
         r#"      printf '{"id":%s,"data":{"store":"%s/default","status":"ok","db":"/fixture/%s.sqlite","tape_dirs":[],"reader_mode":"live","snapshot_at":"2026-09-25T00:00:00Z"}}\n' "$id" "$machine" "$machine""#,
@@ -789,6 +922,10 @@ fn scripted_anchor_validation_peer(
         r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"records":1}}\n' "$id""#,
         "      ;;",
         "    lookup_edges)",
+        "      if [ \"$scenario\" = drop-edges ]; then",
+        r#"        printf '{"id":%s,"data":{"type":"edge","store":"%s/default","node":"reached-anchor","from_anchor":"reached-anchor","to_anchor":"partial-parent","confidence":0.95,"location_delta":"moved","cardinality":"1:1","agent_link":false,"note":"must be discarded before terminal success"}}\n' "$id" "$machine""#,
+        "        exit 0",
+        "      fi",
         r#"      printf '{"id":%s,"data":{"type":"node_result","store":"%s/default","node":"reached-anchor"}}\n' "$id" "$machine""#,
         r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"records":1}}\n' "$id""#,
         "      ;;",
@@ -813,7 +950,7 @@ fn scripted_anchor_validation_peer(
     .replace("@SEMANTICS@", &QUERY_SEMANTICS_VERSION.to_string());
     std::fs::write(&script_path, script).expect("write scripted anchor-validation peer");
     json!({
-        "command": ["/bin/sh", script_path, machine, scenario],
+        "command": ["/bin/sh", script_path, machine, scenario, operation_log],
         "engram": binary,
         "exports": ["default"],
     })
@@ -907,6 +1044,58 @@ fn explain_require_complete_peer_failure_precedes_no_results() {
         "require-complete did not report incomplete coverage: {stderr}"
     );
     assert!(!stderr.contains("no_results"));
+}
+
+#[test]
+fn explain_discards_interrupted_edge_and_keeps_completed_anchor_evidence() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "interrupted-edge-caller",
+        "{\"t\":\"2026-09-25T10:00:00Z\",\"k\":\"note\",\"content\":\"empty\"}\n",
+    );
+    let peer = scripted_anchor_validation_peer(temp.path(), "broken", binary, "drop-edges");
+    set_peer_topology(&caller_home, json!({"broken": peer}));
+
+    let output = run_anchor_validation_explain(binary, &caller_home, &repo, "broken", false);
+    assert!(
+        output.status.success(),
+        "completed anchor evidence should remain useful: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("explain JSON");
+    assert_eq!(result["federation"]["coverage"], "partial");
+    assert!(
+        result["lineage"].as_array().unwrap().is_empty(),
+        "edge data without a terminal success frame must be discarded: {result:#}"
+    );
+    let completed_session = result["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["store"] == "broken/default")
+        .expect("completed direct anchor result remains attributed");
+    assert_eq!(completed_session["tape_id"], "broken-tape");
+    assert!(completed_session["tape_facts"].is_null());
+
+    let source = result["federation"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["store"] == "broken/default")
+        .expect("failed source entry");
+    assert_eq!(source["status"], "failed");
+    assert_eq!(source["phase"], "lookup_edges");
+    assert_eq!(source["error"]["code"], "unavailable");
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("broken-anchor-validation-operations.log"))
+            .expect("peer operation log")
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["open", "lookup_anchors", "lookup_edges"],
+        "a peer that dropped its response must not receive later operations"
+    );
 }
 
 #[test]

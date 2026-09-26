@@ -1,12 +1,8 @@
 # Engram
 
-**How did we get here?**
+Engram records agent work in immutable tape files and builds a local SQLite index from them. Use `explain` to find conversations linked to code or text, `grep` to search conversation text, and `peek` to read a session.
 
-*An automatically built index into why things are the way they are.*
-
-Your code started as a conversation. Every agent reasoning through a problem, every handoff, every rationale spoken aloud leaves a trail. Engram fingerprints and indexes that trail so you can recover why a system ended up the way it did.
-
-Engram answers one question: **why does this exist?**
+Each machine keeps its own SQLite database and tapes. Engram has no central index and starts no listening service. Search and read commands stay local unless you select peers with `--peers` or select one remote export with `--store`. For a remote request, Engram uses SSH to start one temporary `peer-serve` process on each selected owner.
 
 Licensed under the Apache License, Version 2.0.
 
@@ -18,9 +14,10 @@ It stores immutable tapes and indexes their fingerprints in SQLite so a query on
 
 Core model:
 - Tapes are immutable files.
-- The DB is derived from tapes and can be rebuilt.
-- Ingest/fingerprint are local contribution commands.
-- Explain is global retrieval over the resolved DB plus optional additional stores.
+- Engram builds the SQLite index from tapes, so you can rebuild it.
+- `ingest` writes local tapes and index rows. `fingerprint` indexes tapes that already exist locally.
+- `explain` and `grep` use resolved local stores unless you pass `--peers`.
+- `show` and `peek` read one remote export when you pass `--store <machine/export>`.
 
 ## 2. How you use it
 
@@ -43,14 +40,15 @@ engram explain src/auth.rs:40-78
 engram watch
 ```
 
-`engram watch` monitors directories listed under the `watch:` key in config.yml, runs ingest on each new or changed file that matches the configured pattern and optional glob filter, and logs activity to `watch.log`. This is the recommended integration pattern.
+`engram watch` monitors directories listed under the `watch:` key in config.yml, runs ingest on each new or changed file that matches the configured pattern and optional glob filter, and logs activity to the configured log path. This is the recommended integration pattern.
 
 ### How commands work
 
 - `engram ingest [PATH...]`: discovers transcript files, converts recognized logs into tapes, and fingerprints those tapes into the resolved DB.
 - `engram watch`: long-running file watcher. Reads `watch.sources` from the resolved config.yml, watches those directories for new/changed files, debounces, and runs ingest on each file matching the source pattern and optional glob. Requires a `watch:` section in config.
 - `engram fingerprint`: indexes existing `./.engram/tapes/*.jsonl.zst` into the resolved DB (no transcript parsing, no tape creation).
-- `engram explain <file>:<start>-<end>`: computes anchors for the selected span, queries the resolved DB, follows lineage and dispatch-marker links, and returns evidence sessions/windows.
+- `engram explain <file>:<start>-<end>`: computes anchors for the selected span, searches resolved local stores, follows lineage and dispatch-marker links, and returns evidence sessions/windows. Add `--peers <name[,name]>` to search selected owners too.
+- `engram grep <pattern>`, `engram peek <session>`, and `engram show <tape-id>`: search conversation text, read a session, or read a tape. Pass `--peers <name[,name]>` to `grep` or `show` when you want to search selected peers. Pass `--store <machine/export>` to `peek` or `show` when you want one remote export.
 
 Dispatch markers are traversed during normal explain:
 
@@ -58,23 +56,23 @@ Dispatch markers are traversed during normal explain:
 <engram-src id="f47ac10b-58cc-4372-a567-0e02b2c3d479"/>
 ```
 
-There is no separate `--dispatch` explain mode.
+`explain` follows dispatch markers automatically. It has no separate `--dispatch` mode.
 
 ## 3. How you configure it
 
 ### Config resolution
 
-Engram walks up the directory tree from the current working directory, collecting `.engram/config.yml` files from the nearest directory up through `~/.engram/config.yml`. Config values inherit per key across that chain: the nearest config that sets a given key wins, and missing keys fall through to parent configs. If the current working directory is outside `HOME`, Engram skips the walk-up chain and uses `~/.engram/config.yml` directly.
+Engram starts in the current directory and reads `.engram/config.yml` files up to `~/.engram/config.yml`. For each key, the closest file that sets it wins. Other keys inherit from parent files. If the current directory is outside `HOME`, Engram reads only `~/.engram/config.yml`.
 
-On first invocation, Engram auto-creates `~/.engram/config.yml` if missing.
+The first command that loads local configuration creates `~/.engram/config.yml` if it does not exist.
 
-Every command prints the resolved config path and DB path before command output.
+Commands that load the local store print the resolved config path and database path to stderr.
 
-### Repo-level vs global config
+`config.yml` sets local database and tape paths. Peer settings live separately in the home-only `~/.engram/topology.yml`; Engram does not read peer settings from a repository. Search and read commands do not start configured peers unless you pass `--peers` or select one export with `--store`. Run `engram topology status` to check peer connections.
 
-Use two levels of config:
+### Local and global config
 
-**Global** (`~/.engram/config.yml`) — sets `db` and `additional_stores`:
+Put shared database settings in `~/.engram/config.yml`:
 
 ```yaml
 db: ~/.engram/index.sqlite
@@ -82,19 +80,19 @@ additional_stores:
   - /nfs/team/engram/index.sqlite
 ```
 
-**Repo-level** (`.engram/config.yml` in your repo root) — sets `tapes_dir` so tapes travel with the repo:
+Put a repository's tape directory in its `.engram/config.yml`:
 
 ```yaml
 tapes_dir: .engram/tapes
 ```
 
-Do not set `db:` or `additional_stores:` in repo-level configs. Let those walk up to the global config.
+Keep `db` and `additional_stores` out of repository config files. Engram inherits those values from the global config.
 
 ### Field reference
 
 - `db`: primary SQLite store this directory writes to and reads from.
 - `tapes_dir`: where tapes are stored. Relative paths resolve from the config file's parent directory.
-- `additional_stores`: extra read-only stores queried by `engram explain` (fan-out + dedupe).
+- `additional_stores`: extra local read-only databases included in local queries.
 
 ### Watch config
 
@@ -119,7 +117,76 @@ Each source entry:
 - `glob`: optional glob matched against each changed path relative to `path`.
   When omitted, existing `pattern`-only behavior is unchanged.
 
-## 4. How you install it
+## 4. Query peers across machines
+
+The owner keeps its SQLite database and tape files. The caller never opens those files. Instead, it uses SSH to start the owner's Engram binary and sends requests over standard input and output. The temporary `peer-serve --stdio` process reads only the exports that the owner declares in `~/.engram/topology.yml`. It exits when the caller closes the SSH stream or when the owner's idle or session limit expires. Engram does not copy an index or run a central service.
+
+Put this file on an owner to export only its default store:
+
+```yaml
+# /home/alex/.engram/topology.yml on build-host
+version: 1
+self: build-host
+exports:
+  default:
+    db: /home/alex/.engram/index.sqlite
+    tape_dirs:
+      - /home/alex/.engram/tapes
+```
+
+Put this peer entry in the caller's `/home/sam/.engram/topology.yml`:
+
+```yaml
+version: 1
+self: laptop-a
+peers:
+  build-host:
+    ssh: sam@build-host
+    engram: /usr/local/bin/engram
+    exports: [default]
+```
+
+Set `ssh` to a host or alias accepted by your SSH configuration. Set `engram` to the absolute path of the owner's binary. The owner exposes only stores listed under `exports`. This example exposes only `default`.
+
+A peer name in topology does not select that peer for a query. Agents and scripts choose peers for each request:
+
+```bash
+engram explain src/auth.rs:40-55 --peers build-host
+engram grep "token refresh" --peers build-host
+engram show TAPE_ID --peers build-host
+engram show TAPE_ID --store build-host/default
+engram peek SESSION_ID --store build-host/default
+```
+
+Omit `--peers` and `--store` to query the local stores. The CLI does not add configured peers automatically. Pass only the peer names needed for the current task. Use `--store` on `show` or `peek` when you know which single remote export holds the tape.
+
+Check the peer handshake with:
+
+```bash
+engram topology status --peers build-host
+```
+
+The command reports whether each selected peer answered and whether its protocol, schema, and query semantics match. Without `--peers`, it checks every configured peer. It does not tell you whether a watcher has indexed the newest transcript. Add `--check-exports` to count indexed tapes in this machine's declared exports that have no file in their tape directories; this also checks every configured peer unless you select peers explicitly.
+
+When a selected peer fails, `explain`, `grep`, and `show --peers` keep results from sources that completed and report `federation.coverage: "partial"`. The matching entry in `federation.sources` names the machine and store, the failed phase, and a typed error code such as `timeout` or `incompatible`. For example, a connection timeout appears with phase `open`. The entry also carries the observed error message. Use the phase and typed code as the concise reason; the free-form message comes from the peer and may include local details. Add `--require-complete` to federated `explain`, `grep`, or `show --peers` when a failed source or incomplete conclusion should make the command exit nonzero. `show --store` and `peek --store` read one selected export and report a read failure as an error.
+
+Here is a two-sided handoff. An agent on `laptop-a` sends a task to an agent on `build-host` and records this marker in the dispatch arguments:
+
+```text
+<engram-src id="8dfcc36a-75a0-4d18-9e50-8da567e0a44d"/>
+```
+
+The delivered prompt and receiving transcript on `build-host` carry the same marker. The receiving agent edits `src/auth.rs` on `build-host`. After the edit is available in the querying checkout and each machine has run `engram ingest`, query the edited span from `laptop-a`:
+
+```bash
+engram explain src/auth.rs:40-55 --peers build-host
+```
+
+The result can show the edit at `build-host/default` and follow the received marker back to the sender in `laptop-a`'s local store. Engram reports the hop only when it finds the receiver's `received` marker and one independent sender's `sent` marker in the selected stores. If it cannot find both occurrences, it does not invent a handoff. If a selected peer fails, the source coverage is partial.
+
+`show` reads the selected tape's bytes from its owner and verifies the digest on the caller. `explain` and `grep` request derived facts. `peek` requests selected lines. These commands do not copy the remote database or tape collection.
+
+## 5. How you install it
 
 Build from source:
 
@@ -144,95 +211,31 @@ engram --help
 
 `engram init` is optional: it creates `./.engram/config.yml` with `db: .engram/index.sqlite` and local store directories.
 
-## 5. How you link multi-step work together
+## 6. How you link multi-step work together
 
-Include the same marker in handoff content across sessions:
+The sending integration must record a dispatch marker, and the receiving transcript must retain the same marker:
 
 ```text
 <engram-src id="f47ac10b-58cc-4372-a567-0e02b2c3d479"/>
 ```
 
-Human model:
+The handoff works like this:
 1. One conversation sends work with marker `X`.
 2. A later conversation receives marker `X` and edits code.
 3. Another follow-up continues with marker `X`.
 4. `engram explain` on touched code follows dispatch links upstream and returns the causal chain.
 
-This marker pattern is an integration example, not Engram core behavior.
+Engram indexes and follows markers that appear in transcripts. The sending integration must add the marker; Engram does not create the handoff.
 
-## 6. Regression Testing
+## 7. Regression testing
 
-Run the dedicated regression suite that guards explain anchor granularity, scaled performance, config walk-up behavior, and additional-store window resolution:
+Run the regression suite for explain anchors, performance, config lookup, and additional-store window resolution:
 
 ```bash
 cargo test --test regression_suite
 ```
 
-## 7. Usage Metrics & Tuning Defaults
-
-These metrics are for local tuning and evaluation. They are not part of Engram's user-facing provenance model.
-
-Engram logs minimal per-call metrics to `~/.engram/metrics.jsonl` so you can tune default window sizes from real usage data.
-
-### For agents: auto-tuning defaults
-
-An agent can periodically analyze the metrics log and update `config.yml` defaults. Here's the pattern:
-
-```bash
-# Check if default window is too small (agents immediately re-requesting more)
-cat ~/.engram/metrics.jsonl | python3 -c "
-import sys, json
-from collections import defaultdict
-
-calls = [json.loads(l) for l in sys.stdin if l.strip()]
-peeks = [c for c in calls if c['command'] == 'peek' and c['session_id']]
-
-# Group peeks by session_id, sorted by timestamp
-by_session = defaultdict(list)
-for p in peeks:
-    by_session[p['session_id']].append(p)
-
-# Count sessions where agent made 2+ sequential peeks (expanding window)
-sequential = 0
-for sid, ps in by_session.items():
-    ps.sort(key=lambda x: x['ts'])
-    for i in range(1, len(ps)):
-        if ps[i]['window_start'] == ps[i-1]['window_start'] + ps[i-1]['window_lines']:
-            sequential += 1
-            break
-
-total = len(by_session)
-if total > 0:
-    pct = sequential / total * 100
-    print(f'{sequential}/{total} sessions ({pct:.0f}%) had sequential window expansion')
-    if pct > 50:
-        print('Recommendation: increase peek.default_lines in config.yml')
-    else:
-        print('Current default window size looks adequate')
-"
-```
-
-### Config defaults to tune
-
-```yaml
-peek:
-  default_lines: 40    # increase if agents frequently expand
-  default_before: 30   # lines before anchor point
-  default_after: 10    # lines after anchor point
-  grep_context: 5      # lines around grep matches in peek
-
-explain:
-  default_limit: 10    # sessions per query
-```
-
-### Disabling metrics
-
-```yaml
-metrics:
-  enabled: false
-```
-
-## Specs
+## 8. Project specifications
 
 - Core event contract: `specs/core/event-contract.md`
 - Dispatch marker: `specs/core/dispatch-marker.md`

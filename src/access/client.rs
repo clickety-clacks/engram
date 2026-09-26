@@ -358,6 +358,10 @@ impl RemoteOwner {
         self.client.round_cancellable(requests, timeout, cancelled)
     }
 
+    pub fn is_connected(&mut self) -> bool {
+        self.client.is_connected()
+    }
+
     pub fn stderr_text(&self) -> String {
         self.client.stderr_text()
     }
@@ -485,6 +489,10 @@ impl PeerClient {
         self.round_inner(requests, timeout, Some(cancelled))
     }
 
+    fn is_connected(&mut self) -> bool {
+        self.input.is_some() && self.child.try_wait().is_ok_and(|status| status.is_none())
+    }
+
     fn round_inner(
         &mut self,
         requests: &[PeerRequest],
@@ -565,6 +573,7 @@ impl PeerClient {
         let mut outcomes = HashMap::<u64, Result<PeerResponse, PeerFailure>>::new();
         let mut file_response_bytes = HashMap::<u64, usize>::new();
         let mut abort_for_local_budget = false;
+        let mut abort_for_disconnect = false;
         while !pending.is_empty() {
             if let Some(cancelled) = cancelled
                 && cancelled.load(std::sync::atomic::Ordering::SeqCst)
@@ -678,6 +687,7 @@ impl PeerClient {
                     }
                 }
                 Ok(ReaderMessage::Eof) => {
+                    abort_for_disconnect = true;
                     let detail = self.stderr_text();
                     let message = if detail.is_empty() {
                         "peer closed stdout before completing the round".to_string()
@@ -700,6 +710,7 @@ impl PeerClient {
                     }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
+                    abort_for_disconnect = true;
                     fail_pending(
                         &mut pending,
                         &mut outcomes,
@@ -711,6 +722,7 @@ impl PeerClient {
         }
 
         let abort = abort_for_local_budget
+            || abort_for_disconnect
             || outcomes.values().any(|outcome| {
                 matches!(
                     outcome,
