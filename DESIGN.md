@@ -4,12 +4,12 @@
 
 These are hard constraints. Everything else in this document follows from them.
 
-1. **Tapes are just files.** No central authority, no accounts, no servers. A tape is a zstd-compressed JSONL file. Point Engram at folders of tapes, it indexes them.
+1. **Each machine owns its data.** Tapes and the SQLite index stay on the machine that collects them. Queries use local stores by default. When a caller explicitly selects a peer, Engram starts a temporary owner process over SSH; there is no central index or persistent listener. A tape remains an immutable zstd-compressed JSONL file.
 2. **Fingerprints are just hashes.** A fingerprint match is a fingerprint match. Engram doesn't know or care what a "project" is — cross-project connections surface automatically because the text overlaps. No one has to wire them up.
 3. **Tapes are immutable.** Once written, never modified or deleted. This enables safe merging, deduplication, and trust in provenance chains.
 4. **The index is derived.** Delete it, rebuild it from tapes. Change calibration parameters, rebuild it. The index is a cache, not a source of truth.
 5. **Provenance is additive.** Start with zero. Add repo tapes. Add orchestrator tapes. Add cross-project tapes. Each layer enriches. None is required. Some > none, always.
-6. **Scope is user-defined.** You control what Engram can see by where you run ingest and fingerprint. If you haven't processed it, Engram can't see it. Trade recall for privacy. Your choice, not Engram's.
+6. **Scope is user-defined.** You control what Engram can see by where you run ingest and fingerprint, which default stores each owner exports, and which configured peers an agent selects for a query. Queries without `--peers` or a remote `--store` stay local and work offline. Engram does not discover peers or expand query scope on its own.
 
 ## The Problem
 
@@ -71,8 +71,8 @@ No setup step is required. `engram init` is optional and creates a local
 workspace store (`./.engram/config.yml` with `db: .engram/index.sqlite`) when a
 user explicitly wants self-contained local provenance.
 
-### P7. Local-first, offline-only
-No network required. No accounts. No servers. Everything runs locally. This is a tool, not a service.
+### P7. Local-first, offline by default
+The local core works without a network connection. A query stays on the caller's machine unless the caller names peers with `--peers` or selects a remote export with `--store`. For an explicit peer query, SSH starts a temporary `peer-serve --stdio` process on each selected owner. Engram has no central index or persistent listening service.
 
 ### P8. Deterministic core
 Given the same inputs (tapes + code), Engram produces the same outputs. No randomness, no LLM interpretation in the core pipeline. Non-deterministic enrichment is allowed but must be labeled and is never required.
@@ -389,8 +389,11 @@ Fingerprint overlap is the default linking mechanism, but some handoffs need an 
 Plain-language model:
 - A sender session emits a UUID when it dispatches work.
 - A receiver session includes that UUID in incoming message content.
-- Engram ingest records where each UUID was first `received` and where it was later `sent`.
-- During `explain`, Engram walks upstream via those markers automatically as part of normal link traversal to recover parent sessions that led to the edit.
+- Ingest classifies a marker on the message surface as `received` and a marker
+  found in supported tool-call inputs as `sent`; it keeps the first occurrence.
+- During `explain`, Engram folds first occurrences across immutable append
+  segments and follows a marker only when it finds one receiver and one
+  independent sender in the selected stores.
 
 Concrete flow:
 1. Session A dispatches work and includes `<engram-src id="..."/>`.
@@ -405,8 +408,8 @@ Concrete flow:
 This contract is harness-agnostic. Engram only requires the marker text in transcript content; it does not require a specific vendor protocol.
 
 See `specs/core/dispatch-marker.md` for the full dispatch marker specification,
-including direction detection via structural nesting depth and causal preceding
-UUID traversal rules.
+including first-occurrence, append-history, ambiguity, and unresolved-link
+rules.
 
 ### Tier metadata
 
@@ -952,7 +955,11 @@ Wider scope means better recall. If Engram can see tapes from all your repos and
 
 But wider scope also means more exposure. Orchestrator tapes may contain private discussions. Cross-project tapes may reveal internal decisions about other work.
 
-Engram's answer: **you draw the line, not us.** What gets fingerprinted into the DB depends on where you run `ingest` and `fingerprint`. Anything you haven't explicitly ingested is invisible to Engram. There is no ambient discovery, no automatic expansion, no "helpful" scanning of your filesystem.
+Engram's answer: **you draw the line, not us.** What gets fingerprinted into a
+local DB depends on where you run `ingest` and `fingerprint`. A cross-machine
+query can also use only the default exports on peers that the caller selects
+for that command. Anything outside those local stores and selected exports is
+invisible to the query. There is no ambient discovery or automatic expansion.
 
 <!-- CHANGED: "Per-repo vs global config" subsection replaced with walk-up reference. -->
 ### Config and scoping
@@ -962,38 +969,65 @@ receives fingerprints and which DB is queried. By default, everything goes
 to `~/.engram/index.sqlite`. A repo or folder that needs isolation overrides
 `db:` in its local `.engram/config.yml`.
 
-Privacy boundaries are controlled by two mechanisms:
+Peer topology is separate from local `config.yml` and lives in the home-only
+`~/.engram/topology.yml`. A configured peer is not queried automatically.
+Pass `--peers <name[,name]>` for each cross-machine query. Use
+`--store <machine/export>` when a command needs one known remote export. Local
+queries do not contact peers.
+
+Privacy boundaries are controlled by:
 - **Where you run ingest/fingerprint** — only folders you explicitly process
   contribute to the DB
 - **DB isolation via config override** — sensitive work can use a separate DB
   that is never queried by default from other directories
+- **Owner exports and caller selection** — owners declare which default store
+  Engram serves, and callers name the peers needed for each query
 
 ### Privacy guarantees
 
-Engram never phones home. It never reads paths you haven't explicitly processed. It never indexes tapes it wasn't pointed at. The index is local. Tapes don't leave your machine unless you explicitly copy them.
+Engram does not phone home or discover machines. Local queries use the local
+index and tapes. An explicit peer query sends a request over SSH to a temporary
+Engram process on each selected owner. That process reads only the exports
+declared in the owner's home-only topology file. `peek` returns selected
+transcript lines; `show` transfers the selected whole tape and verifies its
+digest on the caller. Other query results contain derived evidence, not a copy
+of the database or tape collection. A selected peer failure leaves completed
+results available and reports partial coverage with the observed phase and
+reason. Do not infer a cause the connection did not report.
 
-If you share a repo that contains `.engram/tapes/`, recipients get those tapes — that's intentional (provenance travels with code). If you don't want that, exclude `.engram/` from distribution or move tapes to `~/.engram/` (home-only, never committed).
+An export limits what Engram serves through this protocol; it is not a shell
+security boundary. Anyone who can log in as the owner account may read files
+that account can access. Use a dedicated SSH key with a forced command when
+the account should serve queries without granting an interactive shell.
 
 ## Sharing Provenance
 
 ### The model
 
-Provenance sharing is file copying. No protocol. No sync service. No accounts.
+Each machine keeps its own database and tapes. For cross-machine queries, an
+owner can export its default store in `~/.engram/topology.yml`; the caller lists
+that owner as a peer in its own home-only topology file. The agent chooses the
+needed peers on each command with `--peers`. Engram asks each selected owner to
+compute results over SSH, so it does not mount or copy a remote database and
+does not build a merged index. `show` is the one query that reads a whole
+remote tape; `peek` returns only the requested lines.
 
-Want to share provenance with a collaborator? Zip the tapes. Send them. The recipient drops them in a directory, runs `engram fingerprint` in that directory. Done. The fingerprints enter their resolved DB.
-
-Want to share provenance with a repo? Commit tapes in `.engram/tapes/`. Anyone who clones the repo gets the provenance. They run `engram fingerprint` in the repo and the tapes are indexed.
+Tapes can still be copied deliberately for an offline import. That is a local
+copy-and-index workflow, not a live shared database. Do not put an SQLite DB on
+a network mount or point two machines at one writable DB.
 
 ### Additive layering
 
 Provenance layers stack:
 
-1. **Repo tapes** — baseline. What happened in this repo. Travels with `git clone`. Indexed via `engram fingerprint`.
-2. **Cross-project tapes** — enrichment. What happened in related repos. Indexed by running `ingest` or `fingerprint` in those repos.
-3. **Orchestrator tapes** — enrichment. Why things happened. Indexed by running `ingest` in the orchestrator's transcript folder.
-4. **Shared tapes** — enrichment. What collaborators did. Dropped in a folder, indexed via `engram fingerprint`.
+1. **Local tapes** — the tapes and index collected on the current machine.
+2. **Additional local stores** — explicitly configured local indexes for a query.
+3. **Selected peer stores** — default exports queried only when an agent passes their names with `--peers` or selects one with `--store`.
 
-Each layer is optional. Each adds recall. The order doesn't matter — fingerprints match regardless of when tapes were added to the index.
+Each source is optional. Results identify the contributing machine and store.
+An unselected peer is outside the query, not a failed source. If a selected
+peer cannot be reached, Engram keeps completed results and reports the observed
+failure reason with partial coverage.
 
 ### No merge conflicts
 

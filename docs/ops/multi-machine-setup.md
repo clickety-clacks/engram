@@ -29,49 +29,78 @@ engram tapes | jq '.tapes | length'
 engram explain src/store/mod.rs:1-2
 ```
 
-## 2) TARS ingest for OpenClaw transcripts (example path)
+## 2) Ingest OpenClaw transcripts on their owner
 
-Use directory-local config walk-up to point transcript folders at the shared DB.
+Keep the transcript source and Engram index on the machine where the collector
+writes them. A local watch config can point at that machine's OpenClaw directory:
 
-```bash
-mkdir -p ~/.openclaw/.engram
-cat > ~/.openclaw/.engram/config.yml <<'YAML'
-db: ~/.engram/index.sqlite
-additional_stores:
-  - /mnt/team/engram/index.sqlite
-YAML
+```yaml
+watch:
+  sources:
+    - path: /home/alex/.openclaw
+      pattern: "*.jsonl"
 ```
 
-Run ingest from the transcript root so scope is `cwd + subfolders`:
+Run `engram watch` with that local config, or ingest from the transcript root:
 
 ```bash
 cd ~/.openclaw
 engram ingest
 ```
 
-Query from any repo (walk-up resolved DB + additional stores):
+Do not point two machines at the same SQLite file or put an active SQLite index
+on NFS. Each owner reads its own database and tape files.
 
-```bash
-cd ~/src/engram
-engram explain src/store/mod.rs:1-2
+## 3) Query another machine explicitly
+
+On the owner, declare only its intended default store in the home-only
+`~/.engram/topology.yml`:
+
+```yaml
+version: 1
+self: build-host
+exports:
+  default:
+    db: /home/alex/.engram/index.sqlite
+    tape_dirs:
+      - /home/alex/.engram/tapes
 ```
 
-## 3) Optional NFS/shared-tape model
+On the caller, add a peer entry to its own `~/.engram/topology.yml`:
 
-When machines share immutable tapes, index them with `fingerprint` from that folder.
-
-```bash
-cd /mnt/engram-shared
-engram fingerprint
+```yaml
+version: 1
+self: laptop-a
+peers:
+  build-host:
+    ssh: alex@build-host
+    engram: /usr/local/bin/engram
+    exports: [default]
 ```
 
-Recommended pattern:
+The peer entry does not change default query scope. Select the peer on each
+command:
 
-1. EEZO/TARS produce local tapes via `engram ingest`.
-2. Copy or sync tape files (`.jsonl.zst`) into shared tape folders.
-3. Each machine runs `engram fingerprint` where those tapes are mounted.
-4. Keep DB files machine-local unless explicitly operating a shared SQLite path.
+```bash
+engram explain src/store/mod.rs:1-2 --peers build-host
+engram grep "token refresh" --peers build-host
+engram topology status --peers build-host
+```
 
-Notes:
-- Engram persisted state uses atomic write + fsync + rename + parent-dir fsync.
-- No `--global` mode in rev2. Scope is controlled by where commands are run and which `db` is selected by config walk-up.
+Engram uses SSH to launch a temporary `peer-serve --stdio` process on the
+owner. It does not mount or copy the remote database. Use a dedicated
+restricted SSH key with a forced command if the key should not grant an
+interactive shell; see [the multi-machine guide](../multi-machine.md).
+
+If a selected peer fails, the command keeps completed results and reports
+partial coverage with the source, failed phase, typed error, and observed
+reason. Do not guess a cause that the connection did not report. Use
+`--require-complete` with federated `explain`, `grep`, or `show --peers` when a
+failed source or incomplete conclusion should make the command exit nonzero.
+
+Keep dated local copies until their separate coverage decision is complete.
+Do not expand the default export as part of setup.
+
+Local config walk-up still chooses the database for ingest and local queries;
+there is no `--global` query mode. State-file writes use atomic replacement
+with file and parent-directory synchronization.
