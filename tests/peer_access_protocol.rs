@@ -3192,6 +3192,133 @@ fn command_peer_runs_real_peer_serve_against_an_isolated_owner_home() {
             .uuid,
         "visible-after-owner-exit"
     );
+    drop(fresh);
+
+    let mut deadline_owner =
+        RemoteOwner::connect("emulated-owner", "caller", &peer, Duration::from_secs(5))
+            .expect("real peer handshake before request deadline");
+    let writer = SqliteIndex::open_writer(db.to_str().expect("UTF-8 DB path"))
+        .expect("open writer during deadline-bound owner session");
+    writer
+        .insert_dispatch_link(
+            tape_id,
+            &DispatchLink {
+                uuid: "visible-after-deadline".into(),
+                first_turn_index: 10,
+                direction: DispatchDirection::Sent,
+            },
+        )
+        .expect("commit row behind deadline-bound reader");
+    drop(writer);
+    let pinned_rows = deadline_owner
+        .round(
+            &[PeerRequest::new(
+                "dispatch_rows",
+                vec!["default".into()],
+                json!({"by_tape":[tape_id]}),
+            )],
+            Duration::from_secs(5),
+        )
+        .pop()
+        .expect("deadline snapshot outcome")
+        .expect("deadline snapshot query");
+    assert!(pinned_rows.data.is_empty());
+    let started = Instant::now();
+    let deadline_error = deadline_owner
+        .round(
+            &[PeerRequest::new(
+                "dispatch_rows",
+                vec!["default".into()],
+                json!({"by_tape":[tape_id]}),
+            )],
+            Duration::ZERO,
+        )
+        .pop()
+        .expect("deadline outcome")
+        .expect_err("expired deadline must abort the owner session");
+    assert_eq!(deadline_error.code, "timeout");
+    drop(deadline_owner);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "deadline did not release the owner within the session bound"
+    );
+    assert_owner_transaction_released(&db, "visible-after-deadline");
+
+    let mut cancelled_owner =
+        RemoteOwner::connect("emulated-owner", "caller", &peer, Duration::from_secs(5))
+            .expect("real peer handshake before caller cancellation");
+    let writer = SqliteIndex::open_writer(db.to_str().expect("UTF-8 DB path"))
+        .expect("open writer during cancellable owner session");
+    writer
+        .insert_dispatch_link(
+            tape_id,
+            &DispatchLink {
+                uuid: "visible-after-cancel".into(),
+                first_turn_index: 11,
+                direction: DispatchDirection::Sent,
+            },
+        )
+        .expect("commit row behind cancellable reader");
+    drop(writer);
+    let pinned_rows = cancelled_owner
+        .round(
+            &[PeerRequest::new(
+                "dispatch_rows",
+                vec!["default".into()],
+                json!({"by_tape":[tape_id]}),
+            )],
+            Duration::from_secs(5),
+        )
+        .pop()
+        .expect("cancellation snapshot outcome")
+        .expect("cancellation snapshot query");
+    assert!(pinned_rows.data.is_empty());
+    let cancelled = std::sync::atomic::AtomicBool::new(true);
+    let started = Instant::now();
+    let cancellation_error = cancelled_owner
+        .round_cancellable(
+            &[PeerRequest::new(
+                "dispatch_rows",
+                vec!["default".into()],
+                json!({"by_tape":[tape_id]}),
+            )],
+            Duration::from_secs(5),
+            &cancelled,
+        )
+        .pop()
+        .expect("cancellation outcome")
+        .expect_err("caller cancellation must abort the owner session");
+    assert_eq!(cancellation_error.code, "cancelled");
+    drop(cancelled_owner);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "caller cancellation did not release the owner within the session bound"
+    );
+    assert_owner_transaction_released(&db, "visible-after-cancel");
+}
+
+fn assert_owner_transaction_released(db: &std::path::Path, uuid: &str) {
+    let checkpoint = rusqlite::Connection::open(db)
+        .expect("open checkpoint connection after owner abort")
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .expect("checkpoint after owner abort");
+    assert_eq!(checkpoint.0, 0, "owner abort must release its WAL reader");
+    let fresh = SqliteIndex::open_reader(db.to_str().expect("UTF-8 DB path"))
+        .expect("fresh snapshot after owner abort");
+    assert!(
+        fresh
+            .dispatch_links_for_uuid(uuid)
+            .expect("fresh dispatch rows")
+            .iter()
+            .any(|link| link.uuid == uuid),
+        "fresh read after owner abort must see {uuid}"
+    );
 }
 
 #[test]
