@@ -3225,6 +3225,7 @@ fn explain_peers_pipelines_negotiated_edge_chunks_and_keeps_semantic_order() {
     );
 }
 
+// macOS provides sleep at /bin/sleep; /usr/bin/sleep makes these fixtures exit immediately.
 fn write_stalled_read_file_fixture(
     root: &std::path::Path,
     request_timeout_ms: u64,
@@ -3261,7 +3262,7 @@ fn write_stalled_remote_operation_fixture(
         r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
         "  case \"$op\" in",
         "    open)",
-        "      if [ \"$blocked_operation\" = open ]; then touch \"$marker\"; exec /usr/bin/sleep 60; fi",
+        "      if [ \"$blocked_operation\" = open ]; then touch \"$marker\"; exec /bin/sleep 60; fi",
         r#"      printf '{"id":%s,"data":{"store":"silent/default","status":"ok","db":"/fixture/owner.sqlite","tape_dirs":[],"reader_mode":"live","snapshot_at":"2026-09-25T00:00:00Z"}}\n' "$id""#,
         r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"silent","build":"@BUILD@","protocol":1,"schema":@SCHEMA@,"query_semantics":@SEMANTICS@,"limits":{"read_file_compressed_bytes":268435456,"decompressed_bytes_per_tape":536870912,"request_timeout_ms":%s}}}\n' "$id" "$request_timeout_ms""#,
         "      ;;",
@@ -3269,7 +3270,7 @@ fn write_stalled_remote_operation_fixture(
         "      if [ \"$blocked_operation\" = locate_tapes ]; then",
         r#"        printf '{"id":%s,"data":{"tape_id":"fixture-tape","file":{"machine":"silent","path":"/owner/tapes/fixture-tape.jsonl.zst","kind":"tape"},"size_bytes":1}}\n' "$id""#,
         "        touch \"$marker\"",
-        "        exec /usr/bin/sleep 60",
+        "        exec /bin/sleep 60",
         "      fi",
         r#"      printf '{"id":%s,"data":{"tape_id":"fixture-tape","file":{"machine":"silent","path":"/owner/tapes/fixture-tape.jsonl.zst","kind":"tape"},"size_bytes":1}}\n' "$id""#,
         r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"located":1}}\n' "$id""#,
@@ -3278,19 +3279,19 @@ fn write_stalled_remote_operation_fixture(
         "      if [ \"$blocked_operation\" != read_file ]; then exit 78; fi",
         r#"      printf '{"id":%s,"data":{"tape_id":"fixture-tape","offset":0,"bytes_b64":"eA=="}}\n' "$id""#,
         "      touch \"$marker\"",
-        "      exec /usr/bin/sleep 60",
+        "      exec /bin/sleep 60",
         "      ;;",
         "    dispatch_rows)",
         "      if [ \"$blocked_operation\" != dispatch_rows ]; then exit 78; fi",
         r#"      printf '{"id":%s,"data":{"store":"silent/default","tape_id":"fixture-tape","direction":"received","first_turn_index":1,"uuid":"fixture-dispatch"}}\n' "$id""#,
         "      touch \"$marker\"",
-        "      exec /usr/bin/sleep 60",
+        "      exec /bin/sleep 60",
         "      ;;",
         "    peek_lines)",
         "      if [ \"$blocked_operation\" != peek_lines ]; then exit 78; fi",
         r#"      printf '{"id":%s,"data":{"tape_id":"fixture-tape","line":1,"text":"unverified partial window"}}\n' "$id""#,
         "      touch \"$marker\"",
-        "      exec /usr/bin/sleep 60",
+        "      exec /bin/sleep 60",
         "      ;;",
         "    *) exit 78 ;;",
         "  esac",
@@ -6939,7 +6940,7 @@ fn peer_open_deadline_bounds_black_hole_latency_with_scheduling_margin() {
             "self": "caller",
             "peers": {
                 "blackhole": {
-                    "command": ["/usr/bin/sleep", "60"],
+                    "command": ["/bin/sleep", "60"],
                     "engram": binary,
                     "exports": ["default"],
                 }
@@ -7728,7 +7729,7 @@ fn grep_peer_that_never_answers_is_partial_and_require_complete_fails() {
             "self": "caller",
             "peers": {
                 "silent": {
-                    "command": ["/usr/bin/sleep", "60"],
+                    "command": ["/bin/sleep", "60"],
                     "engram": binary,
                     "exports": ["default"],
                 }
