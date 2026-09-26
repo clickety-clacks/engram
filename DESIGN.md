@@ -1156,10 +1156,15 @@ Engram integrates with git but does not depend on it. For repos that use git, En
 
 Repository-local tapes can contain transcript text and tool activity. When
 `.engram/tapes/` is included in a repository or its distribution, that content
-travels with it. To keep tapes user-local, omit `.engram/tapes/` from the
-repository or distribution, or set `tapes_dir: ~/.engram/tapes` in the repo's
-`.engram/config.yml`. This setting controls where future tapes are written; it
-does not remove tapes already committed or shared.
+travels with it. To keep tapes out of distribution, omit `.engram/tapes/` from
+the repository or distribution. For checkouts within your home directory,
+Engram loads `.engram/config.yml` files from the working directory up to HOME;
+the nearest file that sets a key takes precedence, and missing keys inherit.
+Set `tapes_dir: ~/.engram/tapes` in the repository-local file to keep future
+tapes user-local. For a checkout outside HOME, the config walk-up is skipped
+and `~/.engram/config.yml` is used directly; set `tapes_dir: ~/.engram/tapes`
+there instead. Changing the output location affects future tapes only and does
+not remove tapes already committed or distributed.
 
 <!-- CHANGED: Clarified that the fingerprint DB is NOT committed. It is derived
      and lives in the system store or a location specified by config. -->
@@ -1222,9 +1227,9 @@ repo/
   .engram/
     config.yml             # optional: db override for isolation. Most repos omit this.
     tapes/
-      <hash>.jsonl.zst     # compressed trace tapes (immutable, committed)
+      <hash>.jsonl.zst     # compressed trace tapes (immutable; optionally included in repository distribution)
     sidecars/
-      <tape_id>.sidecar.jsonl  # enrichment files (immutable, committed)
+      <tape_id>.sidecar.jsonl  # enrichment files (immutable; optionally included in repository distribution)
   .engram-cache/
     cursors/               # per-harness ingest state (local, never committed)
     tmp/                   # scratch (local, never committed)
