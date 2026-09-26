@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::process::{Child, ChildStdin, ChildStdout};
+use std::process::{Child, ChildStdin, ChildStdout, ExitStatus};
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -75,6 +75,7 @@ pub struct PeerClient {
     stdout_thread: Option<JoinHandle<()>>,
     stderr_thread: Option<JoinHandle<()>>,
     stderr: Arc<Mutex<Vec<u8>>>,
+    command: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -443,7 +444,13 @@ mod base64_tests {
 
 impl PeerClient {
     pub fn spawn(peer: &TopologyPeer) -> io::Result<Self> {
-        let mut child = transport::spawn(peer)?;
+        let command = describe_peer_command(peer);
+        let mut child = transport::spawn(peer).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("could not spawn peer command {command}: {error}"),
+            )
+        })?;
         let input = child
             .stdin
             .take()
@@ -469,6 +476,7 @@ impl PeerClient {
             stdout_thread,
             stderr_thread,
             stderr: stderr_bytes,
+            command,
         })
     }
 
@@ -520,12 +528,22 @@ impl PeerClient {
         let started = Instant::now();
 
         if self.input.is_none() {
+            let operations = requests
+                .iter()
+                .map(|request| format!("`{}`", request.op))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let message = format!(
+                "cannot send operation(s) {operations}: stdin is closed for peer command {}",
+                self.command
+            );
             return requests
                 .iter()
-                .map(|_| Err(PeerFailure::new("unavailable", "peer stdin is closed")))
+                .map(|_| Err(PeerFailure::new("unavailable", message.clone())))
                 .collect();
         }
         let mut ids = Vec::with_capacity(requests.len());
+        let mut operations = HashMap::with_capacity(requests.len());
         let mut frames = Vec::with_capacity(requests.len());
         let mut file_requests = HashMap::new();
         for request in requests {
@@ -553,6 +571,7 @@ impl PeerClient {
                 }
             };
             ids.push(id);
+            operations.insert(id, request.op.clone());
             frames.push(encoded);
         }
 
@@ -565,8 +584,16 @@ impl PeerClient {
             input.flush()
         })();
         if let Err(error) = write_result {
-            let error = PeerFailure::new("unavailable", error.to_string());
-            self.abort();
+            let operation_names = ids
+                .iter()
+                .filter_map(|id| operations.get(id))
+                .map(|operation| format!("`{operation}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let message = self.failure_details(format!(
+                "could not send operation(s) {operation_names}: {error}"
+            ));
+            let error = PeerFailure::new("unavailable", message);
             return requests.iter().map(|_| Err(error.clone())).collect();
         }
 
@@ -590,11 +617,15 @@ impl PeerClient {
             }
             let remaining = timeout.saturating_sub(started.elapsed());
             if remaining.is_zero() {
+                let operation_names = pending_operation_names(&ids, &pending, &operations);
                 fail_pending(
                     &mut pending,
                     &mut outcomes,
                     "timeout",
-                    "peer request timed out",
+                    &format!(
+                        "peer command {} timed out waiting for terminal response to operation(s) {operation_names}",
+                        self.command
+                    ),
                 );
                 break;
             }
@@ -690,37 +721,51 @@ impl PeerClient {
                 }
                 Ok(ReaderMessage::Eof) => {
                     abort_for_disconnect = true;
-                    let detail = self.stderr_text();
-                    let message = if detail.is_empty() {
-                        "peer closed stdout before completing the round".to_string()
-                    } else {
-                        format!("peer closed stdout: {detail}")
-                    };
+                    let operation_names = pending_operation_names(&ids, &pending, &operations);
+                    let message = self.failure_details(format!(
+                        "peer closed stdout before sending terminal response(s) for operation(s) {operation_names}"
+                    ));
                     fail_pending(&mut pending, &mut outcomes, "unavailable", &message);
                 }
                 Ok(ReaderMessage::Error(message)) => {
-                    fail_pending(&mut pending, &mut outcomes, "protocol_error", &message);
+                    let operation_names = pending_operation_names(&ids, &pending, &operations);
+                    let details = self.failure_details(format!(
+                        "peer response reader failed during operation(s) {operation_names}: {message}"
+                    ));
+                    fail_pending(&mut pending, &mut outcomes, "protocol_error", &details);
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     if started.elapsed() >= timeout {
+                        let operation_names = pending_operation_names(&ids, &pending, &operations);
                         fail_pending(
                             &mut pending,
                             &mut outcomes,
                             "timeout",
-                            "peer request timed out",
+                            &format!(
+                                "peer command {} timed out waiting for terminal response to operation(s) {operation_names}",
+                                self.command
+                            ),
                         );
                     }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     abort_for_disconnect = true;
-                    fail_pending(
-                        &mut pending,
-                        &mut outcomes,
-                        "unavailable",
-                        "peer response reader stopped",
-                    );
+                    let operation_names = pending_operation_names(&ids, &pending, &operations);
+                    let message = self.failure_details(format!(
+                        "peer response reader stopped before terminal response(s) for operation(s) {operation_names}"
+                    ));
+                    fail_pending(&mut pending, &mut outcomes, "unavailable", &message);
                 }
             }
+        }
+
+        if !pending.is_empty() {
+            abort_for_disconnect = true;
+            let operation_names = pending_operation_names(&ids, &pending, &operations);
+            let message = self.failure_details(format!(
+                "peer command did not complete operation(s) {operation_names} with terminal responses"
+            ));
+            fail_pending(&mut pending, &mut outcomes, "unavailable", &message);
         }
 
         let abort = abort_for_local_budget
@@ -746,7 +791,11 @@ impl PeerClient {
                 outcomes.remove(&id).unwrap_or_else(|| {
                     Err(PeerFailure::new(
                         "unavailable",
-                        "peer did not complete the operation",
+                        format!(
+                            "peer command {} did not complete operation `{}` with a terminal response",
+                            self.command,
+                            operations.get(&id).map(String::as_str).unwrap_or("unknown")
+                        ),
                     ))
                 })
             })
@@ -758,6 +807,56 @@ impl PeerClient {
             .lock()
             .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
             .unwrap_or_else(|_| "peer stderr buffer is unavailable".into())
+    }
+
+    fn failure_details(&mut self, cause: impl AsRef<str>) -> String {
+        self.input.take();
+        let observed_status = self.child.try_wait();
+        self.terminate_child_process_group();
+        let (status, wait_issue) = match observed_status {
+            Ok(Some(status)) => (Some(status), None),
+            Ok(None) => match self.child.wait() {
+                Ok(status) => (Some(status), None),
+                Err(error) => (None, Some(error.to_string())),
+            },
+            Err(error) => match self.child.wait() {
+                Ok(status) => (
+                    Some(status),
+                    Some(format!("could not inspect child status: {error}")),
+                ),
+                Err(wait_error) => (
+                    None,
+                    Some(format!(
+                        "could not inspect child status: {error}; could not reap child: {wait_error}"
+                    )),
+                ),
+            },
+        };
+        if let Some(thread) = self.stdout_thread.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.stderr_thread.take() {
+            let _ = thread.join();
+        }
+        let status = status.map(exit_status_description).unwrap_or_else(|| {
+            format!(
+                "child exit status unavailable ({})",
+                wait_issue.unwrap_or_else(|| "unknown wait error".into())
+            )
+        });
+        let stderr = self.stderr_text();
+        let stderr = if stderr.is_empty() {
+            "<empty>"
+        } else {
+            &stderr
+        };
+        format!(
+            "{}; peer command {}; {}; stderr tail: {}",
+            cause.as_ref(),
+            self.command,
+            status,
+            stderr
+        )
     }
 
     fn abort(&mut self) {
@@ -785,6 +884,60 @@ impl Drop for PeerClient {
             let _ = thread.join();
         }
     }
+}
+
+fn describe_peer_command(peer: &TopologyPeer) -> String {
+    match transport::launch_spec(peer) {
+        Ok(launch) => std::iter::once(launch.program)
+            .chain(launch.args)
+            .map(|argument| format!("{argument:?}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+        Err(_) => match (&peer.command, &peer.ssh) {
+            (Some(command), _) if command.is_empty() => "empty peer command configuration".into(),
+            (Some(command), _) => command
+                .iter()
+                .map(|argument| format!("{argument:?}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            (None, Some(destination)) => {
+                format!("SSH peer {destination:?} running {:?}", peer.engram)
+            }
+            (None, None) => "unconfigured peer command".into(),
+        },
+    }
+}
+
+fn pending_operation_names(
+    ids: &[u64],
+    pending: &HashSet<u64>,
+    operations: &HashMap<u64, String>,
+) -> String {
+    let names = ids
+        .iter()
+        .filter(|id| pending.contains(id))
+        .filter_map(|id| operations.get(id))
+        .map(|operation| format!("`{operation}`"))
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        "<unknown operation>".into()
+    } else {
+        names.join(", ")
+    }
+}
+
+fn exit_status_description(status: ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return format!("terminated by signal {signal}");
+        }
+    }
+    status
+        .code()
+        .map(|code| format!("exited with code {code}"))
+        .unwrap_or_else(|| "terminated without an exit code".into())
 }
 
 #[cfg(unix)]
@@ -908,11 +1061,20 @@ fn drain_stderr(stderr: impl Read + Send + 'static, saved: Arc<Mutex<Vec<u8>>>) 
                 Ok(0) | Err(_) => return,
                 Ok(count) => count,
             };
-            if let Ok(mut saved) = saved.lock()
-                && saved.len() < MAX_STDERR_BYTES
-            {
-                let remaining = MAX_STDERR_BYTES - saved.len();
-                saved.extend_from_slice(&buffer[..count.min(remaining)]);
+            if let Ok(mut saved) = saved.lock() {
+                if count >= MAX_STDERR_BYTES {
+                    saved.clear();
+                    saved.extend_from_slice(&buffer[count - MAX_STDERR_BYTES..count]);
+                } else {
+                    let overflow = saved
+                        .len()
+                        .saturating_add(count)
+                        .saturating_sub(MAX_STDERR_BYTES);
+                    if overflow > 0 {
+                        saved.drain(..overflow);
+                    }
+                    saved.extend_from_slice(&buffer[..count]);
+                }
             }
         }
     })

@@ -634,6 +634,126 @@ fn set_peer_topology(caller_home: &std::path::Path, peers: serde_json::Value) {
     .expect("write peer topology");
 }
 
+fn run_grep_with_peer_command(root: &Path, command: Vec<String>) -> serde_json::Value {
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let (caller_home, repo) = write_local_grep_source(
+        root,
+        "peer-failure-local",
+        "{\"t\":\"2026-09-24T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-peer-process-failure local\"}\n",
+    );
+    set_peer_topology(
+        &caller_home,
+        json!({
+            "broken": {
+                "command": command,
+                "engram": binary,
+                "exports": ["default"],
+            }
+        }),
+    );
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["grep", "needle-peer-process-failure", "--peers", "broken"])
+        .output()
+        .expect("run grep with failing peer command");
+    assert!(
+        output.status.success(),
+        "partial grep should preserve its local match: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("partial grep JSON")
+}
+
+fn broken_peer_source(result: &serde_json::Value) -> &serde_json::Value {
+    result["federation"]["sources"]
+        .as_array()
+        .expect("federation source array")
+        .iter()
+        .find(|source| source["store"] == "broken/default")
+        .expect("broken peer source")
+}
+
+#[test]
+fn grep_unavailable_peer_explains_missing_command() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let missing_command = temp.path().join("missing-peer-command");
+    let result = run_grep_with_peer_command(
+        temp.path(),
+        vec![missing_command.to_string_lossy().into_owned()],
+    );
+
+    let source = broken_peer_source(&result);
+    assert_eq!(source["status"], "unavailable");
+    assert_eq!(source["error"]["code"], "unavailable");
+    let message = source["error"]["message"]
+        .as_str()
+        .expect("unavailable peer message");
+    assert!(
+        message.contains("could not spawn peer command"),
+        "{message}"
+    );
+    assert!(
+        message.contains(&missing_command.to_string_lossy().to_string()),
+        "{message}"
+    );
+    assert!(message.contains("No such file"), "{message}");
+}
+
+#[test]
+fn grep_unavailable_peer_reports_nonzero_exit_and_stderr_tail() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let result = run_grep_with_peer_command(
+        temp.path(),
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            r#"IFS= read -r request || exit 0; printf 'BEGIN-PEER-STDERR\n' >&2; i=0; while [ "$i" -lt 6000 ]; do printf '01234567' >&2; i=$((i + 1)); done; printf '\nPEER_STDERR_TAIL_SENTINEL\n' >&2; exit 23"#.into(),
+        ],
+    );
+
+    let source = broken_peer_source(&result);
+    assert_eq!(source["status"], "unavailable");
+    let message = source["error"]["message"]
+        .as_str()
+        .expect("unavailable peer message");
+    assert!(message.contains("/bin/sh"), "{message}");
+    assert!(message.contains("exited with code 23"), "{message}");
+    assert!(message.contains("stderr tail:"), "{message}");
+    let stderr_tail = message
+        .split_once("stderr tail: ")
+        .expect("stderr tail section")
+        .1;
+    assert!(stderr_tail.contains("PEER_STDERR_TAIL_SENTINEL"));
+    assert!(
+        !stderr_tail.contains("BEGIN-PEER-STDERR"),
+        "stderr retained its prefix instead of the tail"
+    );
+}
+
+#[test]
+fn grep_unavailable_peer_reports_killed_child_signal() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let result = run_grep_with_peer_command(
+        temp.path(),
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "IFS= read -r request || exit 0; kill -KILL $$".into(),
+        ],
+    );
+
+    let source = broken_peer_source(&result);
+    assert_eq!(source["status"], "unavailable");
+    let message = source["error"]["message"]
+        .as_str()
+        .expect("unavailable peer message");
+    assert!(message.contains("/bin/sh"), "{message}");
+    assert!(message.contains("terminated by signal 9"), "{message}");
+    assert!(message.contains("stderr tail:"), "{message}");
+}
+
 fn jsonl(events: &[serde_json::Value]) -> String {
     events
         .iter()
