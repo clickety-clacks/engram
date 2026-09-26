@@ -2601,7 +2601,14 @@ mod tests {
     }
 
     fn tape_address(machine: &str, path: &Path) -> Value {
-        json!({"machine": machine, "path": path, "kind": "tape"})
+        let parent = path
+            .parent()
+            .expect("tape address parent")
+            .canonicalize()
+            .expect("canonical tape address parent");
+        let filename = path.file_name().expect("tape address filename");
+        let address_path = parent.join(filename);
+        json!({"machine": machine, "path": address_path, "kind": "tape"})
     }
 
     fn configured_home() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
@@ -2789,6 +2796,60 @@ mod tests {
     }
 
     #[test]
+    fn locate_tapes_returns_a_readable_owner_issued_file_address() {
+        let (_temp, home, _db, tapes) = configured_home();
+        let tape = tapes.join("roundtrip.jsonl.zst");
+        let bytes = [0, 1, 2, 250, 255];
+        fs::write(&tape, bytes).expect("tape fixture");
+
+        let locate_output = run(
+            &home,
+            &format!(
+                "{}\n{}\n",
+                request(1, "open", &["default"], json!({})),
+                request(
+                    2,
+                    "locate_tapes",
+                    &["default"],
+                    json!({"tape_ids":["roundtrip"]})
+                )
+            ),
+        );
+        let locate_frames = locate_output
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let address = locate_frames[2]["data"]["file"].clone();
+        let canonical_tapes = tapes.canonicalize().expect("canonical tape directory");
+        let expected_path = canonical_tapes.join("roundtrip.jsonl.zst");
+        assert_eq!(
+            address["path"].as_str(),
+            expected_path.to_str(),
+            "owner-issued file address should use the canonical export path"
+        );
+
+        let read_output = run(
+            &home,
+            &format!(
+                "{}\n{}\n",
+                request(3, "open", &["default"], json!({})),
+                request(
+                    4,
+                    "read_file",
+                    &["default"],
+                    json!({"address":address,"max_bytes":bytes.len()})
+                )
+            ),
+        );
+        let read_frames = read_output
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(read_frames[2]["data"]["bytes_b64"], "AAEC+v8=");
+        assert_eq!(read_frames[3]["ok"], true);
+    }
+
+    #[test]
     fn tape_existence_is_memoized_both_when_present_and_missing() {
         let (_temp, home, _db, tapes) = configured_home();
         let present = tapes.join("present.jsonl.zst");
@@ -2885,7 +2946,11 @@ mod tests {
         let still_present: Value = serde_json::from_slice(&output).expect("present frame");
         assert_eq!(
             still_present["data"]["file"]["path"].as_str(),
-            present.to_str()
+            tapes
+                .canonicalize()
+                .expect("canonical tape directory")
+                .join("present.jsonl.zst")
+                .to_str()
         );
         assert_eq!(still_present["data"]["size_bytes"], 6);
     }

@@ -640,6 +640,15 @@ fn jsonl(events: &[serde_json::Value]) -> String {
         + "\n"
 }
 
+fn canonical_tape_address_path(path: &Path) -> PathBuf {
+    let parent = path
+        .parent()
+        .expect("tape address parent")
+        .canonicalize()
+        .expect("canonical tape address parent");
+    parent.join(path.file_name().expect("tape address filename"))
+}
+
 fn ingest_owner_test_tape(
     root: &std::path::Path,
     machine: &str,
@@ -1487,13 +1496,14 @@ fn explain_peers_attributes_remote_only_edits_to_their_physical_owner() {
         session["physical_identity"]["file"]["machine"],
         "remote-owner"
     );
+    let expected_owner_tape_path = canonical_tape_address_path(
+        &owner_home
+            .join(".engram/tapes")
+            .join(format!("{tape_id}.jsonl.zst")),
+    );
     assert_eq!(
         session["physical_identity"]["file"]["path"],
-        owner_home
-            .join(".engram/tapes")
-            .join(format!("{tape_id}.jsonl.zst"))
-            .to_str()
-            .expect("owner tape path")
+        expected_owner_tape_path.to_str().expect("owner tape path")
     );
     assert_eq!(value["federation"]["coverage"], "complete");
     assert_eq!(operation_count(&remote_operations, "lookup_edges"), 2);
@@ -3361,7 +3371,10 @@ fn command_peer_runs_real_peer_serve_against_an_isolated_owner_home() {
 
     let mut owner = RemoteOwner::connect("emulated-owner", "caller", &peer, Duration::from_secs(5))
         .expect("real peer handshake");
-    let large_tape_path = large_tape.to_str().expect("UTF-8 large tape path");
+    let canonical_large_tape = canonical_tape_address_path(&large_tape);
+    let large_tape_path = canonical_large_tape
+        .to_str()
+        .expect("UTF-8 canonical large tape path");
     let large_read_request = || {
         PeerRequest::new(
             "read_file",
@@ -3421,7 +3434,11 @@ fn command_peer_runs_real_peer_serve_against_an_isolated_owner_home() {
         .expect("locate operation succeeds");
     assert_eq!(response.data.len(), 2);
     assert_eq!(response.data[0]["tape_id"], tape_id);
-    assert_eq!(response.data[0]["file"]["path"].as_str(), tape.to_str());
+    let canonical_tape = canonical_tape_address_path(&tape);
+    assert_eq!(
+        response.data[0]["file"]["path"].as_str(),
+        canonical_tape.to_str()
+    );
     assert_eq!(
         response.data[0]["size_bytes"].as_u64(),
         Some(b"compressed fixture placeholder".len() as u64)
@@ -3847,9 +3864,10 @@ fn remote_show_reads_only_the_selected_peer_tape_and_verifies_its_digest() {
     assert!(value["path"].is_null());
     assert_eq!(value["location"]["machine"], "emulated-owner");
     assert_eq!(value["location"]["store"], "emulated-owner/default");
+    let canonical_tape = canonical_tape_address_path(&tape);
     assert_eq!(
         value["location"]["path"],
-        tape.to_str().expect("UTF-8 tape path")
+        canonical_tape.to_str().expect("UTF-8 canonical tape path")
     );
     assert_eq!(value["digest"], tape_id);
     assert_eq!(value["id_verified"], true);
@@ -4016,7 +4034,9 @@ fn remote_show_reads_only_the_selected_peer_tape_and_verifies_its_digest() {
     assert_eq!(opaque_value["id_verified"], false);
     assert_eq!(
         opaque_value["location"]["path"],
-        opaque_tape.to_str().unwrap()
+        canonical_tape_address_path(&opaque_tape)
+            .to_str()
+            .expect("UTF-8 canonical opaque tape path")
     );
 }
 
