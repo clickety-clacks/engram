@@ -1,0 +1,6 @@
+target/
+.engram-cache/
+.engram/
+scratch/
+npm/bin/engram
+npm/bin/engram.exe
