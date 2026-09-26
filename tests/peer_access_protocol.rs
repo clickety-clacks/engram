@@ -214,6 +214,98 @@ fn log_peer_operations(
     log_path
 }
 
+fn log_show_first_round_with_identity_barrier(
+    root: &std::path::Path,
+    machine: &str,
+    binary: &str,
+    peer: &mut serde_json::Value,
+) -> std::path::PathBuf {
+    let log_path = root.join(format!("{machine}-show-operations.log"));
+    let request_log_path = root.join(format!("{machine}-show-requests.jsonl"));
+    let pending_path = root.join(format!("{machine}-show-pending.jsonl"));
+    let ids_path = root.join(format!("{machine}-show-pending.ids"));
+    let responses_root = root.join(format!("{machine}-show-responses"));
+    let fifo_in = root.join(format!("{machine}-show-peer-in.fifo"));
+    let fifo_out = root.join(format!("{machine}-show-peer-out.fifo"));
+    let script_path = root.join(format!("{machine}-show-round-barrier.sh"));
+    let owner_home = peer["command"][1]
+        .as_str()
+        .expect("test owner HOME assignment")
+        .to_string();
+    let script = [
+        "#!/bin/sh",
+        "set -eu",
+        "binary=\"$1\"",
+        "log=\"$2\"",
+        "requests=\"$3\"",
+        "pending=\"$4\"",
+        "ids=\"$5\"",
+        "responses_root=\"$6\"",
+        "fifo_in=\"$7\"",
+        "fifo_out=\"$8\"",
+        "read_terminal() { expected=\"$1\"; response_file=\"$2\"; : >\"$response_file\"; while IFS= read -r response <&4; do printf '%s\\n' \"$response\" >>\"$response_file\"; response_id=$(printf '%s\\n' \"$response\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p'); if [ \"$response_id\" = \"$expected\" ]; then case \"$response\" in *'\"end\":true'*) return 0 ;; esac; fi; done; return 1; }",
+        "mkfifo \"$fifo_in\" \"$fifo_out\"",
+        "\"$binary\" peer-serve --stdio <\"$fifo_in\" >\"$fifo_out\" &",
+        "peer_pid=$!",
+        "cleanup() { kill \"$peer_pid\" 2>/dev/null || true; wait \"$peer_pid\" 2>/dev/null || true; rm -f \"$fifo_in\" \"$fifo_out\"; }",
+        "trap cleanup EXIT",
+        "exec 3>\"$fifo_in\"",
+        "exec 4<\"$fifo_out\"",
+        ": >\"$pending\"",
+        ": >\"$ids\"",
+        "pending_count=0",
+        "while IFS= read -r request; do",
+        "  op=$(printf '%s\\n' \"$request\" | sed -n 's/.*\"op\":\"\\([^\"]*\\)\".*/\\1/p')",
+        "  request_id=$(printf '%s\\n' \"$request\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')",
+        "  printf '%s\\n' \"$op\" >>\"$log\"",
+        "  printf '%s\\n' \"$request\" >>\"$requests\"",
+        "  case \"$op\" in",
+        "    open)",
+        "      printf '%s\\n' \"$request\" >&3",
+        "      read_terminal \"$request_id\" \"$responses_root.open\"",
+        "      cat \"$responses_root.open\"",
+        "      ;;",
+        "    locate_tapes|tape_facts)",
+        "      printf '%s\\n' \"$request\" >>\"$pending\"",
+        "      printf '%s\\n' \"$request_id\" >>\"$ids\"",
+        "      pending_count=$((pending_count + 1))",
+        "      if [ \"$pending_count\" -eq 2 ]; then",
+        "        cat \"$pending\" >&3",
+        "        index=0",
+        "        while IFS= read -r pending_id; do index=$((index + 1)); read_terminal \"$pending_id\" \"$responses_root.$index\"; done <\"$ids\"",
+        "        cat \"$responses_root.1\" \"$responses_root.2\"",
+        "        : >\"$pending\"",
+        "        : >\"$ids\"",
+        "        pending_count=0",
+        "      fi",
+        "      ;;",
+        "    *)",
+        "      printf '%s\\n' \"$request\" >&3",
+        "      read_terminal \"$request_id\" \"$responses_root.next\"",
+        "      cat \"$responses_root.next\"",
+        "      ;;",
+        "  esac",
+        "done",
+    ]
+    .join("\n");
+    std::fs::write(&script_path, script).expect("write show round-barrier peer");
+    peer["command"] = json!([
+        "/usr/bin/env",
+        owner_home,
+        "/bin/sh",
+        script_path,
+        binary,
+        log_path,
+        request_log_path,
+        pending_path,
+        ids_path,
+        responses_root,
+        fifo_in,
+        fifo_out,
+    ]);
+    log_path
+}
+
 fn log_peer_requests_with_chunk_barrier(
     root: &std::path::Path,
     machine: &str,
@@ -3238,18 +3330,18 @@ fn remote_show_reads_only_the_selected_peer_tape_and_verifies_its_digest() {
         "peer-serve".to_string(),
         "--stdio".to_string(),
     ];
+    let mut peer = json!({
+        "command": peer_command,
+        "engram": binary,
+        "exports": ["default"],
+    });
+    let operation_log = log_peer_operations(temp.path(), "emulated-owner", binary, &mut peer);
     std::fs::write(
         caller_engram.join("topology.yml"),
         serde_json::to_vec(&serde_json::json!({
             "version": 1,
             "self": "caller",
-            "peers": {
-                "emulated-owner": {
-                    "command": peer_command,
-                    "engram": binary,
-                    "exports": ["default"],
-                }
-            }
+            "peers": {"emulated-owner": peer}
         }))
         .expect("serialize caller topology"),
     )
@@ -3281,6 +3373,9 @@ fn remote_show_reads_only_the_selected_peer_tape_and_verifies_its_digest() {
     assert_eq!(value["id_verified"], true);
     assert_eq!(value["event_count"], 5);
     assert!(String::from_utf8_lossy(&output.stderr).contains("peers=emulated-owner"));
+    assert_eq!(operation_count(&operation_log, "locate_tapes"), 1);
+    assert_eq!(operation_count(&operation_log, "read_file"), 1);
+    assert_eq!(operation_count(&operation_log, "tape_facts"), 0);
     assert!(
         !repo.join(".engram").exists(),
         "remote query created caller store files"
@@ -3317,6 +3412,8 @@ fn remote_show_reads_only_the_selected_peer_tape_and_verifies_its_digest() {
         explicit_value["session"]["location"]["machine"],
         "emulated-owner"
     );
+    assert_eq!(operation_count(&operation_log, "peek_lines"), 1);
+    assert_eq!(operation_count(&operation_log, "dispatch_rows"), 0);
 
     let anchor_peek = Command::new(binary)
         .current_dir(&repo)
@@ -3343,6 +3440,8 @@ fn remote_show_reads_only_the_selected_peer_tape_and_verifies_its_digest() {
     assert_eq!(anchor_value["session"]["window_start"], 3);
     assert_eq!(anchor_value["session"]["window_end"], 3);
     assert_eq!(anchor_value["session"]["content"][0]["line"], 3);
+    assert_eq!(operation_count(&operation_log, "dispatch_rows"), 1);
+    assert_eq!(operation_count(&operation_log, "peek_lines"), 2);
 
     let grep_peek = Command::new(binary)
         .current_dir(&repo)
@@ -3365,6 +3464,7 @@ fn remote_show_reads_only_the_selected_peer_tape_and_verifies_its_digest() {
     let grep_value: serde_json::Value =
         serde_json::from_slice(&grep_peek.stdout).expect("grep peek JSON");
     assert_eq!(grep_value["session"]["content"][1]["line"], 3);
+    assert_eq!(operation_count(&operation_log, "peek_lines"), 3);
 
     let oversized_peek = Command::new(binary)
         .current_dir(&repo)
@@ -3448,9 +3548,11 @@ fn show_with_selected_peers_reads_and_deduplicates_matching_remote_tapes() {
     );
     let tape_id = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
     let mut alpha = write_grep_owner(temp.path(), "alpha", binary, &[(tape_id.as_str(), content)]);
-    let alpha_operations = log_peer_operations(temp.path(), "alpha", binary, &mut alpha);
+    let alpha_operations =
+        log_show_first_round_with_identity_barrier(temp.path(), "alpha", binary, &mut alpha);
     let mut beta = write_grep_owner(temp.path(), "beta", binary, &[(tape_id.as_str(), content)]);
-    let beta_operations = log_peer_operations(temp.path(), "beta", binary, &mut beta);
+    let beta_operations =
+        log_show_first_round_with_identity_barrier(temp.path(), "beta", binary, &mut beta);
     let unselected_marker = temp.path().join("show-unselected-peer-was-started");
     let unselected = json!({
         "command": ["/usr/bin/touch", unselected_marker],
@@ -3470,8 +3572,13 @@ fn show_with_selected_peers_reads_and_deduplicates_matching_remote_tapes() {
     let caller_engram = caller_home.join(".engram");
     std::fs::write(
         caller_engram.join("topology.yml"),
-        serde_json::to_vec(&json!({"version": 1, "self": "caller", "peers": peers}))
-            .expect("serialize topology"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "self": "caller",
+            "peers": peers,
+            "limits": {"total_query_deadline_ms": 1_500}
+        }))
+        .expect("serialize topology"),
     )
     .expect("write caller topology");
 
@@ -3501,6 +3608,8 @@ fn show_with_selected_peers_reads_and_deduplicates_matching_remote_tapes() {
     assert_eq!(value["federation"]["coverage"], "complete");
     assert_eq!(operation_count(&alpha_operations, "tape_facts"), 1);
     assert_eq!(operation_count(&beta_operations, "tape_facts"), 1);
+    assert_eq!(operation_count(&alpha_operations, "locate_tapes"), 1);
+    assert_eq!(operation_count(&beta_operations, "locate_tapes"), 1);
     assert_eq!(operation_count(&alpha_operations, "read_file"), 0);
     assert_eq!(operation_count(&beta_operations, "read_file"), 1);
     assert!(
@@ -6252,6 +6361,61 @@ fn peer_grep_returns_budget_exceeded_instead_of_a_truncated_page() {
         .expect("grep outcome")
         .expect_err("owner must fail the operation instead of emitting a partial page");
     assert_eq!(failure.code, "budget_exceeded");
+}
+
+#[test]
+fn grep_peer_rounds_do_not_scale_with_the_number_of_matching_tapes() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let tapes = (0..24)
+        .map(|index| {
+            (
+                format!("round-tape-{index:02}"),
+                format!(
+                    "{{\"t\":\"2026-09-25T12:{index:02}:00Z\",\"k\":\"meta\"}}\n{{\"t\":\"2026-09-25T12:{index:02}:01Z\",\"k\":\"note\",\"content\":\"needle round result {index}\"}}\n"
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let tape_refs = tapes
+        .iter()
+        .map(|(tape_id, content)| (tape_id.as_str(), content.as_str()))
+        .collect::<Vec<_>>();
+    let mut peer = write_grep_owner(temp.path(), "round-owner", binary, &tape_refs);
+    let operations = log_peer_operations(temp.path(), "round-owner", binary, &mut peer);
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "round-caller",
+        "{\"t\":\"2026-09-25T11:00:00Z\",\"k\":\"note\",\"content\":\"no remote match\"}\n",
+    );
+    std::fs::write(
+        caller_home.join(".engram/topology.yml"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "self": "caller",
+            "peers": {"round-owner": peer},
+        }))
+        .expect("serialize caller topology"),
+    )
+    .expect("write caller topology");
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["grep", "needle", "--limit", "24", "--peers", "round-owner"])
+        .output()
+        .expect("run many-tape remote grep");
+    assert!(
+        output.status.success(),
+        "many-tape grep failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("grep JSON");
+    assert_eq!(value["federation"]["coverage"], "complete");
+    assert_eq!(value["sessions"].as_array().unwrap().len(), 24);
+    assert_eq!(operation_count(&operations, "grep_scan"), 1);
+    assert_eq!(operation_count(&operations, "dispatch_rows"), 1);
+    assert_eq!(operation_count(&operations, "read_file"), 0);
 }
 
 #[test]

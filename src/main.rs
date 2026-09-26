@@ -3299,6 +3299,13 @@ fn cmd_show_peers_inner(
         connect_peers_concurrently(&selected, &topology, query_deadline, cancelled);
     let mut locate_jobs = Vec::new();
     let mut locate_batches = HashMap::<String, Vec<Vec<String>>>::new();
+    let mut digest_exports = HashMap::<String, Vec<String>>::new();
+    let possible_store_count = candidates.len()
+        + selected
+            .iter()
+            .map(|machine| topology.peers[machine].exports.len())
+            .sum::<usize>();
+    let compare_remote_digests = possible_store_count > 1;
     for machine in &selected {
         let peer = &topology.peers[machine];
         let Some(connection) = connections.remove(machine) else {
@@ -3381,13 +3388,26 @@ fn cmd_show_peers_inner(
                 .chunks(peer_item_cap(&owner))
                 .map(|batch| batch.to_vec())
                 .collect::<Vec<_>>();
-            let requests = batches
+            let mut requests = batches
                 .iter()
                 .map(|batch| {
                     PeerRequest::new("locate_tapes", batch.clone(), json!({"tape_ids":[tape_id]}))
                 })
                 .collect::<Vec<_>>();
+            let fact_exports = if compare_remote_digests {
+                available_exports.clone()
+            } else {
+                Vec::new()
+            };
+            requests.extend(fact_exports.iter().map(|export| {
+                PeerRequest::new(
+                    "tape_facts",
+                    vec![export.clone()],
+                    json!({"items":[{"tape_id":tape_id,"include_digest":true}]}),
+                )
+            }));
             locate_batches.insert(machine.clone(), batches);
+            digest_exports.insert(machine.clone(), fact_exports);
             locate_jobs.push(PeerRoundJob {
                 machine: machine.clone(),
                 owner,
@@ -3405,9 +3425,17 @@ fn cmd_show_peers_inner(
     );
     let mut remote_locators = Vec::<RemoteShowLocator>::new();
     let mut remote_owners = HashMap::<String, RemoteOwner>::new();
+    let mut remote_digest_outcomes = HashMap::<String, Result<PeerResponse, PeerFailure>>::new();
     for result in locate_results {
         let machine = result.machine;
         let batches = locate_batches.remove(&machine).unwrap_or_default();
+        let fact_exports = digest_exports.remove(&machine).unwrap_or_default();
+        let fact_offset = batches.len();
+        for (index, export) in fact_exports.iter().enumerate() {
+            if let Some(outcome) = result.outcomes.get(fact_offset + index) {
+                remote_digest_outcomes.insert(format!("{machine}/{export}"), outcome.clone());
+            }
+        }
         let Some(owner) = result.owner else {
             for export in result.exports {
                 mark_source_phase(
@@ -3576,106 +3604,30 @@ fn cmd_show_peers_inner(
     let multiple_holders = candidates.len() + remote_locators.len() > 1;
     let mut remote_digests = HashMap::<String, String>::new();
     if multiple_holders && !remote_locators.is_empty() {
-        let mut fact_groups = Vec::<(String, Vec<RemoteShowLocator>)>::new();
         for locator in &remote_locators {
-            if let Some((_, group)) = fact_groups
-                .iter_mut()
-                .find(|(machine, _)| machine == &locator.machine)
-            {
-                group.push(locator.clone());
-            } else {
-                fact_groups.push((locator.machine.clone(), vec![locator.clone()]));
-            }
-        }
-
-        let mut fact_group_locators = HashMap::<String, Vec<RemoteShowLocator>>::new();
-        let mut fact_jobs = Vec::new();
-        for (machine, locators) in fact_groups {
-            let Some(owner) = remote_owners.remove(&machine) else {
-                for locator in locators {
+            let fact_result = match remote_digest_outcomes.remove(&locator.store_ref) {
+                Some(Ok(response)) => {
+                    show_tape_facts_digest(&response, &locator.store_ref, tape_id)
+                }
+                Some(Err(failure)) => Err(peer_failure_to_cli(failure)),
+                None => Err(CliError::new(
+                    "protocol_error",
+                    "peer returned no tape_facts outcome",
+                )),
+            };
+            match fact_result {
+                Ok(digest) => {
+                    remote_digests.insert(locator.store_ref.clone(), digest);
+                }
+                Err(error) => {
                     mark_source_phase(
                         &mut source_rows,
                         &locator.store_ref,
                         "tape_facts",
-                        "unavailable",
-                        "peer connection was not retained for tape identity checks",
+                        error.code,
+                        &error.message,
                     );
-                }
-                any_source_failure = true;
-                continue;
-            };
-            let requests = locators
-                .iter()
-                .map(|locator| {
-                    let export = locator
-                        .store_ref
-                        .split_once('/')
-                        .map(|(_, export)| export)
-                        .unwrap_or_default();
-                    PeerRequest::new(
-                        "tape_facts",
-                        vec![export.to_string()],
-                        json!({
-                            "items": [{"tape_id": tape_id, "include_digest": true}],
-                        }),
-                    )
-                })
-                .collect::<Vec<_>>();
-            let exports = locators
-                .iter()
-                .filter_map(|locator| {
-                    locator
-                        .store_ref
-                        .split_once('/')
-                        .map(|(_, export)| export.to_string())
-                })
-                .collect::<Vec<_>>();
-            fact_group_locators.insert(machine.clone(), locators);
-            fact_jobs.push(PeerRoundJob {
-                machine,
-                owner,
-                exports,
-                requests,
-            });
-        }
-
-        let fact_results = run_peer_rounds_concurrently(
-            fact_jobs,
-            query_deadline,
-            cancelled,
-            configured_peer_concurrency(&topology),
-        );
-        for result in fact_results {
-            let machine = result.machine;
-            let locators = fact_group_locators.remove(&machine).unwrap_or_default();
-            if let Some(owner) = result.owner {
-                remote_owners.insert(machine.clone(), owner);
-            }
-            for (index, locator) in locators.iter().enumerate() {
-                let fact_result = match result.outcomes.get(index) {
-                    Some(Ok(response)) => {
-                        show_tape_facts_digest(response, &locator.store_ref, tape_id)
-                    }
-                    Some(Err(failure)) => Err(peer_failure_to_cli(failure.clone())),
-                    None => Err(CliError::new(
-                        "protocol_error",
-                        "peer returned no tape_facts outcome",
-                    )),
-                };
-                match fact_result {
-                    Ok(digest) => {
-                        remote_digests.insert(locator.store_ref.clone(), digest);
-                    }
-                    Err(error) => {
-                        mark_source_phase(
-                            &mut source_rows,
-                            &locator.store_ref,
-                            "tape_facts",
-                            error.code,
-                            &error.message,
-                        );
-                        any_source_failure = true;
-                    }
+                    any_source_failure = true;
                 }
             }
         }
