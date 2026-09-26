@@ -62,15 +62,20 @@ it in each query; the calling agent selects peers explicitly.
 engram topology status --peers build-host
 engram explain src/auth.rs:40-55 --peers build-host
 engram grep "token refresh" --peers build-host
+engram grep "token refresh" --peers all
 engram show TAPE_ID --store build-host/default
 engram peek SESSION_ID --store build-host/default
 ```
 
-Use only the peer set needed to answer the question. `topology status` checks
-connectivity and protocol, schema, and query-semantics compatibility. It does
-not tell you whether the owner collector has ingested its newest transcript.
-`--check-exports` reports indexed tapes that have no file in the declared tape
-directories.
+Use only the peer set needed to answer the question. `--peers all` explicitly
+selects every peer configured in `~/.engram/topology.yml` for that command; it
+does not discover machines or change the local default. `topology status`
+checks connectivity and protocol, schema, and query-semantics compatibility.
+It does not tell you whether the owner collector has ingested its newest
+transcript. `topology status --check-exports` checks this machine's own
+configured exports and reports indexed tapes that have no file in their
+declared tape directories. It does not inspect selected peers' export files;
+run that check on each owner under that owner's authorization.
 
 When a selected peer fails, `explain`, `grep`, and `show --peers` retain
 completed results and mark source coverage `partial`. The source entry names

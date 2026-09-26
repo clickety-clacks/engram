@@ -98,7 +98,9 @@ reason. Do not guess a cause that the connection did not report. Use
 `--require-complete` with federated `explain`, `grep`, or `show --peers` when a
 failed source or incomplete conclusion should make the command exit nonzero.
 
-Keep dated local copies until their separate coverage decision is complete.
+Before removing a peer or export from your configured query scope, compare its
+coverage with the sources that will remain. Changing query scope does not
+delete retained indexes or tape files.
 Do not expand the default export as part of setup.
 
 Local config walk-up still chooses the database for ingest and local queries;

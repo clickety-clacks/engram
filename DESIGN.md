@@ -971,9 +971,11 @@ to `~/.engram/index.sqlite`. A repo or folder that needs isolation overrides
 
 Peer topology is separate from local `config.yml` and lives in the home-only
 `~/.engram/topology.yml`. A configured peer is not queried automatically.
-Pass `--peers <name[,name]>` for each cross-machine query. Use
-`--store <machine/export>` when a command needs one known remote export. Local
-queries do not contact peers.
+Pass `--peers all` to select every configured peer for that command, or
+`--peers <name[,name]>` to select named peers. This is explicit per-query
+selection; it does not change the local default or discover other machines.
+Use `--store <machine/export>` when a command needs one known remote export.
+Local queries do not contact peers.
 
 Privacy boundaries are controlled by:
 - **Where you run ingest/fingerprint** — only folders you explicitly process
@@ -1147,9 +1149,17 @@ Engram integrates with git but does not depend on it. For repos that use git, En
 
 ### Folder model (in-repo)
 
-- `.engram/tapes/` — **committed** to source control. Contains immutable tapes.
+- `.engram/tapes/` — may be committed when the repository intends to share its
+  immutable tapes.
 - `.engram/config.yml` — **committed** if the repo needs config overrides (isolation, custom DB path). Most repos do not have this file.
 - `.engram-cache/` — **never committed**. Contains derived artifacts, temp files.
+
+Repository-local tapes can contain transcript text and tool activity. When
+`.engram/tapes/` is included in a repository or its distribution, that content
+travels with it. To keep tapes user-local, omit `.engram/tapes/` from the
+repository or distribution, or set `tapes_dir: ~/.engram/tapes` in the repo's
+`.engram/config.yml`. This setting controls where future tapes are written; it
+does not remove tapes already committed or shared.
 
 <!-- CHANGED: Clarified that the fingerprint DB is NOT committed. It is derived
      and lives in the system store or a location specified by config. -->
