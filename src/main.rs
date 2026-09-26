@@ -5144,6 +5144,11 @@ fn cmd_explain_with_peers_inner(
         &mut sources,
         &mut any_peer_failure,
     )?;
+    let lineage_coverage = if any_peer_failure {
+        "partial"
+    } else {
+        "complete"
+    };
 
     let mut touch_requests =
         std::collections::BTreeMap::<String, Vec<(String, PeerRequest)>>::new();
@@ -5683,6 +5688,7 @@ fn cmd_explain_with_peers_inner(
         "truncated": truncated,
         "federation": {
             "coverage": if complete { "complete" } else { "partial" },
+            "lineage_coverage": lineage_coverage,
             "sources": sources,
         },
     });

@@ -235,7 +235,33 @@ Run the regression suite for explain anchors, performance, config lookup, and ad
 cargo test --test regression_suite
 ```
 
-## 8. Project specifications
+## 8. Usage metrics and tuning defaults
+
+The default metrics path is `~/.engram/metrics.jsonl`. Metrics are for local tuning and evaluation, not query provenance. Configuration enables metrics by default, but the current CLI does not append per-call records to this file.
+
+When `peek` records are available, an agent can group them by `session_id`, sort each group by `ts`, and look for sessions that request adjacent windows. A session expanded its window when a later record has `window_start` equal to the previous record's `window_start + window_lines`. If more than half of observed sessions expand their windows, consider increasing `peek.default_lines` in `config.yml`.
+
+The defaults are:
+
+```yaml
+peek:
+  default_lines: 30
+  default_before: 30
+  default_after: 10
+  grep_context: 5
+
+explain:
+  default_limit: 10
+```
+
+Set `metrics.enabled` to `false` to disable metrics in `config.yml`:
+
+```yaml
+metrics:
+  enabled: false
+```
+
+## 9. Project specifications
 
 - Core event contract: `specs/core/event-contract.md`
 - Dispatch marker: `specs/core/dispatch-marker.md`

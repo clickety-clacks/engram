@@ -404,7 +404,7 @@ fn operation_count(log_path: &std::path::Path, operation: &str) -> usize {
 
 #[cfg(unix)]
 #[test]
-fn peer_round_discards_incomplete_frames_after_one_frame_for_each_operation() {
+fn peer_round_discards_incomplete_frames_after_one_frame_for_each_uncovered_phase() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = env!("CARGO_BIN_EXE_engram");
     let script_path = temp.path().join("drop-after-one-frame-peer.sh");
@@ -412,25 +412,27 @@ fn peer_round_discards_incomplete_frames_after_one_frame_for_each_operation() {
         "#!/bin/sh",
         "set -eu",
         "drop_op=\"$1\"",
-        "operation_log=\"$2\"",
+        "drop_occurrence=\"$2\"",
+        "operation_log=\"$3\"",
+        "drop_count=0",
         "while IFS= read -r request; do",
         r#"  id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"#,
         r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
         r#"  printf '%s\n' "$op" >> "$operation_log""#,
         "  if [ \"$op\" = open ]; then",
-        "    if [ \"$drop_op\" = open ]; then",
-        r#"      printf '{"id":%s,"data":{"store":"matrix/default","status":"ok","db":"/fixture/matrix.sqlite","tape_dirs":[],"reader_mode":"live","snapshot_at":"2026-09-25T00:00:00Z"}}\n' "$id""#,
-        "      exit 0",
-        "    fi",
         r#"    printf '{"id":%s,"data":{"store":"matrix/default","status":"ok","db":"/fixture/matrix.sqlite","tape_dirs":[],"reader_mode":"live","snapshot_at":"2026-09-25T00:00:00Z"}}\n' "$id""#,
+        "    if [ \"$drop_op\" = open ]; then exit 0; fi",
         r#"    printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"matrix","build":"@BUILD@","protocol":1,"schema":@SCHEMA@,"query_semantics":@SEMANTICS@,"limits":{}}}\n' "$id""#,
         "    continue",
         "  fi",
         "  if [ \"$op\" = \"$drop_op\" ]; then",
-        r#"    printf '{"id":%s,"data":{"partial":true,"op":"%s"}}\n' "$id" "$op""#,
-        "    exit 0",
+        "    drop_count=$((drop_count + 1))",
+        "    if [ \"$drop_count\" -eq \"$drop_occurrence\" ]; then",
+        r#"      printf '{"id":%s,"data":{"store":"matrix/default","op":"%s","partial":true}}\n' "$id" "$op""#,
+        "      exit 0",
+        "    fi",
         "  fi",
-        r#"  printf '{"id":%s,"data":{"completed":true,"op":"%s"}}\n' "$id" "$op""#,
+        r#"  printf '{"id":%s,"data":{"store":"matrix/default","op":"%s","completed":true}}\n' "$id" "$op""#,
         r#"  printf '{"id":%s,"end":true,"ok":true,"stats":{"completed":true}}\n' "$id""#,
         "done",
     ]
@@ -438,20 +440,24 @@ fn peer_round_discards_incomplete_frames_after_one_frame_for_each_operation() {
     .replace("@BUILD@", env!("CARGO_PKG_VERSION"))
     .replace("@SCHEMA@", &SCHEMA_VERSION.to_string())
     .replace("@SEMANTICS@", &QUERY_SEMANTICS_VERSION.to_string());
-    std::fs::write(&script_path, script).expect("write drop-after-frame peer");
+    std::fs::write(&script_path, script).expect("write drop-after-one-frame peer");
 
-    let operations = [
-        "open",
-        "lookup_anchors",
-        "lookup_edges",
-        "dispatch_rows",
-        "locate_tapes",
-        "tape_facts",
-        "grep_scan",
-        "peek_lines",
-        "read_file",
+    // Existing grep disconnect tests cover mid-response drops in grep_scan and
+    // dispatch_rows; this matrix fills the remaining protocol phases.
+    // This fills only open, lookup_anchors, lookup_edges, locate_tapes,
+    // tape_facts, peek_lines, and read_file. Each interrupted operation emits
+    // one data frame without its terminal frame before the connection closes.
+    let cases = [
+        ("open", "", 1),
+        ("lookup_anchors", "lookup_anchors", 2),
+        ("lookup_edges", "lookup_anchors", 1),
+        ("locate_tapes", "lookup_anchors", 1),
+        ("tape_facts", "locate_tapes", 1),
+        ("peek_lines", "tape_facts", 1),
+        ("read_file", "tape_facts", 1),
     ];
-    for operation in operations {
+
+    for (operation, completed_operation, drop_occurrence) in cases {
         let operation_log = temp.path().join(format!("{operation}-operations.log"));
         let peer = TopologyPeer {
             ssh: None,
@@ -459,6 +465,7 @@ fn peer_round_discards_incomplete_frames_after_one_frame_for_each_operation() {
                 "/bin/sh".into(),
                 script_path.to_string_lossy().into_owned(),
                 operation.into(),
+                drop_occurrence.to_string(),
                 operation_log.to_string_lossy().into_owned(),
             ]),
             engram: binary.into(),
@@ -469,7 +476,7 @@ fn peer_round_discards_incomplete_frames_after_one_frame_for_each_operation() {
             let error =
                 match RemoteOwner::connect("matrix", "caller", &peer, Duration::from_secs(2)) {
                     Err(error) => error,
-                    Ok(_) => panic!("open accepted a response without its terminal frame"),
+                    Ok(_) => panic!("open accepted a response missing its terminal frame"),
                 };
             assert_eq!(error.code, "unavailable");
             assert_eq!(
@@ -479,37 +486,90 @@ fn peer_round_discards_incomplete_frames_after_one_frame_for_each_operation() {
                     .collect::<Vec<_>>(),
                 vec!["open"]
             );
+
+            let cli_operation_log = temp.path().join("open-cli-operations.log");
+            let cli_peer = json!({
+                "command": [
+                    "/bin/sh",
+                    script_path.to_string_lossy(),
+                    "open",
+                    "1",
+                    cli_operation_log.to_string_lossy(),
+                ],
+                "engram": binary,
+                "exports": ["default"],
+            });
+            let (caller_home, repo) = write_local_grep_source(
+                temp.path(),
+                "caller-open-drop",
+                "{\"t\":\"2026-09-25T10:00:00Z\",\"k\":\"note\",\"content\":\"no matching anchor\"}\n",
+            );
+            set_peer_topology(&caller_home, json!({"matrix": cli_peer}));
+            let output = Command::new(binary)
+                .current_dir(&repo)
+                .env("HOME", &caller_home)
+                .args(["explain", "query-anchor", "--anchor", "--peers", "matrix"])
+                .output()
+                .expect("run explain with an interrupted open");
+            assert!(!output.status.success());
+            let result: serde_json::Value =
+                serde_json::from_slice(&output.stdout).expect("partial open result JSON");
+            assert_eq!(result["federation"]["coverage"], "partial");
+            assert_eq!(result["federation"]["lineage_coverage"], "partial");
+            let source = result["federation"]["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|source| source["store"] == "matrix/default")
+                .expect("open failure source");
+            assert_eq!(source["status"], "unavailable");
+            assert_eq!(source["phase"], "open");
+            assert_eq!(source["error"]["code"], "unavailable");
+            assert_eq!(
+                std::fs::read_to_string(cli_operation_log)
+                    .expect("CLI open operation log")
+                    .lines()
+                    .collect::<Vec<_>>(),
+                vec!["open"]
+            );
             continue;
         }
 
         let mut owner = RemoteOwner::connect("matrix", "caller", &peer, Duration::from_secs(2))
             .unwrap_or_else(|error| panic!("open failed before {operation}: {error:?}"));
-        let completed_operation = if operation == "lookup_anchors" {
-            "lookup_edges"
-        } else {
-            "lookup_anchors"
-        };
-        let outcomes = owner.round(
-            &[
-                PeerRequest::new(completed_operation, vec!["default".into()], json!({})),
-                PeerRequest::new(operation, vec!["default".into()], json!({})),
-            ],
+        let completed = owner.round(
+            &[PeerRequest::new(
+                completed_operation,
+                vec!["default".into()],
+                json!({}),
+            )],
             Duration::from_secs(2),
         );
-        assert_eq!(outcomes.len(), 2);
-        let completed = outcomes[0].as_ref().unwrap_or_else(|error| {
-            panic!("completed operation was lost before {operation}: {error:?}")
-        });
+        assert_eq!(completed.len(), 1);
+        let completed = completed[0]
+            .as_ref()
+            .unwrap_or_else(|error| panic!("completed phase failed before {operation}: {error:?}"));
         assert_eq!(completed.data[0]["completed"], true);
         assert_eq!(completed.data[0]["op"], completed_operation);
+        assert_eq!(completed.data[0]["store"], "matrix/default");
+
+        let interrupted = owner.round(
+            &[PeerRequest::new(
+                operation,
+                vec!["default".into()],
+                json!({}),
+            )],
+            Duration::from_secs(2),
+        );
+        assert_eq!(interrupted.len(), 1);
         assert_eq!(
-            outcomes[1].as_ref().unwrap_err().code,
+            interrupted[0].as_ref().unwrap_err().code,
             "unavailable",
-            "{operation} must fail when the peer omits its terminal frame"
+            "{operation} must discard data without its terminal frame"
         );
         assert!(
             !owner.is_connected(),
-            "{operation} disconnect must retire the owner for later phases"
+            "a disconnect during {operation} must retire that owner"
         );
         let follow_up = owner.round(
             &[PeerRequest::new(
@@ -520,14 +580,15 @@ fn peer_round_discards_incomplete_frames_after_one_frame_for_each_operation() {
             Duration::from_secs(2),
         );
         assert_eq!(follow_up[0].as_ref().unwrap_err().code, "unavailable");
+
         let expected = vec!["open", completed_operation, operation];
         assert_eq!(
             std::fs::read_to_string(&operation_log)
-                .expect("operation log")
+                .expect("peer operation log")
                 .lines()
                 .collect::<Vec<_>>(),
             expected,
-            "the failed owner must not receive another phase after {operation}"
+            "the owner must receive no operation after its interrupted {operation}"
         );
     }
 }
@@ -978,6 +1039,60 @@ fn run_anchor_validation_explain(
 }
 
 #[test]
+fn explain_discards_interrupted_edge_and_keeps_attributed_anchor_with_partial_lineage_coverage() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "interrupted-edge-caller",
+        "{\"t\":\"2026-09-25T10:00:00Z\",\"k\":\"note\",\"content\":\"empty\"}\n",
+    );
+    let peer = scripted_anchor_validation_peer(temp.path(), "broken", binary, "drop-edges");
+    set_peer_topology(&caller_home, json!({"broken": peer}));
+
+    let output = run_anchor_validation_explain(binary, &caller_home, &repo, "broken", false);
+    assert!(
+        output.status.success(),
+        "completed anchor evidence should remain useful: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("explain JSON");
+    assert_eq!(result["federation"]["coverage"], "partial");
+    assert_eq!(result["federation"]["lineage_coverage"], "partial");
+    assert!(
+        result["lineage"].as_array().unwrap().is_empty(),
+        "edge data without a terminal success frame must be discarded: {result:#}"
+    );
+    let completed_session = result["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["store"] == "broken/default")
+        .expect("completed direct anchor result remains attributed");
+    assert_eq!(completed_session["store"], "broken/default");
+    assert_eq!(completed_session["tape_id"], "broken-tape");
+    assert!(completed_session["tape_facts"].is_null());
+
+    let source = result["federation"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["store"] == "broken/default")
+        .expect("failed source entry");
+    assert_eq!(source["status"], "failed");
+    assert_eq!(source["phase"], "lookup_edges");
+    assert_eq!(source["error"]["code"], "unavailable");
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("broken-anchor-validation-operations.log"))
+            .expect("peer operation log")
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["open", "lookup_anchors", "lookup_edges"],
+        "a peer that dropped its response must not receive later operations"
+    );
+}
+
+#[test]
 fn explain_peer_failure_without_local_matches_emits_partial_sources() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = env!("CARGO_BIN_EXE_engram");
@@ -1044,58 +1159,6 @@ fn explain_require_complete_peer_failure_precedes_no_results() {
         "require-complete did not report incomplete coverage: {stderr}"
     );
     assert!(!stderr.contains("no_results"));
-}
-
-#[test]
-fn explain_discards_interrupted_edge_and_keeps_completed_anchor_evidence() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let binary = env!("CARGO_BIN_EXE_engram");
-    let (caller_home, repo) = write_local_grep_source(
-        temp.path(),
-        "interrupted-edge-caller",
-        "{\"t\":\"2026-09-25T10:00:00Z\",\"k\":\"note\",\"content\":\"empty\"}\n",
-    );
-    let peer = scripted_anchor_validation_peer(temp.path(), "broken", binary, "drop-edges");
-    set_peer_topology(&caller_home, json!({"broken": peer}));
-
-    let output = run_anchor_validation_explain(binary, &caller_home, &repo, "broken", false);
-    assert!(
-        output.status.success(),
-        "completed anchor evidence should remain useful: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("explain JSON");
-    assert_eq!(result["federation"]["coverage"], "partial");
-    assert!(
-        result["lineage"].as_array().unwrap().is_empty(),
-        "edge data without a terminal success frame must be discarded: {result:#}"
-    );
-    let completed_session = result["sessions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|session| session["store"] == "broken/default")
-        .expect("completed direct anchor result remains attributed");
-    assert_eq!(completed_session["tape_id"], "broken-tape");
-    assert!(completed_session["tape_facts"].is_null());
-
-    let source = result["federation"]["sources"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|source| source["store"] == "broken/default")
-        .expect("failed source entry");
-    assert_eq!(source["status"], "failed");
-    assert_eq!(source["phase"], "lookup_edges");
-    assert_eq!(source["error"]["code"], "unavailable");
-    assert_eq!(
-        std::fs::read_to_string(temp.path().join("broken-anchor-validation-operations.log"))
-            .expect("peer operation log")
-            .lines()
-            .collect::<Vec<_>>(),
-        vec!["open", "lookup_anchors", "lookup_edges"],
-        "a peer that dropped its response must not receive later operations"
-    );
 }
 
 #[test]
