@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::path::Path;
 
 use engram::proof::t1772::{

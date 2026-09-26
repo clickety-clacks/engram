@@ -75,6 +75,15 @@ impl From<rusqlite::Error> for PeerError {
 }
 
 /// Serve the bounded newline-delimited JSON protocol on stdin/stdout.
+#[cfg(windows)]
+pub fn serve_stdio(_home: &Path) -> Result<(), String> {
+    Err(
+        "peer serving is unsupported on Windows because safe no-follow tape reads are unavailable"
+            .into(),
+    )
+}
+
+#[cfg(not(windows))]
 pub fn serve_stdio(home: &Path) -> Result<(), String> {
     let topology = load_topology(home)
         .map_err(|error| format!("topology_error: {error}"))?

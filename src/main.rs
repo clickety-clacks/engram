@@ -2246,14 +2246,23 @@ fn run() -> Result<(), CliError> {
             cmd_record(&cwd, &paths, &context, args)
         }
         Command::Explain(args) => {
+            if args.peers.is_some() {
+                ensure_peer_commands_supported()?;
+            }
             let context = resolve_query_runtime_context(&cwd)?;
             cmd_explain(&cwd, &paths, &context, args)
         }
         Command::Grep(args) => {
+            if args.peers.is_some() {
+                ensure_peer_commands_supported()?;
+            }
             let context = resolve_query_runtime_context(&cwd)?;
             cmd_grep(&paths, &context, args)
         }
         Command::Peek(args) => {
+            if args.store.is_some() {
+                ensure_peer_commands_supported()?;
+            }
             let context = resolve_query_runtime_context(&cwd)?;
             cmd_peek(&paths, &context, args)
         }
@@ -2262,6 +2271,9 @@ fn run() -> Result<(), CliError> {
             cmd_tapes(&paths, &context)
         }
         Command::Show(args) => {
+            if args.store.is_some() || args.peers.is_some() {
+                ensure_peer_commands_supported()?;
+            }
             let context = if args.store.is_some() || args.peers.is_some() {
                 resolve_query_runtime_context(&cwd)?
             } else {
@@ -2270,7 +2282,10 @@ fn run() -> Result<(), CliError> {
             cmd_show(&paths, &context, args)
         }
         Command::Topology(args) => match args.command {
-            TopologyCommand::Status(args) => cmd_topology_status(args),
+            TopologyCommand::Status(args) => {
+                ensure_peer_commands_supported()?;
+                cmd_topology_status(args)
+            }
         },
         Command::Gc => {
             let context = resolve_runtime_context(&cwd)?;
@@ -2278,6 +2293,7 @@ fn run() -> Result<(), CliError> {
         }
         Command::PeerServe(args) => {
             if args.stdio {
+                ensure_peer_commands_supported()?;
                 let home = home_dir()?;
                 engram::access::peer::serve_stdio(&home)
                     .map_err(|message| CliError::new("peer_serve", message))
@@ -2285,6 +2301,20 @@ fn run() -> Result<(), CliError> {
                 Err(CliError::new("peer_serve", "peer-serve requires --stdio"))
             }
         }
+    }
+}
+
+fn ensure_peer_commands_supported() -> Result<(), CliError> {
+    #[cfg(windows)]
+    {
+        Err(CliError::new(
+            "unsupported_platform",
+            "cross-machine peer queries and topology status are unsupported on Windows because the owner service cannot safely open tape files without no-follow semantics; local commands remain available",
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(())
     }
 }
 
@@ -4558,7 +4588,7 @@ fn cmd_explain(
     let mut tombstones = Vec::new();
     let touched_anchors;
     let score_by_session;
-    let mut proof_direct_touches = None;
+    let mut proof_direct_touches: Option<Value> = None;
     let date_filter = DateFilter::parse(args.since.as_deref(), args.until.as_deref())?;
 
     match target_kind {
@@ -4626,9 +4656,19 @@ fn cmd_explain(
             let result =
                 explain_across_indexes(&indexes, &query_anchors, traversal, args.forensics)?;
             if std::env::var("T1772_DIRECT_TOUCH_PROJECTION").as_deref() == Ok("1") {
-                proof_direct_touches = Some(engram::proof::performance::direct_projection(
-                    &result.direct,
-                ));
+                #[cfg(unix)]
+                {
+                    proof_direct_touches = Some(engram::proof::performance::direct_projection(
+                        &result.direct,
+                    ));
+                }
+                #[cfg(not(unix))]
+                {
+                    return Err(CliError::new(
+                        "unsupported_platform",
+                        "T1772 direct-touch proof projection is unsupported on this platform",
+                    ));
+                }
             }
             touched_anchors = result.touched_anchors.clone();
             let touches =
