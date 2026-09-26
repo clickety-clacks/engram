@@ -67,6 +67,7 @@ enum ReaderMessage {
 
 pub struct PeerClient {
     child: Child,
+    process_group_terminated: bool,
     input: Option<ChildStdin>,
     responses: Receiver<ReaderMessage>,
     next_id: u64,
@@ -460,6 +461,7 @@ impl PeerClient {
 
         Ok(Self {
             child,
+            process_group_terminated: false,
             input: Some(input),
             responses,
             next_id: 1,
@@ -760,8 +762,13 @@ impl PeerClient {
 
     fn abort(&mut self) {
         self.input.take();
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
+        self.terminate_child_process_group();
+    }
+
+    fn terminate_child_process_group(&mut self) {
+        if !self.process_group_terminated {
+            terminate_peer_process_group(&mut self.child);
+            self.process_group_terminated = true;
         }
     }
 }
@@ -769,9 +776,7 @@ impl PeerClient {
 impl Drop for PeerClient {
     fn drop(&mut self) {
         self.input.take();
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-        }
+        self.terminate_child_process_group();
         let _ = self.child.wait();
         if let Some(thread) = self.stdout_thread.take() {
             let _ = thread.join();
@@ -780,6 +785,21 @@ impl Drop for PeerClient {
             let _ = thread.join();
         }
     }
+}
+
+#[cfg(unix)]
+fn terminate_peer_process_group(child: &mut Child) {
+    let process_group = child.id() as libc::pid_t;
+    if process_group > 0 {
+        // Peer shells may leave descendants holding the piped stderr/stdout.
+        // Kill the isolated group before joining the pipe readers.
+        let _ = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_peer_process_group(child: &mut Child) {
+    let _ = child.kill();
 }
 
 fn fail_pending(
@@ -1042,6 +1062,71 @@ mod tests {
         signal_thread.join().expect("signal cancellation");
         assert_eq!(outcomes[0].as_ref().unwrap_err().code, "cancelled");
         let _ = client.child.wait().expect("wait for aborted owner");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peer_round_cancellation_kills_descendants_holding_inherited_pipes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let child_pid_path = temp.path().join("peer-child.pid");
+        let peer = TopologyPeer {
+            ssh: None,
+            command: Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "sleep 60 & printf '%s\\n' \"$!\" > \"$1\"; wait".into(),
+                "peer-pipe-fixture".into(),
+                child_pid_path.to_string_lossy().into_owned(),
+            ]),
+            engram: "/unused".into(),
+            exports: vec![],
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&cancelled);
+        let marker = child_pid_path.clone();
+        let signal_thread = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !marker.exists() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            signal.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let started = Instant::now();
+        let mut client = PeerClient::spawn(&peer).expect("spawn peer with pipe-inheriting child");
+        let outcomes = client.round_cancellable(
+            &[PeerRequest::new(
+                "grep_scan",
+                vec!["default".into()],
+                json!({}),
+            )],
+            Duration::from_secs(5),
+            &cancelled,
+        );
+        signal_thread.join().expect("signal cancellation");
+        assert!(child_pid_path.exists(), "peer child did not start");
+        assert_eq!(outcomes[0].as_ref().unwrap_err().code, "cancelled");
+        drop(client);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "peer process group cleanup waited on inherited pipes: {:?}",
+            started.elapsed()
+        );
+
+        let child_pid = std::fs::read_to_string(child_pid_path)
+            .expect("read child pid")
+            .trim()
+            .parse::<libc::pid_t>()
+            .expect("parse child pid");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while unsafe { libc::kill(child_pid, 0) } == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_ne!(
+            unsafe { libc::kill(child_pid, 0) },
+            0,
+            "peer descendant survived process-group cancellation"
+        );
     }
 
     #[cfg(unix)]

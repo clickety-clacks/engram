@@ -4,6 +4,8 @@ use std::ffi::OsString;
 use std::io;
 #[cfg(not(windows))]
 use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use crate::config::TopologyPeer;
 
@@ -65,12 +67,15 @@ pub fn spawn(_peer: &TopologyPeer) -> io::Result<std::process::Child> {
 #[cfg(not(windows))]
 pub fn spawn(peer: &TopologyPeer) -> io::Result<std::process::Child> {
     let spec = launch_spec(peer)?;
-    Command::new(spec.program)
+    let mut command = Command::new(spec.program);
+    command
         .args(spec.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+    command.spawn()
 }
 
 fn shell_quote(value: &str) -> String {
