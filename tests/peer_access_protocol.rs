@@ -3222,7 +3222,13 @@ fn command_peer_runs_real_peer_serve_against_an_isolated_owner_home() {
         .pop()
         .expect("deadline snapshot outcome")
         .expect("deadline snapshot query");
-    assert!(pinned_rows.data.is_empty());
+    assert!(
+        pinned_rows
+            .data
+            .iter()
+            .all(|row| row["uuid"] != "visible-after-deadline"),
+        "deadline-bound owner must retain the pre-writer snapshot"
+    );
     let started = Instant::now();
     let deadline_error = deadline_owner
         .round(
@@ -3272,7 +3278,13 @@ fn command_peer_runs_real_peer_serve_against_an_isolated_owner_home() {
         .pop()
         .expect("cancellation snapshot outcome")
         .expect("cancellation snapshot query");
-    assert!(pinned_rows.data.is_empty());
+    assert!(
+        pinned_rows
+            .data
+            .iter()
+            .all(|row| row["uuid"] != "visible-after-cancel"),
+        "cancellable owner must retain the pre-writer snapshot"
+    );
     let cancelled = std::sync::atomic::AtomicBool::new(true);
     let started = Instant::now();
     let cancellation_error = cancelled_owner
