@@ -1825,6 +1825,7 @@ fn collect_federated_lineage(
         }
         let mut returned_nodes_by_store =
             HashMap::<String, std::collections::HashSet<String>>::new();
+        let mut failed_edge_stores = std::collections::HashSet::<String>::new();
         for (machine, export, outcome) in
             run_federated_peer_rounds(request_map, owners, topology, deadline, cancelled)
         {
@@ -1832,6 +1833,7 @@ fn collect_federated_lineage(
             match outcome {
                 Err(failure) => {
                     *peer_failed = true;
+                    failed_edge_stores.insert(store.clone());
                     mark_source_phase(
                         sources,
                         &store,
@@ -1961,6 +1963,9 @@ fn collect_federated_lineage(
             }
         }
         for (store, expected) in &expected_nodes_by_store {
+            if failed_edge_stores.contains(store) {
+                continue;
+            }
             if returned_nodes_by_store.get(store) != Some(expected) {
                 *peer_failed = true;
                 mark_source_phase(
