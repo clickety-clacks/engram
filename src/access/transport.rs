@@ -2,10 +2,10 @@
 
 use std::ffi::OsString;
 use std::io;
-#[cfg(not(windows))]
-use std::process::{Command, Stdio};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(not(windows))]
+use std::process::{Command, Stdio};
 
 use crate::config::TopologyPeer;
 
