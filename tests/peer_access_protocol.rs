@@ -7220,6 +7220,88 @@ fn grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer
 }
 
 #[test]
+fn local_explain_and_peek_without_peer_selection_do_not_start_configured_peers() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let file = "local-offline.rs";
+    let source =
+        "fn local_offline_target() { let value = alpha + beta; consume(value); }\n".repeat(12);
+    let before = source.replace("local_offline_target", "before_local_offline_target");
+    let tape_id = "local-offline-explain";
+    let events = jsonl(&[
+        json!({"t":"2026-09-25T12:00:00Z","k":"meta","model":"local-test"}),
+        edit_event(file, &before, &source),
+    ]);
+    let (caller_home, repo) = write_local_grep_source(temp.path(), tape_id, &events);
+    std::fs::write(repo.join(file), &source).expect("write local explain source");
+    let db = repo.join(".engram/index.sqlite");
+    let parsed = engram::tape::event::parse_jsonl_events(&events).expect("parse local tape");
+    let index =
+        SqliteIndex::open_writer(db.to_str().expect("local DB path")).expect("open local index");
+    index
+        .ingest_tape_events(
+            tape_id,
+            &parsed,
+            engram::index::lineage::LINK_THRESHOLD_DEFAULT,
+        )
+        .expect("index local explain tape");
+    drop(index);
+
+    let marker = temp.path().join("peer-was-started");
+    std::fs::write(
+        caller_home.join(".engram/topology.yml"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "self": "caller",
+            "peers": {
+                "sentinel": {
+                    "command": ["/usr/bin/touch", marker],
+                    "engram": "/unused/engram",
+                    "exports": ["default"],
+                }
+            }
+        }))
+        .expect("serialize topology"),
+    )
+    .expect("write topology");
+
+    let explain = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["explain", file])
+        .output()
+        .expect("run local explain");
+    assert!(
+        explain.status.success(),
+        "local explain failed: {}",
+        String::from_utf8_lossy(&explain.stderr)
+    );
+    let explain: serde_json::Value = serde_json::from_slice(&explain.stdout).expect("explain JSON");
+    assert!(
+        explain["sessions"]
+            .as_array()
+            .is_some_and(|sessions| !sessions.is_empty())
+    );
+    assert!(explain.get("federation").is_none());
+    assert!(!marker.exists(), "local explain started a configured peer");
+
+    let peek = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["peek", tape_id, "--start", "1", "--lines", "1"])
+        .output()
+        .expect("run local peek");
+    assert!(
+        peek.status.success(),
+        "local peek failed: {}",
+        String::from_utf8_lossy(&peek.stderr)
+    );
+    let peek: serde_json::Value = serde_json::from_slice(&peek.stdout).expect("peek JSON");
+    assert!(peek.get("federation").is_none());
+    assert!(!marker.exists(), "local peek started a configured peer");
+}
+
+#[test]
 fn grep_without_peer_selection_does_not_start_configured_peers() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = env!("CARGO_BIN_EXE_engram");
