@@ -7614,7 +7614,11 @@ fn grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer
         .iter()
         .find(|source| source["store"] == "complete/default")
         .expect("completed source row");
-    assert_eq!(complete["status"], "ok");
+    assert_eq!(
+        complete["status"],
+        "ok",
+        "complete peer source: {complete:#}"
+    );
     assert_eq!(complete["grep_scan"]["total"], 1);
 }
 
