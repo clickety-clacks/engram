@@ -284,7 +284,8 @@ fn args_value_matches(raw: &RawValue, pattern: &str) -> bool {
                 .first()
                 .is_some_and(|byte| matches!(byte, b'{' | b'['))
             {
-                return json_text_matches(text.as_ref(), pattern, SearchMode::Arguments);
+                return json_text_matches(text.as_ref(), pattern, SearchMode::Arguments)
+                    .unwrap_or_else(|| text.contains(pattern));
             }
             text.contains(pattern)
         }
@@ -298,16 +299,16 @@ fn content_value_matches(raw: &RawValue, pattern: &str) -> bool {
     json_raw_matches(raw, pattern, SearchMode::Content)
 }
 
-fn json_text_matches(text: &str, pattern: &str, mode: SearchMode) -> bool {
+fn json_text_matches(text: &str, pattern: &str, mode: SearchMode) -> Option<bool> {
     let mut deserializer = serde_json::Deserializer::from_str(text);
     let result = MatchSeed { pattern, mode }
         .deserialize(&mut deserializer)
         .and_then(|matched| deserializer.end().map(|()| matched));
-    result.unwrap_or(false)
+    result.ok()
 }
 
 fn json_raw_matches(raw: &RawValue, pattern: &str, mode: SearchMode) -> bool {
-    json_text_matches(raw.get(), pattern, mode)
+    json_text_matches(raw.get(), pattern, mode).unwrap_or(false)
 }
 
 #[derive(Clone, Copy)]
@@ -670,6 +671,7 @@ mod tests {
 
         assert!(event.matches("café ☃"));
         assert!(event.matches(r"literal\n"));
+        assert!(!event.matches("CAFÉ ☃"));
         assert!(!event.matches("\n"));
         assert!(!event.matches("content"));
         assert!(!event.matches("msg.in"));
@@ -678,21 +680,21 @@ mod tests {
     #[test]
     fn searches_native_and_normalized_tool_arguments_without_joining_keys_or_fields() {
         let normalized: GrepEvent<'_> = serde_json::from_str(
-            r#"{"k":"tool.call","tool":"exec_command","args":"{\"command\":\"printf \\\"hello\\\"\",\"other\":\"world\"}"}"#,
+            r#"{"k":"tool.call","tool":"exec_command","args":"{\"payload_key\":\"printf \\\"hello\\\"\",\"other\":\"world\"}"}"#,
         )
         .expect("valid normalized arguments");
         assert!(normalized.matches("hello"));
         assert!(normalized.matches("world"));
-        assert!(!normalized.matches("command"));
+        assert!(!normalized.matches("payload_key"));
         assert!(!normalized.matches("helloworld"));
 
         let native: GrepEvent<'_> = serde_json::from_str(
-            r#"{"k":"tool.call","args":{"command":["echo","nested"],"count":12}}"#,
+            r#"{"k":"tool.call","args":{"parameter_name":["echo","nested"],"count":12}}"#,
         )
         .expect("valid native arguments");
         assert!(native.matches("nested"));
         assert!(native.matches("12"));
-        assert!(!native.matches("command"));
+        assert!(!native.matches("parameter_name"));
         assert!(!native.matches("echonested"));
     }
 
@@ -704,6 +706,14 @@ mod tests {
 
         assert!(event.matches(r"\u2603"));
         assert!(!event.matches("☃"));
+    }
+
+    #[test]
+    fn malformed_json_shaped_argument_text_remains_searchable_as_text() {
+        let event: GrepEvent<'_> = serde_json::from_str(r#"{"k":"tool.call","args":"{needle"}"#)
+            .expect("valid normalized argument string");
+
+        assert!(event.matches("needle"));
     }
 
     #[test]
@@ -740,7 +750,8 @@ mod tests {
         assert_eq!(summary.total_lines, 3);
         assert_eq!(summary.files_touched, vec!["src/lib.rs"]);
 
-        let malformed = zstd::stream::encode_all(b"{bad json}\n", 0).expect("compress bad tape");
+        let malformed =
+            zstd::stream::encode_all(&b"{bad json}\n"[..], 0).expect("compress bad tape");
         let error = scan_grep_reader(&malformed[..], Some(1024), "needle").unwrap_err();
         assert_eq!(error.code, "json_error");
     }

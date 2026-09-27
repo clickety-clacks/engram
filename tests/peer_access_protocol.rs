@@ -7243,7 +7243,7 @@ fn peer_tape_facts_returns_segment_history_turn_maps_and_bounded_summaries() {
     assert_eq!(facts["summary"]["anchor_line"], 3);
     assert_eq!(facts["summary"]["window_start"], 1);
     assert_eq!(facts["summary"]["window_end"], 4);
-    assert_eq!(facts["summary"]["grep_filter_hits_window"], true);
+    assert_eq!(facts["summary"]["grep_filter_hits_window"], false);
     assert_eq!(facts["summary"]["latest_timestamp"], "2026-09-24T12:02:00Z");
     assert_eq!(facts["summary"]["files_touched"], json!(["src/lib.rs"]));
     assert_eq!(

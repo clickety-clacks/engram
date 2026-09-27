@@ -181,13 +181,27 @@ pub fn prepare_grep_scan(
     context: &RuntimeContext,
     indexes: &[SqliteIndex],
 ) -> Result<GrepScanWork, CliError> {
+    let tape_ids = referenced_grep_tape_ids(indexes)?;
+    prepare_grep_scan_with_tape_ids(context.tape_lookup_dirs.clone(), tape_ids)
+}
+
+pub fn referenced_grep_tape_ids(indexes: &[SqliteIndex]) -> Result<Vec<String>, CliError> {
     let mut tape_ids = HashSet::new();
     for index in indexes {
         tape_ids.extend(index.referenced_tape_ids()?);
     }
+    let mut tape_ids = tape_ids.into_iter().collect::<Vec<_>>();
+    tape_ids.sort();
+    Ok(tape_ids)
+}
 
+pub fn prepare_grep_scan_with_tape_ids(
+    tape_lookup_dirs: Vec<PathBuf>,
+    tape_ids: Vec<String>,
+) -> Result<GrepScanWork, CliError> {
+    let mut tape_ids = tape_ids.into_iter().collect::<HashSet<_>>();
     let mut paths = HashMap::new();
-    for dir in &context.tape_lookup_dirs {
+    for dir in &tape_lookup_dirs {
         if !dir.exists() {
             continue;
         }
@@ -210,19 +224,16 @@ pub fn prepare_grep_scan(
     let tasks = tape_ids
         .into_iter()
         .filter_map(|tape_id| {
-            paths.get(&tape_id).cloned().map(|path| GrepScanTask {
-                tape_id,
-                path,
-            })
+            paths
+                .get(&tape_id)
+                .cloned()
+                .map(|path| GrepScanTask { tape_id, path })
         })
         .collect();
     Ok(GrepScanWork { tasks })
 }
 
-pub fn run_grep_scan(
-    work: GrepScanWork,
-    pattern: &str,
-) -> Result<GrepScanOutput, CliError> {
+pub fn run_grep_scan(work: GrepScanWork, pattern: &str) -> Result<GrepScanOutput, CliError> {
     let scanned_tapes = work.tasks.len();
     let mut raw_sessions = Vec::new();
     let mut ranks = HashMap::new();
@@ -463,7 +474,11 @@ pub fn format_sessions_for_agent(
         let mut files_touched = files_touched.into_iter().collect::<Vec<_>>();
         files_touched.sort();
 
-        let (refs_up, refs_down) = dispatch_ref_counts(indexes, session_id)?;
+        let (refs_up, refs_down) = if grep_prepared {
+            (0, 0)
+        } else {
+            dispatch_ref_counts(indexes, session_id)?
+        };
         let timestamp = raw
             .get("latest_touch_timestamp")
             .and_then(Value::as_str)
@@ -495,7 +510,7 @@ pub fn format_sessions_for_agent(
     Ok(out)
 }
 
-pub(crate) fn dispatch_ref_counts(
+pub fn dispatch_ref_counts(
     indexes: &[SqliteIndex],
     tape_id: &str,
 ) -> Result<(usize, usize), CliError> {

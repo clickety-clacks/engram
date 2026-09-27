@@ -931,9 +931,8 @@ impl PeerSession {
                             if matched {
                                 Ok(true)
                             } else {
-                                grep_line_matches(line, pattern).map_err(|error| {
-                                    PeerError::new("invalid_tape", error.message)
-                                })
+                                grep_line_matches(line, pattern)
+                                    .map_err(|error| PeerError::new("invalid_tape", error.message))
                             }
                         })?,
                 )

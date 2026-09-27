@@ -37,11 +37,12 @@ use engram::query::format::MAX_QUERY_WINDOW_ANCHORS;
 use engram::query::format::{
     DateFilter, ExplainTarget, GrepRank, annotate_chain_fields, apply_session_truncation,
     build_chain_metadata, build_session_windows, classify_explain_target, collect_anchor_scores,
-    collect_touch_evidence, compact_event, compare_explain_sessions,
-    compare_grep_sessions, default_peek_anchor_line, derive_anchor_candidates, edge_to_json,
+    collect_touch_evidence, compact_event, compare_explain_sessions, compare_grep_sessions,
+    default_peek_anchor_line, derive_anchor_candidates, dispatch_ref_counts, edge_to_json,
     emit_query_result, explain_across_indexes, extract_latest_timestamp_from_rows,
-    format_sessions_for_agent, open_query_indexes, prepare_grep_scan, print_pretty_explain,
-    grep_line_matches, read_file_span_variants, run_grep_scan, session_matches_date_filter,
+    format_sessions_for_agent, grep_line_matches, open_query_indexes, prepare_grep_scan,
+    prepare_grep_scan_with_tape_ids, print_pretty_explain, read_file_span_variants,
+    referenced_grep_tape_ids, run_grep_scan, session_matches_date_filter,
 };
 use engram::store::atomic::atomic_write;
 use engram::store::tapes::{
@@ -5955,7 +5956,7 @@ fn cmd_grep(_paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Res
         return Err(CliError::new("no_results", args.pattern));
     }
 
-    let (sessions, returned, total, time_range, truncated) = apply_session_truncation(
+    let (mut sessions, returned, total, time_range, truncated) = apply_session_truncation(
         sessions,
         args.limit,
         args.offset,
@@ -5963,6 +5964,21 @@ fn cmd_grep(_paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Res
     );
     if sessions.is_empty() {
         return Err(CliError::new("no_results", args.pattern));
+    }
+
+    if !args.count {
+        for session in &mut sessions {
+            let Some(session_id) = session
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+            else {
+                continue;
+            };
+            let (refs_up, refs_down) = dispatch_ref_counts(&indexes, &session_id)?;
+            session["refs_up"] = json!(refs_up);
+            session["refs_down"] = json!(refs_down);
+        }
     }
 
     let metrics_sessions = if args.count { Vec::new() } else { sessions };
@@ -6020,9 +6036,13 @@ fn cmd_grep_with_peer(
         selected_machines.join(",")
     );
 
-    let local_work = prepare_grep_scan(context, &indexes)?;
+    let local_tape_ids = referenced_grep_tape_ids(&indexes)?;
+    let local_lookup_dirs = context.tape_lookup_dirs.clone();
     let local_pattern = args.pattern.clone();
-    let local_scan = std::thread::spawn(move || run_grep_scan(local_work, &local_pattern));
+    let local_scan = std::thread::spawn(move || {
+        let local_work = prepare_grep_scan_with_tape_ids(local_lookup_dirs, local_tape_ids)?;
+        run_grep_scan(local_work, &local_pattern)
+    });
 
     let page_limit = args.limit.unwrap_or(context.explain_default_limit).min(25);
     let k = args.offset.saturating_add(page_limit);
