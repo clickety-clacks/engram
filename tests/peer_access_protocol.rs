@@ -246,6 +246,12 @@ fn log_show_first_round_with_identity_barrier(
         "responses_root=\"$6\"",
         "fifo_in=\"$7\"",
         "fifo_out=\"$8\"",
+        "identity_ready=\"${responses_root}.identity.ready\"",
+        "pending=\"${pending}.$$\"",
+        "ids=\"${ids}.$$\"",
+        "responses_root=\"${responses_root}.$$\"",
+        "fifo_in=\"${fifo_in}.$$\"",
+        "fifo_out=\"${fifo_out}.$$\"",
         "read_terminal() { expected=\"$1\"; response_file=\"$2\"; : >\"$response_file\"; while IFS= read -r response <&4; do printf '%s\\n' \"$response\" >>\"$response_file\"; response_id=$(printf '%s\\n' \"$response\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p'); if [ \"$response_id\" = \"$expected\" ]; then case \"$response\" in *'\"end\":true'*) return 0 ;; esac; fi; done; return 1; }",
         "mkfifo \"$fifo_in\" \"$fifo_out\"",
         "\"$binary\" peer-serve --stdio <\"$fifo_in\" >\"$fifo_out\" &",
@@ -278,6 +284,7 @@ fn log_show_first_round_with_identity_barrier(
         "        index=0",
         "        while IFS= read -r pending_id; do index=$((index + 1)); read_terminal \"$pending_id\" \"$responses_root.$index\"; done <\"$ids\"",
         "        cat \"$responses_root.1\" \"$responses_root.2\"",
+        "        : >\"$identity_ready\"",
         "        : >\"$pending\"",
         "        : >\"$ids\"",
         "        pending_count=0",
@@ -3992,7 +3999,7 @@ fn remote_show_reads_only_the_selected_peer_tape_and_verifies_its_digest() {
     std::fs::write(
         owner_engram.join("topology.yml"),
         format!(
-            "version: 1\nself: emulated-owner\nexports:\n  default:\n    db: {}\n    tape_dirs:\n      - {}\nlimits:\n  non_file_response_bytes: 1024\n",
+            "version: 1\nself: emulated-owner\nexports:\n  default:\n    db: {}\n    tape_dirs:\n      - {}\nlimits:\n  non_file_response_bytes: 16384\n",
             db.display(),
             tapes.display()
         ),
@@ -4033,6 +4040,33 @@ fn remote_show_reads_only_the_selected_peer_tape_and_verifies_its_digest() {
     .expect("write caller topology");
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(&repo).expect("caller repo");
+
+    let peer_spec = TopologyPeer {
+        ssh: None,
+        command: Some(
+            peer["command"]
+                .as_array()
+                .expect("logged peer command")
+                .iter()
+                .map(|arg| arg.as_str().expect("command arg").to_string())
+                .collect(),
+        ),
+        engram: binary.to_string(),
+        exports: vec!["default".into()],
+    };
+    let owner = RemoteOwner::connect(
+        "emulated-owner",
+        "caller",
+        &peer_spec,
+        Duration::from_secs(5),
+    )
+    .expect("connect owner with advertised response budget");
+    assert_eq!(
+        owner.limits.get("non_file_response_bytes"),
+        Some(&16_384),
+        "the peer advertises its lower non-file response budget"
+    );
+    drop(owner);
 
     let output = Command::new(binary)
         .current_dir(&repo)
@@ -4151,6 +4185,19 @@ fn remote_show_reads_only_the_selected_peer_tape_and_verifies_its_digest() {
         serde_json::from_slice(&grep_peek.stdout).expect("grep peek JSON");
     assert_eq!(grep_value["session"]["content"][1]["line"], 3);
     assert_eq!(operation_count(&operation_log, "peek_lines"), 3);
+
+    let owner_topology_path = owner_engram.join("topology.yml");
+    let owner_topology = std::fs::read_to_string(&owner_topology_path)
+        .expect("read owner topology before bounded peek");
+    assert!(owner_topology.contains("non_file_response_bytes: 16384"));
+    std::fs::write(
+        &owner_topology_path,
+        owner_topology.replace(
+            "non_file_response_bytes: 16384",
+            "non_file_response_bytes: 1800",
+        ),
+    )
+    .expect("lower response budget for oversized peek");
 
     let oversized_peek = Command::new(binary)
         .current_dir(&repo)
@@ -4546,14 +4593,47 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
         "{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"show partial selected peers\"}\n",
     );
     let tape_id = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
-    let available = write_grep_owner(
+    let mut available = write_grep_owner(
         temp.path(),
         "available",
         binary,
         &[(tape_id.as_str(), content)],
     );
+    let available_operations = log_show_first_round_with_identity_barrier(
+        temp.path(),
+        "available",
+        binary,
+        &mut available,
+    );
+    let available_identity_complete = temp.path().join("available-show-responses.identity.ready");
+    // Let the offline peer open normally, then disconnect its identity query
+    // only after the healthy peer has completed the same discovery round.
+    let offline_script_path = temp.path().join("offline-after-available-discovery.sh");
+    let offline_script = [
+        "#!/bin/sh",
+        "set -eu",
+        "marker=\"$1\"",
+        "while IFS= read -r request; do",
+        r#"  id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"#,
+        r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
+        "  if [ \"$op\" = open ]; then",
+        r#"    printf '{"id":%s,"data":{"store":"offline/default","status":"ok","db":"/fixture/offline.sqlite","tape_dirs":[],"reader_mode":"live","snapshot_at":"2026-09-25T00:00:00Z"}}\n' "$id""#,
+        r#"    printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"offline","build":"fixture","protocol":1,"schema":4,"query_semantics":1,"limits":{"grep_k":10000}}}\n' "$id""#,
+        "  else",
+        "    attempts=0",
+        "    while [ ! -f \"$marker\" ]; do",
+        "      [ \"$attempts\" -lt 600 ] || exit 124",
+        "      attempts=$((attempts + 1))",
+        "      sleep 0.05",
+        "    done",
+        "    exit 1",
+        "  fi",
+        "done",
+    ]
+    .join("\n");
+    std::fs::write(&offline_script_path, offline_script).expect("write delayed offline peer");
     let offline = json!({
-        "command": ["/usr/bin/false"],
+        "command": ["/bin/sh", offline_script_path, available_identity_complete],
         "engram": "/unused/engram",
         "exports": ["default"],
     });
@@ -4582,16 +4662,34 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
         .expect("run partial selected-peer show");
     assert!(
         partial.status.success(),
-        "partial show should keep the completed tape: {}",
-        String::from_utf8_lossy(&partial.stderr)
+        "partial show should keep the completed tape: stderr={}; available operations={}; healthy discovery completed={}",
+        String::from_utf8_lossy(&partial.stderr),
+        std::fs::read_to_string(&available_operations).unwrap_or_default(),
+        available_identity_complete.is_file()
     );
     let value: serde_json::Value = serde_json::from_slice(&partial.stdout).expect("show JSON");
     assert_eq!(value["tape_id"], tape_id);
     assert_eq!(value["federation"]["coverage"], "partial");
-    assert!(value["federation"]["sources"].as_array().unwrap().iter().any(
-        |source| source["store"] == "offline/default" && source["status"] == "unavailable"
+    let offline_source = value["federation"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["store"] == "offline/default")
+        .expect("offline source row");
+    assert_eq!(offline_source["status"], "failed");
+    assert!(matches!(
+        offline_source["phase"].as_str(),
+        Some("locate_tapes" | "tape_facts")
     ));
+    assert_eq!(offline_source["error"]["code"], "unavailable");
+    assert!(available_identity_complete.is_file());
+    assert_eq!(operation_count(&available_operations, "open"), 1);
+    assert_eq!(operation_count(&available_operations, "locate_tapes"), 1);
+    assert_eq!(operation_count(&available_operations, "tape_facts"), 1);
+    assert_eq!(operation_count(&available_operations, "read_file"), 1);
 
+    std::fs::remove_file(&available_identity_complete)
+        .expect("reset discovery barrier for second query");
     let required = Command::new(binary)
         .current_dir(&repo)
         .env("HOME", &caller_home)
@@ -4613,7 +4711,13 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
             .expect("incomplete coverage error line"),
     )
     .expect("error JSON");
-    assert_eq!(error["error"]["code"], "incomplete_coverage");
+    assert_eq!(
+        error["error"]["code"],
+        "incomplete_coverage",
+        "required show error: stderr={stderr}; available operations={}; healthy discovery completed={}",
+        std::fs::read_to_string(&available_operations).unwrap_or_default(),
+        available_identity_complete.is_file()
+    );
 }
 
 #[cfg(unix)]
@@ -6704,8 +6808,9 @@ fn peer_accepts_exact_long_composite_anchors_for_edges_and_touch_lookups() {
         engram: binary.to_string(),
         exports: vec!["default".into()],
     };
-    let mut owner = RemoteOwner::connect("long-anchor-owner", "caller", &peer, Duration::from_secs(5))
-        .expect("connect owner");
+    let mut owner =
+        RemoteOwner::connect("long-anchor-owner", "caller", &peer, Duration::from_secs(5))
+            .expect("connect owner");
     let observed = format!(
         "winnow:{}",
         (0..1_103)
@@ -6740,9 +6845,11 @@ fn peer_accepts_exact_long_composite_anchors_for_edges_and_touch_lookups() {
             .pop()
             .expect("edge response")
             .expect("long exact edge lookup");
-        assert!(edge.data.iter().any(|row| {
-            row["type"] == "node_result" && row["node"] == *anchor
-        }));
+        assert!(
+            edge.data
+                .iter()
+                .any(|row| { row["type"] == "node_result" && row["node"] == *anchor })
+        );
 
         let touch = owner
             .round(
@@ -6818,15 +6925,15 @@ fn public_explain_reconstructs_anchor_matches_across_response_frames() {
         }))
         .collect::<Vec<_>>()
         .join("\n")
-            + "\n";
+        + "\n";
     let remote = write_grep_owner(
         temp.path(),
         "framed-anchor-owner",
         binary,
         &[("framed-anchor-tape", &events)],
     );
-    let writer = SqliteIndex::open_writer(owner_db.to_str().expect("owner DB path"))
-        .expect("owner index");
+    let writer =
+        SqliteIndex::open_writer(owner_db.to_str().expect("owner DB path")).expect("owner index");
     let parsed = engram::tape::event::parse_jsonl_events(&events).expect("parse edits");
     writer
         .ingest_tape_events(
@@ -6850,10 +6957,7 @@ fn public_explain_reconstructs_anchor_matches_across_response_frames() {
         "framed-anchor-caller",
         "{\"t\":\"2026-09-25T10:00:00Z\",\"k\":\"note\",\"content\":\"empty\"}\n",
     );
-    set_peer_topology(
-        &caller_home,
-        json!({"framed-anchor-owner": remote.clone()}),
-    );
+    set_peer_topology(&caller_home, json!({"framed-anchor-owner": remote.clone()}));
     let output = Command::new(binary)
         .current_dir(&repo)
         .env("HOME", &caller_home)
@@ -6873,13 +6977,11 @@ fn public_explain_reconstructs_anchor_matches_across_response_frames() {
     );
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("explain JSON");
     assert_eq!(
-        result["federation"]["coverage"],
-        "complete",
+        result["federation"]["coverage"], "complete",
         "partial explain result: {result:#}"
     );
     assert_eq!(
-        result["federation"]["lineage_coverage"],
-        "complete",
+        result["federation"]["lineage_coverage"], "complete",
         "partial lineage result: {result:#}"
     );
     let source = result["federation"]["sources"]
@@ -6905,7 +7007,7 @@ fn public_explain_reconstructs_anchor_matches_across_response_frames() {
     let topology_path = owner_home.join(".engram/topology.yml");
     let mut topology = std::fs::read_to_string(&topology_path).expect("owner topology");
     topology.push_str("\nlimits:\n  non_file_response_bytes: 1120000\n");
-    std::fs::write(&topology_path, topology).expect("lower bounded response budget");
+    std::fs::write(&topology_path, &topology).expect("lower bounded response budget");
     let peer = TopologyPeer {
         ssh: None,
         command: Some(
@@ -6919,8 +7021,13 @@ fn public_explain_reconstructs_anchor_matches_across_response_frames() {
         engram: binary.to_string(),
         exports: vec!["default".into()],
     };
-    let mut owner = RemoteOwner::connect("framed-anchor-owner", "caller", &peer, Duration::from_secs(5))
-        .expect("connect owner under lower budget");
+    let mut owner = RemoteOwner::connect(
+        "framed-anchor-owner",
+        "caller",
+        &peer,
+        Duration::from_secs(5),
+    )
+    .expect("connect owner under lower budget");
     let failure = owner
         .round(
             &[PeerRequest::new(
@@ -6934,6 +7041,57 @@ fn public_explain_reconstructs_anchor_matches_across_response_frames() {
         .expect("bounded response")
         .expect_err("a later frame over budget invalidates earlier provisional data");
     assert_eq!(failure.code, "budget_exceeded");
+
+    topology = topology.replace(
+        "non_file_response_bytes: 1120000",
+        "non_file_response_bytes: 2600000",
+    );
+    std::fs::write(&topology_path, topology).expect("set lower cumulative response budget");
+    drop(owner);
+    let peer = TopologyPeer {
+        ssh: None,
+        command: Some(
+            remote["command"]
+                .as_array()
+                .expect("owner command")
+                .iter()
+                .map(|arg| arg.as_str().expect("command arg").to_string())
+                .collect(),
+        ),
+        engram: binary.to_string(),
+        exports: vec!["default".into()],
+    };
+    let mut owner = RemoteOwner::connect(
+        "framed-anchor-owner",
+        "caller",
+        &peer,
+        Duration::from_secs(5),
+    )
+    .expect("connect owner under lower cumulative budget");
+    assert_eq!(
+        owner.limits.get("non_file_response_bytes"),
+        Some(&2_600_000)
+    );
+    let request = || {
+        PeerRequest::new(
+            "lookup_anchors",
+            vec!["default".into()],
+            json!({"anchors": [query_anchor], "include_deleted": false}),
+        )
+    };
+    let first = owner
+        .round(&[request()], Duration::from_secs(5))
+        .pop()
+        .expect("first bounded lookup")
+        .expect("first response fits cumulative budget");
+    assert!(first.data.iter().any(|row| row["type"] == "anchor_result"));
+    let second = owner
+        .round(&[request()], Duration::from_secs(5))
+        .pop()
+        .expect("second bounded lookup")
+        .expect_err("separate rounds cannot reset the configured invocation budget");
+    assert_eq!(second.code, "budget_exceeded");
+    assert!(second.message.contains("2600000 byte non-file budget"));
 }
 
 #[test]

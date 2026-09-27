@@ -72,6 +72,7 @@ pub struct PeerClient {
     responses: Receiver<ReaderMessage>,
     next_id: u64,
     response_bytes: usize,
+    response_limit: usize,
     stdout_thread: Option<JoinHandle<()>>,
     stderr_thread: Option<JoinHandle<()>>,
     stderr: Arc<Mutex<Vec<u8>>>,
@@ -223,6 +224,12 @@ impl RemoteOwner {
                     })
             })
             .collect::<Result<HashMap<_, _>, _>>()?;
+        client.set_non_file_response_limit(
+            limits
+                .get("non_file_response_bytes")
+                .copied()
+                .unwrap_or(MAX_NON_FILE_RESPONSE_BYTES as u64),
+        )?;
 
         let mut exports = BTreeMap::new();
         for row in response.data {
@@ -473,11 +480,30 @@ impl PeerClient {
             responses,
             next_id: 1,
             response_bytes: 0,
+            response_limit: MAX_NON_FILE_RESPONSE_BYTES,
             stdout_thread,
             stderr_thread,
             stderr: stderr_bytes,
             command,
         })
+    }
+
+    fn set_non_file_response_limit(&mut self, limit: u64) -> Result<(), PeerFailure> {
+        let limit = usize::try_from(limit)
+            .unwrap_or(usize::MAX)
+            .min(MAX_NON_FILE_RESPONSE_BYTES);
+        if self.response_bytes > limit {
+            self.abort();
+            return Err(PeerFailure::new(
+                "budget_exceeded",
+                format!(
+                    "peer open response used {} bytes, exceeding the {limit} byte non-file budget",
+                    self.response_bytes
+                ),
+            ));
+        }
+        self.response_limit = limit;
+        Ok(())
     }
 
     /// Send every request before draining the response stream, avoiding a full
@@ -669,14 +695,17 @@ impl PeerClient {
                         }
                     } else {
                         self.response_bytes = self.response_bytes.saturating_add(frame_bytes);
-                        if self.response_bytes > MAX_NON_FILE_RESPONSE_BYTES {
+                        if self.response_bytes > self.response_limit {
                             abort_for_local_budget = true;
-                            fail_pending(
-                                &mut pending,
-                                &mut outcomes,
-                                "budget_exceeded",
-                                "peer response exceeds the 32 MiB non-file budget",
-                            );
+                            let message = if self.response_limit == MAX_NON_FILE_RESPONSE_BYTES {
+                                "peer response exceeds the 32 MiB non-file budget".to_string()
+                            } else {
+                                format!(
+                                    "peer response exceeds the {} byte non-file budget",
+                                    self.response_limit
+                                )
+                            };
+                            fail_pending(&mut pending, &mut outcomes, "budget_exceeded", &message);
                             break;
                         }
                     }

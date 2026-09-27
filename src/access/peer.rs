@@ -422,6 +422,11 @@ impl PeerSession {
                     "owner_idle_timeout_secs",
                     DEFAULT_OWNER_IDLE_TIMEOUT_SECS,
                 ),
+                "non_file_response_bytes": configured_limit(
+                    &self.topology.limits,
+                    "non_file_response_bytes",
+                    MAX_NON_FILE_RESPONSE_BYTES as u64,
+                ),
                 "items_per_batch": self.batch_cap(),
             },
             "opened": opened,
