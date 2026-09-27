@@ -37,11 +37,11 @@ use engram::query::format::MAX_QUERY_WINDOW_ANCHORS;
 use engram::query::format::{
     DateFilter, ExplainTarget, GrepRank, annotate_chain_fields, apply_session_truncation,
     build_chain_metadata, build_session_windows, classify_explain_target, collect_anchor_scores,
-    collect_grep_matches, collect_touch_evidence, compact_event, compare_explain_sessions,
+    collect_touch_evidence, compact_event, compare_explain_sessions,
     compare_grep_sessions, default_peek_anchor_line, derive_anchor_candidates, edge_to_json,
     emit_query_result, explain_across_indexes, extract_latest_timestamp_from_rows,
-    format_sessions_for_agent, open_query_indexes, print_pretty_explain, read_file_span_variants,
-    session_matches_date_filter,
+    format_sessions_for_agent, open_query_indexes, prepare_grep_scan, print_pretty_explain,
+    grep_line_matches, read_file_span_variants, run_grep_scan, session_matches_date_filter,
 };
 use engram::store::atomic::atomic_write;
 use engram::store::tapes::{
@@ -5904,17 +5904,7 @@ fn cmd_grep(_paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Res
     } else {
         open_query_indexes(context)?
     };
-    let (raw_sessions, grep_rank_by_session) =
-        collect_grep_matches(context, &indexes, &args.pattern)?;
-    let score_by_session = grep_rank_by_session
-        .iter()
-        .map(|(session_id, rank)| (session_id.clone(), rank.match_count as f32))
-        .collect::<HashMap<_, _>>();
     let date_filter = DateFilter::parse(args.since.as_deref(), args.until.as_deref())?;
-    let mut sessions =
-        format_sessions_for_agent(context, &indexes, raw_sessions, &score_by_session, None)?;
-    sessions.retain(|session| session_matches_date_filter(session, &date_filter));
-    sessions.sort_by(|a, b| compare_grep_sessions(a, b, &grep_rank_by_session));
 
     if args.peers.is_some() {
         let signal_cancelled = Arc::clone(&cancelled);
@@ -5937,14 +5927,30 @@ fn cmd_grep(_paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Res
         return cmd_grep_with_peer(
             context,
             indexes,
-            sessions,
-            grep_rank_by_session,
             args,
+            date_filter,
             query_deadline,
             cancelled,
             terminal_state,
         );
     }
+
+    let work = prepare_grep_scan(context, &indexes)?;
+    let local_scan = run_grep_scan(work, &args.pattern)?;
+    let score_by_session = local_scan
+        .ranks
+        .iter()
+        .map(|(session_id, rank)| (session_id.clone(), rank.match_count as f32))
+        .collect::<HashMap<_, _>>();
+    let mut sessions = format_sessions_for_agent(
+        context,
+        &indexes,
+        local_scan.raw_sessions,
+        &score_by_session,
+        None,
+    )?;
+    sessions.retain(|session| session_matches_date_filter(session, &date_filter));
+    sessions.sort_by(|a, b| compare_grep_sessions(a, b, &local_scan.ranks));
     if sessions.is_empty() {
         return Err(CliError::new("no_results", args.pattern));
     }
@@ -5977,6 +5983,10 @@ fn cmd_grep(_paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Res
         "dispatch_lineage": [],
         "tombstones": [],
         "stores_queried": indexes.len(),
+        "scan_stats": {
+            "local_tapes": local_scan.scanned_tapes,
+            "local_workers": local_scan.workers,
+        },
         "returned": returned,
         "total": total,
         "time_range": time_range,
@@ -5988,9 +5998,8 @@ fn cmd_grep(_paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Res
 fn cmd_grep_with_peer(
     context: &RuntimeContext,
     indexes: Vec<SqliteIndex>,
-    mut sessions: Vec<Value>,
-    mut ranks: HashMap<String, GrepRank>,
     args: GrepArgs,
+    date_filter: DateFilter,
     query_deadline: Instant,
     cancelled: Arc<AtomicBool>,
     terminal_state: Arc<AtomicU8>,
@@ -6011,31 +6020,14 @@ fn cmd_grep_with_peer(
         selected_machines.join(",")
     );
 
-    for session in &mut sessions {
-        let session_id = session
-            .get("session_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        session["tape_id"] = json!(session_id);
-        session["location"] = local_grep_location(context, &topology.self_label, &session_id);
-        session["locations"] = json!([session["location"].clone()]);
-    }
+    let local_work = prepare_grep_scan(context, &indexes)?;
+    let local_pattern = args.pattern.clone();
+    let local_scan = std::thread::spawn(move || run_grep_scan(local_work, &local_pattern));
 
     let page_limit = args.limit.unwrap_or(context.explain_default_limit).min(25);
     let k = args.offset.saturating_add(page_limit);
     let mut source_rows = local_grep_source_rows(context, &topology.self_label);
     let fallback_store = format!("{}/local-files", topology.self_label);
-    if sessions
-        .iter()
-        .any(|session| session["location"]["store"].as_str() == Some(fallback_store.as_str()))
-    {
-        source_rows.push(json!({
-            "store": fallback_store,
-            "kind": "local_tapes",
-            "status": "ok",
-        }));
-    }
     for (unselected, config) in &topology.peers {
         if selected_machines
             .iter()
@@ -6058,17 +6050,13 @@ fn cmd_grep_with_peer(
         }
     }
 
+    let mut sessions = Vec::new();
+    let mut ranks = HashMap::new();
+    let mut peer_session_records = Vec::new();
     let mut identity_conflicts = Vec::new();
-    let mut source_totals = vec![sessions.len()];
+    let mut peer_source_totals = Vec::new();
     let mut source_count_known = true;
-    let mut source_time_ranges = vec![
-        sessions
-            .iter()
-            .filter_map(|session| session.get("timestamp").and_then(Value::as_str))
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>(),
-    ];
+    let mut peer_source_time_ranges = Vec::new();
     let mut any_source_failure = false;
     // Grep aggregates are scoped to every selected source. A later metadata
     // failure must not erase a terminal-success scan, but any missing or
@@ -6321,7 +6309,7 @@ fn cmd_grep_with_peer(
                     }
                 }
             }
-            source_totals.push(total);
+            peer_source_totals.push(total);
             if let Some(source) = source_rows.iter_mut().find(|source| {
                 source.get("store").and_then(Value::as_str) == Some(store_name.as_str())
             }) {
@@ -6330,6 +6318,7 @@ fn cmd_grep_with_peer(
                     "returned": store_records.len(),
                     "time_range": store_time_range,
                     "truncated": store_truncated,
+                    "workers": response.stats.get("workers").cloned().unwrap_or(Value::Null),
                 });
             }
             if !store_failures.is_empty() {
@@ -6337,7 +6326,7 @@ fn cmd_grep_with_peer(
                 source_count_known = false;
                 grep_scan_incomplete = true;
             }
-            source_time_ranges.push(peer_time_range(&response.stats));
+            peer_source_time_ranges.push(peer_time_range(&response.stats));
             // A terminal-success scan can prove a tail even when another
             // selected scan is missing. Its positive evidence remains sound
             // as a lower bound on the merged result set.
@@ -6345,18 +6334,7 @@ fn cmd_grep_with_peer(
             if !valid_response {
                 continue;
             }
-            for (mut session, rank) in store_records {
-                let tape_id = session["tape_id"].as_str().unwrap_or_default().to_string();
-                session["locations"] = json!([session["location"].clone()]);
-                merge_peer_grep_session(
-                    &mut sessions,
-                    &mut ranks,
-                    &mut identity_conflicts,
-                    session,
-                    rank,
-                    &tape_id,
-                );
-            }
+            peer_session_records.extend(store_records);
             grep_succeeded.push(export.clone());
         }
         if let Some(owner) = owner {
@@ -6365,6 +6343,80 @@ fn cmd_grep_with_peer(
         }
     }
 
+    let local_scan = local_scan
+        .join()
+        .map_err(|_| CliError::new("grep_worker_panicked", "local grep scan worker panicked"))??;
+    let local_score_by_session = local_scan
+        .ranks
+        .iter()
+        .map(|(session_id, rank)| (session_id.clone(), rank.match_count as f32))
+        .collect::<HashMap<_, _>>();
+    let mut local_sessions = format_sessions_for_agent(
+        context,
+        &indexes,
+        local_scan.raw_sessions,
+        &local_score_by_session,
+        None,
+    )?;
+    local_sessions.retain(|session| session_matches_date_filter(session, &date_filter));
+    for session in &mut local_sessions {
+        let session_id = session
+            .get("session_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        session["tape_id"] = json!(session_id);
+        session["location"] = local_grep_location(context, &topology.self_label, &session_id);
+        session["locations"] = json!([session["location"].clone()]);
+    }
+    if local_sessions
+        .iter()
+        .any(|session| session["location"]["store"].as_str() == Some(fallback_store.as_str()))
+    {
+        source_rows.push(json!({
+            "store": fallback_store,
+            "kind": "local_tapes",
+            "status": "ok",
+        }));
+    }
+
+    let mut source_totals = vec![local_sessions.len()];
+    source_totals.extend(peer_source_totals);
+    let mut source_time_ranges = vec![
+        local_sessions
+            .iter()
+            .filter_map(|session| session.get("timestamp").and_then(Value::as_str))
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>(),
+    ];
+    source_time_ranges.extend(peer_source_time_ranges);
+
+    for session in local_sessions {
+        let Some(tape_id) = session.get("tape_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let rank = local_scan.ranks.get(tape_id).copied().unwrap_or_default();
+        ranks.insert(tape_id.to_string(), rank);
+        sessions.push(session);
+    }
+    for (mut session, rank) in peer_session_records {
+        let tape_id = session["tape_id"].as_str().unwrap_or_default().to_string();
+        session["locations"] = json!([session["location"].clone()]);
+        merge_peer_grep_session(
+            &mut sessions,
+            &mut ranks,
+            &mut identity_conflicts,
+            session,
+            rank,
+            &tape_id,
+        );
+    }
+
+    let local_scan_stats = json!({
+        "tapes": local_scan.scanned_tapes,
+        "workers": local_scan.workers,
+    });
     let mut page_ranked = sessions;
     page_ranked.sort_by(|a, b| compare_grep_sessions(a, b, &ranks));
     let start = args.offset.min(page_ranked.len());
@@ -6612,6 +6664,7 @@ fn cmd_grep_with_peer(
         "dispatch_lineage": [],
         "tombstones": [],
         "stores_queried": indexes.len() + peer_store_count,
+        "scan_stats": {"local": local_scan_stats},
         "returned": returned,
         "total": exact_total,
         "time_range": time_range,
@@ -7388,7 +7441,7 @@ fn cmd_peek(_paths: &RepoPaths, context: &RuntimeContext, args: PeekArgs) -> Res
     let (window_start, window_end, content) = if let Some(pattern) = args.grep_filter.as_deref() {
         let mut hits = Vec::new();
         for (idx, line) in content_lines.iter().enumerate() {
-            if line.contains(pattern) {
+            if grep_line_matches(line, pattern)? {
                 hits.push(idx);
             }
         }

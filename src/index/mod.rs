@@ -691,6 +691,31 @@ impl SqliteIndex {
         stmt.query_map([], |row| row.get(0))?.collect()
     }
 
+    /// Return indexed and evidence-referenced tape IDs for grep in one query.
+    /// The booleans indicate indexed membership and reference membership.
+    pub fn grep_tape_ids(&self) -> rusqlite::Result<Vec<(String, bool, bool)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tape_id, MAX(indexed), MAX(referenced)
+             FROM (
+                 SELECT tape_id, 1 AS indexed, 0 AS referenced FROM tapes
+                 UNION ALL
+                 SELECT tape_id, 0 AS indexed, 1 AS referenced FROM evidence_windows
+                 UNION ALL
+                 SELECT tape_id, 0 AS indexed, 1 AS referenced FROM tombstones
+             )
+             GROUP BY tape_id
+             ORDER BY tape_id ASC",
+        )?;
+        stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get::<_, i64>(1)? != 0,
+                row.get::<_, i64>(2)? != 0,
+            ))
+        })?
+        .collect()
+    }
+
     pub fn ingest_tape_events(
         &self,
         tape_id: &str,

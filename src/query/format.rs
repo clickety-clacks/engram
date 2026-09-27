@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::fs;
-use std::path::Path;
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use serde_json::{Map, Value, json};
@@ -17,6 +17,9 @@ use crate::query::explain::{
 };
 pub use crate::store::tapes::{TapeRow, parse_jsonl_rows, print_json};
 use crate::store::tapes::{event_window, read_tape_content, resolve_tape_path, tape_id_from_path};
+use crate::tape::grep::{
+    grep_line_matches as decoded_grep_line_matches, scan_grep_reader, scan_parallel_in_order,
+};
 use crate::{CliError, RuntimeContext, path_string};
 
 pub const MAX_QUERY_WINDOW_ANCHORS: usize = 16;
@@ -150,12 +153,40 @@ pub fn collect_grep_matches(
     indexes: &[SqliteIndex],
     pattern: &str,
 ) -> Result<(Vec<Value>, HashMap<String, GrepRank>), CliError> {
+    let work = prepare_grep_scan(context, indexes)?;
+    let result = run_grep_scan(work, pattern)?;
+    Ok((result.raw_sessions, result.ranks))
+}
+
+#[derive(Debug)]
+struct GrepScanTask {
+    tape_id: String,
+    path: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct GrepScanWork {
+    tasks: Vec<GrepScanTask>,
+}
+
+#[derive(Debug)]
+pub struct GrepScanOutput {
+    pub raw_sessions: Vec<Value>,
+    pub ranks: HashMap<String, GrepRank>,
+    pub workers: usize,
+    pub scanned_tapes: usize,
+}
+
+pub fn prepare_grep_scan(
+    context: &RuntimeContext,
+    indexes: &[SqliteIndex],
+) -> Result<GrepScanWork, CliError> {
     let mut tape_ids = HashSet::new();
     for index in indexes {
-        for tape_id in index.referenced_tape_ids()? {
-            tape_ids.insert(tape_id);
-        }
+        tape_ids.extend(index.referenced_tape_ids()?);
     }
+
+    let mut paths = HashMap::new();
     for dir in &context.tape_lookup_dirs {
         if !dir.exists() {
             continue;
@@ -163,80 +194,81 @@ pub fn collect_grep_matches(
         let entries = fs::read_dir(dir).map_err(|err| CliError::io("read_dir_error", err))?;
         for entry in entries {
             let entry = entry.map_err(|err| CliError::io("read_dir_error", err))?;
-            if let Some(tape_id) = tape_id_from_path(&entry.path()) {
-                tape_ids.insert(tape_id);
+            let path = entry.path();
+            let Some(tape_id) = tape_id_from_path(&path) else {
+                continue;
+            };
+            tape_ids.insert(tape_id.clone());
+            if !paths.contains_key(&tape_id) && path.exists() {
+                paths.insert(tape_id, path);
             }
         }
     }
 
+    let mut tape_ids = tape_ids.into_iter().collect::<Vec<_>>();
+    tape_ids.sort();
+    let tasks = tape_ids
+        .into_iter()
+        .filter_map(|tape_id| {
+            paths.get(&tape_id).cloned().map(|path| GrepScanTask {
+                tape_id,
+                path,
+            })
+        })
+        .collect();
+    Ok(GrepScanWork { tasks })
+}
+
+pub fn run_grep_scan(
+    work: GrepScanWork,
+    pattern: &str,
+) -> Result<GrepScanOutput, CliError> {
+    let scanned_tapes = work.tasks.len();
     let mut raw_sessions = Vec::new();
-    let mut rank_by_session = HashMap::new();
-
-    for tape_id in tape_ids {
-        let Some(path) = resolve_tape_path(context, &tape_id) else {
-            continue;
-        };
-        let content = read_tape_content(&path)?;
-        let lines = content.lines().collect::<Vec<_>>();
-        let rows = parse_jsonl_rows(&content)?;
-        let provenance_offsets = rows
-            .iter()
-            .filter(|row| is_provenance_row(&row.value))
-            .map(|row| row.offset)
-            .collect::<HashSet<_>>();
-        let provenance_event_count = provenance_offsets.len();
-
-        let mut first_match = None;
-        let mut first_provenance_match = None;
-        let mut match_count = 0usize;
-        let mut provenance_match_count = 0usize;
-        for (idx, line) in lines.iter().enumerate() {
-            if line.contains(pattern) {
-                match_count += 1;
-                if first_match.is_none() {
-                    first_match = Some(idx as u64);
-                }
-                let offset = idx as u64;
-                if provenance_offsets.contains(&offset) {
-                    provenance_match_count += 1;
-                    if first_provenance_match.is_none() {
-                        first_provenance_match = Some(offset);
-                    }
-                }
+    let mut ranks = HashMap::new();
+    let workers = scan_parallel_in_order(
+        &work.tasks,
+        |task| {
+            let file = File::open(&task.path).map_err(|error| CliError::io("read_error", error))?;
+            scan_grep_reader(file, None, pattern)
+                .map_err(|error| CliError::new(error.code, error.message))
+        },
+        |task, result| -> Result<(), CliError> {
+            let summary = result?;
+            if summary.match_count == 0 {
+                return Ok(());
             }
-        }
-        let Some(first_match) = first_match else {
-            continue;
-        };
-
-        let anchor_offset = first_provenance_match.unwrap_or(first_match);
-        let windows = event_window(&rows, anchor_offset, TRANSCRIPT_WINDOW_RADIUS)
-            .into_iter()
-            .collect::<Vec<_>>();
-        raw_sessions.push(json!({
-            "tape_id": tape_id,
-            "tape_present_locally": true,
-            "touch_count": match_count,
-            "latest_touch_timestamp": extract_latest_timestamp_from_rows(&rows),
-            "touches": [],
-            "windows": windows,
-        }));
-        rank_by_session.insert(
-            raw_sessions
-                .last()
-                .and_then(|v| v.get("tape_id"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            GrepRank {
-                provenance_match_count,
-                match_count,
-                provenance_event_count,
-            },
-        );
-    }
-
-    Ok((raw_sessions, rank_by_session))
+            let anchor_offset = summary.anchor_line.saturating_sub(1) as u64;
+            raw_sessions.push(json!({
+                "tape_id": task.tape_id,
+                "tape_present_locally": true,
+                "touch_count": summary.match_count,
+                "latest_touch_timestamp": summary.timestamp,
+                "touches": [],
+                "windows": [{"touch_offset": anchor_offset}],
+                "grep_scan_prepared": true,
+                "grep_pattern": pattern,
+                "grep_total_lines": summary.total_lines,
+                "grep_files_touched": summary.files_touched,
+                "grep_anchor_line": summary.anchor_line,
+            }));
+            ranks.insert(
+                task.tape_id.clone(),
+                GrepRank {
+                    provenance_match_count: summary.provenance_match_count,
+                    match_count: summary.match_count,
+                    provenance_event_count: summary.provenance_event_count,
+                },
+            );
+            Ok(())
+        },
+    )?;
+    Ok(GrepScanOutput {
+        raw_sessions,
+        ranks,
+        workers,
+        scanned_tapes,
+    })
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -244,6 +276,11 @@ pub struct GrepRank {
     pub provenance_match_count: usize,
     pub match_count: usize,
     pub provenance_event_count: usize,
+}
+
+pub fn grep_line_matches(line: &str, pattern: &str) -> Result<bool, CliError> {
+    decoded_grep_line_matches(line, pattern)
+        .map_err(|error| CliError::new(error.code, error.message))
 }
 
 pub fn compare_grep_sessions(
@@ -307,13 +344,6 @@ pub fn compare_explain_sessions(a: &Value, b: &Value) -> std::cmp::Ordering {
         .then_with(|| a_session_id.cmp(b_session_id))
 }
 
-pub(crate) fn is_provenance_row(value: &Value) -> bool {
-    matches!(
-        value.get("k").and_then(Value::as_str),
-        Some("code.edit" | "code.read" | "span.link")
-    )
-}
-
 pub fn format_sessions_for_agent(
     context: &RuntimeContext,
     indexes: &[SqliteIndex],
@@ -329,8 +359,23 @@ pub fn format_sessions_for_agent(
             continue;
         };
 
-        let tape_path = resolve_tape_path(context, session_id);
-        let (rows, raw_text, total_lines) = if let Some(path) = tape_path.as_ref() {
+        let grep_prepared = raw
+            .get("grep_scan_prepared")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let tape_path = if grep_prepared {
+            None
+        } else {
+            resolve_tape_path(context, session_id)
+        };
+        let (rows, raw_text, total_lines) = if grep_prepared {
+            let total_lines = raw
+                .get("grep_total_lines")
+                .and_then(Value::as_u64)
+                .and_then(|lines| usize::try_from(lines).ok())
+                .unwrap_or_default();
+            (Vec::new(), String::new(), total_lines)
+        } else if let Some(path) = tape_path.as_ref() {
             let content = read_tape_content(path)?;
             let rows = parse_jsonl_rows(&content)?;
             let total = content.lines().count();
@@ -369,25 +414,48 @@ pub fn format_sessions_for_agent(
                 .collect::<Vec<_>>()
         };
 
-        if let Some(pattern) = grep
-            && !window_texts.iter().any(|text| text.contains(pattern))
-        {
-            continue;
+        if let Some(pattern) = grep {
+            let matched = if grep_prepared {
+                raw.get("grep_pattern").and_then(Value::as_str) == Some(pattern)
+            } else {
+                let mut matched = false;
+                for text in &window_texts {
+                    if decoded_grep_line_matches(text, pattern)
+                        .map_err(|error| CliError::new(error.code, error.message))?
+                    {
+                        matched = true;
+                        break;
+                    }
+                }
+                matched
+            };
+            if !matched {
+                continue;
+            }
         }
 
-        let mut files_touched = raw
-            .get("touches")
-            .and_then(Value::as_array)
-            .map(|touches| {
-                touches
-                    .iter()
-                    .filter_map(|touch| touch.get("file_path").and_then(Value::as_str))
-                    .filter(|file| !file.is_empty())
-                    .map(ToOwned::to_owned)
-                    .collect::<HashSet<_>>()
-            })
-            .unwrap_or_default();
-        if files_touched.is_empty() {
+        let mut files_touched = if grep_prepared {
+            raw.get("grep_files_touched")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect::<HashSet<_>>()
+        } else {
+            raw.get("touches")
+                .and_then(Value::as_array)
+                .map(|touches| {
+                    touches
+                        .iter()
+                        .filter_map(|touch| touch.get("file_path").and_then(Value::as_str))
+                        .filter(|file| !file.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect::<HashSet<_>>()
+                })
+                .unwrap_or_default()
+        };
+        if files_touched.is_empty() && !grep_prepared {
             for file in collect_files_touched_from_rows(&rows) {
                 files_touched.insert(file);
             }
@@ -401,7 +469,13 @@ pub fn format_sessions_for_agent(
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
-            .unwrap_or_else(|| extract_latest_timestamp_from_rows(&rows));
+            .unwrap_or_else(|| {
+                if grep_prepared {
+                    String::new()
+                } else {
+                    extract_latest_timestamp_from_rows(&rows)
+                }
+            });
         let touches = raw.get("touches").cloned().unwrap_or_else(|| json!([]));
 
         out.push(json!({

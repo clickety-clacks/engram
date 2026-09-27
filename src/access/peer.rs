@@ -25,10 +25,13 @@ use crate::index::{
 };
 use crate::query::format::{
     DateFilter, collect_files_touched_from_rows, edge_to_json, extract_latest_timestamp_from_rows,
-    is_provenance_row, session_matches_date_filter,
+    session_matches_date_filter,
 };
 use crate::store::tapes::{TapeRow, parse_jsonl_rows};
 use crate::tape::compress::decompress_jsonl_with_limit;
+use crate::tape::grep::{
+    GrepTapeSummary, grep_line_matches, scan_grep_reader, scan_parallel_in_order,
+};
 
 pub const PROTOCOL_VERSION: u64 = 1;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -918,14 +921,25 @@ impl PeerSession {
                     window_start.saturating_add(window_lines).saturating_sub(1),
                 )
             };
-            let grep_filter_hits_window = grep_filter.as_ref().map(|pattern| {
-                window_end > 0
-                    && raw_text
+            let grep_filter_hits_window = if let Some(pattern) = grep_filter.as_ref() {
+                Some(
+                    raw_text
                         .lines()
                         .skip(window_start.saturating_sub(1))
                         .take(window_end.saturating_sub(window_start).saturating_add(1))
-                        .any(|line| line.contains(pattern))
-            });
+                        .try_fold(false, |matched, line| {
+                            if matched {
+                                Ok(true)
+                            } else {
+                                grep_line_matches(line, pattern).map_err(|error| {
+                                    PeerError::new("invalid_tape", error.message)
+                                })
+                            }
+                        })?,
+                )
+            } else {
+                None
+            };
             let summary = json!({
                 "total_lines": total_lines,
                 "anchor_line": anchor_line,
@@ -1164,31 +1178,59 @@ impl PeerSession {
             .map_err(|error| PeerError::new(error.code, error.message))?;
 
         let export = self.require_open(&stores[0])?;
-        let indexed_tape_ids = export
-            .index
-            .tape_ids()?
-            .into_iter()
-            .collect::<HashSet<_>>();
-        let mut tape_ids = export
-            .index
-            .referenced_tape_ids()?
-            .into_iter()
-            .collect::<HashSet<_>>();
+        let mut indexed_tape_ids = HashSet::new();
+        let mut tape_ids = HashSet::new();
+        for (tape_id, indexed, referenced) in export.index.grep_tape_ids()? {
+            if indexed {
+                indexed_tape_ids.insert(tape_id.clone());
+            }
+            if referenced {
+                tape_ids.insert(tape_id);
+            }
+        }
+        let mut tape_paths = HashMap::<String, (PathBuf, u64)>::new();
         for dir in &export.config.tape_dirs {
             let entries = fs::read_dir(dir)
                 .map_err(|error| PeerError::new("tape_inventory_error", error.to_string()))?;
             for entry in entries {
                 let entry = entry
                     .map_err(|error| PeerError::new("tape_inventory_error", error.to_string()))?;
-                if let Some(tape_id) = crate::store::tapes::tape_id_from_path(&entry.path())
+                let path = entry.path();
+                if let Some(tape_id) = crate::store::tapes::tape_id_from_path(&path)
                     && validate_tape_id(&tape_id).is_ok()
                 {
-                    tape_ids.insert(tape_id);
+                    tape_ids.insert(tape_id.clone());
+                    if !tape_paths.contains_key(&tape_id)
+                        && let Some(size) = self.memoized_file_size(&path)
+                    {
+                        tape_paths.insert(tape_id, (path, size));
+                    }
                 }
             }
         }
         let mut tape_ids = tape_ids.into_iter().collect::<Vec<_>>();
         tape_ids.sort();
+
+        let scan_tasks = tape_ids
+            .into_iter()
+            .map(|tape_id| {
+                let indexed = indexed_tape_ids.contains(&tape_id);
+                if let Err(error) = validate_tape_id(&tape_id) {
+                    return GrepScanTask {
+                        tape_id,
+                        indexed,
+                        path: None,
+                        error: Some((error.code, error.message)),
+                    };
+                }
+                GrepScanTask {
+                    path: tape_paths.get(&tape_id).cloned(),
+                    tape_id,
+                    indexed,
+                    error: None,
+                }
+            })
+            .collect::<Vec<_>>();
 
         let mut top = BinaryHeap::new();
         let mut failures = Vec::new();
@@ -1204,45 +1246,24 @@ impl PeerSession {
         let mut time_max: Option<String> = None;
         let store_ref = format!("{}/{}", self.topology.self_label, stores[0]);
 
-        for tape_id in tape_ids {
-            if let Err(error) = validate_tape_id(&tape_id) {
-                let failure = json!({
-                    "type": "failure",
-                    "tape_id": tape_id,
-                    "error": {"code": error.code, "message": error.message},
-                });
-                append_grep_failure(
-                    &mut failures,
-                    failure,
-                    id,
-                    &mut failure_bytes,
-                    top_bytes,
-                    response_limit,
-                )?;
-                continue;
-            }
-            let indexed = indexed_tape_ids.contains(&tape_id);
-            let Some((path, compressed_size)) = self.tape_path(&export.config, &tape_id) else {
-                let failure = json!({
-                    "type": "failure",
-                    "tape_id": tape_id,
-                    "error": {
-                        "code": "tape_unavailable",
-                        "message": "indexed tape is not present in this export's tape directories",
-                    },
-                });
-                append_grep_failure(
-                    &mut failures,
-                    failure,
-                    id,
-                    &mut failure_bytes,
-                    top_bytes,
-                    response_limit,
-                )?;
-                continue;
-            };
-            let summary =
-                match scan_tape_for_grep(&path, compressed_size, &self.topology.limits, pattern) {
+        let limits = self.topology.limits.clone();
+        let scan_workers = scan_parallel_in_order(
+            &scan_tasks,
+            |task| {
+                if let Some((code, message)) = &task.error {
+                    return Err(PeerError::new(*code, message.clone()));
+                }
+                let Some((path, compressed_size)) = &task.path else {
+                    return Err(PeerError::new(
+                        "tape_unavailable",
+                        "indexed tape is not present in this export's tape directories",
+                    ));
+                };
+                scan_tape_for_grep(path, *compressed_size, &limits, pattern)
+            },
+            |task, result| {
+                let tape_id = task.tape_id.as_str();
+                let summary = match result {
                     Ok(summary) => summary,
                     Err(error) => {
                         let failure = json!({
@@ -1258,86 +1279,88 @@ impl PeerSession {
                             top_bytes,
                             response_limit,
                         )?;
-                        continue;
+                        return Ok(());
                     }
                 };
-            if summary.match_count == 0
-                || !session_matches_date_filter(
-                    &json!({"timestamp": summary.timestamp}),
-                    &date_filter,
-                )
-            {
-                continue;
-            }
+                if summary.match_count == 0
+                    || !session_matches_date_filter(
+                        &json!({"timestamp": summary.timestamp}),
+                        &date_filter,
+                    )
+                {
+                    return Ok(());
+                }
 
-            total = total.saturating_add(1);
-            if !summary.timestamp.is_empty() {
-                if time_min
-                    .as_ref()
-                    .is_none_or(|current| summary.timestamp < *current)
-                {
-                    time_min = Some(summary.timestamp.clone());
-                }
-                if time_max
-                    .as_ref()
-                    .is_none_or(|current| summary.timestamp > *current)
-                {
-                    time_max = Some(summary.timestamp.clone());
-                }
-            }
-            let (refs_up, refs_down) = dispatch_ref_counts(&export.index, &tape_id)?;
-            let record = json!({
-                "type": "match",
-                "store": store_ref.clone(),
-                "tape_id": tape_id,
-                "indexed": indexed,
-                "match_count": summary.match_count,
-                "provenance_match_count": summary.provenance_match_count,
-                "provenance_event_count": summary.provenance_event_count,
-                "timestamp": summary.timestamp,
-                "total_lines": summary.total_lines,
-                "anchor_line": summary.anchor_line,
-                "files_touched": summary.files_touched,
-                "refs_up": refs_up,
-                "refs_down": refs_down,
-            });
-            if k > 0 {
-                let mut candidate = GrepCandidate::from_record(record);
-                let replaces_worst = top.peek().is_some_and(|worst| candidate < *worst);
-                if top.len() < k || replaces_worst {
-                    candidate.frame_size = grep_data_frame_size(id, &candidate.record)? as u64;
-                    if candidate.frame_size as usize > MAX_FRAME_BYTES {
-                        return Err(PeerError::new(
-                            "budget_exceeded",
-                            "a grep result exceeds the maximum frame size",
-                        ));
+                total = total.saturating_add(1);
+                if !summary.timestamp.is_empty() {
+                    if time_min
+                        .as_ref()
+                        .is_none_or(|current| summary.timestamp < *current)
+                    {
+                        time_min = Some(summary.timestamp.clone());
+                    }
+                    if time_max
+                        .as_ref()
+                        .is_none_or(|current| summary.timestamp > *current)
+                    {
+                        time_max = Some(summary.timestamp.clone());
                     }
                 }
-                if top.len() < k {
-                    top_bytes = top_bytes.saturating_add(candidate.frame_size);
-                    if top_bytes.saturating_add(failure_bytes) > response_limit {
-                        return Err(PeerError::new(
-                            "budget_exceeded",
-                            format!("grep response exceeds {response_limit} byte limit"),
-                        ));
+                let (refs_up, refs_down) = dispatch_ref_counts(&export.index, tape_id)?;
+                let record = json!({
+                    "type": "match",
+                    "store": store_ref.clone(),
+                    "tape_id": tape_id,
+                    "indexed": task.indexed,
+                    "match_count": summary.match_count,
+                    "provenance_match_count": summary.provenance_match_count,
+                    "provenance_event_count": summary.provenance_event_count,
+                    "timestamp": summary.timestamp,
+                    "total_lines": summary.total_lines,
+                    "anchor_line": summary.anchor_line,
+                    "files_touched": summary.files_touched,
+                    "refs_up": refs_up,
+                    "refs_down": refs_down,
+                });
+                if k > 0 {
+                    let mut candidate = GrepCandidate::from_record(record);
+                    let replaces_worst = top.peek().is_some_and(|worst| candidate < *worst);
+                    if top.len() < k || replaces_worst {
+                        candidate.frame_size = grep_data_frame_size(id, &candidate.record)? as u64;
+                        if candidate.frame_size as usize > MAX_FRAME_BYTES {
+                            return Err(PeerError::new(
+                                "budget_exceeded",
+                                "a grep result exceeds the maximum frame size",
+                            ));
+                        }
                     }
-                    top.push(candidate);
-                } else if replaces_worst {
-                    let worst = top.pop().expect("peeked top candidate");
-                    let next_bytes = top_bytes
-                        .saturating_sub(worst.frame_size)
-                        .saturating_add(candidate.frame_size);
-                    if next_bytes.saturating_add(failure_bytes) > response_limit {
-                        return Err(PeerError::new(
-                            "budget_exceeded",
-                            format!("grep response exceeds {response_limit} byte limit"),
-                        ));
+                    if top.len() < k {
+                        top_bytes = top_bytes.saturating_add(candidate.frame_size);
+                        if top_bytes.saturating_add(failure_bytes) > response_limit {
+                            return Err(PeerError::new(
+                                "budget_exceeded",
+                                format!("grep response exceeds {response_limit} byte limit"),
+                            ));
+                        }
+                        top.push(candidate);
+                    } else if replaces_worst {
+                        let worst = top.pop().expect("peeked top candidate");
+                        let next_bytes = top_bytes
+                            .saturating_sub(worst.frame_size)
+                            .saturating_add(candidate.frame_size);
+                        if next_bytes.saturating_add(failure_bytes) > response_limit {
+                            return Err(PeerError::new(
+                                "budget_exceeded",
+                                format!("grep response exceeds {response_limit} byte limit"),
+                            ));
+                        }
+                        top_bytes = next_bytes;
+                        top.push(candidate);
                     }
-                    top_bytes = next_bytes;
-                    top.push(candidate);
                 }
-            }
-        }
+                Ok(())
+            },
+        )?;
 
         let time_range = json!({
             "start": time_min,
@@ -1353,6 +1376,7 @@ impl PeerSession {
             "time_range": time_range,
             "truncated": total > k,
             "failures": failure_count,
+            "workers": scan_workers,
         });
         let records = matches
             .into_iter()
@@ -1471,7 +1495,9 @@ impl PeerSession {
         let (window_start, window_end, selected_count) = if let Some(pattern) = grep_filter {
             let mut selected_count = 0usize;
             for (index, line) in raw_text.lines().enumerate() {
-                if !line.contains(&pattern) {
+                if !grep_line_matches(line, &pattern)
+                    .map_err(|error| PeerError::new("invalid_tape", error.message))?
+                {
                     continue;
                 }
                 let range_start = index.saturating_sub(grep_context);
@@ -1779,14 +1805,11 @@ fn configured_limit(limits: &BTreeMap<String, u64>, key: &str, default: u64) -> 
 }
 
 #[derive(Debug)]
-struct GrepTapeSummary {
-    match_count: usize,
-    provenance_match_count: usize,
-    provenance_event_count: usize,
-    timestamp: String,
-    total_lines: usize,
-    anchor_line: usize,
-    files_touched: Vec<String>,
+struct GrepScanTask {
+    tape_id: String,
+    indexed: bool,
+    path: Option<(PathBuf, u64)>,
+    error: Option<(&'static str, String)>,
 }
 
 #[derive(Debug)]
@@ -1894,89 +1917,20 @@ fn scan_tape_for_grep(
         ));
     }
 
-    let decoder = zstd::stream::read::Decoder::new(file.take(compressed_limit.saturating_add(1)))
-        .map_err(|error| PeerError::new("invalid_tape", error.to_string()))?;
     let decompressed_limit =
         configured_limit(limits, "decompressed_bytes_per_tape", 512 * 1024 * 1024);
-    let mut reader = io::BufReader::new(decoder.take(decompressed_limit.saturating_add(1)));
-    let mut line = Vec::new();
-    let mut bytes_read = 0u64;
-    let mut total_lines = 0usize;
-    let mut match_count = 0usize;
-    let mut provenance_match_count = 0usize;
-    let mut provenance_event_count = 0usize;
-    let mut first_match = None;
-    let mut first_provenance_match = None;
-    let mut timestamp = String::new();
-    let mut files_touched = HashSet::new();
-
-    loop {
-        line.clear();
-        let bytes = reader
-            .read_until(b'\n', &mut line)
-            .map_err(|error| PeerError::new("invalid_tape", error.to_string()))?;
-        if bytes == 0 {
-            break;
-        }
-        bytes_read = bytes_read.saturating_add(bytes as u64);
-        if bytes_read > decompressed_limit {
-            return Err(PeerError::new(
-                "over_limit",
-                format!("decompressed tape exceeds {decompressed_limit} byte limit"),
-            ));
-        }
-        let mut content_end = line.len();
-        if line.get(content_end.saturating_sub(1)) == Some(&b'\n') {
-            content_end -= 1;
-            if line.get(content_end.saturating_sub(1)) == Some(&b'\r') {
-                content_end -= 1;
-            }
-        }
-        let text = std::str::from_utf8(&line[..content_end])
-            .map_err(|error| PeerError::new("invalid_tape", error.to_string()))?;
-        let line_offset = total_lines as u64;
-        total_lines = total_lines.saturating_add(1);
-        if text.contains(pattern) {
-            match_count = match_count.saturating_add(1);
-            first_match.get_or_insert(line_offset);
-        }
-
-        if !text.trim().is_empty() {
-            let value: Value = serde_json::from_slice(&line[..content_end])
-                .map_err(|error| PeerError::new("invalid_tape", error.to_string()))?;
-            if is_provenance_row(&value) {
-                provenance_event_count = provenance_event_count.saturating_add(1);
-                if text.contains(pattern) {
-                    provenance_match_count = provenance_match_count.saturating_add(1);
-                    first_provenance_match.get_or_insert(line_offset);
-                }
-            }
-            if let Some(row_timestamp) = value.get("t").and_then(Value::as_str)
-                && row_timestamp > timestamp.as_str()
-            {
-                timestamp = row_timestamp.to_string();
-            }
-            for field in ["file", "from_file", "to_file"] {
-                if let Some(file) = value.get(field).and_then(Value::as_str) {
-                    files_touched.insert(file.to_string());
-                }
-            }
-        }
-    }
-
-    let mut files_touched = files_touched.into_iter().collect::<Vec<_>>();
-    files_touched.sort();
-    let anchor_offset = first_provenance_match.or(first_match).unwrap_or_default();
-    Ok(GrepTapeSummary {
-        match_count,
-        provenance_match_count,
-        provenance_event_count,
-        timestamp,
-        total_lines,
-        anchor_line: usize::try_from(anchor_offset)
-            .unwrap_or_default()
-            .saturating_add(1),
-        files_touched,
+    scan_grep_reader(
+        file.take(compressed_limit.saturating_add(1)),
+        Some(decompressed_limit),
+        pattern,
+    )
+    .map_err(|error| {
+        let code = if error.code == "over_limit" {
+            "over_limit"
+        } else {
+            "invalid_tape"
+        };
+        PeerError::new(code, error.message)
     })
 }
 
