@@ -4441,7 +4441,10 @@ exit "$peer_status"
             return bounded_text(line, 360);
         };
         let string_field = |value: Option<&serde_json::Value>| {
-            value.and_then(serde_json::Value::as_str).unwrap_or("-")
+            value
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("-")
+                .to_string()
         };
         let data = frame.get("data");
         let op = frame
