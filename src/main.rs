@@ -7869,21 +7869,21 @@ mod tests {
         let error = explain_require_complete_error(&[json!({
             "store": "eezo/default",
             "status": "failed",
-            "phase": "lookup_edges",
+            "phase": "locate_tapes",
             "error": {
-                "code": "invalid_request",
-                "message": "anchor exceeds the peer frame limit",
+                "code": "protocol_error",
+                "message": "peer omitted one or more requested tape locations",
             },
         })]);
 
         assert_eq!(error.code, "incomplete_results");
         assert!(error.message.contains("eezo/default"));
-        assert!(error.message.contains("phase=lookup_edges"));
-        assert!(error.message.contains("invalid_request"));
+        assert!(error.message.contains("phase=locate_tapes"));
+        assert!(error.message.contains("protocol_error"));
         assert!(
             error
                 .message
-                .contains("anchor exceeds the peer frame limit")
+                .contains("peer omitted one or more requested tape locations")
         );
     }
 
