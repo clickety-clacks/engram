@@ -11,7 +11,11 @@ fn run_cli(repo: &Path, args: &[&str], stdin: Option<&str>) -> Output {
     let isolated_home = repo.join(".home");
     fs::create_dir_all(&isolated_home).expect("home dir");
     cmd.current_dir(repo).args(args);
-    cmd.env("HOME", &isolated_home);
+    if cfg!(windows) {
+        cmd.env("USERPROFILE", &isolated_home).env_remove("HOME");
+    } else {
+        cmd.env("HOME", &isolated_home);
+    }
     if stdin.is_none() {
         return cmd.output().expect("command runs");
     }

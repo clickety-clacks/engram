@@ -9,12 +9,14 @@ use serde_json::{Value, json};
 
 fn run_cli(repo: &Path, args: &[&str], home: &Path) -> Output {
     fs::create_dir_all(home).expect("sandboxed HOME");
-    Command::new(env!("CARGO_BIN_EXE_engram"))
-        .current_dir(repo)
-        .args(args)
-        .env("HOME", home)
-        .output()
-        .expect("compiled engram binary runs")
+    let mut command = Command::new(env!("CARGO_BIN_EXE_engram"));
+    command.current_dir(repo).args(args);
+    if cfg!(windows) {
+        command.env("USERPROFILE", home).env_remove("HOME");
+    } else {
+        command.env("HOME", home);
+    }
+    command.output().expect("compiled engram binary runs")
 }
 
 fn run_json(repo: &Path, args: &[&str], home: &Path) -> Value {

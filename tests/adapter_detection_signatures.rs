@@ -6,12 +6,14 @@ use engram::tape::adapter::{AdapterId, adapter_claims_input};
 use serde_json::Value;
 
 fn run_json(repo: &Path, args: &[&str], home: &Path) -> Value {
-    let output = Command::new(env!("CARGO_BIN_EXE_engram"))
-        .current_dir(repo)
-        .args(args)
-        .env("HOME", home)
-        .output()
-        .expect("engram should run");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_engram"));
+    command.current_dir(repo).args(args);
+    if cfg!(windows) {
+        command.env("USERPROFILE", home).env_remove("HOME");
+    } else {
+        command.env("HOME", home);
+    }
+    let output = command.output().expect("engram should run");
     assert!(
         output.status.success(),
         "args={args:?}\nstdout={}\nstderr={}",

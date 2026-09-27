@@ -10,7 +10,12 @@ use sha2::{Digest, Sha256};
 fn run_cli(repo: &Path, args: &[&str], stdin: Option<&str>, home: &Path) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_engram"));
     fs::create_dir_all(home).expect("home dir");
-    cmd.current_dir(repo).args(args).env("HOME", home);
+    cmd.current_dir(repo).args(args);
+    if cfg!(windows) {
+        cmd.env("USERPROFILE", home).env_remove("HOME");
+    } else {
+        cmd.env("HOME", home);
+    }
     if stdin.is_none() {
         return cmd.output().expect("command runs");
     }
