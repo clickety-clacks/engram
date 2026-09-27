@@ -839,7 +839,7 @@ fn locate_federated_tapes(
         }
     }
     for (store, tape_set) in expected {
-        if returned.get(&store) != Some(&tape_set) {
+        if !locate_tape_responses_complete(&tape_set, returned.get(&store)) {
             *peer_failed = true;
             mark_source_phase(
                 sources,
@@ -875,6 +875,18 @@ fn locate_federated_tapes(
         values.dedup_by(|left, right| left["store"] == right["store"]);
     }
     located
+}
+
+fn locate_tape_responses_complete(
+    expected: &std::collections::BTreeSet<String>,
+    returned: Option<&std::collections::BTreeSet<String>>,
+) -> bool {
+    // Empty candidate sets send no request, so there is no response-map entry to compare.
+    if expected.is_empty() {
+        returned.is_none_or(std::collections::BTreeSet::is_empty)
+    } else {
+        returned == Some(expected)
+    }
 }
 
 struct FederatedDispatchResult {
@@ -5825,10 +5837,7 @@ fn cmd_explain_with_peers_inner(
         context.explain_default_limit,
     );
     if any_peer_failure && args.require_complete {
-        return Err(CliError::new(
-            "incomplete_results",
-            "one or more selected explain sources failed; inspect the source phase without --require-complete",
-        ));
+        return Err(explain_require_complete_error(&sources));
     }
     let no_results = sessions.is_empty() && tombstones.is_empty() && lineage.is_empty();
     let complete = !any_peer_failure;
@@ -6526,8 +6535,7 @@ fn cmd_grep_with_peer(
         }
     }
 
-    let any_selected_failure =
-        any_source_failure || source_rows.iter().any(grep_source_is_incomplete);
+    let any_selected_failure = any_source_failure || source_rows.iter().any(source_is_incomplete);
     let coverage = if any_selected_failure {
         "partial"
     } else {
@@ -6648,7 +6656,7 @@ fn cmd_grep_with_peer(
     if args.require_complete && any_selected_failure {
         let failures = source_rows
             .iter()
-            .filter_map(format_grep_source_failure)
+            .filter_map(format_source_failure)
             .collect::<Vec<_>>();
         let detail = if failures.is_empty() {
             "one or more selected sources did not complete".to_string()
@@ -6980,7 +6988,7 @@ fn peer_failure_status(code: &str) -> &'static str {
     }
 }
 
-fn grep_source_is_incomplete(source: &Value) -> bool {
+fn source_is_incomplete(source: &Value) -> bool {
     source.get("phase").is_some()
         || source
             .get("status")
@@ -6993,8 +7001,8 @@ fn grep_source_is_incomplete(source: &Value) -> bool {
             })
 }
 
-fn format_grep_source_failure(source: &Value) -> Option<String> {
-    if !grep_source_is_incomplete(source) {
+fn format_source_failure(source: &Value) -> Option<String> {
+    if !source_is_incomplete(source) {
         return None;
     }
 
@@ -7040,6 +7048,22 @@ fn format_peer_error_value(error: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("peer operation failed without a message");
     format!("{code}: {message}")
+}
+
+fn explain_require_complete_error(source_rows: &[Value]) -> CliError {
+    let failures = source_rows
+        .iter()
+        .filter_map(format_source_failure)
+        .collect::<Vec<_>>();
+    let detail = if failures.is_empty() {
+        "one or more selected sources did not complete".to_string()
+    } else {
+        failures.join("; ")
+    };
+    CliError::new(
+        "incomplete_results",
+        format!("explain --require-complete rejected incomplete coverage: {detail}"),
+    )
 }
 
 fn peer_operation_timeout(owner: &RemoteOwner, query_deadline: Instant) -> Duration {
@@ -7838,6 +7862,41 @@ mod tests {
                     .map(|anchor| anchor.as_str().expect("anchor string").to_string())
             })
             .collect()
+    }
+
+    #[test]
+    fn explain_require_complete_error_names_source_phase_code_and_reason() {
+        let error = explain_require_complete_error(&[json!({
+            "store": "eezo/default",
+            "status": "failed",
+            "phase": "lookup_edges",
+            "error": {
+                "code": "invalid_request",
+                "message": "anchor exceeds the peer frame limit",
+            },
+        })]);
+
+        assert_eq!(error.code, "incomplete_results");
+        assert!(error.message.contains("eezo/default"));
+        assert!(error.message.contains("phase=lookup_edges"));
+        assert!(error.message.contains("invalid_request"));
+        assert!(
+            error
+                .message
+                .contains("anchor exceeds the peer frame limit")
+        );
+    }
+
+    #[test]
+    fn empty_federated_tape_lookup_needs_no_peer_response() {
+        let empty = std::collections::BTreeSet::new();
+        assert!(locate_tape_responses_complete(&empty, None));
+        let unexpected = std::collections::BTreeSet::from(["unrequested".to_string()]);
+        assert!(!locate_tape_responses_complete(&empty, Some(&unexpected)));
+
+        let requested = std::collections::BTreeSet::from(["sender-tape".to_string()]);
+        assert!(!locate_tape_responses_complete(&requested, None));
+        assert!(locate_tape_responses_complete(&requested, Some(&requested)));
     }
 
     #[test]

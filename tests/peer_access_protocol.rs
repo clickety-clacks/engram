@@ -1335,6 +1335,28 @@ fn explain_require_complete_peer_failure_precedes_no_results() {
     let binary = env!("CARGO_BIN_EXE_engram");
     let (caller_home, repo) = write_unavailable_explain_fixture(temp.path(), binary);
 
+    let partial = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "explain",
+            "unmatched-explain-anchor",
+            "--anchor",
+            "--peers",
+            "offline",
+        ])
+        .output()
+        .expect("run partial explain to observe the failed source");
+    assert!(!partial.status.success());
+    let partial_result: serde_json::Value =
+        serde_json::from_slice(&partial.stdout).expect("partial explain JSON");
+    let failed_source = partial_result["federation"]["sources"]
+        .as_array()
+        .expect("federated explain sources")
+        .iter()
+        .find(|source| source["store"] == "offline/default")
+        .expect("unavailable peer source");
+
     let output = Command::new(binary)
         .current_dir(&repo)
         .env("HOME", &caller_home)
@@ -1356,6 +1378,33 @@ fn explain_require_complete_peer_failure_precedes_no_results() {
         "require-complete did not report incomplete coverage: {stderr}"
     );
     assert!(!stderr.contains("no_results"));
+
+    let error_line = stderr.lines().last().expect("require-complete error line");
+    let error: serde_json::Value =
+        serde_json::from_str(error_line).expect("require-complete error JSON");
+    assert_eq!(error["error"]["code"], "incomplete_results");
+    let message = error["error"]["message"]
+        .as_str()
+        .expect("require-complete error message");
+    assert!(
+        message.contains("offline/default"),
+        "missing source: {message}"
+    );
+    assert!(
+        message.contains(&format!(
+            "phase={}",
+            failed_source["phase"].as_str().unwrap()
+        )),
+        "missing phase: {message}"
+    );
+    assert!(
+        message.contains(failed_source["error"]["code"].as_str().unwrap()),
+        "missing error code: {message}"
+    );
+    assert!(
+        message.contains(failed_source["error"]["message"].as_str().unwrap()),
+        "missing observed reason: {message}"
+    );
 }
 
 #[test]
@@ -2092,6 +2141,15 @@ fn explain_peers_finds_two_sided_handoff_when_querier_holds_neither_endpoint() {
     assert!(sender_removed.status.success());
     let sender_removed: serde_json::Value =
         serde_json::from_slice(&sender_removed.stdout).expect("sender-removed explain JSON");
+    assert_eq!(sender_removed["federation"]["coverage"], "complete");
+    let receiver_source = sender_removed["federation"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["store"] == "machine-b/default")
+        .expect("selected receiver source");
+    assert_eq!(receiver_source["status"], "ok");
+    assert!(receiver_source.get("phase").is_none());
     assert!(
         sender_removed["dispatch_lineage"]
             .as_array()
@@ -2103,7 +2161,11 @@ fn explain_peers_finds_two_sided_handoff_when_querier_holds_neither_endpoint() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|row| { row["reason"] == "no_sender_observed" && row["uuid"] == uuid })
+            .any(|row| {
+                row["reason"] == "no_sender_observed"
+                    && row["uuid"] == uuid
+                    && row["selection_coverage"] == "complete"
+            })
     );
 
     set_peer_topology(&caller_home, json!({"machine-a":sender}));
