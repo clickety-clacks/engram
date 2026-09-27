@@ -4625,7 +4625,7 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
         .iter()
         .find(|source| source["store"] == "offline/default")
         .expect("offline source row");
-    assert_eq!(offline_source["status"], "unavailable");
+    assert_eq!(offline_source["status"], "failed");
     assert!(matches!(
         offline_source["phase"].as_str(),
         Some("locate_tapes" | "tape_facts")
