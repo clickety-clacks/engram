@@ -5,6 +5,12 @@ on:
     tags:
       - "v*.*.*"
   workflow_dispatch:
+    inputs:
+      macos_peer_disconnect_diagnostic:
+        description: Run only the concurrent peer-disconnect test on macOS
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -185,7 +191,7 @@ jobs:
           git push
 
   portability:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.macos_peer_disconnect_diagnostic != true
     strategy:
       fail-fast: false
       matrix:
@@ -211,3 +217,18 @@ jobs:
 
       - name: Run all locked tests, including the Windows local smoke
         run: cargo test --locked --target ${{ matrix.target }} --no-fail-fast
+
+  macos_peer_disconnect_diagnostic:
+    if: github.event_name == 'workflow_dispatch' && inputs.macos_peer_disconnect_diagnostic == true
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Run bounded concurrent peer-disconnect diagnostic
+        run: cargo test --locked --target aarch64-apple-darwin --test peer_access_protocol grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer -- --exact --nocapture
