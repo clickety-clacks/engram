@@ -33,7 +33,6 @@ use crate::tape::compress::decompress_jsonl_with_limit;
 pub const PROTOCOL_VERSION: u64 = 1;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_BATCH_ITEMS: usize = 128;
-const MAX_ANCHOR_BYTES: usize = 16 * 1024;
 pub const MAX_READ_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const READ_FILE_CHUNK_BYTES: usize = 720 * 1024;
 const DEFAULT_OWNER_SESSION_MAX_SECS: u64 = 120;
@@ -547,19 +546,15 @@ impl PeerSession {
             let store_ref = format!("{}/{}", self.topology.self_label, store);
             for anchor in &anchors {
                 let matching = export.index.matching_window_anchors(anchor)?;
-                write_data_limited(
+                records += write_anchor_result_frames(
                     output,
                     id,
-                    json!({
-                        "type": "anchor_result",
-                        "store": store_ref,
-                        "anchor": anchor,
-                        "matching_window_anchors": matching,
-                    }),
+                    &store_ref,
+                    anchor,
+                    &matching,
                     &mut response_bytes,
                     response_limit,
                 )?;
-                records += 1;
 
                 for fragment in export.index.evidence_for_anchor(anchor)? {
                     let held = self.tape_path(&export.config, &fragment.tape_id).is_some();
@@ -2393,7 +2388,10 @@ fn anchor_batch_with_cap(
     label: &str,
     batch_cap: usize,
 ) -> Result<Vec<String>, PeerError> {
-    string_batch_limited_count(value, label, MAX_ANCHOR_BYTES, batch_cap)
+    // The incoming request has already passed the serialized 1 MiB frame
+    // boundary. An additional per-anchor limit would reject valid exact
+    // composite fingerprints before their frame budget is reached.
+    string_batch_limited_count(value, label, usize::MAX, batch_cap)
 }
 
 fn string_batch_limited(
@@ -2497,6 +2495,129 @@ fn write_data_limited<W: Write>(
     Ok(())
 }
 
+fn write_anchor_result_frames<W: Write>(
+    output: &mut W,
+    id: &Value,
+    store: &str,
+    query_anchor: &str,
+    matching: &[String],
+    used_bytes: &mut u64,
+    response_limit: u64,
+) -> Result<usize, PeerError> {
+    let chunks = anchor_result_frame_ranges(id, store, query_anchor, matching, MAX_FRAME_BYTES)?;
+    for range in &chunks {
+        write_data_limited(
+            output,
+            id,
+            json!({
+                "type": "anchor_result",
+                "store": store,
+                "anchor": query_anchor,
+                "matching_window_anchors": &matching[range.clone()],
+            }),
+            used_bytes,
+            response_limit,
+        )?;
+    }
+    Ok(chunks.len())
+}
+
+fn anchor_result_frame_ranges(
+    id: &Value,
+    store: &str,
+    query_anchor: &str,
+    matching: &[String],
+    frame_limit: usize,
+) -> Result<Vec<std::ops::Range<usize>>, PeerError> {
+    let empty_frame_bytes = anchor_result_frame_bytes(id, store, query_anchor, &[])?;
+    if empty_frame_bytes > frame_limit {
+        return Err(anchor_result_over_limit(
+            "query anchor",
+            query_anchor,
+            empty_frame_bytes,
+            frame_limit,
+        ));
+    }
+    if matching.is_empty() {
+        return Ok(vec![0..0]);
+    }
+
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut frame_bytes = empty_frame_bytes;
+    for (index, matched_anchor) in matching.iter().enumerate() {
+        let encoded_anchor_bytes = serde_json::to_vec(matched_anchor)
+            .map_err(|error| PeerError::new("json_error", error.to_string()))?
+            .len();
+        let separator_bytes = usize::from(index > start);
+        let candidate_bytes = frame_bytes
+            .saturating_add(encoded_anchor_bytes)
+            .saturating_add(separator_bytes);
+        if candidate_bytes <= frame_limit {
+            frame_bytes = candidate_bytes;
+            continue;
+        }
+
+        if index == start {
+            return Err(anchor_result_over_limit(
+                "matched anchor",
+                matched_anchor,
+                candidate_bytes,
+                frame_limit,
+            ));
+        }
+        ranges.push(start..index);
+        start = index;
+        frame_bytes = empty_frame_bytes.saturating_add(encoded_anchor_bytes);
+        if frame_bytes > frame_limit {
+            return Err(anchor_result_over_limit(
+                "matched anchor",
+                matched_anchor,
+                frame_bytes,
+                frame_limit,
+            ));
+        }
+    }
+    ranges.push(start..matching.len());
+    Ok(ranges)
+}
+
+fn anchor_result_frame_bytes(
+    id: &Value,
+    store: &str,
+    query_anchor: &str,
+    matching: &[String],
+) -> Result<usize, PeerError> {
+    serde_json::to_vec(&json!({
+        "id": id,
+        "data": {
+            "type": "anchor_result",
+            "store": store,
+            "anchor": query_anchor,
+            "matching_window_anchors": matching,
+        },
+    }))
+    .map(|frame| frame.len().saturating_add(1))
+    .map_err(|error| PeerError::new("json_error", error.to_string()))
+}
+
+fn anchor_result_over_limit(
+    label: &str,
+    anchor: &str,
+    frame_bytes: usize,
+    frame_limit: usize,
+) -> PeerError {
+    let digest = format!("{:x}", Sha256::digest(anchor.as_bytes()));
+    PeerError::new(
+        "budget_exceeded",
+        format!(
+            "lookup_anchors anchor_result frame is {frame_bytes} bytes including envelope and newline (limit {frame_limit}); {label} is {} bytes (sha256 {})",
+            anchor.len(),
+            &digest[..12],
+        ),
+    )
+}
+
 fn write_terminal<W: Write>(
     output: &mut W,
     id: &Value,
@@ -2560,6 +2681,16 @@ mod tests {
             .to_string()
     }
 
+    fn canonical_winnow_anchor(feature_count: usize) -> String {
+        format!(
+            "winnow:{}",
+            (0..feature_count)
+                .map(|feature| format!("{feature:016x}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
+
     struct DelayedFirstFlush {
         bytes: Vec<u8>,
         flush_completed: Option<mpsc::Sender<()>>,
@@ -2616,6 +2747,123 @@ mod tests {
             db.display(), tapes.display()
         )).expect("topology");
         (temp, home, db, tapes)
+    }
+
+    #[test]
+    fn anchor_result_frames_preserve_real_shaped_anchors_and_whole_match_order() {
+        let observed_shape = canonical_winnow_anchor(1_103);
+        assert_eq!(observed_shape.len(), 18_757);
+        let larger_shape = canonical_winnow_anchor(2_100);
+        assert!(larger_shape.len() > 32 * 1024);
+
+        for anchor in [&observed_shape, &larger_shape] {
+            let matching = vec![anchor.clone()];
+            let ranges = anchor_result_frame_ranges(
+                &json!(7),
+                "eezo/default",
+                "winnow:0123456789abcdef",
+                &matching,
+                MAX_FRAME_BYTES,
+            )
+            .expect("real-shaped exact anchor should fit one bounded frame");
+            assert_eq!(ranges, vec![0..1]);
+            assert_eq!(matching[ranges[0].clone()], [anchor.clone()]);
+        }
+
+        let matching = vec![
+            "winnow:quote\"and\\slash".to_string(),
+            "winnow:line\nbreak".to_string(),
+            "winnow:multibyte-λ".to_string(),
+            "winnow:tail".to_string(),
+            "winnow:tail".to_string(),
+        ];
+        let ranges = anchor_result_frame_ranges(
+            &json!(7),
+            "eezo/default",
+            "winnow:0123456789abcdef",
+            &matching,
+            180,
+        )
+        .expect("small frame bound should split between whole anchors");
+        let reconstructed = ranges
+            .iter()
+            .flat_map(|range| matching[range.clone()].iter().cloned())
+            .collect::<Vec<_>>();
+        assert_eq!(reconstructed, matching);
+        assert!(ranges.len() > 1);
+        for range in ranges {
+            assert!(
+                anchor_result_frame_bytes(
+                    &json!(7),
+                    "eezo/default",
+                    "winnow:0123456789abcdef",
+                    &matching[range],
+                )
+                .expect("measure serialized frame")
+                    <= 180
+            );
+        }
+    }
+
+    #[test]
+    fn anchor_result_frames_keep_empty_results_and_reject_an_indivisible_over_limit_item() {
+        let empty = anchor_result_frame_ranges(&json!(1), "eezo/default", "query-anchor", &[], 256)
+            .expect("empty result fits");
+        assert_eq!(empty, vec![0..0]);
+
+        let query = "query-anchor";
+        let matched = "winnow:matched-anchor".to_string();
+        let base = anchor_result_frame_bytes(&json!(1), "eezo/default", query, &[])
+            .expect("measure empty result");
+        let one = base
+            + serde_json::to_vec(&matched)
+                .expect("encode matched value")
+                .len();
+        let failure = anchor_result_frame_ranges(
+            &json!(1),
+            "eezo/default",
+            query,
+            &[matched.clone()],
+            one - 1,
+        )
+        .expect_err("indivisible matching anchor cannot be split");
+        assert_eq!(failure.code, "budget_exceeded");
+        assert!(failure.message.contains("lookup_anchors anchor_result"));
+        assert!(failure.message.contains(&matched.len().to_string()));
+        assert!(failure.message.contains("sha256"));
+        assert!(!failure.message.contains(&matched));
+    }
+
+    #[test]
+    fn anchor_result_frames_account_for_each_frame_in_the_cumulative_budget() {
+        let first = format!("winnow:{}", "a".repeat(700_000));
+        let second = format!("winnow:{}", "b".repeat(700_000));
+        let matching = vec![first.clone(), second];
+        let first_bytes =
+            anchor_result_frame_bytes(&json!(1), "eezo/default", "query-anchor", &matching[..1])
+                .expect("first frame size");
+        let mut output = Vec::new();
+        let mut used_bytes = 0;
+        let failure = write_anchor_result_frames(
+            &mut output,
+            &json!(1),
+            "eezo/default",
+            "query-anchor",
+            &matching,
+            &mut used_bytes,
+            first_bytes as u64,
+        )
+        .expect_err("second bounded frame exceeds the unchanged cumulative budget");
+        assert_eq!(failure.code, "budget_exceeded");
+        assert_eq!(used_bytes, first_bytes as u64);
+        let frames = output
+            .split(|byte| *byte == b'\n')
+            .filter(|frame| !frame.is_empty())
+            .map(|frame| serde_json::from_slice::<Value>(frame).expect("data frame JSON"))
+            .collect::<Vec<_>>();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["data"]["type"], "anchor_result");
+        assert_eq!(frames[0]["data"]["matching_window_anchors"], json!([first]));
     }
 
     fn run(home: &Path, input: &str) -> String {

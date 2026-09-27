@@ -6687,6 +6687,256 @@ fn peer_anchor_and_edge_lookups_preserve_membership_held_and_forensics_data() {
 }
 
 #[test]
+fn peer_accepts_exact_long_composite_anchors_for_edges_and_touch_lookups() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let remote = write_grep_owner(temp.path(), "long-anchor-owner", binary, &[]);
+    let peer = TopologyPeer {
+        ssh: None,
+        command: Some(
+            remote["command"]
+                .as_array()
+                .expect("owner command")
+                .iter()
+                .map(|arg| arg.as_str().expect("command arg").to_string())
+                .collect(),
+        ),
+        engram: binary.to_string(),
+        exports: vec!["default".into()],
+    };
+    let mut owner = RemoteOwner::connect("long-anchor-owner", "caller", &peer, Duration::from_secs(5))
+        .expect("connect owner");
+    let observed = format!(
+        "winnow:{}",
+        (0..1_103)
+            .map(|feature| format!("{feature:016x}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    assert_eq!(observed.len(), 18_757);
+    let larger = format!(
+        "winnow:{}",
+        (0..2_100)
+            .map(|feature| format!("{feature:016x}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    assert!(larger.len() > 32 * 1024);
+
+    for anchor in [&observed, &larger] {
+        let edge = owner
+            .round(
+                &[PeerRequest::new(
+                    "lookup_edges",
+                    vec!["default".into()],
+                    json!({
+                        "nodes": [anchor],
+                        "min_confidence": 0.5,
+                        "include_forensics": false,
+                    }),
+                )],
+                Duration::from_secs(5),
+            )
+            .pop()
+            .expect("edge response")
+            .expect("long exact edge lookup");
+        assert!(edge.data.iter().any(|row| {
+            row["type"] == "node_result" && row["node"] == *anchor
+        }));
+
+        let touch = owner
+            .round(
+                &[PeerRequest::new(
+                    "lookup_anchors",
+                    vec!["default".into()],
+                    json!({"anchors": [anchor], "include_deleted": false}),
+                )],
+                Duration::from_secs(5),
+            )
+            .pop()
+            .expect("touch response")
+            .expect("long exact touch lookup");
+        assert!(touch.data.iter().any(|row| {
+            row["type"] == "anchor_result"
+                && row["anchor"] == *anchor
+                && row["matching_window_anchors"] == json!([anchor])
+        }));
+    }
+
+    for invalid in ["", "winnow:invalid\0anchor"] {
+        let rejected = owner
+            .round(
+                &[PeerRequest::new(
+                    "lookup_edges",
+                    vec!["default".into()],
+                    json!({"nodes": [invalid]}),
+                )],
+                Duration::from_secs(5),
+            )
+            .pop()
+            .expect("invalid-anchor response")
+            .expect_err("empty and NUL anchors remain prohibited");
+        assert_eq!(rejected.code, "invalid_request");
+    }
+    drop(owner);
+}
+
+#[test]
+fn public_explain_reconstructs_anchor_matches_across_response_frames() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let owner_home = temp.path().join("framed-anchor-owner-home");
+    let owner_db = owner_home.join(".engram/index.sqlite");
+    let indexed_text = |seed: usize| {
+        (0..24)
+            .map(|line| {
+                let tokens = (0..120)
+                    .map(|item| {
+                        if line == 0 && item < 20 {
+                            format!("shared{item:02}")
+                        } else {
+                            format!("entry{seed:03}line{line:02}item{item:03}")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!("{tokens}\n")
+            })
+            .collect::<String>()
+    };
+    let events = std::iter::once(json!({"t":"2026-09-25T11:59:00Z","k":"meta"}).to_string())
+        .chain((0..80).map(|index| {
+            json!({
+                "t": format!("2026-09-25T{:02}:{:02}:00Z", 12 + index / 60, index % 60),
+                "k": "code.edit",
+                "file": "fixture.rs",
+                "before_range": [1, 24],
+                "after_range": [1, 24],
+                "after_text": indexed_text(index),
+            })
+            .to_string()
+        }))
+        .collect::<Vec<_>>()
+        .join("\n")
+            + "\n";
+    let remote = write_grep_owner(
+        temp.path(),
+        "framed-anchor-owner",
+        binary,
+        &[("framed-anchor-tape", &events)],
+    );
+    let writer = SqliteIndex::open_writer(owner_db.to_str().expect("owner DB path"))
+        .expect("owner index");
+    let parsed = engram::tape::event::parse_jsonl_events(&events).expect("parse edits");
+    writer
+        .ingest_tape_events(
+            "framed-anchor-tape",
+            &parsed,
+            engram::index::lineage::LINK_THRESHOLD_DEFAULT,
+        )
+        .expect("index many distinct real-shaped anchors");
+    let first_text = indexed_text(0);
+    let query_anchor = engram::anchor::fingerprint_windows(&first_text)[0].features[0].clone();
+    let expected = writer
+        .matching_window_anchors(&query_anchor)
+        .expect("collect expected full matches");
+    assert_eq!(expected.len(), 80);
+    assert!(expected.iter().all(|anchor| anchor.len() > 16 * 1024));
+    assert!(serde_json::to_vec(&expected).unwrap().len() > 1024 * 1024);
+    drop(writer);
+
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "framed-anchor-caller",
+        "{\"t\":\"2026-09-25T10:00:00Z\",\"k\":\"note\",\"content\":\"empty\"}\n",
+    );
+    set_peer_topology(
+        &caller_home,
+        json!({"framed-anchor-owner": remote.clone()}),
+    );
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "explain",
+            &query_anchor,
+            "--anchor",
+            "--peers",
+            "framed-anchor-owner",
+        ])
+        .output()
+        .expect("run public federated explain");
+    assert!(
+        output.status.success(),
+        "public explain failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("explain JSON");
+    assert_eq!(
+        result["federation"]["coverage"],
+        "complete",
+        "partial explain result: {result:#}"
+    );
+    assert_eq!(
+        result["federation"]["lineage_coverage"],
+        "complete",
+        "partial lineage result: {result:#}"
+    );
+    let source = result["federation"]["sources"]
+        .as_array()
+        .expect("federated sources")
+        .iter()
+        .find(|source| source["store"] == "framed-anchor-owner/default")
+        .expect("remote source");
+    assert_eq!(source["status"], "ok");
+    let session = result["sessions"]
+        .as_array()
+        .expect("sessions")
+        .iter()
+        .find(|session| session["store"] == "framed-anchor-owner/default")
+        .expect("remote edited session survives repeated anchor-result frames");
+    assert_eq!(session["tape_id"], "framed-anchor-tape");
+    assert!(session["touches"].as_array().is_some_and(|touches| {
+        touches
+            .iter()
+            .any(|touch| touch["file_path"] == "fixture.rs")
+    }));
+
+    let topology_path = owner_home.join(".engram/topology.yml");
+    let mut topology = std::fs::read_to_string(&topology_path).expect("owner topology");
+    topology.push_str("\nlimits:\n  non_file_response_bytes: 1120000\n");
+    std::fs::write(&topology_path, topology).expect("lower bounded response budget");
+    let peer = TopologyPeer {
+        ssh: None,
+        command: Some(
+            remote["command"]
+                .as_array()
+                .expect("owner command")
+                .iter()
+                .map(|arg| arg.as_str().expect("command arg").to_string())
+                .collect(),
+        ),
+        engram: binary.to_string(),
+        exports: vec!["default".into()],
+    };
+    let mut owner = RemoteOwner::connect("framed-anchor-owner", "caller", &peer, Duration::from_secs(5))
+        .expect("connect owner under lower budget");
+    let failure = owner
+        .round(
+            &[PeerRequest::new(
+                "lookup_anchors",
+                vec!["default".into()],
+                json!({"anchors": [query_anchor], "include_deleted": false}),
+            )],
+            Duration::from_secs(5),
+        )
+        .pop()
+        .expect("bounded response")
+        .expect_err("a later frame over budget invalidates earlier provisional data");
+    assert_eq!(failure.code, "budget_exceeded");
+}
+
+#[test]
 fn peer_tape_facts_returns_segment_history_turn_maps_and_bounded_summaries() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = env!("CARGO_BIN_EXE_engram");

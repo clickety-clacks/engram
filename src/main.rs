@@ -14,7 +14,7 @@ use engram::access::client::{
     DEFAULT_DECOMPRESSED_BYTES_PER_TAPE, DEFAULT_READ_FILE_COMPRESSED_BYTES, PeerFailure,
     PeerRequest, PeerResponse, RemoteOwner, decode_base64_chunk,
 };
-use engram::access::peer::MAX_BATCH_ITEMS;
+use engram::access::peer::{MAX_BATCH_ITEMS, MAX_FRAME_BYTES, PROTOCOL_VERSION};
 use engram::config::{
     EffectiveWatchSource, Topology, TopologyPeer, ensure_user_config,
     load_effective_config_read_only, load_effective_config_with_override, load_frozen_stores,
@@ -78,6 +78,11 @@ struct PeerRoundResult {
     owner: Option<RemoteOwner>,
     exports: Vec<String>,
     outcomes: Vec<Result<PeerResponse, PeerFailure>>,
+}
+
+struct AnchorPeerBatches {
+    requests: Vec<PeerRequest>,
+    over_limit: Vec<PeerFailure>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -296,6 +301,91 @@ fn peer_item_cap(owner: &RemoteOwner) -> usize {
         .copied()
         .unwrap_or(MAX_BATCH_ITEMS as u64)
         .clamp(1, MAX_BATCH_ITEMS as u64) as usize
+}
+
+fn anchor_peer_batches(
+    batch_cap: usize,
+    operation: &str,
+    field: &str,
+    export: &str,
+    anchors: &[String],
+    extra_args: Value,
+) -> AnchorPeerBatches {
+    let mut batches = AnchorPeerBatches {
+        requests: Vec::new(),
+        over_limit: Vec::new(),
+    };
+    let mut current = Vec::<String>::new();
+    let append_batch = |items: &[String]| {
+        let mut args = extra_args
+            .as_object()
+            .expect("anchor request args are an object")
+            .clone();
+        args.insert(field.to_string(), json!(items));
+        PeerRequest::new(operation, vec![export.to_string()], Value::Object(args))
+    };
+
+    for anchor in anchors {
+        let mut candidate = current.clone();
+        candidate.push(anchor.clone());
+        let candidate_request = append_batch(&candidate);
+        let candidate_fits = peer_request_frame_bytes(&candidate_request)
+            .is_ok_and(|bytes| bytes <= MAX_FRAME_BYTES);
+        if candidate_fits && candidate.len() <= batch_cap {
+            current = candidate;
+            continue;
+        }
+
+        if !current.is_empty() {
+            batches.requests.push(append_batch(&current));
+            current.clear();
+        }
+
+        let single_request = append_batch(std::slice::from_ref(anchor));
+        match peer_request_frame_bytes(&single_request) {
+            Ok(frame_bytes) if frame_bytes <= MAX_FRAME_BYTES => {
+                current.push(anchor.clone());
+            }
+            Ok(frame_bytes) => {
+                batches
+                    .over_limit
+                    .push(anchor_request_over_limit(operation, anchor, frame_bytes))
+            }
+            Err(error) => batches.over_limit.push(PeerFailure {
+                code: "invalid_request".into(),
+                message: format!("could not encode {operation} request: {error}"),
+            }),
+        }
+    }
+    if !current.is_empty() {
+        batches.requests.push(append_batch(&current));
+    }
+    batches
+}
+
+fn peer_request_frame_bytes(request: &PeerRequest) -> Result<usize, serde_json::Error> {
+    serde_json::to_vec(&json!({
+        "v": PROTOCOL_VERSION,
+        // The live sequence is always a u64. Measuring with its longest
+        // decimal form guarantees packing remains valid at every request id.
+        "id": u64::MAX,
+        "op": request.op,
+        "stores": request.stores,
+        "args": request.args,
+    }))
+    .map(|frame| frame.len().saturating_add(1))
+}
+
+fn anchor_request_over_limit(operation: &str, anchor: &str, frame_bytes: usize) -> PeerFailure {
+    let digest = format!("{:x}", Sha256::digest(anchor.as_bytes()));
+    PeerFailure {
+        code: "over_limit".into(),
+        message: format!(
+            "{operation} anchor cannot fit one serialized request frame: anchor is {} bytes; complete frame would be {frame_bytes} bytes including envelope and newline (limit {MAX_FRAME_BYTES}); sha256 {}",
+            anchor.len(),
+            &digest[..12],
+        ),
+    }
 }
 
 fn local_dispatch_tape_facts(
@@ -1792,19 +1882,31 @@ fn collect_federated_lineage(
                     .collect::<Vec<_>>();
                 nodes.sort();
                 nodes.dedup();
-                for chunk in nodes.chunks(peer_item_cap(owner)) {
-                    request_map.entry(machine.clone()).or_default().push((
-                        export.clone(),
-                        PeerRequest::new(
-                            "lookup_edges",
-                            vec![export.clone()],
-                            json!({
-                                "nodes": chunk,
-                                "min_confidence": traversal.min_confidence,
-                                "include_forensics": include_forensics,
-                            }),
-                        ),
-                    ));
+                let batches = anchor_peer_batches(
+                    peer_item_cap(owner),
+                    "lookup_edges",
+                    "nodes",
+                    export,
+                    &nodes,
+                    json!({
+                        "min_confidence": traversal.min_confidence,
+                        "include_forensics": include_forensics,
+                    }),
+                );
+                if !batches.over_limit.is_empty() {
+                    *peer_failed = true;
+                    mark_anchor_batch_failures(
+                        sources,
+                        &store,
+                        "lookup_edges",
+                        &batches.over_limit,
+                    );
+                }
+                for request in batches.requests {
+                    request_map
+                        .entry(machine.clone())
+                        .or_default()
+                        .push((export.clone(), request));
                 }
             }
         }
@@ -4977,12 +5079,26 @@ fn cmd_explain_with_peers_inner(
                 let mut requests = Vec::new();
                 let mut request_exports = Vec::new();
                 for export in &active_exports {
-                    for chunk in query_anchors.chunks(peer_item_cap(&owner)) {
-                        requests.push(PeerRequest::new(
+                    let store = format!("{machine}/{export}");
+                    let batches = anchor_peer_batches(
+                        peer_item_cap(&owner),
+                        "lookup_anchors",
+                        "anchors",
+                        export,
+                        &query_anchors,
+                        json!({"include_deleted": args.include_deleted}),
+                    );
+                    if !batches.over_limit.is_empty() {
+                        any_peer_failure = true;
+                        mark_anchor_batch_failures(
+                            &mut sources,
+                            &store,
                             "lookup_anchors",
-                            vec![export.clone()],
-                            json!({"anchors": chunk, "include_deleted": args.include_deleted}),
-                        ));
+                            &batches.over_limit,
+                        );
+                    }
+                    for request in batches.requests {
+                        requests.push(request);
                         request_exports.push(export.clone());
                     }
                 }
@@ -5224,18 +5340,28 @@ fn cmd_explain_with_peers_inner(
                 .entry(store.clone())
                 .or_default()
                 .extend(anchors.iter().cloned());
-            for chunk in anchors.chunks(peer_item_cap(owner)) {
-                touch_requests.entry(machine.clone()).or_default().push((
-                    export.clone(),
-                    PeerRequest::new(
-                        "lookup_anchors",
-                        vec![export.clone()],
-                        json!({
-                            "anchors": chunk,
-                            "include_deleted": args.include_deleted,
-                        }),
-                    ),
-                ));
+            let batches = anchor_peer_batches(
+                peer_item_cap(owner),
+                "lookup_anchors",
+                "anchors",
+                export,
+                &anchors,
+                json!({"include_deleted": args.include_deleted}),
+            );
+            if !batches.over_limit.is_empty() {
+                any_peer_failure = true;
+                mark_anchor_batch_failures(
+                    &mut sources,
+                    &store,
+                    "lookup_anchors",
+                    &batches.over_limit,
+                );
+            }
+            for request in batches.requests {
+                touch_requests
+                    .entry(machine.clone())
+                    .or_default()
+                    .push((export.clone(), request));
             }
         }
     }
@@ -7008,6 +7134,29 @@ fn mark_source_phase(sources: &mut [Value], store: &str, phase: &str, code: &str
     }
 }
 
+fn mark_anchor_batch_failures(
+    sources: &mut [Value],
+    store: &str,
+    phase: &str,
+    failures: &[PeerFailure],
+) {
+    let Some(first) = failures.first() else {
+        return;
+    };
+    mark_source_phase(sources, store, phase, &first.code, &first.message);
+    if failures.len() > 1
+        && let Some(source) = sources
+            .iter_mut()
+            .find(|source| source.get("store").and_then(Value::as_str) == Some(store))
+    {
+        source["failures"] = json!(failures
+            .iter()
+            .skip(1)
+            .map(|failure| json!({"code": failure.code, "message": failure.message}))
+            .collect::<Vec<_>>());
+    }
+}
+
 fn mark_source_failures(sources: &mut [Value], store: &str, phase: &str, failures: &[Value]) {
     if let Some(source) = sources
         .iter_mut()
@@ -7667,6 +7816,187 @@ fn print_context_conspicuity(context: &RuntimeContext) {
 mod tests {
     use super::*;
     use notify::event::{CreateKind, RemoveKind};
+
+    fn canonical_winnow_anchor(feature_count: usize) -> String {
+        format!(
+            "winnow:{}",
+            (0..feature_count)
+                .map(|feature| format!("{feature:016x}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
+
+    fn collected_anchors(batches: &[PeerRequest], field: &str) -> Vec<String> {
+        batches
+            .iter()
+            .flat_map(|request| {
+                request.args[field]
+                    .as_array()
+                    .expect("anchor batch array")
+                    .iter()
+                    .map(|anchor| anchor.as_str().expect("anchor string").to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn federated_anchor_batches_preserve_long_anchors_for_edges_and_touches() {
+        let observed = canonical_winnow_anchor(1_103);
+        assert_eq!(observed.len(), 18_757);
+        let larger = canonical_winnow_anchor(2_100);
+        assert!(larger.len() > 32 * 1024);
+        let anchors = vec![observed.clone(), larger.clone()];
+
+        for (operation, field) in [("lookup_edges", "nodes"), ("lookup_anchors", "anchors")] {
+            let batches = anchor_peer_batches(
+                128,
+                operation,
+                field,
+                "default",
+                &anchors,
+                json!({"include_deleted": false}),
+            );
+            assert!(batches.over_limit.is_empty());
+            assert_eq!(collected_anchors(&batches.requests, field), anchors);
+            assert!(batches.requests.iter().all(|request| {
+                peer_request_frame_bytes(request).expect("encode request") <= MAX_FRAME_BYTES
+            }));
+        }
+    }
+
+    #[test]
+    fn federated_anchor_batches_obey_count_and_serialized_byte_limits() {
+        let count_limited = (0..3)
+            .map(|index| format!("winnow:{index:016x}"))
+            .collect::<Vec<_>>();
+        let count_batches = anchor_peer_batches(
+            2,
+            "lookup_edges",
+            "nodes",
+            "default",
+            &count_limited,
+            json!({"min_confidence": 0.5, "include_forensics": false}),
+        );
+        assert!(count_batches.over_limit.is_empty());
+        assert_eq!(count_batches.requests.len(), 2);
+        assert_eq!(
+            count_batches.requests[0].args["nodes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            collected_anchors(&count_batches.requests, "nodes"),
+            count_limited
+        );
+
+        let byte_limited = (0..10)
+            .map(|index| format!("winnow:{}{index}", "0".repeat(150_000)))
+            .collect::<Vec<_>>();
+        let byte_batches = anchor_peer_batches(
+            128,
+            "lookup_anchors",
+            "anchors",
+            "default",
+            &byte_limited,
+            json!({"include_deleted": false}),
+        );
+        assert!(byte_batches.over_limit.is_empty());
+        assert!(byte_batches.requests.len() > 1);
+        assert_eq!(
+            collected_anchors(&byte_batches.requests, "anchors"),
+            byte_limited
+        );
+        assert!(byte_batches.requests.iter().all(|request| {
+            request.args["anchors"].as_array().unwrap().len() <= 128
+                && peer_request_frame_bytes(request).expect("encode request") <= MAX_FRAME_BYTES
+        }));
+    }
+
+    #[test]
+    fn federated_anchor_batch_boundary_counts_escaping_envelope_and_newline() {
+        let empty = PeerRequest::new(
+            "lookup_anchors",
+            vec!["default".into()],
+            json!({"anchors": [], "include_deleted": false}),
+        );
+        let empty_bytes = peer_request_frame_bytes(&empty).expect("empty request size");
+        let encoded_value_bytes = MAX_FRAME_BYTES - empty_bytes;
+        let exact_anchor = if encoded_value_bytes % 2 == 0 {
+            "\"".repeat((encoded_value_bytes - 2) / 2)
+        } else {
+            format!("{}x", "\"".repeat((encoded_value_bytes - 3) / 2))
+        };
+        let exact_request = PeerRequest::new(
+            "lookup_anchors",
+            vec!["default".into()],
+            json!({"anchors": [exact_anchor], "include_deleted": false}),
+        );
+        assert_eq!(
+            peer_request_frame_bytes(&exact_request).expect("exact boundary size"),
+            MAX_FRAME_BYTES
+        );
+
+        let exact = exact_request.args["anchors"][0]
+            .as_str()
+            .expect("exact anchor")
+            .to_string();
+        let accepted = anchor_peer_batches(
+            128,
+            "lookup_anchors",
+            "anchors",
+            "default",
+            std::slice::from_ref(&exact),
+            json!({"include_deleted": false}),
+        );
+        assert!(accepted.over_limit.is_empty());
+        assert_eq!(accepted.requests.len(), 1);
+        assert_eq!(
+            peer_request_frame_bytes(&accepted.requests[0]).unwrap(),
+            MAX_FRAME_BYTES
+        );
+
+        let over = format!("{exact}x");
+        let rejected = anchor_peer_batches(
+            128,
+            "lookup_anchors",
+            "anchors",
+            "default",
+            std::slice::from_ref(&over),
+            json!({"include_deleted": false}),
+        );
+        assert!(rejected.requests.is_empty());
+        assert_eq!(rejected.over_limit.len(), 1);
+        assert_eq!(rejected.over_limit[0].code, "over_limit");
+        assert!(rejected.over_limit[0].message.contains("lookup_anchors"));
+        assert!(rejected.over_limit[0].message.contains("bytes"));
+        assert!(rejected.over_limit[0].message.contains("limit 1048576"));
+        assert!(!rejected.over_limit[0].message.contains(&over));
+
+        let second_over = format!("{over}y");
+        let multiple = anchor_peer_batches(
+            128,
+            "lookup_anchors",
+            "anchors",
+            "default",
+            &[over.clone(), second_over.clone()],
+            json!({"include_deleted": false}),
+        );
+        assert_eq!(multiple.over_limit.len(), 2);
+        let mut sources = vec![json!({"store":"peer/default", "status":"ok"})];
+        mark_anchor_batch_failures(
+            &mut sources,
+            "peer/default",
+            "lookup_anchors",
+            &multiple.over_limit,
+        );
+        assert_eq!(sources[0]["error"]["code"], "over_limit");
+        assert_eq!(sources[0]["failures"].as_array().unwrap().len(), 1);
+        assert!(!sources[0].to_string().contains(&over));
+        assert!(!sources[0].to_string().contains(&second_over));
+    }
 
     #[test]
     fn grep_time_range_distinguishes_completed_empty_from_unknown_scope() {
