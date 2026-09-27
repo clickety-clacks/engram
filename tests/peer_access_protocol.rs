@@ -4361,12 +4361,46 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
     let binary = env!("CARGO_BIN_EXE_engram");
     let content = "{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"show partial selected peers\"}\n";
     let tape_id = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
-    let available = write_grep_owner(
+    let mut available = write_grep_owner(
         temp.path(),
         "available",
         binary,
         &[(tape_id.as_str(), content)],
     );
+    let owner_home = temp.path().join("available-home");
+    let peer_trace = temp.path().join("show-peer-trace.log");
+    let peer_wrapper = temp.path().join("trace-peer-serve.sh");
+    std::fs::write(
+        &peer_wrapper,
+        r#"#!/bin/bash
+set -o pipefail
+binary="$1"
+owner_home="$2"
+trace="$3"
+request_file="$trace.$$.requests"
+response_file="$trace.$$.responses"
+stderr_file="$trace.$$.stderr"
+printf 'peer_start pid=%s\n' "$$" >> "$trace"
+tee "$request_file" | env HOME="$owner_home" "$binary" peer-serve --stdio 2>"$stderr_file" | tee "$response_file"
+peer_status=$?
+printf 'peer_exit=%s\n' "$peer_status" >> "$trace"
+while IFS= read -r line; do printf 'request %s\n' "$line" >> "$trace"; done < "$request_file"
+while IFS= read -r line; do printf 'response %s\n' "$line" >> "$trace"; done < "$response_file"
+if [ -s "$stderr_file" ]; then
+    while IFS= read -r line; do printf 'peer_stderr %s\n' "$line" >> "$trace"; done < "$stderr_file"
+    cat "$stderr_file" >&2
+fi
+exit "$peer_status"
+"#,
+    )
+    .expect("write diagnostic peer wrapper");
+    available["command"] = json!([
+        "/bin/bash",
+        peer_wrapper.to_string_lossy().into_owned(),
+        binary,
+        owner_home.to_string_lossy().into_owned(),
+        peer_trace.to_string_lossy().into_owned(),
+    ]);
     let offline = json!({
         "command": ["/usr/bin/false"],
         "engram": "/unused/engram",
@@ -4389,23 +4423,135 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
     )
     .expect("write caller topology");
 
+    let bounded_text = |text: &str, max_chars: usize| {
+        let mut bounded = text.chars().take(max_chars).collect::<String>();
+        if text.chars().count() > max_chars {
+            bounded.push_str("…<truncated>");
+        }
+        bounded
+    };
+    let summarize_peer_line = |line: &str| {
+        let Some((direction, raw)) = line.split_once(' ') else {
+            return bounded_text(line, 360);
+        };
+        if !matches!(direction, "request" | "response") {
+            return bounded_text(line, 360);
+        }
+        let Ok(frame) = serde_json::from_str::<serde_json::Value>(raw) else {
+            return bounded_text(line, 360);
+        };
+        let string_field = |value: Option<&serde_json::Value>| {
+            value.and_then(serde_json::Value::as_str).unwrap_or("-")
+        };
+        let data = frame.get("data");
+        let op = frame
+            .get("op")
+            .or_else(|| data.and_then(|value| value.get("op")));
+        let store = data.and_then(|value| value.get("store"));
+        let status = data.and_then(|value| value.get("status"));
+        let phase = data.and_then(|value| value.get("phase"));
+        let error = frame
+            .pointer("/error")
+            .or_else(|| frame.pointer("/data/error"));
+        let error_summary = error
+            .map(|value| bounded_text(&value.to_string(), 160))
+            .unwrap_or_else(|| "-".into());
+        let content_bytes = data
+            .and_then(|value| value.get("content"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::len)
+            .unwrap_or(0);
+        format!(
+            "{direction} id={} op={} store={} status={} phase={} end={} ok={} error={} content_bytes={content_bytes}",
+            frame
+                .get("id")
+                .and_then(serde_json::Value::as_u64)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".into()),
+            string_field(op),
+            string_field(store),
+            string_field(status),
+            string_field(phase),
+            frame.get("end").map_or("-".into(), ToString::to_string),
+            frame.get("ok").map_or("-".into(), ToString::to_string),
+            error_summary,
+        )
+    };
+    let dump_diagnostics = |stage: &str, output: &std::process::Output| {
+        eprintln!(
+            "diagnostic show failure stage={stage} cli_status={:?}",
+            output.status
+        );
+        eprintln!(
+            "diagnostic cli_stdout={}",
+            bounded_text(&String::from_utf8_lossy(&output.stdout), 2048)
+        );
+        eprintln!(
+            "diagnostic cli_stderr={}",
+            bounded_text(&String::from_utf8_lossy(&output.stderr), 2048)
+        );
+        let trace = std::fs::read_to_string(&peer_trace)
+            .unwrap_or_else(|error| format!("<trace unavailable: {error}>"));
+        for line in trace.lines().take(64) {
+            eprintln!("diagnostic peer {}", summarize_peer_line(line));
+        }
+        if trace.lines().count() > 64 {
+            eprintln!("diagnostic peer trace truncated after 64 lines");
+        }
+    };
+    macro_rules! assert_with_peer_trace {
+        ($condition:expr, $stage:expr, $output:expr, $message:expr) => {{
+            if !$condition {
+                dump_diagnostics($stage, $output);
+                panic!("{}", $message);
+            }
+        }};
+    }
+
     let partial = Command::new(binary)
         .current_dir(&repo)
         .env("HOME", &caller_home)
         .args(["show", &tape_id, "--peers", "available,offline"])
         .output()
         .expect("run partial selected-peer show");
-    assert!(
+    assert_with_peer_trace!(
         partial.status.success(),
-        "partial show should keep the completed tape: {}",
-        String::from_utf8_lossy(&partial.stderr)
+        "partial",
+        &partial,
+        "partial show should keep the completed tape"
     );
-    let value: serde_json::Value = serde_json::from_slice(&partial.stdout).expect("show JSON");
-    assert_eq!(value["tape_id"], tape_id);
-    assert_eq!(value["federation"]["coverage"], "partial");
-    assert!(value["federation"]["sources"].as_array().unwrap().iter().any(
-        |source| source["store"] == "offline/default" && source["status"] == "unavailable"
-    ));
+    let value: serde_json::Value = match serde_json::from_slice(&partial.stdout) {
+        Ok(value) => value,
+        Err(error) => {
+            dump_diagnostics("partial", &partial);
+            panic!("show JSON parse failed: {error}");
+        }
+    };
+    assert_with_peer_trace!(
+        value["tape_id"].as_str() == Some(tape_id.as_str()),
+        "partial",
+        &partial,
+        "partial show returned the wrong tape"
+    );
+    assert_with_peer_trace!(
+        value["federation"]["coverage"] == "partial",
+        "partial",
+        &partial,
+        "partial show returned the wrong coverage"
+    );
+    let offline_source_is_unavailable = value["federation"]["sources"]
+        .as_array()
+        .is_some_and(|sources| {
+            sources.iter().any(|source| {
+                source["store"] == "offline/default" && source["status"] == "unavailable"
+            })
+        });
+    assert_with_peer_trace!(
+        offline_source_is_unavailable,
+        "partial",
+        &partial,
+        "partial show omitted the unavailable peer"
+    );
 
     let required = Command::new(binary)
         .current_dir(&repo)
@@ -4419,16 +4565,33 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
         ])
         .output()
         .expect("run require-complete selected-peer show");
-    assert!(!required.status.success());
+    assert_with_peer_trace!(
+        !required.status.success(),
+        "require-complete",
+        &required,
+        "require-complete show unexpectedly succeeded"
+    );
     let stderr = String::from_utf8_lossy(&required.stderr);
-    let error: serde_json::Value = serde_json::from_str(
-        stderr
-            .lines()
-            .last()
-            .expect("incomplete coverage error line"),
-    )
-    .expect("error JSON");
-    assert_eq!(error["error"]["code"], "incomplete_coverage");
+    let error_line = match stderr.lines().last() {
+        Some(line) => line,
+        None => {
+            dump_diagnostics("require-complete", &required);
+            panic!("incomplete coverage error line was missing");
+        }
+    };
+    let error: serde_json::Value = match serde_json::from_str(error_line) {
+        Ok(error) => error,
+        Err(parse_error) => {
+            dump_diagnostics("require-complete", &required);
+            panic!("incomplete coverage error JSON was invalid: {parse_error}");
+        }
+    };
+    assert_with_peer_trace!(
+        error["error"]["code"] == "incomplete_coverage",
+        "require-complete",
+        &required,
+        "require-complete show returned the wrong error"
+    );
 }
 
 #[cfg(unix)]
