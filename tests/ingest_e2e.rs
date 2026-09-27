@@ -44,7 +44,16 @@ fn run_json(repo: &Path, args: &[&str], stdin: Option<&str>, home: &Path) -> Val
 }
 
 fn path_identity(path: &Path) -> String {
-    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    // `init` reports the configured database path before SQLite creates it.
+    // Canonicalize the existing parent too so aliases such as macOS `/var`
+    // and `/private/var` compare by their actual filesystem location.
+    let canonical =
+        fs::canonicalize(path).unwrap_or_else(|_| match (path.parent(), path.file_name()) {
+            (Some(parent), Some(file_name)) => fs::canonicalize(parent)
+                .map(|parent| parent.join(file_name))
+                .unwrap_or_else(|_| path.to_path_buf()),
+            _ => path.to_path_buf(),
+        });
     let rendered = canonical.to_string_lossy().replace('\\', "/");
     #[cfg(windows)]
     {

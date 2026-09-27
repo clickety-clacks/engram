@@ -286,6 +286,7 @@ fn log_show_first_round_with_identity_barrier(
         "    *)",
         "      printf '%s\\n' \"$request\" >&3",
         "      read_terminal \"$request_id\" \"$responses_root.next\"",
+        "      if [ \"$op\" = read_file ]; then : >\"$responses_root.read_file.ready\"; fi",
         "      cat \"$responses_root.next\"",
         "      ;;",
         "  esac",
@@ -4553,9 +4554,9 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
         binary,
         &mut available,
     );
-    let available_open_complete = temp.path().join("available-show-responses.open.ready");
-    // Make the offline peer wait for a completed healthy open before it exits.
-    let offline_script_path = temp.path().join("offline-after-available-open.sh");
+    let available_read_complete = temp.path().join("available-show-responses.read_file.ready");
+    // Make the offline peer wait until the healthy peer has returned the tape.
+    let offline_script_path = temp.path().join("offline-after-available-read.sh");
     let offline_script = [
         "#!/bin/sh",
         "set -eu",
@@ -4572,7 +4573,7 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
     .join("\n");
     std::fs::write(&offline_script_path, offline_script).expect("write delayed offline peer");
     let offline = json!({
-        "command": ["/bin/sh", offline_script_path, available_open_complete],
+        "command": ["/bin/sh", offline_script_path, available_read_complete],
         "engram": "/unused/engram",
         "exports": ["default"],
     });
@@ -4601,10 +4602,10 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
         .expect("run partial selected-peer show");
     assert!(
         partial.status.success(),
-        "partial show should keep the completed tape: stderr={}; available operations={}; healthy open completed={}",
+        "partial show should keep the completed tape: stderr={}; available operations={}; healthy read completed={}",
         String::from_utf8_lossy(&partial.stderr),
         std::fs::read_to_string(&available_operations).unwrap_or_default(),
-        available_open_complete.is_file()
+        available_read_complete.is_file()
     );
     let value: serde_json::Value = serde_json::from_slice(&partial.stdout).expect("show JSON");
     assert_eq!(value["tape_id"], tape_id);
@@ -4618,13 +4619,13 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
     assert_eq!(offline_source["status"], "unavailable");
     assert_eq!(offline_source["phase"], "open");
     assert_eq!(offline_source["error"]["code"], "unavailable");
-    assert!(available_open_complete.is_file());
+    assert!(available_read_complete.is_file());
     assert_eq!(operation_count(&available_operations, "open"), 1);
     assert_eq!(operation_count(&available_operations, "locate_tapes"), 1);
     assert_eq!(operation_count(&available_operations, "tape_facts"), 1);
     assert_eq!(operation_count(&available_operations, "read_file"), 1);
 
-    std::fs::remove_file(&available_open_complete).expect("reset open barrier for second query");
+    std::fs::remove_file(&available_read_complete).expect("reset read barrier for second query");
     let required = Command::new(binary)
         .current_dir(&repo)
         .env("HOME", &caller_home)
@@ -7731,8 +7732,7 @@ fn grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer
         .find(|source| source["store"] == "complete/default")
         .expect("completed source row");
     assert_eq!(
-        complete["status"],
-        "ok",
+        complete["status"], "ok",
         "complete peer source: {complete:#}"
     );
     assert_eq!(complete["grep_scan"]["total"], 1);
