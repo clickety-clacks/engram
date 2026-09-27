@@ -266,6 +266,7 @@ fn log_show_first_round_with_identity_barrier(
         "    open)",
         "      printf '%s\\n' \"$request\" >&3",
         "      read_terminal \"$request_id\" \"$responses_root.open\"",
+        "      : >\"$responses_root.open.ready\"",
         "      cat \"$responses_root.open\"",
         "      ;;",
         "    locate_tapes|tape_facts)",
@@ -307,6 +308,62 @@ fn log_show_first_round_with_identity_barrier(
         fifo_out,
     ]);
     log_path
+}
+
+// Order a selected peer's operation behind its sibling's scripted disconnect;
+// the concurrency assertion should exercise result isolation, not process startup order.
+fn gate_peer_operation_until_file(
+    root: &std::path::Path,
+    machine: &str,
+    binary: &str,
+    peer: &mut serde_json::Value,
+    operation: &str,
+    ready_path: &std::path::Path,
+    release_path: &std::path::Path,
+) -> std::path::PathBuf {
+    let request_log_path = root.join(format!("{machine}-gated-peer-requests.jsonl"));
+    let script_path = root.join(format!("{machine}-gated-peer.sh"));
+    let owner_home = peer["command"][1]
+        .as_str()
+        .expect("test owner HOME assignment")
+        .to_string();
+    let script = [
+        "#!/bin/sh",
+        "set -eu",
+        "binary=\"$1\"",
+        "operation=\"$2\"",
+        "ready=\"$3\"",
+        "release=\"$4\"",
+        "requests=\"$5\"",
+        "while IFS= read -r request; do",
+        "  printf '%s\\n' \"$request\" >> \"$requests\"",
+        r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
+        "  if [ \"$op\" = \"$operation\" ]; then",
+        "    : > \"$ready\"",
+        "    attempts=0",
+        "    while [ ! -f \"$release\" ]; do",
+        "      [ \"$attempts\" -lt 100 ] || exit 124",
+        "      attempts=$((attempts + 1))",
+        "      sleep 0.05",
+        "    done",
+        "  fi",
+        "  printf '%s\\n' \"$request\"",
+        "done | \"$binary\" peer-serve --stdio",
+    ]
+    .join("\n");
+    std::fs::write(&script_path, script).expect("write gated peer wrapper");
+    peer["command"] = json!([
+        "/usr/bin/env",
+        owner_home,
+        "/bin/sh",
+        script_path,
+        binary,
+        operation,
+        ready_path,
+        release_path,
+        request_log_path,
+    ]);
+    request_log_path
 }
 
 fn log_peer_requests_with_chunk_barrier(
@@ -4484,14 +4541,38 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
         "{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"show partial selected peers\"}\n",
     );
     let tape_id = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
-    let available = write_grep_owner(
+    let mut available = write_grep_owner(
         temp.path(),
         "available",
         binary,
         &[(tape_id.as_str(), content)],
     );
+    let available_operations = log_show_first_round_with_identity_barrier(
+        temp.path(),
+        "available",
+        binary,
+        &mut available,
+    );
+    let available_open_complete = temp.path().join("available-show-responses.open.ready");
+    // Make the offline peer wait for a completed healthy open before it exits.
+    let offline_script_path = temp.path().join("offline-after-available-open.sh");
+    let offline_script = [
+        "#!/bin/sh",
+        "set -eu",
+        "marker=\"$1\"",
+        "IFS= read -r _request || exit 1",
+        "attempts=0",
+        "while [ ! -f \"$marker\" ]; do",
+        "  [ \"$attempts\" -lt 100 ] || exit 124",
+        "  attempts=$((attempts + 1))",
+        "  sleep 0.05",
+        "done",
+        "exit 1",
+    ]
+    .join("\n");
+    std::fs::write(&offline_script_path, offline_script).expect("write delayed offline peer");
     let offline = json!({
-        "command": ["/usr/bin/false"],
+        "command": ["/bin/sh", offline_script_path, available_open_complete],
         "engram": "/unused/engram",
         "exports": ["default"],
     });
@@ -4520,16 +4601,30 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
         .expect("run partial selected-peer show");
     assert!(
         partial.status.success(),
-        "partial show should keep the completed tape: {}",
-        String::from_utf8_lossy(&partial.stderr)
+        "partial show should keep the completed tape: stderr={}; available operations={}; healthy open completed={}",
+        String::from_utf8_lossy(&partial.stderr),
+        std::fs::read_to_string(&available_operations).unwrap_or_default(),
+        available_open_complete.is_file()
     );
     let value: serde_json::Value = serde_json::from_slice(&partial.stdout).expect("show JSON");
     assert_eq!(value["tape_id"], tape_id);
     assert_eq!(value["federation"]["coverage"], "partial");
-    assert!(value["federation"]["sources"].as_array().unwrap().iter().any(
-        |source| source["store"] == "offline/default" && source["status"] == "unavailable"
-    ));
+    let offline_source = value["federation"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["store"] == "offline/default")
+        .expect("offline source row");
+    assert_eq!(offline_source["status"], "unavailable");
+    assert_eq!(offline_source["phase"], "open");
+    assert_eq!(offline_source["error"]["code"], "unavailable");
+    assert!(available_open_complete.is_file());
+    assert_eq!(operation_count(&available_operations, "open"), 1);
+    assert_eq!(operation_count(&available_operations, "locate_tapes"), 1);
+    assert_eq!(operation_count(&available_operations, "tape_facts"), 1);
+    assert_eq!(operation_count(&available_operations, "read_file"), 1);
 
+    std::fs::remove_file(&available_open_complete).expect("reset open barrier for second query");
     let required = Command::new(binary)
         .current_dir(&repo)
         .env("HOME", &caller_home)
@@ -7515,7 +7610,7 @@ fn grep_discards_match_frames_from_failed_scan_when_aggregating() {
 fn grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = env!("CARGO_BIN_EXE_engram");
-    let complete = write_grep_owner(
+    let mut complete = write_grep_owner(
         temp.path(),
         "complete",
         binary,
@@ -7524,10 +7619,23 @@ fn grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer
             "{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle complete peer\"}\n",
         )],
     );
+    let complete_scan_started = temp.path().join("complete-grep-scan-started");
+    let broken_scan_released = temp.path().join("broken-peer-disconnected");
+    let complete_peer_requests = gate_peer_operation_until_file(
+        temp.path(),
+        "complete",
+        binary,
+        &mut complete,
+        "grep_scan",
+        &complete_scan_started,
+        &broken_scan_released,
+    );
     let script_path = temp.path().join("disconnect-during-scan.sh");
     let script = [
         "#!/bin/sh",
         "set -eu",
+        "ready=\"$1\"",
+        "release=\"$2\"",
         "while IFS= read -r request; do",
         r#"  id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"#,
         r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
@@ -7537,7 +7645,14 @@ fn grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer
         r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"broken","build":"fixture","protocol":1,"schema":4,"query_semantics":1,"limits":{"grep_k":10000}}}\n' "$id""#,
         "      ;;",
         "    grep_scan)",
+        "      attempts=0",
+        "      while [ ! -f \"$ready\" ]; do",
+        "        [ \"$attempts\" -lt 100 ] || exit 124",
+        "        attempts=$((attempts + 1))",
+        "        sleep 0.05",
+        "      done",
         r#"      printf '{"id":%s,"data":{"type":"match","store":"broken/default","tape_id":"must-be-discarded","timestamp":"2026-09-25T13:00:00Z","total_lines":1,"anchor_line":1,"match_count":1,"provenance_match_count":0,"provenance_event_count":1,"refs_up":0,"refs_down":0,"files_touched":[]}}\n' "$id""#,
+        "      : > \"$release\"",
         "      exit 0",
         "      ;;",
         "    *) exit 78 ;;",
@@ -7556,7 +7671,7 @@ fn grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer
         json!({
             "complete": complete,
             "broken": {
-                "command": ["/bin/sh", script_path],
+                "command": ["/bin/sh", script_path, complete_scan_started, broken_scan_released],
                 "engram": binary,
                 "exports": ["default"],
             }
@@ -7607,6 +7722,7 @@ fn grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer
         .expect("broken source row");
     assert_eq!(broken["status"], "failed");
     assert_eq!(broken["phase"], "grep_scan");
+    assert_eq!(broken["error"]["code"], "unavailable");
     assert!(broken.get("grep_scan").is_none());
     let complete = result["federation"]["sources"]
         .as_array()
@@ -7620,6 +7736,10 @@ fn grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer
         "complete peer source: {complete:#}"
     );
     assert_eq!(complete["grep_scan"]["total"], 1);
+    assert!(complete_scan_started.is_file());
+    assert!(broken_scan_released.is_file());
+    assert_eq!(operation_count(&complete_peer_requests, "open"), 1);
+    assert_eq!(operation_count(&complete_peer_requests, "grep_scan"), 1);
 }
 
 #[test]
