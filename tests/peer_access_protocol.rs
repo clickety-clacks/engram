@@ -217,6 +217,90 @@ fn log_peer_operations(
     log_path
 }
 
+struct PeerPhaseTrace {
+    operations: PathBuf,
+    requests: PathBuf,
+    responses: PathBuf,
+    stderr: PathBuf,
+}
+
+fn log_peer_phase_trace(
+    root: &std::path::Path,
+    machine: &str,
+    binary: &str,
+    peer: &mut serde_json::Value,
+) -> PeerPhaseTrace {
+    let operations = root.join(format!("{machine}-phase-operations.log"));
+    let requests = root.join(format!("{machine}-phase-requests.jsonl"));
+    let responses = root.join(format!("{machine}-phase-responses.jsonl"));
+    let stderr = root.join(format!("{machine}-phase-peer-stderr.log"));
+    let script_path = root.join(format!("{machine}-phase-trace-peer.sh"));
+    let owner_home = peer["command"][1]
+        .as_str()
+        .expect("test owner HOME assignment")
+        .to_string();
+    let script = [
+        "#!/bin/bash",
+        "set -euo pipefail",
+        "binary=\"$1\"",
+        "operations=\"$2\"",
+        "requests=\"$3\"",
+        "responses=\"$4\"",
+        "errors=\"$5\"",
+        "printf '%s\\n' 'peer_wrapper_started' >> \"$operations\"",
+        "while IFS= read -r request; do",
+        r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
+        r#"  printf '%s\n' "$op" >> "$operations""#,
+        r#"  printf '%s\n' "$request" >> "$requests""#,
+        r#"  printf '%s\n' "$request""#,
+        "done | \"$binary\" peer-serve --stdio 2>\"$errors\" | tee -a \"$responses\"",
+    ]
+    .join("\n");
+    std::fs::write(&script_path, script).expect("write phase-tracing peer wrapper");
+    peer["command"] = json!([
+        "/usr/bin/env",
+        owner_home,
+        "/bin/bash",
+        script_path,
+        binary,
+        operations,
+        requests,
+        responses,
+        stderr,
+    ]);
+    PeerPhaseTrace {
+        operations,
+        requests,
+        responses,
+        stderr,
+    }
+}
+
+fn report_peer_phase_trace(
+    label: &str,
+    elapsed: Duration,
+    output: &std::process::Output,
+    trace: &PeerPhaseTrace,
+) {
+    let read = |path: &Path| {
+        std::fs::read_to_string(path).unwrap_or_else(|error| format!("<unavailable: {error}>"))
+    };
+    let message = format!(
+        "{label} diagnostic: elapsed_ms={} status={:?}\noperations:\n{}requests:\n{}responses:\n{}peer stderr:\n{}CLI stderr:\n{}\n",
+        elapsed.as_millis(),
+        output.status,
+        read(&trace.operations),
+        read(&trace.requests),
+        read(&trace.responses),
+        read(&trace.stderr),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    std::io::stderr()
+        .lock()
+        .write_all(message.as_bytes())
+        .expect("write peer phase trace to test stderr");
+}
+
 fn log_show_first_round_with_identity_barrier(
     root: &std::path::Path,
     machine: &str,
@@ -4361,12 +4445,13 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
     let binary = env!("CARGO_BIN_EXE_engram");
     let content = "{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"show partial selected peers\"}\n";
     let tape_id = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
-    let available = write_grep_owner(
+    let mut available = write_grep_owner(
         temp.path(),
         "available",
         binary,
         &[(tape_id.as_str(), content)],
     );
+    let phase_trace = log_peer_phase_trace(temp.path(), "available", binary, &mut available);
     let offline = json!({
         "command": ["/usr/bin/false"],
         "engram": "/unused/engram",
@@ -4389,12 +4474,19 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
     )
     .expect("write caller topology");
 
+    let partial_started = Instant::now();
     let partial = Command::new(binary)
         .current_dir(&repo)
         .env("HOME", &caller_home)
         .args(["show", &tape_id, "--peers", "available,offline"])
         .output()
         .expect("run partial selected-peer show");
+    report_peer_phase_trace(
+        "historical selected-peer show",
+        partial_started.elapsed(),
+        &partial,
+        &phase_trace,
+    );
     assert!(
         partial.status.success(),
         "partial show should keep the completed tape: {}",
@@ -7392,7 +7484,7 @@ fn grep_discards_match_frames_from_failed_scan_when_aggregating() {
 fn grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = env!("CARGO_BIN_EXE_engram");
-    let complete = write_grep_owner(
+    let mut complete = write_grep_owner(
         temp.path(),
         "complete",
         binary,
@@ -7401,6 +7493,7 @@ fn grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer
             "{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle complete peer\"}\n",
         )],
     );
+    let phase_trace = log_peer_phase_trace(temp.path(), "complete", binary, &mut complete);
     let script_path = temp.path().join("disconnect-during-scan.sh");
     let script = [
         "#!/bin/sh",
@@ -7440,12 +7533,19 @@ fn grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer
         }),
     );
 
+    let query_started = Instant::now();
     let output = Command::new(binary)
         .current_dir(&repo)
         .env("HOME", &caller_home)
         .args(["grep", "needle", "--peers", "complete,broken"])
         .output()
         .expect("run concurrent grep with mid-response disconnect");
+    report_peer_phase_trace(
+        "historical concurrent disconnect grep",
+        query_started.elapsed(),
+        &output,
+        &phase_trace,
+    );
     assert!(
         output.status.success(),
         "completed data should survive peer disconnect: {}",
