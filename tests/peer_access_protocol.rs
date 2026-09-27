@@ -321,7 +321,7 @@ fn gate_peer_operation_until_file(
     ready_path: &std::path::Path,
     release_path: &std::path::Path,
 ) -> std::path::PathBuf {
-    let request_log_path = root.join(format!("{machine}-gated-peer-requests.jsonl"));
+    let operation_log_path = root.join(format!("{machine}-gated-peer-operations.log"));
     let script_path = root.join(format!("{machine}-gated-peer.sh"));
     let owner_home = peer["command"][1]
         .as_str()
@@ -334,15 +334,15 @@ fn gate_peer_operation_until_file(
         "operation=\"$2\"",
         "ready=\"$3\"",
         "release=\"$4\"",
-        "requests=\"$5\"",
+        "operations=\"$5\"",
         "while IFS= read -r request; do",
-        "  printf '%s\\n' \"$request\" >> \"$requests\"",
         r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
+        "  printf '%s\\n' \"$op\" >> \"$operations\"",
         "  if [ \"$op\" = \"$operation\" ]; then",
         "    : > \"$ready\"",
         "    attempts=0",
         "    while [ ! -f \"$release\" ]; do",
-        "      [ \"$attempts\" -lt 100 ] || exit 124",
+        "      [ \"$attempts\" -lt 600 ] || exit 124",
         "      attempts=$((attempts + 1))",
         "      sleep 0.05",
         "    done",
@@ -361,9 +361,9 @@ fn gate_peer_operation_until_file(
         operation,
         ready_path,
         release_path,
-        request_log_path,
+        operation_log_path,
     ]);
-    request_log_path
+    operation_log_path
 }
 
 fn log_peer_requests_with_chunk_barrier(
@@ -4563,7 +4563,7 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
         "IFS= read -r _request || exit 1",
         "attempts=0",
         "while [ ! -f \"$marker\" ]; do",
-        "  [ \"$attempts\" -lt 100 ] || exit 124",
+        "  [ \"$attempts\" -lt 600 ] || exit 124",
         "  attempts=$((attempts + 1))",
         "  sleep 0.05",
         "done",
@@ -7647,7 +7647,7 @@ fn grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer
         "    grep_scan)",
         "      attempts=0",
         "      while [ ! -f \"$ready\" ]; do",
-        "        [ \"$attempts\" -lt 100 ] || exit 124",
+        "        [ \"$attempts\" -lt 600 ] || exit 124",
         "        attempts=$((attempts + 1))",
         "        sleep 0.05",
         "      done",

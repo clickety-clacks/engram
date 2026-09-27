@@ -245,14 +245,12 @@ fn real_layout_cursor_discovery_and_import_validation() {
 
     let transcript = matching_workspace.join("state.vscdb");
     let noise = wrong_workspace.join("state.vscdb");
-    write_fixture(
-        &matching_workspace.join("workspace.json"),
-        format!("{{\"folder\":\"{}\"}}\n", canonical_text(&repo)).as_str(),
-    );
-    write_fixture(
-        &wrong_workspace.join("workspace.json"),
-        format!("{{\"folder\":\"{}\"}}\n", canonical_text(&wrong_repo)).as_str(),
-    );
+    let matching_manifest =
+        format!("{}\n", serde_json::json!({"folder": canonical_text(&repo)}));
+    let wrong_manifest =
+        format!("{}\n", serde_json::json!({"folder": canonical_text(&wrong_repo)}));
+    write_fixture(&matching_workspace.join("workspace.json"), &matching_manifest);
+    write_fixture(&wrong_workspace.join("workspace.json"), &wrong_manifest);
     write_fixture(
         &transcript,
         include_str!("fixtures/cursor/supported_paths.jsonl"),

@@ -1,5 +1,3 @@
-use std::path::{Component, Path, PathBuf};
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StructuredRead {
     pub file: String,
@@ -71,9 +69,9 @@ pub(crate) fn bounded_shell_read(
     if lines == 0 || maximum.is_some_and(|maximum| lines > maximum - start + 1) {
         return None;
     }
-    let path_is_absolute = Path::new(path).is_absolute();
+    let path_is_absolute = is_absolute_path(path);
     let coverage_complete = path_is_absolute
-        || workdir.is_some_and(|workdir| Path::new(workdir).is_absolute())
+        || workdir.is_some_and(is_absolute_path)
         || cwd.is_some();
     Some(StructuredRead {
         file: shell_path(path, workdir, cwd),
@@ -165,45 +163,129 @@ fn shell_words(command: &str) -> Option<Vec<String>> {
     Some(words)
 }
 
-fn shell_path(path: &str, workdir: Option<&str>, cwd: Option<&str>) -> String {
-    let path = Path::new(path);
-    let joined = if path.is_absolute() {
-        path.to_path_buf()
-    } else if let Some(workdir) = workdir {
-        let workdir = Path::new(workdir);
-        if workdir.is_absolute() {
-            workdir.join(path)
-        } else if let Some(cwd) = cwd {
-            Path::new(cwd).join(workdir).join(path)
-        } else {
-            workdir.join(path)
-        }
-    } else if let Some(cwd) = cwd {
-        Path::new(cwd).join(path)
-    } else {
-        path.to_path_buf()
-    };
-    lexical_normalize(&joined).to_string_lossy().into_owned()
+pub(crate) fn is_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with('/')
+        || path.starts_with('\\')
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'))
 }
 
-fn lexical_normalize(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
+fn has_windows_drive_prefix(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+fn shell_path(path: &str, workdir: Option<&str>, cwd: Option<&str>) -> String {
+    let joined = if is_absolute_path(path) {
+        path.to_owned()
+    } else if let Some(workdir) = workdir {
+        if is_absolute_path(workdir) {
+            join_path(workdir, path)
+        } else if let Some(cwd) = cwd {
+            join_path(&join_path(cwd, workdir), path)
+        } else {
+            join_path(workdir, path)
+        }
+    } else if let Some(cwd) = cwd {
+        join_path(cwd, path)
+    } else {
+        path.to_owned()
+    };
+    lexical_normalize(&joined)
+}
+
+fn join_path(base: &str, tail: &str) -> String {
+    if base.is_empty() {
+        tail.to_owned()
+    } else if base.ends_with('/') || base.ends_with('\\') {
+        format!("{base}{tail}")
+    } else {
+        format!("{base}/{tail}")
+    }
+}
+
+fn lexical_normalize(path: &str) -> String {
+    // Transcript paths are data, so interpret both POSIX and Windows roots
+    // independently of the host that imports them. Emit a stable slash form.
+    let windows_syntax = cfg!(windows) || has_windows_drive_prefix(path) || path.starts_with('\\');
+    let normalized = if windows_syntax {
+        path.replace('\\', "/")
+    } else {
+        path.to_owned()
+    };
+
+    let (prefix, rest, rooted) = if has_windows_drive_prefix(&normalized) {
+        let prefix = &normalized[..2];
+        let rest = &normalized[2..];
+        (prefix, rest.trim_start_matches('/'), rest.starts_with('/'))
+    } else if normalized.starts_with("//") {
+        ("//", normalized.trim_start_matches('/'), true)
+    } else if normalized.starts_with('/') {
+        ("/", normalized.trim_start_matches('/'), true)
+    } else {
+        ("", normalized.as_str(), false)
+    };
+
+    let mut components = Vec::new();
+    for component in rest.split('/') {
         match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if normalized.as_os_str().is_empty() || normalized.ends_with("..") {
-                    if !path.is_absolute() {
-                        normalized.push("..");
-                    }
-                } else if !normalized.pop() && !path.is_absolute() {
-                    normalized.push("..");
+            "" | "." => {}
+            ".." => {
+                if components.last().is_some_and(|last| *last != "..") {
+                    components.pop();
+                } else if !rooted {
+                    components.push("..");
                 }
             }
-            other => normalized.push(other.as_os_str()),
+            _ => components.push(component),
         }
     }
-    normalized
+
+    let body = components.join("/");
+    if prefix == "/" {
+        if body.is_empty() {
+            "/".to_owned()
+        } else {
+            format!("/{body}")
+        }
+    } else if prefix == "//" {
+        if body.is_empty() {
+            "//".to_owned()
+        } else {
+            format!("//{body}")
+        }
+    } else if !prefix.is_empty() && rooted {
+        if body.is_empty() {
+            format!("{prefix}/")
+        } else {
+            format!("{prefix}/{body}")
+        }
+    } else if prefix.is_empty() {
+        body
+    } else {
+        format!("{prefix}{body}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_absolute_path, shell_path};
+
+    #[test]
+    fn shell_paths_preserve_recorded_posix_and_windows_roots() {
+        assert_eq!(shell_path("src/a.rs", None, Some("/repo")), "/repo/src/a.rs");
+        assert_eq!(shell_path("src\\a.rs", None, Some(r"C:\repo")), "C:/repo/src/a.rs");
+        assert_eq!(
+            shell_path("../src/a.rs", None, Some(r"C:\repo\pkg")),
+            "C:/repo/src/a.rs"
+        );
+        assert!(is_absolute_path("/repo/src/a.rs"));
+        assert!(is_absolute_path(r"C:\repo\src\a.rs"));
+        assert!(!is_absolute_path("src/a.rs"));
+    }
 }
 
 pub(crate) fn parse_patch(patch: &str) -> Vec<StructuredEdit> {

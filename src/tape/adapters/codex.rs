@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::structured::{bounded_shell_read, parse_patch, patch_is_complete};
+use super::structured::{bounded_shell_read, is_absolute_path, parse_patch, patch_is_complete};
 
 const CODEX_COVERAGE_TOOL: &str = "full";
 const CODEX_COVERAGE_READ: &str = "partial";
@@ -348,7 +348,7 @@ fn codex_coverage(events: &[Value]) -> (&'static str, &'static str) {
         } else if tool == "exec_command"
             && emitted
                 .and_then(|event| event["file"].as_str())
-                .is_some_and(|file| !std::path::Path::new(file).is_absolute())
+                .is_some_and(|file| !is_absolute_path(file))
         {
             read_partial = true;
             edit_partial = true;

@@ -43,6 +43,35 @@ fn run_json(repo: &Path, args: &[&str], stdin: Option<&str>, home: &Path) -> Val
     serde_json::from_slice(&output.stdout).expect("json stdout")
 }
 
+fn path_identity(path: &Path) -> String {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let rendered = canonical.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    {
+        rendered
+            .strip_prefix("//?/")
+            .unwrap_or(&rendered)
+            .to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        rendered
+    }
+}
+
+fn assert_reported_path(stderr: &str, label: &str, expected: &Path) {
+    let prefix = format!("{label}: ");
+    let reported = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("missing {label} path in stderr: {stderr}"));
+    assert_eq!(
+        path_identity(Path::new(reported)),
+        path_identity(expected),
+        "reported {label} path differs from its expected file: {stderr}"
+    );
+}
+
 fn stderr_json_line(stderr: &[u8]) -> Value {
     let text = String::from_utf8_lossy(stderr);
     let line = text
@@ -468,23 +497,39 @@ fn ingest_discovers_codex_sessions_for_repo_via_adapter_hook() {
     fs::create_dir_all(&repo).expect("repo");
     let codex_root = home.join(".codex/sessions/2026/03/10");
     fs::create_dir_all(&codex_root).expect("codex root");
-    fs::write(
-        codex_root.join("session.jsonl"),
-        format!(
-            concat!(
-                "{{\"timestamp\":\"2026-02-22T00:00:00Z\",\"type\":\"session_meta\",",
-                "\"payload\":{{\"cwd\":\"{}\",\"git\":{{\"commit_hash\":\"abc123\"}}}}}}\n",
-                "{{\"timestamp\":\"2026-02-22T00:00:01Z\",\"type\":\"response_item\",",
-                "\"payload\":{{\"type\":\"function_call\",\"name\":\"exec_command\",",
-                "\"call_id\":\"call_1\",\"arguments\":\"{{\\\"cmd\\\":\\\"echo hi\\\"}}\"}}}}\n",
-                "{{\"timestamp\":\"2026-02-22T00:00:02Z\",\"type\":\"response_item\",",
-                "\"payload\":{{\"type\":\"function_call_output\",\"call_id\":\"call_1\",",
-                "\"output\":\"Process exited with code 0\\nOutput:\\nhi\"}}}}\n"
-            ),
-            repo.to_string_lossy()
-        ),
-    )
-    .expect("codex session");
+    let rows = [
+        serde_json::json!({
+            "timestamp": "2026-02-22T00:00:00Z",
+            "type": "session_meta",
+            "payload": {"cwd": repo.to_string_lossy(), "git": {"commit_hash": "abc123"}}
+        }),
+        serde_json::json!({
+            "timestamp": "2026-02-22T00:00:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call_1",
+                "arguments": serde_json::json!({"cmd": "echo hi"}).to_string()
+            }
+        }),
+        serde_json::json!({
+            "timestamp": "2026-02-22T00:00:02Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "Process exited with code 0\nOutput:\nhi"
+            }
+        }),
+    ];
+    let session = rows
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(codex_root.join("session.jsonl"), format!("{session}\n"))
+        .expect("codex session");
 
     let ingest = run_json(&repo, &["ingest"], None, &home);
     assert_eq!(ingest["status"], "ok");
@@ -664,8 +709,8 @@ fn config_walkup_cascades_with_nearest_key_wins() {
     let stderr = String::from_utf8_lossy(&ingest.stderr);
     assert!(stderr.contains("config: "));
     assert!(stderr.contains("db: "));
-    assert!(stderr.contains(repo.join(".engram/config.yml").to_string_lossy().as_ref()));
-    assert!(stderr.contains(repo.join(".engram/repo.sqlite").to_string_lossy().as_ref()));
+    assert_reported_path(&stderr, "config", &repo.join(".engram/config.yml"));
+    assert_reported_path(&stderr, "db", &repo.join(".engram/repo.sqlite"));
     assert!(repo.join(".engram/repo.sqlite").exists());
 }
 
@@ -703,11 +748,8 @@ fn init_creates_local_config_and_store_dirs() {
     assert!(repo.join(".engram/cursors").is_dir());
 
     let stderr = String::from_utf8_lossy(&init.stderr);
-    assert!(stderr.contains(config_path.to_string_lossy().as_ref()));
-    assert!(
-        stderr.contains(repo.join(".engram/index.sqlite").to_string_lossy().as_ref()),
-        "stderr={stderr}"
-    );
+    assert_reported_path(&stderr, "config", &config_path);
+    assert_reported_path(&stderr, "db", &repo.join(".engram/index.sqlite"));
 }
 
 #[test]
@@ -751,14 +793,8 @@ fn ingest_after_init_uses_local_db() {
         String::from_utf8_lossy(&ingest.stderr)
     );
     let stderr = String::from_utf8_lossy(&ingest.stderr);
-    assert!(
-        stderr.contains(repo.join(".engram/config.yml").to_string_lossy().as_ref()),
-        "stderr={stderr}"
-    );
-    assert!(
-        stderr.contains(repo.join(".engram/index.sqlite").to_string_lossy().as_ref()),
-        "stderr={stderr}"
-    );
+    assert_reported_path(&stderr, "config", &repo.join(".engram/config.yml"));
+    assert_reported_path(&stderr, "db", &repo.join(".engram/index.sqlite"));
     assert!(repo.join(".engram/index.sqlite").exists());
 }
 

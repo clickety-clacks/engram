@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use chrono::{SecondsFormat, TimeZone, Utc};
 use serde_json::{Value, json};
 
-use super::structured::{bounded_shell_read, parse_patch, patch_is_complete};
+use super::structured::{bounded_shell_read, is_absolute_path, parse_patch, patch_is_complete};
 
 const DEFAULT_TS: &str = "1970-01-01T00:00:00Z";
 
@@ -148,7 +148,7 @@ fn native_coverage(events: &[Value]) -> (&'static str, &'static str) {
         } else if kind == ToolKind::Shell
             && emitted
                 .and_then(|event| event["file"].as_str())
-                .is_some_and(|file| !std::path::Path::new(file).is_absolute())
+                .is_some_and(|file| !is_absolute_path(file))
         {
             read_partial = true;
             edit_partial = true;
