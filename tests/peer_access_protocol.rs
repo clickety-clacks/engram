@@ -8140,7 +8140,9 @@ fn grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer
     command
         .current_dir(&repo)
         .env("HOME", &caller_home)
-        .args(["grep", "needle", "--peers", "complete,broken"]);
+        .args(["grep", "needle", "--peers", "complete,broken"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     command.process_group(0);
     let child = command
         .spawn()
