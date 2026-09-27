@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::Value;
@@ -342,23 +342,11 @@ pub fn discovery_scaffold(id: AdapterId, home_dir: &Path) -> Vec<PathBuf> {
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                let _ = out.pop();
-            }
-            Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
-                out.push(component.as_os_str())
-            }
-        }
-    }
-    out
+    crate::platform::normalize_path(path)
 }
 
 fn canonicalize_or_normalize(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
+    crate::platform::canonicalize_or_normalize(path)
 }
 
 fn sorted_unique(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -432,20 +420,6 @@ fn sha256_hex(input: &str) -> String {
     out
 }
 
-fn repository_path_key(path: &Path) -> String {
-    let path = canonicalize_or_normalize(path);
-    let text = path.to_string_lossy();
-    #[cfg(windows)]
-    {
-        let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
-        text.replace('\\', "-").replace('/', "-").replace(':', "-")
-    }
-    #[cfg(not(windows))]
-    {
-        text.replace('/', "-")
-    }
-}
-
 fn read_first_matching_codex_cwd(path: &Path) -> Option<PathBuf> {
     let file = fs::File::open(path).ok()?;
     let reader = BufReader::new(file);
@@ -493,7 +467,7 @@ fn discover_codex_sessions(repo_path: &Path, home_dir: &Path) -> Vec<PathBuf> {
 }
 
 fn discover_claude_sessions(repo_path: &Path, home_dir: &Path) -> Vec<PathBuf> {
-    let key = repository_path_key(repo_path);
+    let key = crate::platform::repository_path_key(repo_path);
     let project_root = home_dir.join(".claude").join("projects").join(key);
     if !project_root.exists() {
         return Vec::new();
@@ -593,7 +567,7 @@ fn discover_openclaw_sessions(repo_path: &Path, home_dir: &Path) -> Vec<PathBuf>
     }
     let repo = canonicalize_or_normalize(repo_path);
     let repo_text = repo.to_string_lossy().to_string();
-    let repo_dash = repository_path_key(&repo);
+    let repo_dash = crate::platform::repository_path_key(&repo);
     let repo_hash = sha256_hex(&repo_text);
     let mut out = Vec::new();
     for candidate in list_files_by_extension_recursive(&sessions_root, "jsonl") {
@@ -734,49 +708,8 @@ fn cursor_workspace_storage_roots(home_dir: &Path) -> Vec<PathBuf> {
     sorted_unique(roots)
 }
 
-fn percent_decode_file_uri_path(raw: &str) -> Option<String> {
-    let bytes = raw.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            let high = *bytes.get(index + 1)?;
-            let low = *bytes.get(index + 2)?;
-            let digit = |byte: u8| match byte {
-                b'0'..=b'9' => Some(byte - b'0'),
-                b'a'..=b'f' => Some(byte - b'a' + 10),
-                b'A'..=b'F' => Some(byte - b'A' + 10),
-                _ => None,
-            };
-            decoded.push((digit(high)? << 4) | digit(low)?);
-            index += 3;
-        } else {
-            decoded.push(bytes[index]);
-            index += 1;
-        }
-    }
-    String::from_utf8(decoded).ok()
-}
-
 fn file_uri_path(rest: &str) -> Option<PathBuf> {
-    let decoded = percent_decode_file_uri_path(rest)?;
-    #[cfg(windows)]
-    {
-        let decoded = decoded.strip_prefix('/').unwrap_or(&decoded);
-        let bytes = decoded.as_bytes();
-        if bytes.len() < 3
-            || !bytes[0].is_ascii_alphabetic()
-            || bytes[1] != b':'
-            || !matches!(bytes[2], b'/' | b'\\')
-        {
-            return None;
-        }
-        Some(PathBuf::from(decoded.replace('/', "\\")))
-    }
-    #[cfg(not(windows))]
-    {
-        decoded.starts_with('/').then(|| PathBuf::from(decoded))
-    }
+    crate::platform::file_uri_path(rest)
 }
 
 fn normalize_workspace_manifest_path(raw: &str) -> Option<PathBuf> {
@@ -1657,18 +1590,17 @@ mod tests {
             home.join("Library/Application Support/Cursor/User/workspaceStorage/abc");
         fs::create_dir_all(&workspace_dir).expect("workspace dir");
         let repo_text = canonical_repo.to_string_lossy();
-        #[cfg(windows)]
         let uri_path = repo_text
             .strip_prefix(r"\\?\")
             .unwrap_or(&repo_text)
             .replace('\\', "/");
-        #[cfg(not(windows))]
-        let uri_path = repo_text.to_string();
         let uri_path = uri_path.replace(' ', "%20");
-        #[cfg(windows)]
-        let workspace_uri = format!("file:///{}", uri_path);
-        #[cfg(not(windows))]
-        let workspace_uri = format!("file://{}", uri_path);
+        let uri_prefix = if uri_path.starts_with('/') {
+            "file://"
+        } else {
+            "file:///"
+        };
+        let workspace_uri = format!("{uri_prefix}{uri_path}");
         fs::write(
             workspace_dir.join("workspace.json"),
             format!("{}\n", serde_json::json!({"workspaceUri": workspace_uri})),
@@ -1785,7 +1717,7 @@ mod tests {
         fs::create_dir_all(&repo).expect("repo");
         fs::create_dir_all(&other_repo).expect("other repo");
         let canonical_repo = super::canonicalize_or_normalize(&repo);
-        let project_key = canonical_repo.to_string_lossy().replace('/', "-");
+        let project_key = crate::platform::repository_path_key(&canonical_repo);
         let claude_root = home.join(".claude/projects").join(project_key);
         let session_root = claude_root.join("session-a");
         let root_jsonl = claude_root.join("main.jsonl");
@@ -1884,7 +1816,7 @@ mod tests {
         fs::create_dir_all(&repo).expect("repo");
         fs::create_dir_all(&other_repo).expect("other repo");
         let canonical_repo = super::canonicalize_or_normalize(&repo);
-        let repo_dash = super::repository_path_key(&canonical_repo);
+        let repo_dash = crate::platform::repository_path_key(&canonical_repo);
         let sessions = home.join(".openclaw/sessions");
         let by_path = sessions.join(&repo_dash).join("a.jsonl");
         let by_content = sessions.join("misc").join("b.jsonl");

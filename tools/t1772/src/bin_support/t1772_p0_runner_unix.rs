@@ -8,7 +8,7 @@ use clap::Parser;
 use engram::dispatch::extract_dispatch_links_from_transcript;
 use engram::index::SqliteIndex;
 use engram::index::lineage::LINK_THRESHOLD_DEFAULT;
-use engram::proof::t1772::{
+use engram_t1772_tools::proof::t1772::{
     self, BASELINE_BYTES, CANDIDATE_BASE, DISPATCH_JSONL_SHA256, DISPATCH_ROWS,
     EXPECTED_EDIT_EDGES, EXPECTED_EDIT_WINDOWS, EXPECTED_EVENTS, EXPECTED_EVIDENCE_FEATURES,
     EXPECTED_EVIDENCE_WINDOWS, EXPECTED_INPUTS, EXPECTED_LEGACY_TOMBSTONE_KEYS,
@@ -116,7 +116,7 @@ fn run() -> ProofResult<()> {
     // The reviewed controller observes this post-exec stop, records csops, and
     // resumes with Darwin SIGCONT 19. No proof output is opened before resume.
     suspend_for_controller()?;
-    let comparator = engram::proof::baseline_custody::read_comparator_receipt(
+    let comparator = engram_t1772_tools::proof::baseline_custody::read_comparator_receipt(
         &args.baseline_database,
         &args.baseline_database_sha256,
         &args.comparator_receipt,
@@ -194,14 +194,14 @@ fn run() -> ProofResult<()> {
             &output.join("per-tape-accounting.jsonl"),
         )?;
         verify_dispatch_oracle(&db, &tape_ids, &output.join("dispatch-oracle.jsonl"))?;
-        engram::proof::canonical_oracle::verify(
+        engram_t1772_tools::proof::canonical_oracle::verify(
             &db,
             &args.tape_root,
             &tape_ids,
             &args.oracle_root,
             &output.join("canonical-oracle"),
         )?;
-        engram::proof::compatibility::verify(
+        engram_t1772_tools::proof::compatibility::verify(
             &db,
             &tape_ids,
             &args.input_root.join("p0-tombstone-key-to-window.jsonl"),
@@ -215,7 +215,7 @@ fn run() -> ProofResult<()> {
                 .join("p0-performance-expected-direct-touches.json"),
             &output.join("direct-touch-results.json"),
         )?;
-        engram::proof::journeys::run(
+        engram_t1772_tools::proof::journeys::run(
             &args.journey_root,
             &args.journey_manifest_sha256,
             &args.candidate_binary,
@@ -248,15 +248,15 @@ fn run() -> ProofResult<()> {
         &runner_root.join("rebuild-1/index.sqlite"),
         &runner_root.join("queries/query-plan.json"),
     )?;
-    engram::proof::concurrency::run(
+    engram_t1772_tools::proof::concurrency::run(
         &runner_root.join("rebuild-1/index.sqlite"),
         &args.tape_root,
         &tape_ids,
         &args.input_root.join("p0-performance-query-manifest.json"),
         &runner_root.join("concurrency"),
     )?;
-    engram::proof::performance::run(
-        &engram::proof::performance::Inputs {
+    engram_t1772_tools::proof::performance::run(
+        &engram_t1772_tools::proof::performance::Inputs {
             baseline_binary: &args.baseline_binary,
             baseline_database: &args.baseline_database,
             baseline_database_sha256: &args.baseline_database_sha256,
@@ -289,11 +289,11 @@ fn run() -> ProofResult<()> {
         "counts": reports[0].counts,
         "rebuilds_logically_identical": true,
         "candidate_bytes_below_historical_ceiling": true,
-        "reconstruction_amendment_sha256":engram::proof::baseline_custody::RECONSTRUCTION_AMENDMENT_SHA256,
+        "reconstruction_amendment_sha256":engram_t1772_tools::proof::baseline_custody::RECONSTRUCTION_AMENDMENT_SHA256,
         "comparator_receipt_sha256":args.comparator_receipt_sha256,
-        "cold_custody_amendment_sha256":engram::proof::baseline_custody::COLD_AMENDMENT_SHA256,
-        "cold_copy_limitation":engram::proof::baseline_custody::COLD_LIMITATION,
-        "size_comparison":engram::proof::baseline_custody::size_comparison(reports[0].bytes, comparator["database_bytes"].as_u64().ok_or("comparator bytes absent")?),
+        "cold_custody_amendment_sha256":engram_t1772_tools::proof::baseline_custody::COLD_AMENDMENT_SHA256,
+        "cold_copy_limitation":engram_t1772_tools::proof::baseline_custody::COLD_LIMITATION,
+        "size_comparison":engram_t1772_tools::proof::baseline_custody::size_comparison(reports[0].bytes, comparator["database_bytes"].as_u64().ok_or("comparator bytes absent")?),
         "elapsed_milliseconds": started.elapsed().as_millis(),
         "no_live_write_targets": true,
         "publication_performed": false
@@ -348,16 +348,16 @@ fn validate_args(args: &Args) -> ProofResult<()> {
     require_exact_path(&args.input_root, INPUT_ROOT, "INPUT_ROOT")?;
     require_exact_path(
         &args.journey_root,
-        engram::proof::journeys::ROOT,
+        engram_t1772_tools::proof::journeys::ROOT,
         "JOURNEY_ROOT",
     )?;
-    engram::proof::journeys::verify_inputs(&args.journey_root, &args.journey_manifest_sha256)?;
+    engram_t1772_tools::proof::journeys::verify_inputs(&args.journey_root, &args.journey_manifest_sha256)?;
     require_exact_path(
         &args.oracle_root,
-        engram::proof::canonical_oracle::SUPPLEMENT_ROOT,
+        engram_t1772_tools::proof::canonical_oracle::SUPPLEMENT_ROOT,
         "ORACLE_ROOT",
     )?;
-    engram::proof::canonical_oracle::verify_inputs(&args.oracle_root)?;
+    engram_t1772_tools::proof::canonical_oracle::verify_inputs(&args.oracle_root)?;
     require_exact_path(&args.proof_root, PROOF_ROOT, "PROOF_ROOT")?;
     if args.manifest != args.input_root.join(MANIFEST_NAME) {
         return Err("manifest path is not the reviewed R29 manifest".into());
@@ -755,8 +755,8 @@ fn write_test_definitions(path: &Path) -> ProofResult<()> {
                 {"id":"exact-accounting", "assertion":"all frozen cardinalities, per-tape CSV rows, and 14,369 dispatch rows match"},
                 {"id":"query-equivalence", "assertion":"both rebuilds: exact global/per-tape typed digests, complete 25305 legacy tombstone-key journeys and 12 fixed canonical event-touch projections; hash-bound complete product journey cases must pass on both rebuilds under per-query read-only mutation custody; missing cases/expectations prevent passing"},
                 {"id":"read-only-plan", "assertion":"feature lookup uses posting/window keys without full evidence scan or temporary B-tree"},
-                {"id":"performance", "assertion":"reconstructed pinned-baseline versus candidate: 12 identical manifest queries, both binaries, hot and filesystem-cold; 3 warmups and 30 measured fresh processes each, alternating order; raw RSS/elapsed and p50/p95/p99 thresholds retained; baseline CLI counters unavailable/non-comparable, never substituted; every candidate warmup/measured slot requires full ordered same-invocation oracle equality, bound per-statement direct-touch probe coverage with SORT=0/AUTOINDEX=0, and successful zero-observed-temp evidence; retain collector paths/interval/gaps/errors and unlinked/between-sample limitations, never claim zero total temp allocation", "telemetry_amendment_sha256":engram::proof::performance::TELEMETRY_AMENDMENT_SHA256},
-                {"id":"reconstructed-comparator-custody", "assertion":"before root creation reject missing/changed receipt, binary/source/manifest/blob identity, schema/table accounting, corpus registration, sidecars, mutable master, reordered/extra/missing transcript slots or non-single-tape fingerprint invocations; accept distinct actual comparator size without historical equality; candidate historical ceiling remains strict; signed actual difference permits savings only when positive; provenance attribution and effective invocation remain independent inspection requirements", "amendment_sha256":engram::proof::baseline_custody::RECONSTRUCTION_AMENDMENT_SHA256},
+                {"id":"performance", "assertion":"reconstructed pinned-baseline versus candidate: 12 identical manifest queries, both binaries, hot and filesystem-cold; 3 warmups and 30 measured fresh processes each, alternating order; raw RSS/elapsed and p50/p95/p99 thresholds retained; baseline CLI counters unavailable/non-comparable, never substituted; every candidate warmup/measured slot requires full ordered same-invocation oracle equality, bound per-statement direct-touch probe coverage with SORT=0/AUTOINDEX=0, and successful zero-observed-temp evidence; retain collector paths/interval/gaps/errors and unlinked/between-sample limitations, never claim zero total temp allocation", "telemetry_amendment_sha256":engram_t1772_tools::proof::performance::TELEMETRY_AMENDMENT_SHA256},
+                {"id":"reconstructed-comparator-custody", "assertion":"before root creation reject missing/changed receipt, binary/source/manifest/blob identity, schema/table accounting, corpus registration, sidecars, mutable master, reordered/extra/missing transcript slots or non-single-tape fingerprint invocations; accept distinct actual comparator size without historical equality; candidate historical ceiling remains strict; signed actual difference permits savings only when positive; provenance attribution and effective invocation remain independent inspection requirements", "amendment_sha256":engram_t1772_tools::proof::baseline_custody::RECONSTRUCTION_AMENDMENT_SHA256},
                 {"id":"concurrency", "assertion":"real multi-posting open_reader snapshot held >=60s through 100 actual frozen-tape ingest commits at fixed cadence; interval passive checkpoints; repeat short-query loop; exact error histogram/no retries, commit percentiles, WAL maximum and final checkpoint"},
                 {"id":"peak-staging", "assertion":"controller continuously samples staged file sizes and allocated blocks every requested 100ms across operation; preserve raw samples, maximum gap and observed peaks; join sampler before output hashing"},
                 {"id":"performance-custody-placement", "assertion":"hot baseline series retain pre/post full hashes and post logical/schema checks against verified master state; cold slots require recorded successful APFS CoW operation, protected stable master/absent sidecars, distinct destination identity, exact invocation/config binding, pre/post metadata and source-write-contract evidence; cold copy digests/logical validation null with accepted limitation; every anomaly or failed/missing invocation receipt fails; candidate full-slot pre/post custody remains; 24 baseline and 1584 candidate working-file hash reads; io-plan reports fresh-copy/cache and shared-block limits"},

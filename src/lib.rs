@@ -10,8 +10,7 @@ pub mod config;
 pub mod dispatch;
 pub mod index;
 pub mod ingest;
-#[cfg(unix)]
-pub mod proof;
+pub mod platform;
 pub mod query;
 pub mod store;
 pub mod tape;
@@ -99,16 +98,5 @@ pub fn path_string(path: &Path) -> String {
 }
 
 pub fn home_dir() -> Result<PathBuf, CliError> {
-    #[cfg(windows)]
-    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
-    #[cfg(not(windows))]
-    let home = std::env::var_os("HOME");
-
-    home.map(PathBuf::from).ok_or_else(|| {
-        #[cfg(windows)]
-        let message = "USERPROFILE or HOME environment variable is not set";
-        #[cfg(not(windows))]
-        let message = "HOME environment variable is not set";
-        CliError::new("home_error", message)
-    })
+    platform::home_dir()
 }

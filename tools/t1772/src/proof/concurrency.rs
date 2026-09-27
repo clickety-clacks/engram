@@ -14,12 +14,12 @@ use super::t1772::{
     ProofResult, RETAINED_READER_SECONDS, WATCHER_TRANSACTIONS, canonical_json_lf, sha256_bytes,
     write_canonical_json,
 };
-use crate::dispatch::extract_dispatch_links_from_transcript;
-use crate::index::lineage::LINK_THRESHOLD_DEFAULT;
-use crate::index::{DispatchLink, SqliteIndex};
-use crate::query::format::derive_anchor_candidates;
-use crate::store::tapes::read_tape_content;
-use crate::tape::event::{TapeEventAt, parse_jsonl_events};
+use engram::dispatch::extract_dispatch_links_from_transcript;
+use engram::index::lineage::LINK_THRESHOLD_DEFAULT;
+use engram::index::{DispatchLink, SqliteIndex};
+use engram::query::format::derive_anchor_candidates;
+use engram::store::tapes::read_tape_content;
+use engram::tape::event::{TapeEventAt, parse_jsonl_events};
 
 struct Tape {
     id: String,

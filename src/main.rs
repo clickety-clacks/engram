@@ -2247,21 +2247,21 @@ fn run() -> Result<(), CliError> {
         }
         Command::Explain(args) => {
             if args.peers.is_some() {
-                ensure_peer_commands_supported()?;
+                engram::platform::ensure_peer_commands_supported()?;
             }
             let context = resolve_query_runtime_context(&cwd)?;
             cmd_explain(&cwd, &paths, &context, args)
         }
         Command::Grep(args) => {
             if args.peers.is_some() {
-                ensure_peer_commands_supported()?;
+                engram::platform::ensure_peer_commands_supported()?;
             }
             let context = resolve_query_runtime_context(&cwd)?;
             cmd_grep(&paths, &context, args)
         }
         Command::Peek(args) => {
             if args.store.is_some() {
-                ensure_peer_commands_supported()?;
+                engram::platform::ensure_peer_commands_supported()?;
             }
             let context = resolve_query_runtime_context(&cwd)?;
             cmd_peek(&paths, &context, args)
@@ -2272,7 +2272,7 @@ fn run() -> Result<(), CliError> {
         }
         Command::Show(args) => {
             if args.store.is_some() || args.peers.is_some() {
-                ensure_peer_commands_supported()?;
+                engram::platform::ensure_peer_commands_supported()?;
             }
             let context = if args.store.is_some() || args.peers.is_some() {
                 resolve_query_runtime_context(&cwd)?
@@ -2283,7 +2283,7 @@ fn run() -> Result<(), CliError> {
         }
         Command::Topology(args) => match args.command {
             TopologyCommand::Status(args) => {
-                ensure_peer_commands_supported()?;
+                engram::platform::ensure_peer_commands_supported()?;
                 cmd_topology_status(args)
             }
         },
@@ -2301,20 +2301,6 @@ fn run() -> Result<(), CliError> {
                 Err(CliError::new("peer_serve", "peer-serve requires --stdio"))
             }
         }
-    }
-}
-
-fn ensure_peer_commands_supported() -> Result<(), CliError> {
-    #[cfg(windows)]
-    {
-        Err(CliError::new(
-            "unsupported_platform",
-            "cross-machine peer queries and topology status are unsupported on Windows because the owner service cannot safely open tape files without no-follow semantics; local commands remain available",
-        ))
-    }
-    #[cfg(not(windows))]
-    {
-        Ok(())
     }
 }
 
@@ -4588,6 +4574,7 @@ fn cmd_explain(
     let mut tombstones = Vec::new();
     let touched_anchors;
     let score_by_session;
+    #[cfg(feature = "t1772-proof")]
     let mut proof_direct_touches: Option<Value> = None;
     let date_filter = DateFilter::parse(args.since.as_deref(), args.until.as_deref())?;
 
@@ -4655,20 +4642,9 @@ fn cmd_explain(
             };
             let result =
                 explain_across_indexes(&indexes, &query_anchors, traversal, args.forensics)?;
+            #[cfg(feature = "t1772-proof")]
             if std::env::var("T1772_DIRECT_TOUCH_PROJECTION").as_deref() == Ok("1") {
-                #[cfg(unix)]
-                {
-                    proof_direct_touches = Some(engram::proof::performance::direct_projection(
-                        &result.direct,
-                    ));
-                }
-                #[cfg(not(unix))]
-                {
-                    return Err(CliError::new(
-                        "unsupported_platform",
-                        "T1772 direct-touch proof projection is unsupported on this platform",
-                    ));
-                }
+                proof_direct_touches = Some(direct_touch_projection(&result.direct));
             }
             touched_anchors = result.touched_anchors.clone();
             let touches =
@@ -4781,6 +4757,7 @@ fn cmd_explain(
     "time_range": time_range,
     "truncated": truncated,
     });
+    #[cfg(feature = "t1772-proof")]
     if let Some(touches) = proof_direct_touches {
         payload["t1772_direct_touches"] = touches;
     }
@@ -4791,6 +4768,41 @@ fn cmd_explain(
         payload["dispatch_ambiguous"] = json!(dispatch_ambiguous);
     }
     emit_query_result("explain", payload)
+}
+
+#[cfg(feature = "t1772-proof")]
+fn direct_touch_projection(
+    touches: &[engram::index::lineage::EvidenceFragmentRef],
+) -> Value {
+    let mut rows = touches
+        .iter()
+        .map(|touch| {
+            json!({
+                "event_offset": touch.event_offset,
+                "file_path": touch.file_path,
+                "kind": match touch.kind {
+                    engram::index::lineage::EvidenceKind::Read => "read",
+                    engram::index::lineage::EvidenceKind::Edit => "edit",
+                },
+                "tape_id": touch.tape_id,
+                "timestamp": touch.timestamp,
+            })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        left["timestamp"]
+            .as_str()
+            .cmp(&right["timestamp"].as_str())
+            .then_with(|| left["tape_id"].as_str().cmp(&right["tape_id"].as_str()))
+            .then_with(|| {
+                left["event_offset"]
+                    .as_u64()
+                    .cmp(&right["event_offset"].as_u64())
+            })
+            .then_with(|| left["kind"].as_str().cmp(&right["kind"].as_str()))
+            .then_with(|| left["file_path"].as_str().cmp(&right["file_path"].as_str()))
+    });
+    Value::Array(rows)
 }
 
 fn cmd_explain_with_peers(
@@ -8092,16 +8104,24 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
     #[test]
     fn watch_path_matches_canonicalized_source_root() {
+        if std::env::consts::FAMILY != "unix" {
+            return;
+        }
         let dir = tempfile::tempdir().expect("tempdir");
         let real_source = dir.path().join("real-source");
         let linked_source = dir.path().join("linked-source");
         fs::create_dir_all(real_source.join("accepted/nested")).expect("real source");
         fs::write(real_source.join("accepted/session.jsonl"), "{}\n").expect("shallow file");
         fs::write(real_source.join("accepted/nested/session.jsonl"), "{}\n").expect("nested file");
-        std::os::unix::fs::symlink(&real_source, &linked_source).expect("symlink source");
+        let symlink = std::process::Command::new("ln")
+            .arg("-s")
+            .arg(&real_source)
+            .arg(&linked_source)
+            .status()
+            .expect("run symlink fixture command");
+        assert!(symlink.success(), "create symlink source");
         let match_root = fs::canonicalize(&linked_source).expect("canonical source");
         let runtime = WatchSourceRuntime {
             source: EffectiveWatchSource {

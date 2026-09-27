@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::t1772::{self, ProofResult, write_canonical_json, write_canonical_jsonl};
-use crate::index::SqliteIndex;
+use engram::index::SqliteIndex;
 
 // This is the retained census's legacy preimage, not the new artifact encoding.
 // Source 0fc03ad99e48f293f0b351ddbc4269ed4b48681bc2ff4a31e6f88403ba6915cd.

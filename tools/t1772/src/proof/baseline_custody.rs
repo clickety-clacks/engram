@@ -212,7 +212,7 @@ pub fn verify_comparator(
             return Err(format!("comparator build transcript slot {ordinal} invalid").into());
         }
         // Bind the normalized content address as well as the compressed blob.
-        let text = crate::store::tapes::read_tape_content(&source)
+        let text = engram::store::tapes::read_tape_content(&source)
             .map_err(|e| format!("comparator source read: {}", e.message))?;
         if t1772::sha256_bytes(text.as_bytes()) != *id {
             return Err("comparator normalized source identity mismatch".into());

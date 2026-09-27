@@ -551,9 +551,11 @@ fn explain_forensics_and_agent_links_behave_as_specified() {
 }
 
 // This command-capture fixture invokes the POSIX shell at /bin/sh.
-#[cfg(unix)]
 #[test]
 fn record_command_captures_tool_events_and_exit_status() {
+    if std::env::consts::FAMILY != "unix" {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();
     let _ = run_json(repo, &["init"], None);
@@ -768,9 +770,11 @@ fn record_recovers_when_tape_file_exists_but_index_missing() {
 }
 
 // This command-capture fixture invokes the POSIX shell at /bin/sh.
-#[cfg(unix)]
 #[test]
 fn record_command_captures_tool_events_and_persists_tape() {
+    if std::env::consts::FAMILY != "unix" {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();
     let _ = run_json(repo, &["init"], None);
@@ -791,9 +795,11 @@ fn record_command_captures_tool_events_and_persists_tape() {
 }
 
 // This failed-command fixture invokes the POSIX shell at /bin/sh.
-#[cfg(unix)]
 #[test]
 fn record_command_keeps_trace_for_failed_process() {
+    if std::env::consts::FAMILY != "unix" {
+        return;
+    }
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();
     let _ = run_json(repo, &["init"], None);

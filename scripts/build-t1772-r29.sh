@@ -14,8 +14,8 @@ export TZ=UTC
 export LC_ALL=C
 export T1772_BUILD_REVISION="$revision"
 
-cargo build --locked --release \
-  --bin engram \
+cargo build --locked --release --features t1772-proof --bin engram
+cargo build --locked --release --manifest-path tools/t1772/Cargo.toml \
   --bin t1772_p0_runner \
   --bin t1772_p0_controller
 

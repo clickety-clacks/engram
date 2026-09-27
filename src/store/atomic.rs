@@ -25,8 +25,8 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         tmp_file.sync_all()?;
         drop(tmp_file);
 
-        rename_overwrite(&tmp_path, path)?;
-        sync_parent_dir(parent)?;
+        crate::platform::atomic_replace(&tmp_path, path)?;
+        crate::platform::sync_parent_dir(parent)?;
         Ok(())
     })();
 
@@ -38,30 +38,6 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 fn create_temp_file(path: &Path) -> io::Result<File> {
     OpenOptions::new().create_new(true).write(true).open(path)
-}
-
-fn rename_overwrite(from: &Path, to: &Path) -> io::Result<()> {
-    match fs::rename(from, to) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            if to.exists() {
-                fs::remove_file(to)?;
-                fs::rename(from, to)
-            } else {
-                Err(err)
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-fn sync_parent_dir(parent: &Path) -> io::Result<()> {
-    File::open(parent)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_parent_dir(_parent: &Path) -> io::Result<()> {
-    Ok(())
 }
 
 fn temp_path_in_parent(parent: &Path, final_path: &Path) -> io::Result<PathBuf> {

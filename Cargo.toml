@@ -4,6 +4,10 @@ version = "0.2.9"
 edition = "2024"
 license = "Apache-2.0"
 
+[features]
+default = []
+t1772-proof = []
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -21,3 +25,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+
+[workspace]
+members = ["tools/t1772"]
+default-members = ["."]
+resolver = "3"

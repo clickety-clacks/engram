@@ -1,7 +1,7 @@
 //! One-time, exact legacy native chronology recovery. Original tapes and evidence
 //! stay untouched; immutable context tapes and small locator files bind old offsets.
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -55,15 +55,7 @@ fn read_locator(path: &Path, max_bytes: u64) -> Result<Locator, CliError> {
             "recovery locator exceeds the {max_bytes} byte limit"
         )));
     }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let file = options
-        .open(path)
+    let file = crate::platform::open_read_nofollow(path)
         .map_err(|e| CliError::io("native_recovery_error", e))?;
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.take(max_bytes.saturating_add(1))

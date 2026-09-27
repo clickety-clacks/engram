@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use crate::store::atomic::atomic_write;
 use serde::Deserialize;
@@ -607,19 +607,7 @@ fn resolve_path(raw: &str, base_dir: &Path, home: &Path) -> Result<PathBuf, Conf
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                let _ = out.pop();
-            }
-            Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
-                out.push(component.as_os_str())
-            }
-        }
-    }
-    out
+    crate::platform::normalize_path(path)
 }
 
 fn parse_config(content: &str) -> Result<ParsedConfig, ConfigError> {
@@ -707,7 +695,7 @@ fn is_within_home(path: &Path, home: &Path) -> bool {
 }
 
 fn canonicalize_or_normalize(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
+    crate::platform::canonicalize_or_normalize(path)
 }
 
 pub fn default_user_config_yaml() -> String {

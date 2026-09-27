@@ -1,6 +1,6 @@
 //! Exact §9.3 product observations against a separately frozen expectation package.
 use super::t1772::{ProofResult, sha256_file, write_canonical_json};
-use crate::{
+use engram::{
     dispatch::extract_dispatch_links_from_transcript, index::SqliteIndex,
     tape::event::parse_jsonl_events,
 };
@@ -206,7 +206,7 @@ fn setup_db(db: &Path, tapes: &Path, ids: &[String]) -> ProofResult<()> {
             id,
             &parse_jsonl_events(&content)?,
             &extract_dispatch_links_from_transcript(&content),
-            crate::index::lineage::LINK_THRESHOLD_DEFAULT,
+            engram::index::lineage::LINK_THRESHOLD_DEFAULT,
         )?;
     }
     Ok(())

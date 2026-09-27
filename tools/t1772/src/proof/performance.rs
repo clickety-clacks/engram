@@ -8,10 +8,10 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
-pub fn direct_projection(touches: &[crate::index::lineage::EvidenceFragmentRef]) -> Value {
+pub fn direct_projection(touches: &[engram::index::lineage::EvidenceFragmentRef]) -> Value {
     let mut rows = touches.iter().map(|touch| json!({
         "event_offset":touch.event_offset,"file_path":touch.file_path,
-        "kind":match touch.kind { crate::index::lineage::EvidenceKind::Read=>"read", crate::index::lineage::EvidenceKind::Edit=>"edit" },
+        "kind":match touch.kind { engram::index::lineage::EvidenceKind::Read=>"read", engram::index::lineage::EvidenceKind::Edit=>"edit" },
         "tape_id":touch.tape_id,"timestamp":touch.timestamp})).collect::<Vec<_>>();
     rows.sort_by(|a, b| {
         a["timestamp"]
@@ -204,7 +204,7 @@ pub fn run(inputs: &Inputs<'_>, root: &Path) -> ProofResult<()> {
                     };
                     let target = query["target"].as_str().ok_or("target absent")?;
                     let anchors =
-                        crate::query::format::derive_anchor_candidates(&[target.to_string()]);
+                        engram::query::format::derive_anchor_candidates(&[target.to_string()]);
                     let binding = json!({"query_id":id,"variant":label,"cache_class":mode,
                         "comparison_label":baseline_custody::COMPARISON_LABEL,
                         "reconstruction_amendment_sha256":baseline_custody::RECONSTRUCTION_AMENDMENT_SHA256,
@@ -867,7 +867,7 @@ fn measure(
             "source_revision":binding["product_source_revision"],"binary_sha256":binding["product_binary_sha256"]},
         "complete_temporary_bytes":Value::Null,
         "temporary_byte_limitation":TEMP_LIMITATION,"zero_total_temporary_allocation_claimed":false,
-        "temp_collector_identity":{"module":"src/proof/measurement.rs::DiskSampler","source_revision":binding["collector_source_revision"],"binary_sha256":binding["collector_binary_sha256"]},
+        "temp_collector_identity":{"module":"tools/t1772/src/proof/measurement.rs::DiskSampler","source_revision":binding["collector_source_revision"],"binary_sha256":binding["collector_binary_sha256"]},
         "temp_samples_path":root.join("temp-samples.jsonl"),"temp_collector_errors":[],
         "canonical_output_sha256":sha256_file(&canonical_output)?,
         "observed_sqlite_temp_bytes":disk["peak_observed_logical_bytes"],

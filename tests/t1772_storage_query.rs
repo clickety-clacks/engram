@@ -11,6 +11,12 @@ use engram::tape::event::{
 };
 use rusqlite::Connection;
 
+fn set_readonly(path: &std::path::Path, readonly: bool) {
+    let mut permissions = fs::metadata(path).expect("metadata").permissions();
+    permissions.set_readonly(readonly);
+    fs::set_permissions(path, permissions).expect("permissions");
+}
+
 fn code(prefix: &str, lines: usize) -> String {
     (1..=lines)
         .map(|line| format!("fn {prefix}_{line}() {{ value_{line}(); }}\n"))
@@ -113,15 +119,10 @@ fn feature_composite_span_and_tombstone_modes_are_explicit() {
     assert_eq!(tombstones[0].file_path, "src/deleted.rs");
 }
 
-#[cfg(unix)]
 #[test]
 fn live_primary_and_frozen_additional_query_stores_open_without_index_file_mutation() {
-    use std::os::unix::fs::PermissionsExt;
-
-    // D1/T1: the old test placed both readers under one non-writable parent and
-    // depended on automatic immutable-mode inference. Live readers now remain
-    // mode=ro and may need parent-directory access for SQLite's -shm file, so
-    // only the explicitly frozen captured copy belongs in the non-writable dir.
+    // Live readers remain mode=ro and may need parent-directory access for
+    // SQLite's -shm file; this checks that readonly database files stay unchanged.
     let temp = tempfile::tempdir().expect("tempdir");
     let active_dir = temp.path().join("active");
     let frozen_dir = temp.path().join("frozen");
@@ -139,9 +140,8 @@ fn live_primary_and_frozen_additional_query_stores_open_without_index_file_mutat
         .map(|entry| entry.unwrap().file_name())
         .collect::<Vec<_>>();
 
-    fs::set_permissions(&primary, fs::Permissions::from_mode(0o444)).expect("primary mode");
-    fs::set_permissions(&additional, fs::Permissions::from_mode(0o444)).expect("additional mode");
-    fs::set_permissions(&frozen_dir, fs::Permissions::from_mode(0o555)).expect("frozen dir mode");
+    set_readonly(&primary, true);
+    set_readonly(&additional, true);
 
     let context = RuntimeContext {
         config_path: temp.path().join("config.yml"),
@@ -175,13 +175,15 @@ fn live_primary_and_frozen_additional_query_stores_open_without_index_file_mutat
             .collect::<Vec<_>>(),
         listing_before
     );
-    fs::set_permissions(&frozen_dir, fs::Permissions::from_mode(0o755)).expect("restore mode");
+    set_readonly(&primary, false);
+    set_readonly(&additional, false);
 }
 
-#[cfg(unix)]
 #[test]
 fn live_reader_in_read_only_directory_reports_unavailability_and_fix() {
-    use std::os::unix::fs::PermissionsExt;
+    if std::env::consts::FAMILY != "unix" {
+        return;
+    }
 
     let temp = tempfile::tempdir().expect("tempdir");
     let live_dir = temp.path().join("live");
@@ -189,8 +191,8 @@ fn live_reader_in_read_only_directory_reports_unavailability_and_fix() {
     let primary = live_dir.join("primary.sqlite");
     drop(SqliteIndex::open_writer(primary.to_str().unwrap()).expect("writer"));
     let before = fs::read(&primary).expect("primary bytes");
-    fs::set_permissions(&primary, fs::Permissions::from_mode(0o444)).expect("read-only file");
-    fs::set_permissions(&live_dir, fs::Permissions::from_mode(0o555)).expect("read-only dir");
+    set_readonly(&primary, true);
+    set_readonly(&live_dir, true);
 
     let context = RuntimeContext {
         config_path: temp.path().join("config.yml"),
@@ -209,7 +211,8 @@ fn live_reader_in_read_only_directory_reports_unavailability_and_fix() {
         watch: None,
     };
     let result = open_query_indexes(&context);
-    fs::set_permissions(&live_dir, fs::Permissions::from_mode(0o755)).expect("restore dir mode");
+    set_readonly(&live_dir, false);
+    set_readonly(&primary, false);
 
     let error = result
         .err()

@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use engram::proof::t1772::{
+use engram_t1772_tools::proof::t1772::{
     CANDIDATE_BASE, CANONICAL_BYTES_CONTRACT, DISPATCH_ROWS, INPUT_ROOT, MANIFEST_SHA256,
     PROOF_ROOT, canonical_json_lf, safe_relative_path, sha256_bytes,
 };
@@ -12,7 +12,7 @@ use serde_json::json;
 #[test]
 fn same_invocation_direct_projection_keeps_extras_duplicates_and_canonical_order() {
     use engram::index::lineage::{EvidenceFragmentRef, EvidenceKind};
-    use engram::proof::performance::direct_projection;
+    use engram_t1772_tools::proof::performance::direct_projection;
     let row = |kind, path: &str| EvidenceFragmentRef {
         tape_id: "t".into(),
         event_offset: 4,
@@ -37,10 +37,10 @@ fn same_invocation_direct_projection_keeps_extras_duplicates_and_canonical_order
 
 #[test]
 fn direct_only_probe_preserves_binding_counts_and_rejects_missing_coverage() {
-    use engram::proof::statement_probe::{
+    use engram_t1772_tools::proof::statement_probe::{
         COUNTER_SCOPE, run, validate_candidate_direct_statements,
     };
-    use engram::proof::t1772::sha256_file;
+    use engram_t1772_tools::proof::t1772::sha256_file;
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("candidate.sqlite");
     let conn = rusqlite::Connection::open(&db).unwrap();
@@ -89,7 +89,7 @@ fn direct_only_probe_preserves_binding_counts_and_rejects_missing_coverage() {
 
 #[test]
 fn performance_order_alternates_by_query_and_iteration() {
-    use engram::proof::performance::alternating_order;
+    use engram_t1772_tools::proof::performance::alternating_order;
     let mut launches = [0, 0];
     for query in 0..12 {
         for _mode in 0..2 {
@@ -108,7 +108,7 @@ fn performance_order_alternates_by_query_and_iteration() {
 
 #[test]
 fn thirty_sample_tail_percentiles_use_nearest_rank() {
-    use engram::proof::measurement::percentiles;
+    use engram_t1772_tools::proof::measurement::percentiles;
     let samples = (1..=30).rev().collect::<Vec<u64>>();
     let result = percentiles(&samples).unwrap();
     assert_eq!(result["p50"], 15);
@@ -119,7 +119,7 @@ fn thirty_sample_tail_percentiles_use_nearest_rank() {
 
 #[test]
 fn darwin_rss_requires_one_unambiguous_observation() {
-    use engram::proof::performance::parse_darwin_rss;
+    use engram_t1772_tools::proof::performance::parse_darwin_rss;
     assert_eq!(
         parse_darwin_rss("noise\n  4096  maximum resident set size\n").unwrap(),
         4096
@@ -180,13 +180,13 @@ fn reviewed_r29_bindings_are_compile_time_constants() {
 #[cfg(target_os = "macos")]
 #[test]
 fn darwin_sigcont_is_19() {
-    assert_eq!(engram::proof::t1772::SIGCONT_NUMBER, 19);
+    assert_eq!(engram_t1772_tools::proof::t1772::SIGCONT_NUMBER, 19);
 }
 
 #[test]
 fn early_projection_collapses_matching_windows_but_keeps_distinct_events_and_ties() {
     use engram::index::SqliteIndex;
-    use engram::proof::t1772::canonical_event_touches;
+    use engram_t1772_tools::proof::t1772::canonical_event_touches;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("physical.sqlite");
     let conn = rusqlite::Connection::open(&path).unwrap();

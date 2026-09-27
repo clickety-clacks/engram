@@ -26,7 +26,6 @@ fn run_json(repo: &Path, home: &Path, args: &[&str]) -> Value {
     serde_json::from_slice(&output.stdout).expect("Engram emits JSON")
 }
 
-#[cfg(windows)]
 fn assert_unsupported_peer_command(repo: &Path, home: &Path, args: &[&str]) {
     let output = run_cli(repo, home, args);
     assert!(
@@ -154,8 +153,7 @@ fn local_ingest_explain_grep_peek_and_show_work_with_the_platform_home() {
     assert_eq!(show["tape_id"], tape_id);
     assert!(show["event_count"].as_u64().unwrap() >= 2);
 
-    #[cfg(windows)]
-    {
+    if std::env::consts::OS == "windows" {
         assert_unsupported_peer_command(
             &repo,
             &home,

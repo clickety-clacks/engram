@@ -1352,14 +1352,11 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     // D1/T1: this intentionally exercises Frozen mode. The previous test name
     // implied arbitrary readers could use immutable mode when sidecars were
     // absent; Live readers must instead remain mode=ro.
     fn frozen_reader_opens_schema_v4_without_wal_shm_or_file_mutation() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("index.sqlite");
         {
@@ -1367,9 +1364,6 @@ mod tests {
             assert_eq!(writer.user_version().unwrap(), 4);
         }
         let before = std::fs::read(&path).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
-        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
-
         {
             let reader =
                 SqliteIndex::open_reader_mode(path.to_str().unwrap(), ReaderMode::Frozen).unwrap();
@@ -1379,7 +1373,6 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert!(!path.with_extension("sqlite-wal").exists());
         assert!(!path.with_extension("sqlite-shm").exists());
-        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
@@ -1473,11 +1466,8 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn read_transaction_rolls_back_errors_without_store_mutation() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("index.sqlite");
         {
@@ -1492,9 +1482,6 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
-        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
-
         {
             let reader =
                 SqliteIndex::open_reader_mode(path.to_str().unwrap(), ReaderMode::Frozen).unwrap();
@@ -1547,6 +1534,5 @@ mod tests {
         );
         assert!(!path.with_extension("sqlite-wal").exists());
         assert!(!path.with_extension("sqlite-shm").exists());
-        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 }

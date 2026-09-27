@@ -7,7 +7,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
-use engram::proof::t1772::{
+use engram_t1772_tools::proof::t1772::{
     self, CANDIDATE_BASE, INPUT_ROOT, MANIFEST_NAME, MANIFEST_SHA256, PROOF_ROOT, ProofResult,
     SIGCONT_NUMBER, canonical_json_lf, collect_custody, manifest_result, require_exact_path,
     sha256_file, verify_input_manifest, write_canonical_json, write_canonical_jsonl,
@@ -155,7 +155,7 @@ fn run() -> ProofResult<()> {
 
     validate_source_checkout(&args)?;
     validate_executables(&args)?;
-    let comparator = engram::proof::baseline_custody::verify_comparator(
+    let comparator = engram_t1772_tools::proof::baseline_custody::verify_comparator(
         &args.baseline_database,
         &args.baseline_database_sha256,
         &args.comparator_receipt,
@@ -171,13 +171,13 @@ fn run() -> ProofResult<()> {
         args.journey_root.clone(),
         args.tape_root.clone(),
         args.baseline_binary.clone(),
-        PathBuf::from(engram::proof::baseline_custody::COMPARATOR_ROOT),
+        PathBuf::from(engram_t1772_tools::proof::baseline_custody::COMPARATOR_ROOT),
     ];
     let immutable_pre = collect_custody(&custody_roots)?;
     let capacity_before = capacity(&args.proof_root.parent().ok_or("proof root has no parent")?)?;
 
     fs::create_dir(&args.proof_root)?;
-    let disk_sampler = engram::proof::measurement::DiskSampler::start(
+    let disk_sampler = engram_t1772_tools::proof::measurement::DiskSampler::start(
         &args.proof_root,
         &args.proof_root.join("staging-disk-samples.jsonl"),
         &args.proof_root.join("staging-disk-peak.json"),
@@ -193,7 +193,7 @@ fn run() -> ProofResult<()> {
     )?;
     write_canonical_json(
         &args.proof_root.join("manifests/oracle-inputs-pre.json"),
-        &engram::proof::canonical_oracle::verify_inputs(&args.oracle_root)?,
+        &engram_t1772_tools::proof::canonical_oracle::verify_inputs(&args.oracle_root)?,
     )?;
     // Immutable/input checks still precede root creation. Live CoW captures need
     // their staging directory and complete before any runner staging read.
@@ -366,7 +366,7 @@ fn retain_after_runner(
     immutable_pre: &[t1772::CustodyEntry],
     live_pre: &Value,
     runner_result: ProofResult<()>,
-    disk_sampler: engram::proof::measurement::DiskSampler,
+    disk_sampler: engram_t1772_tools::proof::measurement::DiskSampler,
 ) -> ProofResult<Value> {
     let post_result = retain_post_custody(args, custody_roots, immutable_pre, live_pre);
     let disk_result = disk_sampler.finish();
@@ -407,8 +407,8 @@ fn finalize_eligibility(root: &Path) -> ProofResult<()> {
             "runner_output_manifest_sha256":runner_hash,
             "full_proof_output_manifest_sha256":payload_hash,
             "payload_exclusions":["manifests/full-proof-output.jsonl","publication/review-eligibility.json"],
-            "cold_custody_amendment_sha256":engram::proof::baseline_custody::COLD_AMENDMENT_SHA256,
-            "cold_copy_limitation":engram::proof::baseline_custody::COLD_LIMITATION,
+            "cold_custody_amendment_sha256":engram_t1772_tools::proof::baseline_custody::COLD_AMENDMENT_SHA256,
+            "cold_copy_limitation":engram_t1772_tools::proof::baseline_custody::COLD_LIMITATION,
             "no_external_publication_performed":true,"no_live_state_targeted_for_write":true
         }),
     )?;
@@ -470,7 +470,7 @@ fn retain_post_custody(
     save(
         root,
         "manifests/oracle-inputs-post.json",
-        engram::proof::canonical_oracle::verify_inputs(&args.oracle_root),
+        engram_t1772_tools::proof::canonical_oracle::verify_inputs(&args.oracle_root),
         &mut errors,
     );
     if let Some(live) = save(
@@ -510,16 +510,16 @@ fn validate_static_contract(args: &Args) -> ProofResult<()> {
     require_exact_path(&args.input_root, INPUT_ROOT, "INPUT_ROOT")?;
     require_exact_path(
         &args.oracle_root,
-        engram::proof::canonical_oracle::SUPPLEMENT_ROOT,
+        engram_t1772_tools::proof::canonical_oracle::SUPPLEMENT_ROOT,
         "ORACLE_ROOT",
     )?;
-    engram::proof::canonical_oracle::verify_inputs(&args.oracle_root)?;
+    engram_t1772_tools::proof::canonical_oracle::verify_inputs(&args.oracle_root)?;
     require_exact_path(
         &args.journey_root,
-        engram::proof::journeys::ROOT,
+        engram_t1772_tools::proof::journeys::ROOT,
         "JOURNEY_ROOT",
     )?;
-    engram::proof::journeys::verify_inputs(&args.journey_root, &args.journey_manifest_sha256)?;
+    engram_t1772_tools::proof::journeys::verify_inputs(&args.journey_root, &args.journey_manifest_sha256)?;
     require_exact_path(&args.proof_root, PROOF_ROOT, "PROOF_ROOT")?;
     if args.manifest != args.input_root.join(MANIFEST_NAME) {
         return Err("manifest path is not exact".into());
@@ -579,7 +579,7 @@ fn git_output(root: &Path, args: &[&str]) -> ProofResult<String> {
 fn validate_executables(args: &Args) -> ProofResult<()> {
     require_exact_path(
         &args.baseline_binary,
-        engram::proof::performance::BASELINE_BINARY_PATH,
+        engram_t1772_tools::proof::performance::BASELINE_BINARY_PATH,
         "baseline binary",
     )?;
     if args.baseline_database.canonicalize()? == args.live_index.canonicalize()? {
@@ -601,7 +601,7 @@ fn validate_executables(args: &Args) -> ProofResult<()> {
         (
             "baseline",
             args.baseline_binary.as_path(),
-            engram::proof::performance::BASELINE_BINARY_SHA256,
+            engram_t1772_tools::proof::performance::BASELINE_BINARY_SHA256,
         ),
     ] {
         let observed = sha256_file(path)?;
@@ -1000,7 +1000,7 @@ mod live_clone_tests {
             let roots = vec![args.input_root.clone()];
             let pre = collect_custody(&roots).unwrap();
             fs::write(&input, b"changed").unwrap();
-            let sampler = engram::proof::measurement::DiskSampler::start(
+            let sampler = engram_t1772_tools::proof::measurement::DiskSampler::start(
                 &args.proof_root,
                 &args.proof_root.join("samples.jsonl"),
                 &args.proof_root.join("disk.json"),

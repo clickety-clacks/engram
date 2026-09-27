@@ -15,16 +15,7 @@ fn canonical_text(path: &Path) -> String {
 }
 
 fn repo_dash_key(path: &Path) -> String {
-    let text = canonical_text(path);
-    #[cfg(windows)]
-    {
-        let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
-        text.replace('\\', "-").replace('/', "-").replace(':', "-")
-    }
-    #[cfg(not(windows))]
-    {
-        text.replace('/', "-")
-    }
+    engram::platform::repository_path_key(path)
 }
 
 fn repo_hash(path: &Path) -> String {

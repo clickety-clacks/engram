@@ -72,7 +72,7 @@ pub struct CustodyEntry {
 
 /// Physical windows can match the same event more than once. Only the early
 /// index gate collapses them; the same-invocation CLI seam must preserve extras.
-pub fn canonical_event_touches(touches: &[crate::index::lineage::EvidenceFragmentRef]) -> Value {
+pub fn canonical_event_touches(touches: &[engram::index::lineage::EvidenceFragmentRef]) -> Value {
     let mut value = super::performance::direct_projection(touches);
     value
         .as_array_mut()

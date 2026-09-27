@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::process::{Child, ChildStdin, ChildStdout, ExitStatus};
+use std::process::{Child, ChildStdin, ChildStdout};
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -838,12 +838,14 @@ impl PeerClient {
         if let Some(thread) = self.stderr_thread.take() {
             let _ = thread.join();
         }
-        let status = status.map(exit_status_description).unwrap_or_else(|| {
-            format!(
-                "child exit status unavailable ({})",
-                wait_issue.unwrap_or_else(|| "unknown wait error".into())
-            )
-        });
+        let status = status
+            .map(crate::platform::exit_status_description)
+            .unwrap_or_else(|| {
+                format!(
+                    "child exit status unavailable ({})",
+                    wait_issue.unwrap_or_else(|| "unknown wait error".into())
+                )
+            });
         let stderr = self.stderr_text();
         let stderr = if stderr.is_empty() {
             "<empty>"
@@ -866,7 +868,7 @@ impl PeerClient {
 
     fn terminate_child_process_group(&mut self) {
         if !self.process_group_terminated {
-            terminate_peer_process_group(&mut self.child);
+            crate::platform::terminate_peer_process_group(&mut self.child);
             self.process_group_terminated = true;
         }
     }
@@ -924,35 +926,6 @@ fn pending_operation_names(
     } else {
         names.join(", ")
     }
-}
-
-fn exit_status_description(status: ExitStatus) -> String {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(signal) = status.signal() {
-            return format!("terminated by signal {signal}");
-        }
-    }
-    status
-        .code()
-        .map(|code| format!("exited with code {code}"))
-        .unwrap_or_else(|| "terminated without an exit code".into())
-}
-
-#[cfg(unix)]
-fn terminate_peer_process_group(child: &mut Child) {
-    let process_group = child.id() as libc::pid_t;
-    if process_group > 0 {
-        // Peer shells may leave descendants holding the piped stderr/stdout.
-        // Kill the isolated group before joining the pipe readers.
-        let _ = unsafe { libc::kill(-process_group, libc::SIGKILL) };
-    }
-}
-
-#[cfg(not(unix))]
-fn terminate_peer_process_group(child: &mut Child) {
-    let _ = child.kill();
 }
 
 fn fail_pending(
@@ -1083,10 +1056,17 @@ fn drain_stderr(stderr: impl Read + Send + 'static, saved: Arc<Mutex<Vec<u8>>>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
-    #[cfg(unix)]
+    fn unix_command_fixture_available() -> bool {
+        std::env::consts::FAMILY == "unix"
+    }
+
     #[test]
     fn command_peer_round_pipelines_requests_and_collects_data_until_terminal_frames() {
+        if !unix_command_fixture_available() {
+            return;
+        }
         let peer = TopologyPeer {
             ssh: None,
             command: Some(vec![
@@ -1117,9 +1097,11 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn peer_round_stops_buffering_over_budget_read_file_responses() {
+        if !unix_command_fixture_available() {
+            return;
+        }
         let peer = TopologyPeer {
             ssh: None,
             command: Some(vec![
@@ -1158,9 +1140,11 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn peer_round_keeps_connection_after_terminal_budget_exceeded() {
+        if !unix_command_fixture_available() {
+            return;
+        }
         let peer = TopologyPeer {
             ssh: None,
             command: Some(vec![
@@ -1195,9 +1179,11 @@ mod tests {
         assert_eq!(follow_up[0].as_ref().unwrap().stats["id"], 3);
     }
 
-    #[cfg(unix)]
     #[test]
     fn peer_round_cancellation_aborts_owner_process() {
+        if !unix_command_fixture_available() {
+            return;
+        }
         let peer = TopologyPeer {
             ssh: None,
             command: Some(vec!["/bin/sh".into(), "-c".into(), "cat >/dev/null".into()]),
@@ -1226,9 +1212,11 @@ mod tests {
         let _ = client.child.wait().expect("wait for aborted owner");
     }
 
-    #[cfg(unix)]
     #[test]
     fn peer_round_cancellation_kills_descendants_holding_inherited_pipes() {
+        if !unix_command_fixture_available() {
+            return;
+        }
         let temp = tempfile::tempdir().expect("tempdir");
         let child_pid_path = temp.path().join("peer-child.pid");
         let peer = TopologyPeer {
@@ -1278,22 +1266,30 @@ mod tests {
         let child_pid = std::fs::read_to_string(child_pid_path)
             .expect("read child pid")
             .trim()
-            .parse::<libc::pid_t>()
+            .parse::<u32>()
             .expect("parse child pid");
+        let child_is_alive = || {
+            Command::new("kill")
+                .arg("-0")
+                .arg(child_pid.to_string())
+                .status()
+                .is_ok_and(|status| status.success())
+        };
         let deadline = Instant::now() + Duration::from_secs(2);
-        while unsafe { libc::kill(child_pid, 0) } == 0 && Instant::now() < deadline {
+        while child_is_alive() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
-        assert_ne!(
-            unsafe { libc::kill(child_pid, 0) },
-            0,
+        assert!(
+            !child_is_alive(),
             "peer descendant survived process-group cancellation"
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn expired_peer_round_aborts_without_writing_a_request() {
+        if !unix_command_fixture_available() {
+            return;
+        }
         let peer = TopologyPeer {
             ssh: None,
             command: Some(vec!["/bin/sh".into(), "-c".into(), "cat >/dev/null".into()]),
@@ -1313,9 +1309,11 @@ mod tests {
         let _ = client.child.wait().expect("wait for expired owner");
     }
 
-    #[cfg(unix)]
     #[test]
     fn remote_owner_validates_identity_and_records_open_export_metadata() {
+        if !unix_command_fixture_available() {
+            return;
+        }
         let peer = TopologyPeer {
             ssh: None,
             command: Some(vec![

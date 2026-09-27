@@ -380,7 +380,7 @@ pub fn verify(
             serde_json::from_str(&expected.next().ok_or("missing per-tape oracle row")??)?;
         let mut actual = stored_tape(&conn, tape, &mut global)?;
         let path = tape_root.join(format!("{tape}.jsonl.zst"));
-        let content = crate::store::tapes::read_tape_content(&path).map_err(|e| e.message)?;
+        let content = engram::store::tapes::read_tape_content(&path).map_err(|e| e.message)?;
         actual.inc(
             "normalized_events",
             content
@@ -466,7 +466,7 @@ mod tests {
     fn stored_fields_and_posting_membership_are_not_replaced_by_counts() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("db");
-        drop(crate::index::SqliteIndex::open_writer(db.to_str().unwrap()).unwrap());
+        drop(engram::index::SqliteIndex::open_writer(db.to_str().unwrap()).unwrap());
         let conn = Connection::open(db).unwrap();
         conn.execute_batch("INSERT INTO evidence_windows VALUES(1,'winnow:a,b','t',2,'read','/right','now',0);INSERT INTO evidence_features VALUES('winnow:a',1),('winnow:b',1);").unwrap();
         let before = stored_tape(&conn, "t", &mut Oracle::new("global"))

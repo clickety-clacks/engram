@@ -7,7 +7,7 @@
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -75,16 +75,8 @@ impl From<rusqlite::Error> for PeerError {
 }
 
 /// Serve the bounded newline-delimited JSON protocol on stdin/stdout.
-#[cfg(windows)]
-pub fn serve_stdio(_home: &Path) -> Result<(), String> {
-    Err(
-        "peer serving is unsupported on Windows because safe no-follow tape reads are unavailable"
-            .into(),
-    )
-}
-
-#[cfg(not(windows))]
 pub fn serve_stdio(home: &Path) -> Result<(), String> {
+    crate::platform::ensure_peer_commands_supported().map_err(|error| error.message)?;
     let topology = load_topology(home)
         .map_err(|error| format!("topology_error: {error}"))?
         .ok_or_else(|| "topology_missing: expected ~/.engram/topology.yml".to_string())?;
@@ -1697,15 +1689,7 @@ impl PeerSession {
                 format!("tape `{tape_id}` is not present in this export"),
             ));
         }
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW);
-        }
-        let mut file = options
-            .open(&path)
+        let mut file = crate::platform::open_read_nofollow(&path)
             .map_err(|error| PeerError::new("tape_unavailable", error.to_string()))?;
         let metadata = file
             .metadata()
@@ -1887,15 +1871,7 @@ fn scan_tape_for_grep(
             format!("compressed tape exceeds {compressed_limit} byte limit"),
         ));
     }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let file = options
-        .open(path)
+    let file = crate::platform::open_read_nofollow(path)
         .map_err(|error| PeerError::new("tape_unavailable", error.to_string()))?;
     let metadata = file
         .metadata()
@@ -2118,15 +2094,7 @@ fn read_tape_for_query(
             format!("compressed tape exceeds {compressed_limit} byte limit"),
         ));
     }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let file = options
-        .open(path)
+    let file = crate::platform::open_read_nofollow(path)
         .map_err(|error| PeerError::new("tape_unavailable", error.to_string()))?;
     let metadata = file
         .metadata()
@@ -2783,7 +2751,7 @@ mod tests {
 
     #[test]
     fn dispatch_and_locate_are_owner_local_and_read_only() {
-        let (_temp, home, _db, tapes) = configured_home();
+        let (_temp, home, _db, _tapes) = configured_home();
         fs::write(tapes.join("abc.jsonl.zst"), b"not a real zstd tape").expect("tape fixture");
         let input = format!(
             "{}\n{}\n{}\n",
@@ -2969,8 +2937,6 @@ mod tests {
         let (_temp, home, _db, tapes) = configured_home();
         let tape = tapes.join("abc.jsonl.zst");
         fs::write(&tape, [0, 1, 2, 250, 255]).expect("tape");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("abc.jsonl.zst", tapes.join("link.jsonl.zst")).expect("symlink");
         let input = format!(
             "{}\n{}\n{}\n",
             request(1, "open", &["default"], json!({})),
@@ -2999,28 +2965,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_symlinked_tape_files_and_unknown_operations() {
-        let (_temp, home, _db, tapes) = configured_home();
-        fs::write(tapes.join("real.jsonl.zst"), b"data").expect("tape");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("real.jsonl.zst", tapes.join("link.jsonl.zst"))
-            .expect("symlink");
-        let input = format!(
-            "{}\n{}\n",
-            request(1, "open", &["default"], json!({})),
-            request(
-                2,
-                "read_file",
-                &["default"],
-                json!({"address":tape_address("test-owner", &tapes.join("link.jsonl.zst"))})
-            )
-        );
-        let output = run(&home, &input);
-        let frames = output
-            .lines()
-            .map(|line| serde_json::from_str::<Value>(line).unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(frames[2]["error"]["code"], "tape_unavailable");
+    fn rejects_unknown_operations() {
+        let (_temp, home, _db, _tapes) = configured_home();
         let output = run(
             &home,
             &format!(

@@ -2,10 +2,6 @@
 
 use std::ffi::OsString;
 use std::io;
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-#[cfg(not(windows))]
-use std::process::{Command, Stdio};
 
 use crate::config::TopologyPeer;
 
@@ -56,26 +52,8 @@ pub fn launch_spec(peer: &TopologyPeer) -> io::Result<LaunchSpec> {
     })
 }
 
-#[cfg(windows)]
-pub fn spawn(_peer: &TopologyPeer) -> io::Result<std::process::Child> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "cross-machine peer transport is unsupported on Windows",
-    ))
-}
-
-#[cfg(not(windows))]
 pub fn spawn(peer: &TopologyPeer) -> io::Result<std::process::Child> {
-    let spec = launch_spec(peer)?;
-    let mut command = Command::new(spec.program);
-    command
-        .args(spec.args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    command.process_group(0);
-    command.spawn()
+    crate::platform::spawn_peer(peer)
 }
 
 fn shell_quote(value: &str) -> String {
@@ -119,19 +97,5 @@ mod tests {
         let launch = launch_spec(&peer).expect("command launch");
         assert_eq!(launch.program, OsString::from("/tmp/peer helper"));
         assert_eq!(launch.args, vec![OsString::from("arg with spaces")]);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_peer_transport_fails_with_an_explicit_unsupported_reason() {
-        let peer = TopologyPeer {
-            ssh: Some("eezo".into()),
-            command: None,
-            engram: "engram".into(),
-            exports: vec!["default".into()],
-        };
-        let error = spawn(&peer).expect_err("Windows does not launch peer transports");
-        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert!(error.to_string().contains("unsupported on Windows"));
     }
 }
