@@ -2,7 +2,8 @@
 #![cfg(unix)]
 
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -78,6 +79,40 @@ fn assert_owner_unchanged_except_sqlite_sidecars(
             "unexpected new owner path: {path:?}"
         );
     }
+}
+
+fn read_diagnostic_tail(path: &Path, max_bytes: usize) -> String {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+        return String::new();
+    };
+    let start = length.saturating_sub(max_bytes as u64);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return String::new();
+    }
+    let mut bytes = Vec::with_capacity(max_bytes);
+    if file.take(max_bytes as u64).read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    let tail = String::from_utf8_lossy(&bytes);
+    if start == 0 {
+        tail.into_owned()
+    } else {
+        format!("<{start} earlier bytes omitted>\n{tail}")
+    }
+}
+
+fn record_peer_grep_diagnostic_event(trace: &Path, event: &str) {
+    let line = format!("{event}\n");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(trace)
+        .expect("open peer grep diagnostic trace");
+    file.write_all(line.as_bytes())
+        .expect("append peer grep diagnostic trace");
 }
 
 fn one_shot_handshake_peer(root: &Path, name: &str, frame: &str) -> TopologyPeer {
@@ -327,6 +362,8 @@ fn gate_peer_operation_until_file(
     operation: &str,
     ready_path: &std::path::Path,
     release_path: &std::path::Path,
+    diagnostic_path: &std::path::Path,
+    responses_path: &std::path::Path,
 ) -> std::path::PathBuf {
     let operation_log_path = root.join(format!("{machine}-gated-peer-operations.log"));
     let script_path = root.join(format!("{machine}-gated-peer.sh"));
@@ -342,20 +379,26 @@ fn gate_peer_operation_until_file(
         "ready=\"$3\"",
         "release=\"$4\"",
         "operations=\"$5\"",
+        "diagnostic=\"$6\"",
+        "responses=\"$7\"",
         "while IFS= read -r request; do",
         r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
         "  printf '%s\\n' \"$op\" >> \"$operations\"",
+        "  printf 'healthy peer request received: %s\\n' \"$op\" >> \"$diagnostic\"",
         "  if [ \"$op\" = \"$operation\" ]; then",
         "    : > \"$ready\"",
+        "    printf 'healthy peer entered gated grep_scan\\n' >> \"$diagnostic\"",
         "    attempts=0",
         "    while [ ! -f \"$release\" ]; do",
         "      [ \"$attempts\" -lt 600 ] || exit 124",
         "      attempts=$((attempts + 1))",
         "      sleep 0.05",
         "    done",
+        "    printf 'healthy peer released to peer-serve\\n' >> \"$diagnostic\"",
         "  fi",
         "  printf '%s\\n' \"$request\"",
-        "done | \"$binary\" peer-serve --stdio",
+        "done | \"$binary\" peer-serve --stdio | /usr/bin/tee \"$responses\"",
+        "printf 'healthy peer output pipeline closed\\n' >> \"$diagnostic\"",
     ]
     .join("\n");
     std::fs::write(&script_path, script).expect("write gated peer wrapper");
@@ -369,6 +412,8 @@ fn gate_peer_operation_until_file(
         ready_path,
         release_path,
         operation_log_path,
+        diagnostic_path,
+        responses_path,
     ]);
     operation_log_path
 }
@@ -8078,6 +8123,9 @@ fn grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer
     );
     let complete_scan_started = temp.path().join("complete-grep-scan-started");
     let broken_scan_released = temp.path().join("broken-peer-disconnected");
+    let broken_peer_exited = temp.path().join("broken-peer-process-exited");
+    let diagnostic_trace = temp.path().join("peer-grep-diagnostic.log");
+    let complete_peer_responses = temp.path().join("complete-peer-responses.jsonl");
     let complete_peer_requests = gate_peer_operation_until_file(
         temp.path(),
         "complete",
@@ -8086,6 +8134,8 @@ fn grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer
         "grep_scan",
         &complete_scan_started,
         &broken_scan_released,
+        &diagnostic_trace,
+        &complete_peer_responses,
     );
     let script_path = temp.path().join("disconnect-during-scan.sh");
     let script = [
@@ -8093,6 +8143,10 @@ fn grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer
         "set -eu",
         "ready=\"$1\"",
         "release=\"$2\"",
+        "diagnostic=\"$3\"",
+        "peer_exit=\"$4\"",
+        "set +e",
+        "(",
         "while IFS= read -r request; do",
         r#"  id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"#,
         r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
@@ -8109,12 +8163,19 @@ fn grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer
         "        sleep 0.05",
         "      done",
         r#"      printf '{"id":%s,"data":{"type":"match","store":"broken/default","tape_id":"must-be-discarded","timestamp":"2026-09-25T13:00:00Z","total_lines":1,"anchor_line":1,"match_count":1,"provenance_match_count":0,"provenance_event_count":1,"refs_up":0,"refs_down":0,"files_touched":[]}}\n' "$id""#,
+        "      printf 'broken peer wrote partial grep_scan frame\\n' >> \"$diagnostic\"",
         "      : > \"$release\"",
+        "      printf 'broken peer released healthy peer\\n' >> \"$diagnostic\"",
         "      exit 0",
         "      ;;",
         "    *) exit 78 ;;",
         "  esac",
         "done",
+        ")",
+        "peer_status=$?",
+        "printf 'broken peer protocol handler exited status=%s\\n' \"$peer_status\" >> \"$diagnostic\"",
+        ": > \"$peer_exit\"",
+        "exit \"$peer_status\"",
     ]
     .join("\n");
     std::fs::write(&script_path, script).expect("write disconnecting peer");
@@ -8128,25 +8189,99 @@ fn grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer
         json!({
             "complete": complete,
             "broken": {
-                "command": ["/bin/sh", script_path, complete_scan_started, broken_scan_released],
+                "command": [
+                    "/bin/sh",
+                    script_path,
+                    complete_scan_started,
+                    broken_scan_released,
+                    diagnostic_trace,
+                    broken_peer_exited,
+                ],
                 "engram": binary,
                 "exports": ["default"],
             }
         }),
     );
 
-    let output = Command::new(binary)
+    let client_stdout = temp.path().join("caller.stdout");
+    let client_stderr = temp.path().join("caller.stderr");
+    let mut command = Command::new(binary);
+    command
         .current_dir(&repo)
         .env("HOME", &caller_home)
         .args(["grep", "needle", "--peers", "complete,broken"])
-        .output()
-        .expect("run concurrent grep with mid-response disconnect");
-    assert!(
-        output.status.success(),
-        "completed data should survive peer disconnect: {}",
-        String::from_utf8_lossy(&output.stderr)
+        .stdout(Stdio::from(
+            std::fs::File::create(&client_stdout).expect("create caller stdout log"),
+        ))
+        .stderr(Stdio::from(
+            std::fs::File::create(&client_stderr).expect("create caller stderr log"),
+        ));
+    command.process_group(0);
+    let mut child = command
+        .spawn()
+        .expect("spawn concurrent grep with mid-response disconnect");
+    let started = Instant::now();
+    record_peer_grep_diagnostic_event(
+        &diagnostic_trace,
+        &format!("caller child started pid={}", child.id()),
     );
-    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("grep JSON");
+
+    const CHILD_WATCHDOG: Duration = Duration::from_secs(150);
+    let mut saw_healthy_match = false;
+    let mut saw_healthy_terminal = false;
+    let status = loop {
+        let responses = read_diagnostic_tail(&complete_peer_responses, 16 * 1024);
+        if !saw_healthy_match && responses.contains("complete-tape") {
+            saw_healthy_match = true;
+            record_peer_grep_diagnostic_event(
+                &diagnostic_trace,
+                "healthy peer response: complete-tape match frame observed",
+            );
+        }
+        if !saw_healthy_terminal && responses.contains("\"returned\":1") {
+            saw_healthy_terminal = true;
+            record_peer_grep_diagnostic_event(
+                &diagnostic_trace,
+                "healthy peer response: grep_scan terminal stats observed",
+            );
+        }
+        if let Some(status) = child.try_wait().expect("poll caller child") {
+            record_peer_grep_diagnostic_event(
+                &diagnostic_trace,
+                &format!("caller child exited status={status}"),
+            );
+            break status;
+        }
+        if started.elapsed() >= CHILD_WATCHDOG {
+            record_peer_grep_diagnostic_event(
+                &diagnostic_trace,
+                "watchdog expired; killing isolated caller process group",
+            );
+            let kill_result = unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+            let status = child.wait().expect("reap timed-out caller process group");
+            let trace = read_diagnostic_tail(&diagnostic_trace, 16 * 1024);
+            let stdout = read_diagnostic_tail(&client_stdout, 4 * 1024);
+            let stderr = read_diagnostic_tail(&client_stderr, 4 * 1024);
+            let healthy_responses = read_diagnostic_tail(&complete_peer_responses, 4 * 1024);
+            panic!(
+                "concurrent grep child exceeded {CHILD_WATCHDOG:?}; group kill result={kill_result}, status={status}; stdout tail={stdout:?}; stderr tail={stderr:?}; healthy peer response tail={healthy_responses:?}; phase trace tail:\n{trace}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+
+    let stdout = std::fs::read(&client_stdout).expect("read caller stdout");
+    let stderr = read_diagnostic_tail(&client_stderr, 4 * 1024);
+    let trace = read_diagnostic_tail(&diagnostic_trace, 16 * 1024);
+    eprintln!(
+        "[peer-grep-diag] child completed in {:?}; healthy-match={saw_healthy_match}; healthy-terminal={saw_healthy_terminal}; trace tail:\n{trace}",
+        started.elapsed(),
+    );
+    assert!(
+        status.success(),
+        "completed data should survive peer disconnect: status={status}; stderr={stderr}; trace={trace}"
+    );
+    let result: serde_json::Value = serde_json::from_slice(&stdout).expect("grep JSON");
     assert_eq!(result["federation"]["coverage"], "partial");
     assert!(
         result["sessions"]
