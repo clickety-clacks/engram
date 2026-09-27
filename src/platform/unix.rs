@@ -106,7 +106,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).expect("symlink");
 
         let error = open_read_nofollow(&link).expect_err("refuse symlink");
-        assert_eq!(error.kind(), io::ErrorKind::FilesystemLoop);
+        assert_eq!(error.raw_os_error(), Some(libc::ELOOP));
     }
 
     #[test]

@@ -2751,7 +2751,7 @@ mod tests {
 
     #[test]
     fn dispatch_and_locate_are_owner_local_and_read_only() {
-        let (_temp, home, _db, _tapes) = configured_home();
+        let (_temp, home, _db, tapes) = configured_home();
         fs::write(tapes.join("abc.jsonl.zst"), b"not a real zstd tape").expect("tape fixture");
         let input = format!(
             "{}\n{}\n{}\n",

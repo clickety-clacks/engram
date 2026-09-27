@@ -341,10 +341,6 @@ pub fn discovery_scaffold(id: AdapterId, home_dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn normalize_path(path: &Path) -> PathBuf {
-    crate::platform::normalize_path(path)
-}
-
 fn canonicalize_or_normalize(path: &Path) -> PathBuf {
     crate::platform::canonicalize_or_normalize(path)
 }
