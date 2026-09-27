@@ -4555,20 +4555,29 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
         &mut available,
     );
     let available_identity_complete = temp.path().join("available-show-responses.identity.ready");
-    // Make the offline peer wait until the healthy peer has discovered the tape.
+    // Let the offline peer open normally, then disconnect its identity query
+    // only after the healthy peer has completed the same discovery round.
     let offline_script_path = temp.path().join("offline-after-available-discovery.sh");
     let offline_script = [
         "#!/bin/sh",
         "set -eu",
         "marker=\"$1\"",
-        "IFS= read -r _request || exit 1",
-        "attempts=0",
-        "while [ ! -f \"$marker\" ]; do",
-        "  [ \"$attempts\" -lt 600 ] || exit 124",
-        "  attempts=$((attempts + 1))",
-        "  sleep 0.05",
+        "while IFS= read -r request; do",
+        r#"  id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"#,
+        r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
+        "  if [ \"$op\" = open ]; then",
+        r#"    printf '{"id":%s,"data":{"store":"offline/default","status":"ok","db":"/fixture/offline.sqlite","tape_dirs":[],"reader_mode":"live","snapshot_at":"2026-09-25T00:00:00Z"}}\n' "$id""#,
+        r#"    printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"offline","build":"fixture","protocol":1,"schema":4,"query_semantics":1,"limits":{"grep_k":10000}}}\n' "$id""#,
+        "  else",
+        "    attempts=0",
+        "    while [ ! -f \"$marker\" ]; do",
+        "      [ \"$attempts\" -lt 600 ] || exit 124",
+        "      attempts=$((attempts + 1))",
+        "      sleep 0.05",
+        "    done",
+        "    exit 1",
+        "  fi",
         "done",
-        "exit 1",
     ]
     .join("\n");
     std::fs::write(&offline_script_path, offline_script).expect("write delayed offline peer");
@@ -4617,7 +4626,10 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
         .find(|source| source["store"] == "offline/default")
         .expect("offline source row");
     assert_eq!(offline_source["status"], "unavailable");
-    assert_eq!(offline_source["phase"], "open");
+    assert!(matches!(
+        offline_source["phase"].as_str(),
+        Some("locate_tapes" | "tape_facts")
+    ));
     assert_eq!(offline_source["error"]["code"], "unavailable");
     assert!(available_identity_complete.is_file());
     assert_eq!(operation_count(&available_operations, "open"), 1);
