@@ -50,7 +50,8 @@ pub(super) fn canonicalize_or_normalize(path: &Path) -> PathBuf {
 }
 
 pub(super) fn repository_path_key(path: &Path) -> String {
-    let text = canonicalize_or_normalize(path).to_string_lossy();
+    let normalized = canonicalize_or_normalize(path);
+    let text = normalized.to_string_lossy();
     let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
     text.replace('\\', "-")
         .replace('/', "-")

@@ -2293,7 +2293,7 @@ fn run() -> Result<(), CliError> {
         }
         Command::PeerServe(args) => {
             if args.stdio {
-                ensure_peer_commands_supported()?;
+                engram::platform::ensure_peer_commands_supported()?;
                 let home = home_dir()?;
                 engram::access::peer::serve_stdio(&home)
                     .map_err(|message| CliError::new("peer_serve", message))
