@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       macos_peer_disconnect_diagnostic:
-        description: Run only the concurrent peer-disconnect test on macOS
+        description: Run the peer protocol test suite on macOS with disconnect diagnostics
         required: false
         type: boolean
         default: false
@@ -230,5 +230,5 @@ jobs:
         with:
           targets: aarch64-apple-darwin
 
-      - name: Run bounded concurrent peer-disconnect diagnostic
-        run: cargo test --locked --target aarch64-apple-darwin --test peer_access_protocol grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer -- --exact --nocapture
+      - name: Run peer protocol suite with disconnect hang diagnostics
+        run: cargo test --locked --target aarch64-apple-darwin --test peer_access_protocol --no-fail-fast -- --nocapture
