@@ -210,4 +210,4 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Run all locked tests, including the Windows local smoke
-        run: cargo test --locked --target ${{ matrix.target }}
+        run: cargo test --locked --target ${{ matrix.target }} --no-fail-fast
