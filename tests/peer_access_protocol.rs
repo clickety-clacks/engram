@@ -316,9 +316,9 @@ fn log_show_first_round_with_identity_barrier(
     log_path
 }
 
-// Order a selected peer's operation behind its sibling's scripted disconnect;
-// the concurrency assertion should exercise result isolation, not process startup order.
-fn gate_peer_operation_until_file(
+// Buffer a healthy peer's actual terminal response while its sibling disconnects.
+// The CLI keeps that peer request in flight until it sees the incomplete response.
+fn gate_peer_response_until_file(
     root: &std::path::Path,
     machine: &str,
     binary: &str,
@@ -328,6 +328,10 @@ fn gate_peer_operation_until_file(
     release_path: &std::path::Path,
 ) -> std::path::PathBuf {
     let operation_log_path = root.join(format!("{machine}-gated-peer-operations.log"));
+    let request_log_path = root.join(format!("{machine}-gated-peer-requests.jsonl"));
+    let responses_root = root.join(format!("{machine}-gated-peer-responses"));
+    let fifo_in = root.join(format!("{machine}-gated-peer-in.fifo"));
+    let fifo_out = root.join(format!("{machine}-gated-peer-out.fifo"));
     let script_path = root.join(format!("{machine}-gated-peer.sh"));
     let owner_home = peer["command"][1]
         .as_str()
@@ -341,9 +345,29 @@ fn gate_peer_operation_until_file(
         "ready=\"$3\"",
         "release=\"$4\"",
         "operations=\"$5\"",
+        "requests=\"$6\"",
+        "responses_root=\"$7\"",
+        "fifo_in=\"$8\"",
+        "fifo_out=\"$9\"",
+        "responses_root=\"${responses_root}.$$\"",
+        "fifo_in=\"${fifo_in}.$$\"",
+        "fifo_out=\"${fifo_out}.$$\"",
+        r#"read_terminal() { expected="$1"; response_file="$2"; : >"$response_file"; while IFS= read -r response <&4; do printf '%s\n' "$response" >>"$response_file"; response_id=$(printf '%s\n' "$response" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); if [ "$response_id" = "$expected" ]; then case "$response" in *'"end":true'*) return 0 ;; esac; fi; done; return 1; }"#,
+        "mkfifo \"$fifo_in\" \"$fifo_out\"",
+        "\"$binary\" peer-serve --stdio <\"$fifo_in\" >\"$fifo_out\" &",
+        "peer_pid=$!",
+        "cleanup() { kill \"$peer_pid\" 2>/dev/null || true; wait \"$peer_pid\" 2>/dev/null || true; rm -f \"$fifo_in\" \"$fifo_out\"; }",
+        "trap cleanup EXIT",
+        "exec 3>\"$fifo_in\"",
+        "exec 4<\"$fifo_out\"",
         "while IFS= read -r request; do",
+        "  printf '%s\\n' \"$request\" >> \"$requests\"",
         r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
+        r#"  request_id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"#,
         "  printf '%s\\n' \"$op\" >> \"$operations\"",
+        "  printf '%s\\n' \"$request\" >&3",
+        "  response_file=\"${responses_root}.${request_id}\"",
+        "  read_terminal \"$request_id\" \"$response_file\"",
         "  if [ \"$op\" = \"$operation\" ]; then",
         "    : > \"$ready\"",
         "    attempts=0",
@@ -353,8 +377,8 @@ fn gate_peer_operation_until_file(
         "      sleep 0.05",
         "    done",
         "  fi",
-        "  printf '%s\\n' \"$request\"",
-        "done | \"$binary\" peer-serve --stdio",
+        "  cat \"$response_file\"",
+        "done",
     ]
     .join("\n");
     std::fs::write(&script_path, script).expect("write gated peer wrapper");
@@ -368,6 +392,10 @@ fn gate_peer_operation_until_file(
         ready_path,
         release_path,
         operation_log_path,
+        request_log_path,
+        responses_root,
+        fifo_in,
+        fifo_out,
     ]);
     operation_log_path
 }
@@ -7635,16 +7663,17 @@ fn grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer
             "{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle complete peer\"}\n",
         )],
     );
-    let complete_scan_started = temp.path().join("complete-grep-scan-started");
-    let broken_scan_released = temp.path().join("broken-peer-disconnected");
-    let complete_peer_requests = gate_peer_operation_until_file(
+    let complete_scan_response_buffered =
+        temp.path().join("complete-grep-scan-response-buffered");
+    let broken_peer_closed_output = temp.path().join("broken-peer-output-closed");
+    let complete_peer_operations = gate_peer_response_until_file(
         temp.path(),
         "complete",
         binary,
         &mut complete,
         "grep_scan",
-        &complete_scan_started,
-        &broken_scan_released,
+        &complete_scan_response_buffered,
+        &broken_peer_closed_output,
     );
     let script_path = temp.path().join("disconnect-during-scan.sh");
     let script = [
@@ -7668,6 +7697,7 @@ fn grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer
         "        sleep 0.05",
         "      done",
         r#"      printf '{"id":%s,"data":{"type":"match","store":"broken/default","tape_id":"must-be-discarded","timestamp":"2026-09-25T13:00:00Z","total_lines":1,"anchor_line":1,"match_count":1,"provenance_match_count":0,"provenance_event_count":1,"refs_up":0,"refs_down":0,"files_touched":[]}}\n' "$id""#,
+        "      exec 1>&-",
         "      : > \"$release\"",
         "      exit 0",
         "      ;;",
@@ -7687,7 +7717,7 @@ fn grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer
         json!({
             "complete": complete,
             "broken": {
-                "command": ["/bin/sh", script_path, complete_scan_started, broken_scan_released],
+                "command": ["/bin/sh", script_path, complete_scan_response_buffered, broken_peer_closed_output],
                 "engram": binary,
                 "exports": ["default"],
             }
@@ -7751,10 +7781,10 @@ fn grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer
         "complete peer source: {complete:#}"
     );
     assert_eq!(complete["grep_scan"]["total"], 1);
-    assert!(complete_scan_started.is_file());
-    assert!(broken_scan_released.is_file());
-    assert_eq!(operation_count(&complete_peer_requests, "open"), 1);
-    assert_eq!(operation_count(&complete_peer_requests, "grep_scan"), 1);
+    assert!(complete_scan_response_buffered.is_file());
+    assert!(broken_peer_closed_output.is_file());
+    assert_eq!(operation_count(&complete_peer_operations, "open"), 1);
+    assert_eq!(operation_count(&complete_peer_operations, "grep_scan"), 1);
 }
 
 #[test]
