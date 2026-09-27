@@ -81,9 +81,10 @@ When a selected peer fails, `explain`, `grep`, and `show --peers` retain
 completed results and mark source coverage `partial`. The source entry names
 the machine and export, phase, typed error, and observed reason. Report only
 what the connection exposed; a timeout does not establish whether a host is
-asleep, a route is broken, or authentication failed. Use `--require-complete`
-with `explain`, `grep`, or `show --peers` when a failed source or incomplete
-conclusion should make the command exit nonzero.
+asleep, a route is broken, or authentication failed. With `--require-complete`,
+the error message repeats each failed store, phase, typed error, and observed
+reason. Use that option with `explain`, `grep`, or `show --peers` when a failed
+source or incomplete conclusion should make the command exit nonzero.
 
 ## Follow a handoff across machines
 

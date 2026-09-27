@@ -1164,6 +1164,11 @@ impl PeerSession {
             .map_err(|error| PeerError::new(error.code, error.message))?;
 
         let export = self.require_open(&stores[0])?;
+        let indexed_tape_ids = export
+            .index
+            .tape_ids()?
+            .into_iter()
+            .collect::<HashSet<_>>();
         let mut tape_ids = export
             .index
             .referenced_tape_ids()?
@@ -1216,7 +1221,7 @@ impl PeerSession {
                 )?;
                 continue;
             }
-            let indexed = export.index.has_tape(&tape_id)?;
+            let indexed = indexed_tape_ids.contains(&tape_id);
             let Some((path, compressed_size)) = self.tape_path(&export.config, &tape_id) else {
                 let failure = json!({
                     "type": "failure",

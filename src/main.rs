@@ -6400,19 +6400,8 @@ fn cmd_grep_with_peer(
         }
     }
 
-    let any_selected_failure = any_source_failure
-        || source_rows.iter().any(|source| {
-            source
-                .get("status")
-                .and_then(Value::as_str)
-                .is_some_and(|status| {
-                    status == "unavailable"
-                        || status == "incompatible"
-                        || status == "label_mismatch"
-                        || status == "failed"
-                        || status == "partial"
-                })
-        });
+    let any_selected_failure =
+        any_source_failure || source_rows.iter().any(grep_source_is_incomplete);
     let coverage = if any_selected_failure {
         "partial"
     } else {
@@ -6531,9 +6520,18 @@ fn cmd_grep_with_peer(
         );
     }
     if args.require_complete && any_selected_failure {
+        let failures = source_rows
+            .iter()
+            .filter_map(format_grep_source_failure)
+            .collect::<Vec<_>>();
+        let detail = if failures.is_empty() {
+            "one or more selected sources did not complete".to_string()
+        } else {
+            failures.join("; ")
+        };
         return Err(CliError::new(
             "incomplete_coverage",
-            "grep --require-complete rejected one or more failed peer sources",
+            format!("grep --require-complete rejected incomplete coverage: {detail}"),
         ));
     }
     if returned == 0 {
@@ -6854,6 +6852,68 @@ fn peer_failure_status(code: &str) -> &'static str {
         "cancelled" => "failed",
         _ => "unavailable",
     }
+}
+
+fn grep_source_is_incomplete(source: &Value) -> bool {
+    source.get("phase").is_some()
+        || source
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| {
+                matches!(
+                    status,
+                    "unavailable" | "incompatible" | "label_mismatch" | "failed" | "partial"
+                )
+            })
+}
+
+fn format_grep_source_failure(source: &Value) -> Option<String> {
+    if !grep_source_is_incomplete(source) {
+        return None;
+    }
+
+    let store = source
+        .get("store")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown source");
+    let phase = source
+        .get("phase")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown phase");
+    let status = source
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("failed");
+    let reason = if let Some(error) = source.get("error") {
+        format_peer_error_value(error)
+    } else if let Some(failures) = source.get("failures").and_then(Value::as_array) {
+        let first_reason = failures
+            .iter()
+            .find_map(|failure| failure.get("error"))
+            .map(format_peer_error_value);
+        match (failures.len(), first_reason) {
+            (count, Some(first_reason)) => {
+                format!("{count} scan failure(s); first: {first_reason}")
+            }
+            (count, None) => format!("{count} scan failure(s)"),
+        }
+    } else {
+        "source did not complete".to_string()
+    };
+
+    Some(format!("{store} phase={phase} status={status}: {reason}"))
+}
+
+fn format_peer_error_value(error: &Value) -> String {
+    let code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or("peer_error");
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("peer operation failed without a message");
+    format!("{code}: {message}")
 }
 
 fn peer_operation_timeout(owner: &RemoteOwner, query_deadline: Instant) -> Duration {

@@ -3470,6 +3470,11 @@ fn write_stalled_remote_operation_fixture(
         "      touch \"$marker\"",
         "      exec /bin/sleep 60",
         "      ;;",
+        "    grep_scan)",
+        "      if [ \"$blocked_operation\" != grep_scan ]; then exit 78; fi",
+        "      touch \"$marker\"",
+        "      exec /bin/sleep 60",
+        "      ;;",
         "    *) exit 78 ;;",
         "  esac",
         "done",
@@ -5101,6 +5106,88 @@ fn grep_with_one_selected_peer_merges_local_and_remote_results() {
                 && source["status"] == "not_selected")
     );
     assert!(!unselected_marker.exists(), "unselected peer was launched");
+}
+
+#[test]
+fn grep_pages_a_large_real_peer_scan_with_complete_owner_attribution() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let remote_tapes = (0..60)
+        .map(|index| {
+            let minute = index / 60;
+            let second = index % 60;
+            (
+                format!("remote-grep-{index:03}"),
+                format!(
+                    "{{\"t\":\"2026-09-24T12:{minute:02}:{second:02}Z\",\"k\":\"msg.in\",\"content\":\"needle-multipage peer {index}\"}}\n"
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let remote_tape_refs = remote_tapes
+        .iter()
+        .map(|(tape_id, content)| (tape_id.as_str(), content.as_str()))
+        .collect::<Vec<_>>();
+    let remote = write_grep_owner(temp.path(), "remote", binary, &remote_tape_refs);
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "local-no-match",
+        "{\"t\":\"2026-09-24T11:00:00Z\",\"k\":\"msg.in\",\"content\":\"quiet local tape\"}\n",
+    );
+    set_peer_topology(&caller_home, json!({"remote": remote}));
+
+    let mut seen = std::collections::HashSet::new();
+    for (offset, expected_returned, expected_scan_returned, expected_truncated) in [
+        (0usize, 25usize, 25usize, true),
+        (25, 25, 50, true),
+        (50, 10, 60, false),
+    ] {
+        let offset_arg = offset.to_string();
+        let output = Command::new(binary)
+            .current_dir(&repo)
+            .env("HOME", &caller_home)
+            .args([
+                "grep",
+                "needle-multipage",
+                "--peers",
+                "remote",
+                "--limit",
+                "25",
+                "--offset",
+                &offset_arg,
+            ])
+            .output()
+            .expect("run federated grep page");
+        assert!(
+            output.status.success(),
+            "page at offset {offset} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("grep page JSON");
+        assert_eq!(result["federation"]["coverage"], "complete");
+        assert_eq!(result["returned"], expected_returned);
+        assert_eq!(result["total"], 60);
+        assert_eq!(result["truncated"], expected_truncated);
+        let sessions = result["sessions"].as_array().expect("page sessions");
+        assert_eq!(sessions.len(), expected_returned);
+        for session in sessions {
+            assert_eq!(session["location"]["machine"], "remote");
+            assert_eq!(session["location"]["store"], "remote/default");
+            assert!(seen.insert(session["tape_id"].as_str().unwrap().to_string()));
+        }
+        let remote_source = result["federation"]["sources"]
+            .as_array()
+            .expect("federation sources")
+            .iter()
+            .find(|source| source["store"] == "remote/default")
+            .expect("remote owner source");
+        assert_eq!(remote_source["status"], "ok");
+        assert_eq!(remote_source["grep_scan"]["total"], 60);
+        assert_eq!(remote_source["grep_scan"]["returned"], expected_scan_returned);
+        assert_eq!(remote_source["grep_scan"]["truncated"], expected_truncated);
+    }
+    assert_eq!(seen.len(), 60, "all owner matches span the three pages");
 }
 
 #[test]
@@ -7918,6 +8005,76 @@ fn grep_unavailable_peer_is_partial_and_require_complete_fails() {
     assert!(
         stderr.contains("incomplete_coverage"),
         "unexpected error: {stderr}"
+    );
+}
+
+#[test]
+fn grep_scan_timeout_reason_is_kept_in_partial_and_require_complete_output() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let (caller_home, repo, scan_started) =
+        write_stalled_remote_operation_fixture(temp.path(), 300, "grep_scan");
+    let caller_engram = caller_home.join(".engram");
+    let local_tapes = caller_engram.join("tapes");
+    std::fs::create_dir_all(&local_tapes).expect("caller tape directory");
+    let local_db = caller_engram.join("index.sqlite");
+    drop(SqliteIndex::open_writer(local_db.to_str().expect("caller DB path")).expect("caller DB"));
+    let local_content =
+        "{\"t\":\"2026-09-24T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-timeout local\"}\n";
+    let compressed = zstd::stream::encode_all(local_content.as_bytes(), 0).expect("compress tape");
+    std::fs::write(local_tapes.join("local-timeout.jsonl.zst"), compressed)
+        .expect("write local tape");
+
+    let partial = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["grep", "needle-timeout", "--peers", "silent"])
+        .output()
+        .expect("run partial grep with stalled scan");
+    assert!(
+        partial.status.success(),
+        "partial grep failed: {}",
+        String::from_utf8_lossy(&partial.stderr)
+    );
+    let result: serde_json::Value =
+        serde_json::from_slice(&partial.stdout).expect("partial grep JSON");
+    assert_eq!(result["federation"]["coverage"], "partial");
+    let silent = result["federation"]["sources"]
+        .as_array()
+        .expect("sources")
+        .iter()
+        .find(|source| source["store"] == "silent/default")
+        .expect("failed remote source");
+    assert_eq!(silent["phase"], "grep_scan");
+    assert_eq!(silent["error"]["code"], "timeout");
+    assert!(silent["error"]["message"].as_str().unwrap().contains("grep_scan"));
+    assert!(scan_started.exists(), "the peer reached grep_scan");
+
+    let required = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "grep",
+            "needle-timeout",
+            "--peers",
+            "silent",
+            "--require-complete",
+        ])
+        .output()
+        .expect("run require-complete grep with stalled scan");
+    assert!(!required.status.success());
+    let stderr = String::from_utf8_lossy(&required.stderr);
+    let error_line = stderr.lines().last().expect("error output");
+    let error: serde_json::Value =
+        serde_json::from_str(error_line).expect("require-complete error JSON");
+    assert_eq!(error["error"]["code"], "incomplete_coverage");
+    let message = error["error"]["message"].as_str().expect("error message");
+    assert!(message.contains("silent/default"), "missing peer: {message}");
+    assert!(message.contains("phase=grep_scan"), "missing phase: {message}");
+    assert!(message.contains("timeout"), "missing reason: {message}");
+    assert!(
+        message.contains("timed out waiting for terminal response"),
+        "missing observed detail: {message}"
     );
 }
 
