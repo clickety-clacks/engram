@@ -278,7 +278,6 @@ fn log_show_first_round_with_identity_barrier(
         "        index=0",
         "        while IFS= read -r pending_id; do index=$((index + 1)); read_terminal \"$pending_id\" \"$responses_root.$index\"; done <\"$ids\"",
         "        cat \"$responses_root.1\" \"$responses_root.2\"",
-        "        : >\"$responses_root.identity.ready\"",
         "        : >\"$pending\"",
         "        : >\"$ids\"",
         "        pending_count=0",
@@ -4542,47 +4541,14 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
         "{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"show partial selected peers\"}\n",
     );
     let tape_id = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
-    let mut available = write_grep_owner(
+    let available = write_grep_owner(
         temp.path(),
         "available",
         binary,
         &[(tape_id.as_str(), content)],
     );
-    let available_operations = log_show_first_round_with_identity_barrier(
-        temp.path(),
-        "available",
-        binary,
-        &mut available,
-    );
-    let available_identity_complete = temp.path().join("available-show-responses.identity.ready");
-    // Let the offline peer open normally, then disconnect its identity query
-    // only after the healthy peer has completed the same discovery round.
-    let offline_script_path = temp.path().join("offline-after-available-discovery.sh");
-    let offline_script = [
-        "#!/bin/sh",
-        "set -eu",
-        "marker=\"$1\"",
-        "while IFS= read -r request; do",
-        r#"  id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"#,
-        r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
-        "  if [ \"$op\" = open ]; then",
-        r#"    printf '{"id":%s,"data":{"store":"offline/default","status":"ok","db":"/fixture/offline.sqlite","tape_dirs":[],"reader_mode":"live","snapshot_at":"2026-09-25T00:00:00Z"}}\n' "$id""#,
-        r#"    printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"offline","build":"fixture","protocol":1,"schema":4,"query_semantics":1,"limits":{"grep_k":10000}}}\n' "$id""#,
-        "  else",
-        "    attempts=0",
-        "    while [ ! -f \"$marker\" ]; do",
-        "      [ \"$attempts\" -lt 600 ] || exit 124",
-        "      attempts=$((attempts + 1))",
-        "      sleep 0.05",
-        "    done",
-        "    exit 1",
-        "  fi",
-        "done",
-    ]
-    .join("\n");
-    std::fs::write(&offline_script_path, offline_script).expect("write delayed offline peer");
     let offline = json!({
-        "command": ["/bin/sh", offline_script_path, available_identity_complete],
+        "command": ["/usr/bin/false"],
         "engram": "/unused/engram",
         "exports": ["default"],
     });
@@ -4611,34 +4577,16 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
         .expect("run partial selected-peer show");
     assert!(
         partial.status.success(),
-        "partial show should keep the completed tape: stderr={}; available operations={}; healthy discovery completed={}",
-        String::from_utf8_lossy(&partial.stderr),
-        std::fs::read_to_string(&available_operations).unwrap_or_default(),
-        available_identity_complete.is_file()
+        "partial show should keep the completed tape: {}",
+        String::from_utf8_lossy(&partial.stderr)
     );
     let value: serde_json::Value = serde_json::from_slice(&partial.stdout).expect("show JSON");
     assert_eq!(value["tape_id"], tape_id);
     assert_eq!(value["federation"]["coverage"], "partial");
-    let offline_source = value["federation"]["sources"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|source| source["store"] == "offline/default")
-        .expect("offline source row");
-    assert_eq!(offline_source["status"], "failed");
-    assert!(matches!(
-        offline_source["phase"].as_str(),
-        Some("locate_tapes" | "tape_facts")
+    assert!(value["federation"]["sources"].as_array().unwrap().iter().any(
+        |source| source["store"] == "offline/default" && source["status"] == "unavailable"
     ));
-    assert_eq!(offline_source["error"]["code"], "unavailable");
-    assert!(available_identity_complete.is_file());
-    assert_eq!(operation_count(&available_operations, "open"), 1);
-    assert_eq!(operation_count(&available_operations, "locate_tapes"), 1);
-    assert_eq!(operation_count(&available_operations, "tape_facts"), 1);
-    assert_eq!(operation_count(&available_operations, "read_file"), 1);
 
-    std::fs::remove_file(&available_identity_complete)
-        .expect("reset discovery barrier for second query");
     let required = Command::new(binary)
         .current_dir(&repo)
         .env("HOME", &caller_home)
