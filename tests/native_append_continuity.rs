@@ -12,12 +12,20 @@ use std::{
 const UUID: &str = "788de2da-5970-4814-a2aa-217c5f484d8a";
 const LATER: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const TEXT: &str = "pub fn isolated_handoff_probe() -> u64 { 73849127 }";
+
+fn set_test_home(command: &mut Command, home: &Path) {
+    if cfg!(windows) {
+        command.env("USERPROFILE", home).env_remove("HOME");
+    } else {
+        command.env("HOME", home);
+    }
+}
+
 fn cli(root: &Path, args: &[&str], input: Option<&str>) -> Value {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_engram"));
-    cmd.current_dir(root)
-        .env("HOME", root.join("home"))
-        .args(args)
-        .stdin(Stdio::piped())
+    cmd.current_dir(root).args(args);
+    set_test_home(&mut cmd, &root.join("home"));
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().unwrap();
@@ -839,12 +847,10 @@ fn legacy_recovery_uses_committed_prefix_and_rejects_unbound_locator() {
     let mut value: Value = serde_json::from_slice(&fs::read(&locator).unwrap()).unwrap();
     value["recovered"]["points"][0]["turn"] = json!(999);
     fs::write(&locator, line(value)).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_engram"))
-        .current_dir(root)
-        .env("HOME", root.join("home"))
-        .args(["explain", "--", TEXT])
-        .output()
-        .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_engram"));
+    command.current_dir(root).args(["explain", "--", TEXT]);
+    set_test_home(&mut command, &root.join("home"));
+    let out = command.output().unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("recovery locator not bound by context"));
 }
@@ -870,12 +876,12 @@ fn ambiguous_legacy_events_fail_without_advancing_cursor_or_publishing_context()
     let input = root.join(name);
     let state_before = fs::read(cursor(root, &input)).unwrap();
     let tapes_before = snapshots(root);
-    let out = Command::new(env!("CARGO_BIN_EXE_engram"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_engram"));
+    command
         .current_dir(root)
-        .env("HOME", root.join("home"))
-        .args(["ingest", input.to_str().unwrap()])
-        .output()
-        .unwrap();
+        .args(["ingest", input.to_str().unwrap()]);
+    set_test_home(&mut command, &root.join("home"));
+    let out = command.output().unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("ambiguous legacy event"));
     assert_eq!(state_before, fs::read(cursor(root, &input)).unwrap());
@@ -1550,12 +1556,12 @@ fn legacy_recovery_excludes_foreign_session_candidates_but_rejects_current_misma
         let immutable = snapshots(root);
         let counts = stored_counts(root);
         let before = fs::read(cursor(root, &path)).unwrap();
-        let result = Command::new(env!("CARGO_BIN_EXE_engram"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_engram"));
+        command
             .current_dir(root)
-            .env("HOME", root.join("home"))
-            .args(["ingest", path.to_str().unwrap()])
-            .output()
-            .unwrap();
+            .args(["ingest", path.to_str().unwrap()]);
+        set_test_home(&mut command, &root.join("home"));
+        let result = command.output().unwrap();
         if mismatched_current {
             assert!(!result.status.success());
             assert!(
@@ -1672,12 +1678,12 @@ fn legacy_unknown_exec_result_recovers_only_missing_derived_success() {
         let before = fs::read(cursor(root, &input)).unwrap();
         let immutable = snapshots(root);
         let counts = stored_counts(root);
-        let out = Command::new(env!("CARGO_BIN_EXE_engram"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_engram"));
+        command
             .current_dir(root)
-            .env("HOME", root.join("home"))
-            .args(["ingest", input.to_str().unwrap()])
-            .output()
-            .unwrap();
+            .args(["ingest", input.to_str().unwrap()]);
+        set_test_home(&mut command, &root.join("home"));
+        let out = command.output().unwrap();
         let success = matches!(mode, "valid" | "recorded_success");
         assert_eq!(
             out.status.success(),

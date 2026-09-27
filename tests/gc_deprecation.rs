@@ -10,12 +10,14 @@ const DEPRECATION_LINE: &str = "deprecation: engram gc is deprecated and permane
 fn run_cli(repo: &Path, args: &[&str]) -> Output {
     let isolated_home = repo.join(".home");
     fs::create_dir_all(&isolated_home).expect("home dir");
-    Command::new(env!("CARGO_BIN_EXE_engram"))
-        .current_dir(repo)
-        .env("HOME", isolated_home)
-        .args(args)
-        .output()
-        .expect("command runs")
+    let mut command = Command::new(env!("CARGO_BIN_EXE_engram"));
+    command.current_dir(repo).args(args);
+    if cfg!(windows) {
+        command.env("USERPROFILE", &isolated_home).env_remove("HOME");
+    } else {
+        command.env("HOME", isolated_home);
+    }
+    command.output().expect("command runs")
 }
 
 fn seed_store(repo: &Path) -> PathBuf {
