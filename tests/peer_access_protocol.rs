@@ -4541,14 +4541,37 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
         "{\"t\":\"2026-09-25T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"show partial selected peers\"}\n",
     );
     let tape_id = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
-    let available = write_grep_owner(
+    let mut available = write_grep_owner(
         temp.path(),
         "available",
         binary,
         &[(tape_id.as_str(), content)],
     );
+    let available_operations = log_show_first_round_with_identity_barrier(
+        temp.path(),
+        "available",
+        binary,
+        &mut available,
+    );
+    let available_open_complete = temp.path().join("available-show-responses.open.ready");
+    let offline_script_path = temp.path().join("offline-after-available-open.sh");
+    let offline_script = [
+        "#!/bin/sh",
+        "set -eu",
+        "marker=\"$1\"",
+        "IFS= read -r _request || exit 1",
+        "attempts=0",
+        "while [ ! -f \"$marker\" ]; do",
+        "  [ \"$attempts\" -lt 600 ] || exit 124",
+        "  attempts=$((attempts + 1))",
+        "  sleep 0.05",
+        "done",
+        "exit 1",
+    ]
+    .join("\n");
+    std::fs::write(&offline_script_path, offline_script).expect("write delayed offline peer");
     let offline = json!({
-        "command": ["/usr/bin/false"],
+        "command": ["/bin/sh", offline_script_path, available_open_complete],
         "engram": "/unused/engram",
         "exports": ["default"],
     });
@@ -4577,16 +4600,30 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
         .expect("run partial selected-peer show");
     assert!(
         partial.status.success(),
-        "partial show should keep the completed tape: {}",
-        String::from_utf8_lossy(&partial.stderr)
+        "partial show should keep the completed tape: stderr={}; available operations={}; healthy open completed={}",
+        String::from_utf8_lossy(&partial.stderr),
+        std::fs::read_to_string(&available_operations).unwrap_or_default(),
+        available_open_complete.is_file()
     );
     let value: serde_json::Value = serde_json::from_slice(&partial.stdout).expect("show JSON");
     assert_eq!(value["tape_id"], tape_id);
     assert_eq!(value["federation"]["coverage"], "partial");
-    assert!(value["federation"]["sources"].as_array().unwrap().iter().any(
-        |source| source["store"] == "offline/default" && source["status"] == "unavailable"
-    ));
+    let offline_source = value["federation"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["store"] == "offline/default")
+        .expect("offline source row");
+    assert_eq!(offline_source["status"], "unavailable");
+    assert_eq!(offline_source["phase"], "open");
+    assert_eq!(offline_source["error"]["code"], "unavailable");
+    assert!(available_open_complete.is_file());
+    assert_eq!(operation_count(&available_operations, "open"), 1);
+    assert_eq!(operation_count(&available_operations, "locate_tapes"), 1);
+    assert_eq!(operation_count(&available_operations, "tape_facts"), 1);
+    assert_eq!(operation_count(&available_operations, "read_file"), 1);
 
+    std::fs::remove_file(&available_open_complete).expect("reset open barrier for second query");
     let required = Command::new(binary)
         .current_dir(&repo)
         .env("HOME", &caller_home)
@@ -4608,7 +4645,18 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
             .expect("incomplete coverage error line"),
     )
     .expect("error JSON");
-    assert_eq!(error["error"]["code"], "incomplete_coverage");
+    assert_eq!(
+        error["error"]["code"],
+        "incomplete_coverage",
+        "required show error: stderr={stderr}; available operations={}; healthy open completed={}",
+        std::fs::read_to_string(&available_operations).unwrap_or_default(),
+        available_open_complete.is_file()
+    );
+    assert!(available_open_complete.is_file());
+    assert_eq!(operation_count(&available_operations, "open"), 2);
+    assert_eq!(operation_count(&available_operations, "locate_tapes"), 2);
+    assert_eq!(operation_count(&available_operations, "tape_facts"), 2);
+    assert_eq!(operation_count(&available_operations, "read_file"), 2);
 }
 
 #[cfg(unix)]
