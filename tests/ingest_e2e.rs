@@ -528,8 +528,7 @@ fn ingest_discovers_codex_sessions_for_repo_via_adapter_hook() {
         .map(Value::to_string)
         .collect::<Vec<_>>()
         .join("\n");
-    fs::write(codex_root.join("session.jsonl"), format!("{session}\n"))
-        .expect("codex session");
+    fs::write(codex_root.join("session.jsonl"), format!("{session}\n")).expect("codex session");
 
     let ingest = run_json(&repo, &["ingest"], None, &home);
     assert_eq!(ingest["status"], "ok");

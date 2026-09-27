@@ -70,9 +70,8 @@ pub(crate) fn bounded_shell_read(
         return None;
     }
     let path_is_absolute = is_absolute_path(path);
-    let coverage_complete = path_is_absolute
-        || workdir.is_some_and(is_absolute_path)
-        || cwd.is_some();
+    let coverage_complete =
+        path_is_absolute || workdir.is_some_and(is_absolute_path) || cwd.is_some();
     Some(StructuredRead {
         file: shell_path(path, workdir, cwd),
         range: [start, start + lines - 1],
@@ -270,24 +269,6 @@ fn lexical_normalize(path: &str) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{is_absolute_path, shell_path};
-
-    #[test]
-    fn shell_paths_preserve_recorded_posix_and_windows_roots() {
-        assert_eq!(shell_path("src/a.rs", None, Some("/repo")), "/repo/src/a.rs");
-        assert_eq!(shell_path("src\\a.rs", None, Some(r"C:\repo")), "C:/repo/src/a.rs");
-        assert_eq!(
-            shell_path("../src/a.rs", None, Some(r"C:\repo\pkg")),
-            "C:/repo/src/a.rs"
-        );
-        assert!(is_absolute_path("/repo/src/a.rs"));
-        assert!(is_absolute_path(r"C:\repo\src\a.rs"));
-        assert!(!is_absolute_path("src/a.rs"));
-    }
-}
-
 pub(crate) fn parse_patch(patch: &str) -> Vec<StructuredEdit> {
     #[derive(Clone, Copy)]
     enum Kind {
@@ -424,7 +405,7 @@ pub(crate) fn patch_is_complete(patch: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded_shell_read, parse_patch};
+    use super::{bounded_shell_read, is_absolute_path, parse_patch, shell_path};
 
     #[test]
     fn rejects_unbounded_shell_syntax() {
@@ -455,5 +436,24 @@ mod tests {
         assert_eq!(edits[0].file, "a");
         assert_eq!(edits[1].file, "a");
         assert_eq!(edits[2].file, "b");
+    }
+
+    #[test]
+    fn shell_paths_preserve_recorded_posix_and_windows_roots() {
+        assert_eq!(
+            shell_path("src/a.rs", None, Some("/repo")),
+            "/repo/src/a.rs"
+        );
+        assert_eq!(
+            shell_path("src\\a.rs", None, Some(r"C:\repo")),
+            "C:/repo/src/a.rs"
+        );
+        assert_eq!(
+            shell_path("../src/a.rs", None, Some(r"C:\repo\pkg")),
+            "C:/repo/src/a.rs"
+        );
+        assert!(is_absolute_path("/repo/src/a.rs"));
+        assert!(is_absolute_path(r"C:\repo\src\a.rs"));
+        assert!(!is_absolute_path("src/a.rs"));
     }
 }

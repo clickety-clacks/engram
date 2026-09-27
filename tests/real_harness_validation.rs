@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use engram::tape::adapter::{AdapterId, convert_with_adapter, discover_sessions_with_adapter};
+use engram::tape::adapter::{convert_with_adapter, discover_sessions_with_adapter, AdapterId};
 use engram::tape::event::parse_jsonl_events;
 use sha2::{Digest, Sha256};
 
@@ -245,11 +245,15 @@ fn real_layout_cursor_discovery_and_import_validation() {
 
     let transcript = matching_workspace.join("state.vscdb");
     let noise = wrong_workspace.join("state.vscdb");
-    let matching_manifest =
-        format!("{}\n", serde_json::json!({"folder": canonical_text(&repo)}));
-    let wrong_manifest =
-        format!("{}\n", serde_json::json!({"folder": canonical_text(&wrong_repo)}));
-    write_fixture(&matching_workspace.join("workspace.json"), &matching_manifest);
+    let matching_manifest = format!("{}\n", serde_json::json!({"folder": canonical_text(&repo)}));
+    let wrong_manifest = format!(
+        "{}\n",
+        serde_json::json!({"folder": canonical_text(&wrong_repo)})
+    );
+    write_fixture(
+        &matching_workspace.join("workspace.json"),
+        &matching_manifest,
+    );
     write_fixture(&wrong_workspace.join("workspace.json"), &wrong_manifest);
     write_fixture(
         &transcript,
