@@ -3114,7 +3114,17 @@ mod tests {
             .handle(&locate_missing, &locate_missing["id"], &mut output)
             .expect("first missing lookup");
         let first_missing: Value = serde_json::from_slice(&output).expect("missing frame");
-        assert_eq!(first_missing["data"]["file"], Value::Null);
+        assert_eq!(first_missing["id"], 2);
+        assert_eq!(
+            first_missing["data"],
+            json!({
+                "store":"test-owner/default",
+                "tape_id":"appears-later",
+                "indexed":false,
+                "file":null,
+                "size_bytes":null,
+            })
+        );
         output.clear();
 
         let appeared = tapes.join("appears-later.jsonl.zst");

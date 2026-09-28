@@ -2102,6 +2102,29 @@ fn explain_peers_finds_two_sided_handoff_when_querier_holds_neither_endpoint() {
     );
     let complete: serde_json::Value =
         serde_json::from_slice(&complete.stdout).expect("explain JSON");
+    assert_eq!(complete["federation"]["coverage"], "complete");
+    let receiver_source = complete["federation"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["store"] == "machine-b/default")
+        .expect("selected receiver source");
+    assert_eq!(receiver_source["status"], "ok");
+    assert!(receiver_source.get("phase").is_none());
+    let receiver_requests = std::fs::read_to_string(
+        temp.path().join("machine-b-peer-requests.jsonl"),
+    )
+    .expect("receiver peer request log");
+    assert!(
+        receiver_requests
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("request JSON"))
+            .any(|request| {
+                request["op"] == "locate_tapes"
+                    && request["args"]["tape_ids"] == json!([sender_id])
+            }),
+        "the non-empty sender candidate must be requested from the receiver owner"
+    );
     let [hop] = complete["dispatch_lineage"].as_array().unwrap().as_slice() else {
         panic!(
             "expected one physical two-sided hop: {complete:#}\nsender requests:\n{}\nreceiver requests:\n{}",
@@ -2139,11 +2162,18 @@ fn explain_peers_finds_two_sided_handoff_when_querier_holds_neither_endpoint() {
     assert_eq!(operation_count(&sender_operations, "read_file"), 0);
     assert_eq!(operation_count(&receiver_operations, "read_file"), 0);
 
+    let receiver_locate_requests_before =
+        operation_count(&receiver_operations, "locate_tapes");
     set_peer_topology(&caller_home, json!({"machine-b":receiver}));
     let sender_removed = run_peer_explain(binary, &caller_home, &repo, file, "machine-b");
     assert!(sender_removed.status.success());
     let sender_removed: serde_json::Value =
         serde_json::from_slice(&sender_removed.stdout).expect("sender-removed explain JSON");
+    assert_eq!(
+        operation_count(&receiver_operations, "locate_tapes"),
+        receiver_locate_requests_before,
+        "a received-only UUID with no selected sender candidate sends no locate_tapes request or response"
+    );
     assert_eq!(sender_removed["federation"]["coverage"], "complete");
     let receiver_source = sender_removed["federation"]["sources"]
         .as_array()

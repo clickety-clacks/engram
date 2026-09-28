@@ -752,21 +752,25 @@ fn locate_federated_tapes(
                 continue;
             }
             let store = format!("{machine}/{export}");
-            expected
-                .entry(store.clone())
-                .or_default()
-                .extend(tape_ids.iter().cloned());
             for chunk in tape_ids.chunks(peer_item_cap(owner)) {
-                if !chunk.is_empty() {
-                    requests.entry(machine.clone()).or_default().push((
-                        export.clone(),
-                        PeerRequest::new(
-                            "locate_tapes",
-                            vec![export.clone()],
-                            json!({"tape_ids":chunk}),
-                        ),
-                    ));
+                if chunk.is_empty() {
+                    continue;
                 }
+                // Track returned IDs only for a request actually placed on the wire.
+                // An empty sender-candidate set emits no locate_tapes request and has
+                // no peer response to compare against.
+                expected
+                    .entry(store.clone())
+                    .or_default()
+                    .extend(chunk.iter().cloned());
+                requests.entry(machine.clone()).or_default().push((
+                    export.clone(),
+                    PeerRequest::new(
+                        "locate_tapes",
+                        vec![export.clone()],
+                        json!({"tape_ids":chunk}),
+                    ),
+                ));
             }
         }
     }
@@ -839,7 +843,7 @@ fn locate_federated_tapes(
         }
     }
     for (store, tape_set) in expected {
-        if !locate_tape_responses_complete(&tape_set, returned.get(&store)) {
+        if returned.get(&store) != Some(&tape_set) {
             *peer_failed = true;
             mark_source_phase(
                 sources,
@@ -875,18 +879,6 @@ fn locate_federated_tapes(
         values.dedup_by(|left, right| left["store"] == right["store"]);
     }
     located
-}
-
-fn locate_tape_responses_complete(
-    expected: &std::collections::BTreeSet<String>,
-    returned: Option<&std::collections::BTreeSet<String>>,
-) -> bool {
-    // Empty candidate sets send no request, so there is no response-map entry to compare.
-    if expected.is_empty() {
-        returned.is_none_or(std::collections::BTreeSet::is_empty)
-    } else {
-        returned == Some(expected)
-    }
 }
 
 struct FederatedDispatchResult {
@@ -7885,18 +7877,6 @@ mod tests {
                 .message
                 .contains("peer omitted one or more requested tape locations")
         );
-    }
-
-    #[test]
-    fn empty_federated_tape_lookup_needs_no_peer_response() {
-        let empty = std::collections::BTreeSet::new();
-        assert!(locate_tape_responses_complete(&empty, None));
-        let unexpected = std::collections::BTreeSet::from(["unrequested".to_string()]);
-        assert!(!locate_tape_responses_complete(&empty, Some(&unexpected)));
-
-        let requested = std::collections::BTreeSet::from(["sender-tape".to_string()]);
-        assert!(!locate_tape_responses_complete(&requested, None));
-        assert!(locate_tape_responses_complete(&requested, Some(&requested)));
     }
 
     #[test]
