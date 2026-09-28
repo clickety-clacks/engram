@@ -38,8 +38,8 @@ use engram::query::format::MAX_QUERY_WINDOW_ANCHORS;
 use engram::query::format::{
     DateFilter, ExplainTarget, GrepRank, annotate_chain_fields, apply_session_truncation,
     build_chain_metadata, build_session_windows, classify_explain_target, collect_anchor_scores,
-    collect_touch_evidence, compact_event, compare_explain_sessions,
-    compare_explain_sessions_with_span_priority, compare_grep_sessions, default_peek_anchor_line,
+    collect_touch_evidence, compact_event, compare_explain_sessions_with_span_priority,
+    compare_grep_sessions, default_peek_anchor_line,
     derive_anchor_candidates, dispatch_ref_counts, edge_to_json, emit_query_result,
     exact_span_edit_sessions, explain_across_indexes, extract_latest_timestamp_from_rows,
     format_sessions_for_agent, grep_line_matches, open_query_indexes, prepare_grep_scan,
@@ -5851,7 +5851,11 @@ fn cmd_explain_with_peers_inner(
                             continue;
                         }
                         if row.get("type").and_then(Value::as_str) == Some("tape_facts") {
-                            let Some(tape_id) = row.get("tape_id").and_then(Value::as_str) else {
+                            let Some(tape_id) = row
+                                .get("tape_id")
+                                .and_then(Value::as_str)
+                                .map(ToOwned::to_owned)
+                            else {
                                 any_peer_failure = true;
                                 mark_source_phase(
                                     &mut sources,

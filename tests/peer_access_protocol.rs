@@ -718,7 +718,7 @@ fn write_ranked_explain_source(
     for (tape_id, content) in tapes {
         assert_eq!(
             format!("{:x}", sha2::Sha256::digest(content.as_bytes())),
-            tape_id,
+            tape_id.as_str(),
             "rank fixture tape must retain its content address"
         );
         let compressed =
