@@ -2638,6 +2638,9 @@ fn explain_peers_reports_missing_segment_and_missing_tape_without_dropping_sessi
         .expect("unresolved rows");
     assert!(unresolved.iter().any(|row| {
         row["reason"] == "history_incomplete"
+            && row["phase"] == "dispatch_history"
+            && row["code"] == "history_incomplete"
+            && row["session_location"] == "receiver-owner/default"
             && row["session"] == missing_predecessor_id
             && row["missing"] == "deleted-predecessor-segment"
     }));
@@ -2647,6 +2650,27 @@ fn explain_peers_reports_missing_segment_and_missing_tape_without_dropping_sessi
         })
     );
     assert_eq!(operation_count(&receiver_operations, "read_file"), 0);
+
+    let required = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "explain",
+            file,
+            "--peers",
+            "sender-owner,receiver-owner",
+            "--require-complete",
+        ])
+        .output()
+        .expect("run require-complete explain with incomplete dispatch history");
+    assert!(!required.status.success());
+    assert!(required.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&required.stderr);
+    assert!(stderr.contains("incomplete_results"), "{stderr}");
+    assert!(stderr.contains("receiver-owner/default"), "{stderr}");
+    assert!(stderr.contains("phase=dispatch_history"), "{stderr}");
+    assert!(stderr.contains("code=history_incomplete"), "{stderr}");
+    assert!(stderr.contains("deleted-predecessor-segment"), "{stderr}");
 }
 
 #[test]

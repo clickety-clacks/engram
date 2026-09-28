@@ -898,6 +898,32 @@ struct FederatedDispatchResult {
     ambiguous: Vec<Value>,
 }
 
+fn dispatch_history_incomplete(
+    store: &str,
+    session: &str,
+    missing: Option<Value>,
+    message: Option<&str>,
+    candidate_uuid: Option<&str>,
+) -> Value {
+    let mut issue = json!({
+        "reason": "history_incomplete",
+        "phase": "dispatch_history",
+        "code": "history_incomplete",
+        "session": session,
+        "session_location": store,
+    });
+    if let Some(missing) = missing {
+        issue["missing"] = missing;
+    }
+    if let Some(message) = message {
+        issue["message"] = json!(message);
+    }
+    if let Some(candidate_uuid) = candidate_uuid {
+        issue["candidate_uuid"] = json!(candidate_uuid);
+    }
+    issue
+}
+
 #[derive(Clone)]
 struct FederatedSenderCandidate {
     store: String,
@@ -1163,12 +1189,13 @@ fn collect_federated_dispatch(
                             current_tape.clone(),
                             "history_incomplete".into(),
                         )) {
-                            result.unresolved.push(json!({
-                                "reason":"history_incomplete",
-                                "session":current_tape,
-                                "message":message,
-                                "session_location":current_store,
-                            }));
+                            result.unresolved.push(dispatch_history_incomplete(
+                                &current_store,
+                                &current_tape,
+                                None,
+                                Some(&message),
+                                None,
+                            ));
                         }
                         continue;
                     }
@@ -1192,12 +1219,13 @@ fn collect_federated_dispatch(
                         current_history.tip.clone(),
                         "history_incomplete".into(),
                     )) {
-                        result.unresolved.push(json!({
-                            "reason":"history_incomplete",
-                            "session":current_history.tip,
-                            "missing":missing,
-                            "session_location":current_store,
-                        }));
+                        result.unresolved.push(dispatch_history_incomplete(
+                            &current_store,
+                            &current_history.tip,
+                            Some(json!(missing)),
+                            None,
+                            None,
+                        ));
                     }
                     break;
                 }
@@ -1405,9 +1433,25 @@ fn collect_federated_dispatch(
                         }
                         continue;
                     }
-                    let Ok(mut history) = FederatedDispatchHistory::from_tape_facts(facts) else {
-                        candidate_partial = true;
-                        continue;
+                    let mut history = match FederatedDispatchHistory::from_tape_facts(facts) {
+                        Ok(history) => history,
+                        Err(message) => {
+                            candidate_partial = true;
+                            if unresolved_seen.insert((
+                                store.clone(),
+                                tape_id.clone(),
+                                "history_incomplete".into(),
+                            )) {
+                                result.unresolved.push(dispatch_history_incomplete(
+                                    store,
+                                    tape_id,
+                                    None,
+                                    Some(&message),
+                                    Some(&received.row.uuid),
+                                ));
+                            }
+                            continue;
+                        }
                     };
                     if !history.complete {
                         candidate_partial = true;
@@ -1416,7 +1460,13 @@ fn collect_federated_dispatch(
                             tape_id.clone(),
                             "history_incomplete".into(),
                         )) {
-                            result.unresolved.push(json!({"reason":"history_incomplete","session":tape_id,"missing":history.missing,"session_location":store,"candidate_uuid":received.row.uuid}));
+                            result.unresolved.push(dispatch_history_incomplete(
+                                store,
+                                tape_id,
+                                Some(json!(history.missing)),
+                                None,
+                                Some(&received.row.uuid),
+                            ));
                         }
                         continue;
                     }
@@ -5838,7 +5888,7 @@ fn cmd_explain_with_peers_inner(
         context.explain_default_limit,
     );
     if any_peer_failure && args.require_complete {
-        return Err(explain_require_complete_error(&sources));
+        return Err(explain_require_complete_error(&sources, &dispatch_unresolved));
     }
     let no_results = sessions.is_empty() && tombstones.is_empty() && lineage.is_empty();
     let complete = !any_peer_failure;
@@ -7123,10 +7173,69 @@ fn format_peer_error_value(error: &Value) -> String {
     format!("{code}: {message}")
 }
 
-fn explain_require_complete_error(source_rows: &[Value]) -> CliError {
+fn format_dispatch_history_failures(unresolved_rows: &[Value]) -> Vec<String> {
+    const MAX_HISTORY_DETAILS: usize = 5;
+
+    let history_rows = unresolved_rows
+        .iter()
+        .filter(|row| row.get("reason").and_then(Value::as_str) == Some("history_incomplete"))
+        .collect::<Vec<_>>();
+    let mut failures = history_rows
+        .iter()
+        .take(MAX_HISTORY_DETAILS)
+        .map(|row| {
+            let store = row
+                .get("session_location")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown store");
+            let phase = row
+                .get("phase")
+                .and_then(Value::as_str)
+                .unwrap_or("dispatch_history");
+            let code = row
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("history_incomplete");
+            let session = row
+                .get("session")
+                .or_else(|| row.get("received_session"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown session");
+            let reason = match row.get("missing") {
+                Some(Value::String(missing)) => {
+                    format!("missing predecessor segment {missing}")
+                }
+                Some(Value::Array(missing)) => {
+                    let segments = missing
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("missing predecessor segment(s) [{segments}]")
+                }
+                _ => row
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("dispatch history is incomplete")
+                    .to_string(),
+            };
+            format!("{store} phase={phase} code={code} session={session}: {reason}")
+        })
+        .collect::<Vec<_>>();
+    if history_rows.len() > MAX_HISTORY_DETAILS {
+        failures.push(format!(
+            "{} additional history_incomplete record(s) in dispatch_unresolved",
+            history_rows.len() - MAX_HISTORY_DETAILS
+        ));
+    }
+    failures
+}
+
+fn explain_require_complete_error(source_rows: &[Value], unresolved_rows: &[Value]) -> CliError {
     let failures = source_rows
         .iter()
         .filter_map(format_source_failure)
+        .chain(format_dispatch_history_failures(unresolved_rows))
         .collect::<Vec<_>>();
     let detail = if failures.is_empty() {
         "one or more selected sources did not complete".to_string()
@@ -7947,7 +8056,7 @@ mod tests {
                 "code": "protocol_error",
                 "message": "peer omitted one or more requested tape locations",
             },
-        })]);
+        })], &[]);
 
         assert_eq!(error.code, "incomplete_results");
         assert!(error.message.contains("eezo/default"));
@@ -7958,6 +8067,41 @@ mod tests {
                 .message
                 .contains("peer omitted one or more requested tape locations")
         );
+    }
+
+    #[test]
+    fn explain_require_complete_error_reports_missing_history_from_healthy_sources() {
+        let issue = dispatch_history_incomplete(
+            "gibson/local:0",
+            "edit-tape-8936",
+            Some(json!("missing-predecessor-4950")),
+            None,
+            Some("candidate-uuid"),
+        );
+        assert_eq!(issue["reason"], "history_incomplete");
+        assert_eq!(issue["phase"], "dispatch_history");
+        assert_eq!(issue["code"], "history_incomplete");
+        assert_eq!(issue["session_location"], "gibson/local:0");
+        assert_eq!(issue["missing"], "missing-predecessor-4950");
+
+        let error = explain_require_complete_error(
+            &[
+                json!({"store":"gibson/local:0","status":"ok"}),
+                json!({"store":"eezo/default","status":"ok"}),
+            ],
+            &[
+                issue,
+                json!({"reason":"no_sender_observed","uuid":"unrelated-uuid"}),
+            ],
+        );
+
+        assert_eq!(error.code, "incomplete_results");
+        assert!(error.message.contains("gibson/local:0"));
+        assert!(error.message.contains("phase=dispatch_history"));
+        assert!(error.message.contains("code=history_incomplete"));
+        assert!(error.message.contains("edit-tape-8936"));
+        assert!(error.message.contains("missing predecessor segment missing-predecessor-4950"));
+        assert!(!error.message.contains("unrelated-uuid"));
     }
 
     #[test]
