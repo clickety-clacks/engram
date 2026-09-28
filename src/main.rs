@@ -641,12 +641,14 @@ fn query_remote_tape_facts(
 
     let mut facts = HashMap::new();
     let mut returned = std::collections::HashSet::new();
+    let mut failed_stores = std::collections::HashSet::new();
     for (machine, export, outcome) in
         run_federated_peer_rounds(requests, owners, topology, deadline, cancelled)
     {
         let store = format!("{machine}/{export}");
         match outcome {
             Err(failure) => {
+                failed_stores.insert(store.clone());
                 *peer_failed = true;
                 mark_source_phase(
                     sources,
@@ -661,6 +663,7 @@ fn query_remote_tape_facts(
                     if row.get("store").and_then(Value::as_str) != Some(store.as_str())
                         || row.get("type").and_then(Value::as_str) != Some("tape_facts")
                     {
+                        failed_stores.insert(store.clone());
                         *peer_failed = true;
                         mark_source_phase(
                             sources,
@@ -672,6 +675,7 @@ fn query_remote_tape_facts(
                         continue;
                     }
                     let Some(tape_id) = row.get("tape_id").and_then(Value::as_str) else {
+                        failed_stores.insert(store.clone());
                         *peer_failed = true;
                         mark_source_phase(
                             sources,
@@ -686,6 +690,7 @@ fn query_remote_tape_facts(
                         .get(&store)
                         .is_some_and(|tapes| tapes.contains(tape_id))
                     {
+                        failed_stores.insert(store.clone());
                         *peer_failed = true;
                         mark_source_phase(
                             sources,
@@ -717,6 +722,7 @@ fn query_remote_tape_facts(
                         }
                         *peer_failed = true;
                         if status == Some("unavailable") && code == Some("tape_unavailable") {
+                            failed_stores.insert(store.clone());
                             mark_source_phase(
                                 sources,
                                 &store,
@@ -750,6 +756,7 @@ fn query_remote_tape_facts(
                                 "peer returned an invalid tape facts status",
                             ),
                         };
+                        failed_stores.insert(store.clone());
                         mark_source_phase(sources, &store, "tape_facts", code, message);
                         continue;
                     }
@@ -759,6 +766,9 @@ fn query_remote_tape_facts(
         }
     }
     for (store, tapes) in expected {
+        if failed_stores.contains(&store) {
+            continue;
+        }
         for tape_id in tapes {
             if !returned.contains(&(store.clone(), tape_id.clone())) {
                 *peer_failed = true;
