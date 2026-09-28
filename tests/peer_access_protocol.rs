@@ -2674,6 +2674,133 @@ fn explain_peers_reports_missing_segment_and_missing_tape_without_dropping_sessi
 }
 
 #[test]
+fn explain_require_complete_rejects_candidate_only_incomplete_history() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let uuid = "423e4567-e89b-12d3-a456-426614174031";
+    let file = "candidate-only-history.rs";
+    let source =
+        "fn candidate_only_history_edit() { let result = red + blue; use_result(result); }\n"
+            .repeat(12);
+    let before = source.replace(
+        "candidate_only_history_edit",
+        "before_candidate_only_history_edit",
+    );
+
+    let sender_tape = "sender-with-missing-predecessor";
+    let sender_events = jsonl(&[
+        json!({"t":"2026-09-25T10:00:00Z","k":"meta","model":"peer-test","ingest_continuation":{"previous_tape_id":"deleted-sender-predecessor"}}),
+        json!({"t":"2026-09-25T10:01:00Z","k":"msg.out","content":format!("<engram-src id=\"{uuid}\"/>")}),
+    ]);
+    let mut sender = write_grep_owner(
+        temp.path(),
+        "sender-owner",
+        binary,
+        &[(sender_tape, &sender_events)],
+    );
+    ingest_owner_test_tape(
+        temp.path(),
+        "sender-owner",
+        sender_tape,
+        &sender_events,
+        &[DispatchLink {
+            uuid: uuid.into(),
+            first_turn_index: 0,
+            direction: DispatchDirection::Sent,
+        }],
+    );
+
+    let receiver_tape = "complete-receiver-edit";
+    let receiver_events = jsonl(&[
+        json!({"t":"2026-09-25T11:00:00Z","k":"meta","model":"peer-test"}),
+        json!({"t":"2026-09-25T11:01:00Z","k":"msg.in","content":format!("<engram-src id=\"{uuid}\"/>")}),
+        edit_event(file, &before, &source),
+    ]);
+    let mut receiver = write_grep_owner(
+        temp.path(),
+        "receiver-owner",
+        binary,
+        &[(receiver_tape, &receiver_events)],
+    );
+    ingest_owner_test_tape(
+        temp.path(),
+        "receiver-owner",
+        receiver_tape,
+        &receiver_events,
+        &[DispatchLink {
+            uuid: uuid.into(),
+            first_turn_index: 0,
+            direction: DispatchDirection::Received,
+        }],
+    );
+
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "candidate-only-caller",
+        "{\"t\":\"2026-09-25T09:00:00Z\",\"k\":\"note\",\"content\":\"empty\"}\n",
+    );
+    std::fs::write(repo.join(file), &source).expect("write candidate-only target");
+    set_peer_topology(
+        &caller_home,
+        json!({"sender-owner":sender, "receiver-owner":receiver}),
+    );
+
+    let partial = run_peer_explain(
+        binary,
+        &caller_home,
+        &repo,
+        file,
+        "sender-owner,receiver-owner",
+    );
+    assert!(
+        partial.status.success(),
+        "relaxed explain should retain partial results: {}",
+        String::from_utf8_lossy(&partial.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&partial.stdout).expect("partial explain JSON");
+    assert_eq!(value["federation"]["coverage"], "partial");
+    for store in ["sender-owner/default", "receiver-owner/default"] {
+        let source = value["federation"]["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|source| source["store"] == store)
+            .expect("selected source");
+        assert_eq!(source["status"], "ok");
+    }
+    assert!(value["dispatch_unresolved"].as_array().unwrap().iter().any(|row| {
+        row["reason"] == "history_incomplete"
+            && row["phase"] == "dispatch_history"
+            && row["code"] == "history_incomplete"
+            && row["session_location"] == "sender-owner/default"
+            && row["session"] == sender_tape
+            && row["missing"] == "deleted-sender-predecessor"
+    }));
+
+    let required = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "explain",
+            file,
+            "--peers",
+            "sender-owner,receiver-owner",
+            "--require-complete",
+        ])
+        .output()
+        .expect("run strict explain with candidate-only incomplete history");
+    assert!(!required.status.success());
+    assert!(required.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&required.stderr);
+    assert!(stderr.contains("incomplete_results"), "{stderr}");
+    assert!(stderr.contains("sender-owner/default"), "{stderr}");
+    assert!(stderr.contains("phase=dispatch_history"), "{stderr}");
+    assert!(stderr.contains("code=history_incomplete"), "{stderr}");
+    assert!(stderr.contains("deleted-sender-predecessor"), "{stderr}");
+}
+
+#[test]
 fn explain_peers_reports_missing_sender_owner_without_inventing_a_hop() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = env!("CARGO_BIN_EXE_engram");

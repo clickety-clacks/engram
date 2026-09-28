@@ -1686,6 +1686,10 @@ fn collect_federated_dispatch(
                     }
                 }
 
+                if candidate_partial {
+                    *peer_failed = true;
+                }
+
                 let all_candidates = candidates;
                 let mut candidates = all_candidates
                     .iter()
