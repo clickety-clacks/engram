@@ -10,7 +10,7 @@ use crate::dispatch::message_turn_to_event_offset;
 use crate::index::lineage::{
     Cardinality, EvidenceFragmentRef, EvidenceKind, LocationDelta, StoredEdgeClass,
 };
-use crate::index::{DispatchDirection, EdgeRow, ReaderMode, SqliteIndex};
+use crate::index::{DispatchDirection, EdgeRow, ReaderMode, ReaderOpenError, SqliteIndex};
 use crate::query::explain::{
     ExplainResult, ExplainTraversal, PrettyConfidenceTier, explain_across_indexes_by_anchor,
     pretty_tier,
@@ -69,15 +69,23 @@ fn open_query_index(path: &Path, mode: ReaderMode) -> Result<SqliteIndex, CliErr
             "verify the declared frozen copy exists, is readable, and has the expected schema"
         }
     };
-    SqliteIndex::open_reader_mode(&path_string(path), mode).map_err(|error| {
-        CliError::new(
+    match SqliteIndex::open_reader_mode_detailed(&path_string(path), mode) {
+        Ok(index) => Ok(index),
+        Err(ReaderOpenError::SchemaVersion { expected, actual }) => Err(CliError::new(
+            "reader_unavailable",
+            format!(
+                "store `{}` has schema version {actual}; this Engram reader requires version {expected}. The query remains read-only and does not migrate the store.",
+                path.display()
+            ),
+        )),
+        Err(ReaderOpenError::Sqlite(error)) => Err(CliError::new(
             "reader_unavailable",
             format!(
                 "store `{}` could not be opened in {mode_label} read-only mode: {error}. Fix: {fix}.",
                 path.display()
             ),
-        )
-    })
+        )),
+    }
 }
 
 pub fn classify_explain_target(
@@ -1413,6 +1421,29 @@ pub(crate) fn pretty_tier_name(tier: PrettyConfidenceTier) -> &'static str {
 #[cfg(test)]
 mod chain_graph_tests {
     use super::*;
+
+    #[test]
+    fn query_schema_mismatch_is_not_reported_as_a_readonly_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index.sqlite");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch("PRAGMA user_version = 3").unwrap();
+        drop(connection);
+        let before = std::fs::read(&path).unwrap();
+
+        let error = match open_query_index(&path, ReaderMode::Live) {
+            Err(error) => error,
+            Ok(_) => panic!("v3 index must not open as a v4 reader"),
+        };
+
+        assert_eq!(error.code, "reader_unavailable");
+        assert!(error.message.contains("schema version 3"));
+        assert!(error.message.contains("requires version 4"));
+        assert!(error.message.contains("does not migrate"));
+        assert!(!error.message.contains("Query is not read-only"));
+        assert!(!error.message.contains("grant SQLite write access"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
 
     #[test]
     fn chain_graph_retains_multiple_parents_and_reports_multiple_roots() {
