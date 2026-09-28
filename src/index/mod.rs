@@ -98,6 +98,41 @@ pub enum ReaderMode {
     Frozen,
 }
 
+#[derive(Debug)]
+pub enum ReaderOpenError {
+    Sqlite(rusqlite::Error),
+    SchemaVersion { expected: i64, actual: i64 },
+}
+
+impl ReaderOpenError {
+    fn into_rusqlite(self) -> rusqlite::Error {
+        match self {
+            Self::Sqlite(error) => error,
+            Self::SchemaVersion { .. } => rusqlite::Error::InvalidQuery,
+        }
+    }
+}
+
+impl std::fmt::Display for ReaderOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sqlite(error) => std::fmt::Display::fmt(error, f),
+            Self::SchemaVersion { expected, actual } => write!(
+                f,
+                "database schema version {actual} is unsupported; this reader requires version {expected}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReaderOpenError {}
+
+impl From<rusqlite::Error> for ReaderOpenError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Sqlite(error)
+    }
+}
+
 pub struct ReadSnapshot<'a> {
     index: &'a SqliteIndex,
 }
@@ -139,8 +174,16 @@ impl SqliteIndex {
     }
 
     pub fn open_reader_mode(path: &str, mode: ReaderMode) -> rusqlite::Result<Self> {
-        let absolute = std::fs::canonicalize(path)
-            .map_err(|_| rusqlite::Error::InvalidPath(Path::new(path).to_path_buf()))?;
+        Self::open_reader_mode_detailed(path, mode).map_err(ReaderOpenError::into_rusqlite)
+    }
+
+    pub fn open_reader_mode_detailed(
+        path: &str,
+        mode: ReaderMode,
+    ) -> Result<Self, ReaderOpenError> {
+        let absolute = std::fs::canonicalize(path).map_err(|_| {
+            ReaderOpenError::Sqlite(rusqlite::Error::InvalidPath(Path::new(path).to_path_buf()))
+        })?;
         let mode_query = match mode {
             ReaderMode::Live => "mode=ro",
             ReaderMode::Frozen => "mode=ro&immutable=1",
@@ -159,8 +202,12 @@ impl SqliteIndex {
             reader_mode: Some(mode),
         };
         index.conn.execute_batch("PRAGMA query_only = ON")?;
-        if index.user_version()? != SCHEMA_VERSION {
-            return Err(rusqlite::Error::InvalidQuery);
+        let actual_version = index.user_version()?;
+        if actual_version != SCHEMA_VERSION {
+            return Err(ReaderOpenError::SchemaVersion {
+                expected: SCHEMA_VERSION,
+                actual: actual_version,
+            });
         }
         Ok(index)
     }

@@ -508,6 +508,9 @@ fn nested_calls(code: &str) -> Option<Vec<CodexCall>> {
     if rest.starts_with("// @exec:") {
         rest = rest.split_once('\n')?.1.trim_start();
     }
+    if rest.starts_with("const ") {
+        return assigned_apply_patch_call(rest);
+    }
     let mut calls = Vec::new();
     while !rest.is_empty() {
         rest = rest.strip_prefix("text(await tools.")?;
@@ -535,6 +538,46 @@ fn nested_calls(code: &str) -> Option<Vec<CodexCall>> {
         });
     }
     (!calls.is_empty()).then_some(calls)
+}
+
+/// Accept the recorded exec wrapper only when it binds one literal patch and
+/// echoes that same result. This parses syntax; it never evaluates JavaScript.
+fn assigned_apply_patch_call(code: &str) -> Option<Vec<CodexCall>> {
+    let rest = code.strip_prefix("const ")?;
+    let (binding, rest) = rest.split_once('=')?;
+    let binding = binding.trim();
+    if !is_ascii_identifier(binding) {
+        return None;
+    }
+
+    let arguments = rest.trim_start().strip_prefix("await tools.apply_patch(")?;
+    let mut values = serde_json::Deserializer::from_str(arguments).into_iter::<String>();
+    let patch = values.next()?.ok()?;
+    if !patch_is_complete(&patch) || parse_patch(&patch).is_empty() {
+        return None;
+    }
+    let rest = arguments[values.byte_offset()..]
+        .trim_start()
+        .strip_prefix(");")?
+        .trim_start()
+        .strip_prefix("text(")?;
+    let (printed, rest) = rest.split_once(')')?;
+    if printed.trim() != binding || rest.trim_start().strip_prefix(';')?.trim().len() != 0 {
+        return None;
+    }
+
+    Some(vec![CodexCall {
+        tool: "apply_patch".into(),
+        args: patch,
+    }])
+}
+
+fn is_ascii_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .is_some_and(|c| c == '_' || c == '$' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c == '$' || c.is_ascii_alphanumeric())
 }
 
 // JSON literal values and literal property names only; handles the recorded
@@ -687,6 +730,96 @@ mod tests {
     use serde_json::Value;
 
     use super::codex_jsonl_to_tape_jsonl;
+
+    #[test]
+    fn codex_adapter_emits_patch_from_recorded_assigned_exec_wrapper() {
+        let input = r#"{"timestamp":"2026-08-22T09:17:27.500Z","type":"session_meta","payload":{"id":"01a028d3-ebd5-7f83-ac3c-8084d8fd686a","model_provider":"openai"}}
+{"timestamp":"2026-09-28T09:17:27.523Z","type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_05c582b826bb8eb6016aba30a59fd087d288859b23ca842429","status":"completed","call_id":"call_DRmC7XHFZMYY0GQh8AjnGuOi","name":"exec","input":"const r = await tools.apply_patch(\"*** Begin Patch\\n*** Add File: /Users/mike/.tightbeam/work/d009fb9f2357/e1-lineage-fixture-1e5d708e/scratch/e1-lineage-1e5d708e.txt\\n+e1-lineage-1e5d708e-8e69-469a-99f3-e5b95a13f7ef\\n*** End Patch\");\ntext(r);\n"}}
+{"timestamp":"2026-09-28T09:17:27.611Z","type":"response_item","payload":{"type":"custom_tool_call_output","id":"ctco_01a0e74e-0ebb-7271-9450-e31838c1b72c","call_id":"call_DRmC7XHFZMYY0GQh8AjnGuOi","output":[{"type":"input_text","text":"Script completed\nWall time 0.0s\nOutput:\n"},{"type":"input_text","text":"{}"}]}}
+"#;
+
+        let out = codex_jsonl_to_tape_jsonl(input).expect("adapter should parse");
+        let events: Vec<Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid JSON event"))
+            .collect();
+
+        let meta = events.iter().find(|event| event["k"] == "meta").unwrap();
+        assert_eq!(meta["coverage.edit"], "full");
+        let edit = events
+            .iter()
+            .find(|event| event["k"] == "code.edit")
+            .unwrap();
+        assert_eq!(
+            edit["file"],
+            "/Users/mike/.tightbeam/work/d009fb9f2357/e1-lineage-fixture-1e5d708e/scratch/e1-lineage-1e5d708e.txt"
+        );
+        assert_eq!(
+            edit["after_text"],
+            "e1-lineage-1e5d708e-8e69-469a-99f3-e5b95a13f7ef\n"
+        );
+        assert_eq!(meta["source"], serde_json::json!({"harness": "codex-cli"}));
+        assert_eq!(edit["source"], serde_json::json!({"harness": "codex-cli"}));
+        for raw in events
+            .iter()
+            .filter(|event| matches!(event["k"].as_str(), Some("tool.call" | "tool.result")))
+        {
+            assert_eq!(raw["source"], serde_json::json!({"harness": "codex-cli"}));
+        }
+    }
+
+    #[test]
+    fn codex_adapter_refuses_nonliteral_or_mismatched_assigned_patch_wrapper() {
+        let input = r#"{"timestamp":"2026-09-28T09:17:27.523Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call_unresolved","name":"exec","input":"const r = await tools.apply_patch(patch); text(r);"}}
+{"timestamp":"2026-09-28T09:17:27.611Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_unresolved","output":[{"type":"input_text","text":"Script completed\nWall time 0.0s\nOutput:\n"},{"type":"input_text","text":"{}"}]}}
+{"timestamp":"2026-09-28T09:18:27.523Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call_mismatched","name":"exec","input":"const r = await tools.apply_patch(\"*** Begin Patch\\n*** Add File: file.txt\\n+line\\n*** End Patch\"); text(other);"}}
+{"timestamp":"2026-09-28T09:18:27.611Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_mismatched","output":[{"type":"input_text","text":"Script completed\nWall time 0.0s\nOutput:\n"},{"type":"input_text","text":"{}"}]}}"#;
+
+        let out = codex_jsonl_to_tape_jsonl(input).expect("adapter should parse");
+        let events: Vec<Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid JSON event"))
+            .collect();
+
+        assert_eq!(events[0]["coverage.edit"], "partial");
+        assert!(events.iter().all(|event| event["k"] != "code.edit"));
+    }
+
+    #[test]
+    fn codex_adapter_refuses_ambiguous_assigned_patch_result() {
+        let patch = "*** Begin Patch\n*** Add File: file.txt\n+line\n*** End Patch\n";
+        let input = format!(
+            "const r = await tools.apply_patch({});\ntext(r);\n",
+            serde_json::to_string(patch).unwrap()
+        );
+        let raw = [
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{"type":"custom_tool_call","name":"exec","call_id":"p","input":input}
+            }),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{"type":"custom_tool_call_output","call_id":"p","output":[
+                    {"type":"input_text","text":"Script completed\nWall Time 0.0s\nOutput:\n"},
+                    {"type":"input_text","text":"{}"},
+                    {"type":"input_text","text":"{}"}
+                ]}
+            }),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        let out = codex_jsonl_to_tape_jsonl(&raw).expect("adapter should parse");
+        let events: Vec<Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid JSON event"))
+            .collect();
+
+        assert_eq!(events[0]["coverage.edit"], "partial");
+        assert!(events.iter().all(|event| event["k"] != "code.edit"));
+    }
 
     #[test]
     fn codex_adapter_emits_tool_and_apply_patch_edit() {
