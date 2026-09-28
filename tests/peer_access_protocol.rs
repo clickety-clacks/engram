@@ -2684,14 +2684,13 @@ fn explain_peers_reports_missing_segment_and_missing_tape_without_dropping_sessi
     assert!(stderr.contains("phase=tape_facts"), "{stderr}");
     assert!(stderr.contains("tape_unavailable"), "{stderr}");
     assert!(stderr.contains("tape is not present in this export"), "{stderr}");
-    assert!(
-        !stderr.contains("deleted-predecessor-segment"),
-        "optional history must not be reported as the strict failure: {stderr}"
-    );
+    assert!(stderr.contains("phase=dispatch_history"), "{stderr}");
+    assert!(stderr.contains("code=history_incomplete"), "{stderr}");
+    assert!(stderr.contains("deleted-predecessor-segment"), "{stderr}");
 }
 
 #[test]
-fn explain_require_complete_keeps_candidate_only_incomplete_history_best_effort() {
+fn explain_require_complete_rejects_candidate_only_incomplete_history_with_reason() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = env!("CARGO_BIN_EXE_engram");
     let uuid = "423e4567-e89b-12d3-a456-426614174031";
@@ -2795,7 +2794,7 @@ fn explain_require_complete_keeps_candidate_only_incomplete_history_best_effort(
     );
     let value: serde_json::Value =
         serde_json::from_slice(&partial.stdout).expect("partial explain JSON");
-    assert_eq!(value["federation"]["coverage"], "complete");
+    assert_eq!(value["federation"]["coverage"], "partial");
     for store in ["sender-owner/default", "receiver-owner/default"] {
         let source = value["federation"]["sources"]
             .as_array()
@@ -2837,29 +2836,85 @@ fn explain_require_complete_keeps_candidate_only_incomplete_history_best_effort(
         .output()
         .expect("run strict explain with candidate-only incomplete history");
     assert!(
-        required.status.success(),
-        "a candidate-only broken link should not fail strict query completion: {}",
-        String::from_utf8_lossy(&required.stderr)
+        !required.status.success(),
+        "candidate-only incomplete history must fail strict query completion"
     );
-    let strict: serde_json::Value =
-        serde_json::from_slice(&required.stdout).expect("strict explain JSON");
-    assert_eq!(strict["federation"]["coverage"], "complete");
-    assert!(strict["dispatch_unresolved"].as_array().unwrap().iter().any(|row| {
-        row["reason"] == "history_incomplete"
-            && row["session_location"] == "sender-owner/default"
-            && row["session"] == sender_tape
-            && row["missing"] == "deleted-sender-predecessor"
-    }));
-    assert!(strict["dispatch_unresolved"].as_array().unwrap().iter().any(|row| {
-        row["reason"] == "tape_unavailable"
-            && row["session_location"] == "sender-owner/default"
-            && row["session"] == missing_sender_tape
-    }));
-    assert!(strict["dispatch_unresolved"].as_array().unwrap().iter().any(|row| {
-        row["uuid"] == uuid
-            && row["reason"] == "history_incomplete"
-            && row["selection_coverage"] == "partial"
-    }));
+    assert!(required.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&required.stderr);
+    assert!(stderr.contains("incomplete_results"), "{stderr}");
+    assert!(stderr.contains("sender-owner/default"), "{stderr}");
+    assert!(stderr.contains("phase=dispatch_history"), "{stderr}");
+    assert!(stderr.contains("code=history_incomplete"), "{stderr}");
+    assert!(stderr.contains(sender_tape), "{stderr}");
+    assert!(stderr.contains("deleted-sender-predecessor"), "{stderr}");
+    assert!(
+        !stderr.contains("tape_unavailable"),
+        "the candidate tape absence must not be misreported as the strict cause: {stderr}"
+    );
+}
+
+#[test]
+fn explain_require_complete_allows_complete_results_to_be_paginated() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let file = "complete-pagination.rs";
+    let source = "fn pagination_target() { let result = red + blue; use_result(result); }\n"
+        .repeat(12);
+    let before_a = source.replace("pagination_target", "before_pagination_target_a");
+    let before_b = source.replace("pagination_target", "before_pagination_target_b");
+    let tape_a = "complete-pagination-edit-a";
+    let tape_b = "complete-pagination-edit-b";
+    let events_a = jsonl(&[
+        json!({"t":"2026-09-25T10:00:00Z","k":"meta","model":"peer-test"}),
+        edit_event(file, &before_a, &source),
+    ]);
+    let events_b = jsonl(&[
+        json!({"t":"2026-09-25T10:02:00Z","k":"meta","model":"peer-test"}),
+        edit_event(file, &before_b, &source),
+    ]);
+    let peer = write_grep_owner(
+        temp.path(),
+        "pagination-owner",
+        binary,
+        &[(tape_a, &events_a), (tape_b, &events_b)],
+    );
+    for (tape_id, events) in [(tape_a, &events_a), (tape_b, &events_b)] {
+        ingest_owner_test_tape(temp.path(), "pagination-owner", tape_id, events, &[]);
+    }
+
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "pagination-caller",
+        "{\"t\":\"2026-09-25T09:00:00Z\",\"k\":\"note\",\"content\":\"empty\"}\n",
+    );
+    std::fs::write(repo.join(file), &source).expect("write pagination target");
+    set_peer_topology(&caller_home, json!({"pagination-owner":peer}));
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "explain",
+            file,
+            "--peers",
+            "pagination-owner",
+            "--limit",
+            "1",
+            "--require-complete",
+        ])
+        .output()
+        .expect("run strict paginated explain with complete sources");
+    assert!(
+        output.status.success(),
+        "pagination alone must not fail strict explain: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("explain JSON");
+    assert_eq!(result["federation"]["coverage"], "complete");
+    assert_eq!(result["returned"], 1);
+    assert_eq!(result["total"], 2);
+    assert_eq!(result["truncated"], true);
+    assert_eq!(result["sessions"].as_array().unwrap().len(), 1);
+    assert!(result["dispatch_unresolved"].as_array().unwrap().is_empty());
 }
 
 #[test]

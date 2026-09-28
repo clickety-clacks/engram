@@ -1272,6 +1272,7 @@ fn collect_federated_dispatch(
                     break;
                 }
                 if !current_history.complete {
+                    *peer_failed = true;
                     let missing = current_history.missing.clone();
                     if unresolved_seen.insert((
                         current_store.clone(),
@@ -1522,6 +1523,7 @@ fn collect_federated_dispatch(
                     };
                     if !history.complete {
                         candidate_partial = true;
+                        *peer_failed = true;
                         if unresolved_seen.insert((
                             store.clone(),
                             tape_id.clone(),
@@ -1721,6 +1723,7 @@ fn collect_federated_dispatch(
                                     }
                                     Ok(context_history) => {
                                         candidate_partial = true;
+                                        *peer_failed = true;
                                         if unresolved_seen.insert((
                                             store.clone(),
                                             context_history.tip.clone(),
@@ -6026,7 +6029,10 @@ fn cmd_explain_with_peers_inner(
         context.explain_default_limit,
     );
     if any_peer_failure && args.require_complete {
-        return Err(explain_require_complete_error(&sources));
+        return Err(explain_require_complete_error(
+            &sources,
+            &dispatch_unresolved,
+        ));
     }
     let no_results = sessions.is_empty() && tombstones.is_empty() && lineage.is_empty();
     let complete = !any_peer_failure;
@@ -7311,13 +7317,16 @@ fn format_peer_error_value(error: &Value) -> String {
     format!("{code}: {message}")
 }
 
-fn explain_require_complete_error(source_rows: &[Value]) -> CliError {
-    let failures = source_rows
+fn explain_require_complete_error(source_rows: &[Value], unresolved_rows: &[Value]) -> CliError {
+    let mut failures = source_rows
         .iter()
         .filter_map(format_source_failure)
         .collect::<Vec<_>>();
+    if let Some(history_failures) = format_dispatch_history_failures(unresolved_rows) {
+        failures.push(history_failures);
+    }
     let detail = if failures.is_empty() {
-        "one or more selected sources did not complete".to_string()
+        "one or more selected sources or dispatch histories did not complete".to_string()
     } else {
         failures.join("; ")
     };
@@ -7325,6 +7334,71 @@ fn explain_require_complete_error(source_rows: &[Value]) -> CliError {
         "incomplete_results",
         format!("explain --require-complete rejected incomplete coverage: {detail}"),
     )
+}
+
+fn format_dispatch_history_failures(unresolved_rows: &[Value]) -> Option<String> {
+    let findings = unresolved_rows
+        .iter()
+        .filter(|row| {
+            row.get("reason").and_then(Value::as_str) == Some("history_incomplete")
+                && (row.get("phase").and_then(Value::as_str) == Some("dispatch_history")
+                    || row.get("code").and_then(Value::as_str) == Some("history_incomplete")
+                    || row.get("missing").is_some()
+                    || row.get("message").is_some())
+        })
+        .map(|row| {
+            let store = row
+                .get("session_location")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown store");
+            let session = row
+                .get("session")
+                .and_then(Value::as_str)
+                .or_else(|| row.get("received_session").and_then(Value::as_str))
+                .unwrap_or("unknown session");
+            let phase = row
+                .get("phase")
+                .and_then(Value::as_str)
+                .unwrap_or("dispatch_history");
+            let code = row
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("history_incomplete");
+            let missing = row
+                .get("missing")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| value.to_string())
+                })
+                .map(|value| format!(" missing={value}"))
+                .unwrap_or_default();
+            let message = row
+                .get("message")
+                .and_then(Value::as_str)
+                .map(|message| format!(" message={message}"))
+                .unwrap_or_default();
+            format!(
+                "{store} phase={phase} code={code} session={session}{missing}{message}"
+            )
+        })
+        .collect::<Vec<_>>();
+    if findings.is_empty() {
+        return None;
+    }
+
+    let shown = findings.iter().take(3).cloned().collect::<Vec<_>>();
+    let omitted = findings.len().saturating_sub(shown.len());
+    let details = if omitted == 0 {
+        shown.join("; ")
+    } else {
+        format!("{}; {omitted} more", shown.join("; "))
+    };
+    Some(format!(
+        "{} incomplete dispatch history record(s): {details}",
+        findings.len()
+    ))
 }
 
 fn peer_operation_timeout(owner: &RemoteOwner, query_deadline: Instant) -> Duration {
@@ -8127,15 +8201,18 @@ mod tests {
 
     #[test]
     fn explain_require_complete_error_names_source_phase_code_and_reason() {
-        let error = explain_require_complete_error(&[json!({
-            "store": "eezo/default",
-            "status": "failed",
-            "phase": "locate_tapes",
-            "error": {
-                "code": "protocol_error",
-                "message": "peer omitted one or more requested tape locations",
-            },
-        })]);
+        let error = explain_require_complete_error(
+            &[json!({
+                "store": "eezo/default",
+                "status": "failed",
+                "phase": "locate_tapes",
+                "error": {
+                    "code": "protocol_error",
+                    "message": "peer omitted one or more requested tape locations",
+                },
+            })],
+            &[],
+        );
 
         assert_eq!(error.code, "incomplete_results");
         assert!(error.message.contains("eezo/default"));
@@ -8146,6 +8223,27 @@ mod tests {
                 .message
                 .contains("peer omitted one or more requested tape locations")
         );
+    }
+
+    #[test]
+    fn explain_require_complete_error_names_source_ok_history_gap() {
+        let error = explain_require_complete_error(
+            &[json!({"store":"eezo/default","status":"ok"})],
+            &[json!({
+                "reason":"history_incomplete",
+                "session":"sender-with-gap",
+                "session_location":"eezo/default",
+                "missing":"deleted-predecessor-segment",
+            })],
+        );
+
+        assert_eq!(error.code, "incomplete_results");
+        assert!(error.message.contains("eezo/default"));
+        assert!(error.message.contains("phase=dispatch_history"));
+        assert!(error.message.contains("code=history_incomplete"));
+        assert!(error.message.contains("session=sender-with-gap"));
+        assert!(error.message.contains("missing=deleted-predecessor-segment"));
+        assert!(!error.message.contains("source did not complete"));
     }
 
     #[test]
