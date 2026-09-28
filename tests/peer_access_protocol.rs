@@ -2617,16 +2617,20 @@ fn explain_peers_reports_missing_segment_and_missing_tape_without_dropping_sessi
         String::from_utf8_lossy(&output.stderr)
     );
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("explain JSON");
-    assert_eq!(value["federation"]["coverage"], "complete");
-    for store in ["sender-owner/default", "receiver-owner/default"] {
-        let source = value["federation"]["sources"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|source| source["store"] == store)
-            .expect("selected source");
-        assert_eq!(source["status"], "ok");
-    }
+    assert_eq!(value["federation"]["coverage"], "partial");
+    let receiver_source = value["federation"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["store"] == "receiver-owner/default")
+        .expect("receiver source");
+    assert_eq!(receiver_source["status"], "failed");
+    assert_eq!(receiver_source["phase"], "tape_facts");
+    assert_eq!(receiver_source["error"]["code"], "tape_unavailable");
+    assert_eq!(
+        receiver_source["error"]["message"],
+        "tape is not present in this export"
+    );
     assert!(value["dispatch_lineage"].as_array().unwrap().is_empty());
     assert!(
         value["sessions"]
@@ -2672,24 +2676,18 @@ fn explain_peers_reports_missing_segment_and_missing_tape_without_dropping_sessi
         ])
         .output()
         .expect("run require-complete explain with incomplete dispatch history");
+    assert!(!required.status.success());
+    assert!(required.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&required.stderr);
+    assert!(stderr.contains("incomplete_results"), "{stderr}");
+    assert!(stderr.contains("receiver-owner/default"), "{stderr}");
+    assert!(stderr.contains("phase=tape_facts"), "{stderr}");
+    assert!(stderr.contains("tape_unavailable"), "{stderr}");
+    assert!(stderr.contains("tape is not present in this export"), "{stderr}");
     assert!(
-        required.status.success(),
-        "a broken voluntary link should not fail strict query completion: {}",
-        String::from_utf8_lossy(&required.stderr)
+        !stderr.contains("deleted-predecessor-segment"),
+        "optional history must not be reported as the strict failure: {stderr}"
     );
-    let strict: serde_json::Value =
-        serde_json::from_slice(&required.stdout).expect("strict explain JSON");
-    assert_eq!(strict["federation"]["coverage"], "complete");
-    let strict_unresolved = strict["dispatch_unresolved"].as_array().unwrap();
-    assert!(strict_unresolved.iter().any(|row| {
-        row["reason"] == "history_incomplete"
-            && row["session_location"] == "receiver-owner/default"
-            && row["session"] == missing_predecessor_id
-            && row["missing"] == "deleted-predecessor-segment"
-    }));
-    assert!(strict_unresolved.iter().any(|row| {
-        row["reason"] == "tape_unavailable" && row["session"] == missing_tape_id
-    }));
 }
 
 #[test]
@@ -2711,23 +2709,42 @@ fn explain_require_complete_keeps_candidate_only_incomplete_history_best_effort(
         json!({"t":"2026-09-25T10:00:00Z","k":"meta","model":"peer-test","ingest_continuation":{"previous_tape_id":"deleted-sender-predecessor"}}),
         json!({"t":"2026-09-25T10:01:00Z","k":"msg.out","content":format!("<engram-src id=\"{uuid}\"/>")}),
     ]);
+    let missing_sender_tape = "sender-with-missing-file";
+    let missing_sender_events = jsonl(&[
+        json!({"t":"2026-09-25T10:02:00Z","k":"meta","model":"peer-test"}),
+        json!({"t":"2026-09-25T10:03:00Z","k":"msg.out","content":format!("<engram-src id=\"{uuid}\"/>")}),
+    ]);
     let mut sender = write_grep_owner(
         temp.path(),
         "sender-owner",
         binary,
-        &[(sender_tape, &sender_events)],
+        &[
+            (sender_tape, &sender_events),
+            (missing_sender_tape, &missing_sender_events),
+        ],
     );
-    ingest_owner_test_tape(
-        temp.path(),
-        "sender-owner",
-        sender_tape,
-        &sender_events,
-        &[DispatchLink {
-            uuid: uuid.into(),
-            first_turn_index: 0,
-            direction: DispatchDirection::Sent,
-        }],
-    );
+    for (tape_id, events) in [
+        (sender_tape, &sender_events),
+        (missing_sender_tape, &missing_sender_events),
+    ] {
+        ingest_owner_test_tape(
+            temp.path(),
+            "sender-owner",
+            tape_id,
+            events,
+            &[DispatchLink {
+                uuid: uuid.into(),
+                first_turn_index: 0,
+                direction: DispatchDirection::Sent,
+            }],
+        );
+    }
+    std::fs::remove_file(
+        temp.path()
+            .join("sender-owner-home/.engram/tapes")
+            .join(format!("{missing_sender_tape}.jsonl.zst")),
+    )
+    .expect("remove indexed sender tape file");
 
     let receiver_tape = "complete-receiver-edit";
     let receiver_events = jsonl(&[
@@ -2797,6 +2814,11 @@ fn explain_require_complete_keeps_candidate_only_incomplete_history_best_effort(
             && row["missing"] == "deleted-sender-predecessor"
     }));
     assert!(value["dispatch_unresolved"].as_array().unwrap().iter().any(|row| {
+        row["reason"] == "tape_unavailable"
+            && row["session_location"] == "sender-owner/default"
+            && row["session"] == missing_sender_tape
+    }));
+    assert!(value["dispatch_unresolved"].as_array().unwrap().iter().any(|row| {
         row["uuid"] == uuid
             && row["reason"] == "history_incomplete"
             && row["selection_coverage"] == "partial"
@@ -2827,6 +2849,11 @@ fn explain_require_complete_keeps_candidate_only_incomplete_history_best_effort(
             && row["session_location"] == "sender-owner/default"
             && row["session"] == sender_tape
             && row["missing"] == "deleted-sender-predecessor"
+    }));
+    assert!(strict["dispatch_unresolved"].as_array().unwrap().iter().any(|row| {
+        row["reason"] == "tape_unavailable"
+            && row["session_location"] == "sender-owner/default"
+            && row["session"] == missing_sender_tape
     }));
     assert!(strict["dispatch_unresolved"].as_array().unwrap().iter().any(|row| {
         row["uuid"] == uuid
