@@ -1,6 +1,7 @@
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{BufRead, BufReader, Read};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 use serde::Deserializer;
@@ -840,29 +841,32 @@ where
     if tasks.is_empty() {
         return Ok(0);
     }
-    // Four workers captured most of the measured parallel scan benefit while
-    // keeping simultaneous per-tape decompression bounded.
-    let worker_count = std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
-        .max(1)
-        .min(MAX_GREP_SCAN_WORKERS)
-        .min(tasks.len());
+    let worker_count = grep_scan_worker_count(tasks.len());
+    // Keep at most one extra worker-width of ordered results and active work
+    // outstanding. This lets idle workers refill around a slow early tape,
+    // while decompression concurrency and retained summaries remain bounded.
+    let max_unconsumed = worker_count.saturating_mul(2);
 
     std::thread::scope(|scope| {
         let (job_tx, job_rx) = mpsc::sync_channel::<usize>(worker_count);
         let job_rx = Arc::new(Mutex::new(job_rx));
         let (result_tx, result_rx) = mpsc::sync_channel::<(usize, R)>(worker_count);
+        let cancelled = Arc::new(AtomicBool::new(false));
         for _ in 0..worker_count {
             let job_rx = Arc::clone(&job_rx);
             let result_tx = result_tx.clone();
+            let cancelled = Arc::clone(&cancelled);
             let scan = &scan;
             scope.spawn(move || {
                 loop {
                     let next = job_rx.lock().expect("grep job receiver lock").recv();
                     let Ok(index) = next else { break };
+                    if cancelled.load(Ordering::Relaxed) {
+                        break;
+                    }
                     let result = scan(&tasks[index]);
-                    if result_tx.send((index, result)).is_err() {
+                    if cancelled.load(Ordering::Relaxed) || result_tx.send((index, result)).is_err()
+                    {
                         break;
                     }
                 }
@@ -870,30 +874,68 @@ where
         }
         drop(result_tx);
 
-        let mut start = 0usize;
-        while start < tasks.len() {
-            let end = start.saturating_add(worker_count).min(tasks.len());
-            for index in start..end {
-                job_tx.send(index).expect("grep worker pool is alive");
+        let mut next_to_dispatch = 0usize;
+        let mut next_to_consume = 0usize;
+        let mut in_flight = 0usize;
+        let mut completed = BTreeMap::new();
+        while next_to_consume < tasks.len() {
+            while next_to_dispatch < tasks.len()
+                && in_flight < worker_count
+                && next_to_dispatch.saturating_sub(next_to_consume) < max_unconsumed
+            {
+                job_tx
+                    .send(next_to_dispatch)
+                    .expect("grep worker pool is alive");
+                next_to_dispatch += 1;
+                in_flight += 1;
             }
-            let mut completed = Vec::with_capacity(end - start);
-            for _ in start..end {
-                completed.push(result_rx.recv().expect("grep worker returned a result"));
+
+            let (index, result) = result_rx.recv().expect("grep worker returned a result");
+            in_flight = in_flight
+                .checked_sub(1)
+                .expect("grep worker returned a result that was not in flight");
+            assert!(
+                completed.insert(index, result).is_none(),
+                "grep worker returned a duplicate result"
+            );
+
+            while let Some(result) = completed.remove(&next_to_consume) {
+                if let Err(error) = consume(&tasks[next_to_consume], result) {
+                    cancelled.store(true, Ordering::Relaxed);
+                    drop(job_tx);
+                    return Err(error);
+                }
+                next_to_consume += 1;
             }
-            completed.sort_by_key(|(index, _)| *index);
-            for (index, result) in completed {
-                consume(&tasks[index], result)?;
-            }
-            start = end;
         }
         drop(job_tx);
         Ok(worker_count)
     })
 }
 
+fn grep_scan_worker_count(task_count: usize) -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .max(1)
+        .min(MAX_GREP_SCAN_WORKERS)
+        .min(task_count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Condvar;
+
+    #[derive(Default)]
+    struct ScanPoolGate {
+        first_released: bool,
+        replacement_started: bool,
+        replacement_started_before_release: bool,
+        task_one_finished: bool,
+        release_later_tasks: bool,
+        started: Vec<usize>,
+    }
 
     fn matches(line: &str, pattern: &str) -> bool {
         grep_line_matches(line, pattern).expect("valid event")
@@ -992,11 +1034,7 @@ mod tests {
         )
         .expect("parallel scan");
 
-        let expected_workers = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(1)
-            .min(MAX_GREP_SCAN_WORKERS)
-            .min(tasks.len());
+        let expected_workers = grep_scan_worker_count(tasks.len());
         assert_eq!(workers, expected_workers);
         assert_eq!(
             seen,
@@ -1005,5 +1043,146 @@ mod tests {
                 .map(|task| (*task, task * 2))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn parallel_scan_refills_around_a_skewed_first_tape_and_consumes_in_order() {
+        let tasks = (0usize..32).collect::<Vec<_>>();
+        let worker_count = grep_scan_worker_count(tasks.len());
+        if worker_count < 2 {
+            return;
+        }
+
+        let gate = Arc::new((Mutex::new(ScanPoolGate::default()), Condvar::new()));
+        let scan_gate = Arc::clone(&gate);
+        let consumed = Arc::new(Mutex::new(Vec::new()));
+        let scan_consumed = Arc::clone(&consumed);
+        let replacement_index = worker_count;
+        let task_count = tasks.len();
+
+        let runner = std::thread::spawn(move || {
+            scan_parallel_in_order(
+                &tasks,
+                |task| {
+                    let (state_lock, changed) = &*scan_gate;
+                    let mut state = state_lock.lock().expect("test gate lock");
+                    state.started.push(*task);
+                    if *task == 0 {
+                        while !state.first_released {
+                            state = changed.wait(state).expect("test gate wait");
+                        }
+                    }
+                    if *task == replacement_index {
+                        state.replacement_started = true;
+                        state.replacement_started_before_release = !state.first_released;
+                        changed.notify_all();
+                    }
+                    *task
+                },
+                |task, result| {
+                    assert_eq!(*task, result);
+                    scan_consumed.lock().expect("consumed lock").push(*task);
+                    Ok::<(), ()>(())
+                },
+            )
+        });
+
+        let (state_lock, changed) = &*gate;
+        let state = state_lock.lock().expect("test gate lock");
+        let (mut state, _) = changed
+            .wait_timeout_while(state, std::time::Duration::from_secs(2), |state| {
+                !state.replacement_started
+            })
+            .expect("test gate wait");
+        let refilled_before_release =
+            state.replacement_started && state.replacement_started_before_release;
+        state.first_released = true;
+        changed.notify_all();
+        drop(state);
+
+        let workers = runner.join().expect("scan runner").expect("parallel scan");
+        assert!(
+            refilled_before_release,
+            "a later tape should start before the slow first tape is released"
+        );
+        assert_eq!(workers, worker_count);
+        assert_eq!(
+            *consumed.lock().expect("consumed lock"),
+            (0..task_count).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parallel_scan_preserves_first_ordered_failure_and_stops_feeding_work() {
+        let tasks = (0usize..64).collect::<Vec<_>>();
+        let worker_count = grep_scan_worker_count(tasks.len());
+        let failure_index = if worker_count > 1 { 1 } else { 0 };
+        let gate = Arc::new((Mutex::new(ScanPoolGate::default()), Condvar::new()));
+        let scan_gate = Arc::clone(&gate);
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let scan_started = Arc::clone(&started);
+        let consumed = Arc::new(Mutex::new(Vec::new()));
+        let scan_consumed = Arc::clone(&consumed);
+
+        let result = scan_parallel_in_order(
+            &tasks,
+            |task| {
+                let (state_lock, changed) = &*scan_gate;
+                let mut state = state_lock.lock().expect("test gate lock");
+                state.started.push(*task);
+                scan_started.lock().expect("started lock").push(*task);
+                changed.notify_all();
+
+                match *task {
+                    0 if worker_count > 1 => {
+                        let (state, _) = changed
+                            .wait_timeout_while(state, std::time::Duration::from_secs(2), |state| {
+                                state.started.len() < worker_count || !state.task_one_finished
+                            })
+                            .expect("initial workers wait");
+                        assert!(state.started.len() >= worker_count);
+                        assert!(state.task_one_finished);
+                    }
+                    1 if worker_count > 1 => {
+                        state.task_one_finished = true;
+                        changed.notify_all();
+                    }
+                    index if index > failure_index => {
+                        let (state, _) = changed
+                            .wait_timeout_while(state, std::time::Duration::from_secs(2), |state| {
+                                !state.release_later_tasks
+                            })
+                            .expect("later worker release wait");
+                        assert!(state.release_later_tasks);
+                    }
+                    _ => {}
+                };
+                *task
+            },
+            |task, result| {
+                assert_eq!(*task, result);
+                scan_consumed.lock().expect("consumed lock").push(*task);
+                if *task == failure_index {
+                    let (state_lock, changed) = &*gate;
+                    state_lock
+                        .lock()
+                        .expect("test gate lock")
+                        .release_later_tasks = true;
+                    changed.notify_all();
+                    Err("first ordered failure")
+                } else {
+                    Ok(())
+                }
+            },
+        );
+
+        assert_eq!(result, Err("first ordered failure"));
+        assert_eq!(
+            *consumed.lock().expect("consumed lock"),
+            (0..=failure_index).collect::<Vec<_>>()
+        );
+        let started = started.lock().expect("started lock");
+        assert!(started.len() <= worker_count + 1);
+        assert!(started.iter().all(|index| *index <= worker_count));
     }
 }
