@@ -96,6 +96,7 @@ pub struct RemoteOwner {
     pub protocol: u64,
     pub schema: u64,
     pub query_semantics: u64,
+    pub features: HashSet<String>,
     pub limits: HashMap<String, u64>,
     pub exports: BTreeMap<String, Result<PeerExport, PeerFailure>>,
     client: PeerClient,
@@ -206,6 +207,23 @@ impl RemoteOwner {
             .and_then(Value::as_str)
             .ok_or_else(|| PeerFailure::new("protocol_error", "open response has no build id"))?
             .to_string();
+        let features = match response.stats.get("features") {
+            None => HashSet::new(),
+            Some(Value::Array(values)) => values
+                .iter()
+                .map(|value| {
+                    value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                        PeerFailure::new("protocol_error", "open feature entries must be strings")
+                    })
+                })
+                .collect::<Result<HashSet<_>, _>>()?,
+            Some(_) => {
+                return Err(PeerFailure::new(
+                    "protocol_error",
+                    "open features must be an array",
+                ));
+            }
+        };
         let limits = response
             .stats
             .get("limits")
@@ -344,6 +362,7 @@ impl RemoteOwner {
             protocol,
             schema,
             query_semantics,
+            features,
             limits,
             exports,
             client,

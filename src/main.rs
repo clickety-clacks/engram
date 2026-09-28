@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
+use engram::access::QUERY_FEATURE_EXACT_SPAN_EDIT_RANKING;
 use engram::access::client::{
     DEFAULT_DECOMPRESSED_BYTES_PER_TAPE, DEFAULT_READ_FILE_COMPRESSED_BYTES, PeerFailure,
     PeerRequest, PeerResponse, RemoteOwner, decode_base64_chunk,
@@ -37,9 +38,10 @@ use engram::query::format::MAX_QUERY_WINDOW_ANCHORS;
 use engram::query::format::{
     DateFilter, ExplainTarget, GrepRank, annotate_chain_fields, apply_session_truncation,
     build_chain_metadata, build_session_windows, classify_explain_target, collect_anchor_scores,
-    collect_touch_evidence, compact_event, compare_explain_sessions, compare_grep_sessions,
-    default_peek_anchor_line, derive_anchor_candidates, dispatch_ref_counts, edge_to_json,
-    emit_query_result, explain_across_indexes, extract_latest_timestamp_from_rows,
+    collect_touch_evidence, compact_event, compare_explain_sessions,
+    compare_explain_sessions_with_span_priority, compare_grep_sessions, default_peek_anchor_line,
+    derive_anchor_candidates, dispatch_ref_counts, edge_to_json, emit_query_result,
+    exact_span_edit_sessions, explain_across_indexes, extract_latest_timestamp_from_rows,
     format_sessions_for_agent, grep_line_matches, open_query_indexes, prepare_grep_scan,
     prepare_grep_scan_with_tape_ids, print_pretty_explain, read_file_span_variants,
     referenced_grep_tape_ids, run_grep_scan, session_matches_date_filter,
@@ -4877,13 +4879,14 @@ fn cmd_explain(
     let mut tombstones = Vec::new();
     let touched_anchors;
     let score_by_session;
+    let mut exact_edit_sessions = HashSet::new();
     #[cfg(feature = "t1772-proof")]
     let mut proof_direct_touches: Option<Value> = None;
     let date_filter = DateFilter::parse(args.since.as_deref(), args.until.as_deref())?;
 
     match target_kind {
         ExplainTarget::FileRange { file, start, end } => {
-            let span_texts = read_file_span_variants(&cwd.join(file), start, end)?;
+            let span_texts = read_file_span_variants(&cwd.join(&file), start, end)?;
             query_anchors = derive_anchor_candidates(&span_texts);
             let traversal = ExplainTraversal {
                 min_confidence: args.min_confidence,
@@ -4897,6 +4900,7 @@ fn cmd_explain(
             let touches =
                 collect_touch_evidence(&indexes, &result.direct, &result.touched_anchors)?;
             raw_sessions = build_session_windows(context, touches)?;
+            exact_edit_sessions.extend(exact_span_edit_sessions(&raw_sessions, &file, start, end));
             let (chain, dispatch_sessions, unresolved, ambiguous) =
                 collect_dispatch_upstream_sessions(context, &indexes, &raw_sessions)?;
             dispatch_lineage = chain;
@@ -5016,7 +5020,8 @@ fn cmd_explain(
     )?;
     sessions.retain(|session| session_matches_date_filter(session, &date_filter));
     annotate_chain_fields(&mut sessions, &dispatch_lineage);
-    sessions.sort_by(compare_explain_sessions);
+    sessions
+        .sort_by(|a, b| compare_explain_sessions_with_span_priority(a, b, &exact_edit_sessions));
     if sessions.is_empty() && tombstones.is_empty() && lineage.is_empty() {
         return Err(CliError::new("no_results", target));
     }
@@ -5129,6 +5134,11 @@ fn cmd_explain_with_peers_inner(
     cancelled: &Arc<AtomicBool>,
 ) -> Result<(), CliError> {
     let query_deadline = Instant::now() + PEER_QUERY_TIMEOUT;
+    let exact_span_target = match &target_kind {
+        ExplainTarget::FileRange { file, start, end } => Some((file.clone(), *start, *end)),
+        ExplainTarget::FileWhole { .. } | ExplainTarget::Literal(_) => None,
+    };
+    let mut exact_edit_sessions = HashSet::new();
     let home = home_dir()?;
     let topology = load_topology(&home)
         .map_err(|error| CliError::new("config_error", error.to_string()))?
@@ -5693,6 +5703,14 @@ fn cmd_explain_with_peers_inner(
     let local_touches =
         collect_local_federated_touches(&indexes, &local_stores, &query_anchors, &visited_anchors)?;
     let mut local_raw_sessions = build_session_windows(context, local_touches)?;
+    if let Some((file, start, end)) = exact_span_target.as_ref() {
+        exact_edit_sessions.extend(exact_span_edit_sessions(
+            &local_raw_sessions,
+            file,
+            *start,
+            *end,
+        ));
+    }
     for session in &mut local_raw_sessions {
         if let Some(tape_id) = session
             .get("tape_id")
@@ -5739,14 +5757,27 @@ fn cmd_explain_with_peers_inner(
                     .collect::<Vec<_>>();
                 edit_offsets.sort_unstable();
                 edit_offsets.dedup();
-                items.push(json!({
+                let mut item = json!({
                     "tape_id": tape_id,
                     "edit_offsets": edit_offsets,
                     "anchor_offsets": offsets,
                     "grep_filter": args.grep_filter,
                     "window_lines": context.peek_default_lines.max(1),
                     "include_digest": false,
-                }));
+                });
+                if owner
+                    .features
+                    .contains(QUERY_FEATURE_EXACT_SPAN_EDIT_RANKING)
+                    && let Some((file, start, end)) = exact_span_target.as_ref()
+                    && fragments.iter().any(|fragment| {
+                        fragment.get("kind").and_then(Value::as_str) == Some("edit")
+                            && fragment.get("file_path").and_then(Value::as_str)
+                                == Some(file.as_str())
+                    })
+                {
+                    item["rank_span"] = json!({"file": file, "start": start, "end": end});
+                }
+                items.push(item);
                 tape_ids.push(tape_id.clone());
             }
             for chunk in items.chunks(peer_item_cap(&owner)) {
@@ -5807,7 +5838,7 @@ fn cmd_explain_with_peers_inner(
                     );
                 }
                 Ok(response) => {
-                    for row in response.data {
+                    for mut row in response.data {
                         if row.get("store").and_then(Value::as_str) != Some(store.as_str()) {
                             any_peer_failure = true;
                             mark_source_phase(
@@ -5850,6 +5881,14 @@ fn cmd_explain_with_peers_inner(
                                     code,
                                     message,
                                 );
+                            }
+                            if row.get("status").and_then(Value::as_str) == Some("ok")
+                                && row.get("span_edit_match").and_then(Value::as_bool) == Some(true)
+                            {
+                                exact_edit_sessions.insert(tape_id.to_string());
+                            }
+                            if let Some(fields) = row.as_object_mut() {
+                                fields.remove("span_edit_match");
                             }
                             remote_facts.insert((store.clone(), tape_id.to_string()), row);
                         } else if let Some(tape_id) = row.get("tape_id").and_then(Value::as_str) {
@@ -5987,7 +6026,8 @@ fn cmd_explain_with_peers_inner(
     sessions.extend(dispatch.remote_parent_sessions);
     sessions.retain(|session| session_matches_date_filter(session, &date_filter));
     annotate_chain_fields(&mut sessions, &dispatch_lineage);
-    sessions.sort_by(compare_explain_sessions);
+    sessions
+        .sort_by(|a, b| compare_explain_sessions_with_span_priority(a, b, &exact_edit_sessions));
 
     let mut tombstones = Vec::new();
     if args.include_deleted {
