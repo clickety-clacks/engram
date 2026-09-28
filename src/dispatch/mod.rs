@@ -341,6 +341,7 @@ pub fn local_tape_facts(
             })
         })
         .collect::<Vec<_>>();
+    let dispatch_event_times = first_dispatch_event_times(&rows, turns);
     let recovery_binding = locator.map(|locator| {
         json!({
             "verified":true,
@@ -371,6 +372,7 @@ pub fn local_tape_facts(
         "unresolved_predecessor":unresolved_predecessor,
         "edit_offset_to_turn":edit_offset_to_turn,
         "turn_to_offset":turn_to_offset,
+        "dispatch_event_times":dispatch_event_times,
         "recovery_binding":recovery_binding,
         "digest":digest,
     }))
@@ -563,6 +565,155 @@ pub(crate) fn message_turn_to_event_offset(rows: &[TapeRow], turn_index: i64) ->
         }
     }
     None
+}
+
+/// Return the exact event row for each first dispatch occurrence whose turn was
+/// requested. The turn is segment-local; callers use the segment metadata to
+/// validate its global turn. In particular, a tool-call marker's timestamp and
+/// offset come from the tool-call event, not the adjacent message row.
+pub(crate) fn first_dispatch_event_times(rows: &[TapeRow], turns: &[i64]) -> Vec<Value> {
+    #[derive(Clone)]
+    struct Occurrence {
+        turn: i64,
+        direction: DispatchDirection,
+        timestamp: Option<String>,
+        event_offset: u64,
+    }
+
+    fn record_first(first: &mut HashMap<String, Occurrence>, uuid: String, occurrence: Occurrence) {
+        let replace = match first.get(&uuid) {
+            None => true,
+            Some(seen) => {
+                occurrence.turn < seen.turn
+                    || (occurrence.turn == seen.turn
+                        && seen.direction == DispatchDirection::Sent
+                        && occurrence.direction == DispatchDirection::Received)
+            }
+        };
+        if replace {
+            first.insert(uuid, occurrence);
+        }
+    }
+
+    let mut turn_index = 0_i64;
+    let mut last_message_timestamp = None::<String>;
+    let mut first = HashMap::<String, Occurrence>::new();
+
+    for row in rows {
+        let timestamp = row
+            .value
+            .get("t")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        if row.value["k"] == "meta" {
+            last_message_timestamp = row.value["ingest_continuation"]["last_message_timestamp"]
+                .as_str()
+                .map(ToOwned::to_owned);
+        }
+        if row.value["type"] == "response_item"
+            && matches!(
+                row.value["payload"]["type"].as_str(),
+                Some("custom_tool_call" | "function_call")
+            )
+        {
+            let mut uuids = HashSet::new();
+            for key in ["input", "arguments"] {
+                collect_dispatch_uuids_anywhere(&row.value["payload"][key], &mut uuids);
+            }
+            for uuid in uuids {
+                record_first(
+                    &mut first,
+                    uuid,
+                    Occurrence {
+                        turn: turn_index,
+                        direction: DispatchDirection::Sent,
+                        timestamp: timestamp.clone(),
+                        event_offset: row.offset,
+                    },
+                );
+            }
+        }
+        if row.value.get("k").and_then(Value::as_str) == Some("tool.call") {
+            let mut uuids = HashSet::new();
+            if let Some(args) = row.value.get("args") {
+                collect_dispatch_uuids_anywhere(args, &mut uuids);
+            }
+            let timestamp_text = timestamp.as_deref().unwrap_or("");
+            let dispatch_turn = if last_message_timestamp.as_deref() == Some(timestamp_text) {
+                turn_index.saturating_sub(1)
+            } else {
+                turn_index
+            };
+            for uuid in uuids {
+                record_first(
+                    &mut first,
+                    uuid,
+                    Occurrence {
+                        turn: dispatch_turn,
+                        direction: DispatchDirection::Sent,
+                        timestamp: timestamp.clone(),
+                        event_offset: row.offset,
+                    },
+                );
+            }
+        }
+        for message in extract_message_objects(&row.value) {
+            let mut native_user;
+            let message = if row.value["type"] == "user" {
+                native_user = message.clone();
+                if let Some(blocks) = native_user["content"].as_array_mut() {
+                    blocks.retain(|block| block["type"] != "tool_result");
+                }
+                &native_user
+            } else {
+                message
+            };
+            for (uuid, direction) in extract_dispatch_direction_by_uuid(message) {
+                record_first(
+                    &mut first,
+                    uuid,
+                    Occurrence {
+                        turn: turn_index,
+                        direction,
+                        timestamp: timestamp.clone(),
+                        event_offset: row.offset,
+                    },
+                );
+            }
+            turn_index += 1;
+        }
+        if is_message_row(&row.value) {
+            last_message_timestamp = Some(timestamp.unwrap_or_default());
+        }
+    }
+
+    let requested = turns.iter().copied().collect::<HashSet<_>>();
+    let mut events = first
+        .into_iter()
+        .filter(|(_, occurrence)| {
+            occurrence.direction == DispatchDirection::Sent && requested.contains(&occurrence.turn)
+        })
+        .map(|(uuid, occurrence)| {
+            json!({
+                "uuid":uuid,
+                "direction":"sent",
+                "turn":occurrence.turn,
+                "timestamp":occurrence.timestamp,
+                "event_offset":occurrence.event_offset,
+            })
+        })
+        .collect::<Vec<_>>();
+    events.sort_by(|left, right| {
+        left.get("turn")
+            .and_then(Value::as_i64)
+            .cmp(&right.get("turn").and_then(Value::as_i64))
+            .then_with(|| {
+                left.get("uuid")
+                    .and_then(Value::as_str)
+                    .cmp(&right.get("uuid").and_then(Value::as_str))
+            })
+    });
+    events
 }
 
 pub(crate) fn is_message_row(value: &Value) -> bool {

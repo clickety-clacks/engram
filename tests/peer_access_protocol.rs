@@ -828,6 +828,15 @@ fn jsonl(events: &[serde_json::Value]) -> String {
         + "\n"
 }
 
+fn dispatch_call_event(timestamp: &str, uuid: &str, command: &str) -> serde_json::Value {
+    json!({
+        "t":timestamp,
+        "k":"tool.call",
+        "tool":"exec_command",
+        "args":{"cmd":format!("{command} <engram-src id=\"{uuid}\"/>")},
+    })
+}
+
 fn canonical_tape_address_path(path: &Path) -> PathBuf {
     let parent = path
         .parent()
@@ -1927,9 +1936,14 @@ fn explain_peers_folds_a_remote_received_marker_to_one_local_sender() {
     drop(owner_index);
 
     let sender_tape = "local-sender-tape";
-    let sender_events = format!(
-        "{{\"t\":\"2026-09-25T11:00:00Z\",\"k\":\"meta\",\"model\":\"local-test\"}}\n{{\"t\":\"2026-09-25T11:01:00Z\",\"k\":\"msg.out\",\"content\":\"<engram-src id=\\\"{uuid}\\\"/>\"}}\n"
-    );
+    let sender_events = jsonl(&[
+        json!({"t":"2026-09-25T11:00:00Z","k":"meta","model":"local-test"}),
+        dispatch_call_event(
+            "2026-09-25T11:01:00Z",
+            uuid,
+            "tightbeam dispatch --subject local-to-remote",
+        ),
+    ]);
     let (caller_home, repo) = write_local_grep_source(temp.path(), sender_tape, &sender_events);
     let caller_db = repo.join(".engram/index.sqlite");
     let caller_index = SqliteIndex::open_writer(caller_db.to_str().expect("caller DB path"))
@@ -1998,7 +2012,11 @@ fn explain_peers_finds_two_sided_handoff_when_querier_holds_neither_endpoint() {
     let sender_id = "machine-a-sender";
     let sender_events = jsonl(&[
         json!({"t":"2026-09-25T11:00:00Z","k":"meta","model":"peer-test"}),
-        json!({"t":"2026-09-25T11:01:00Z","k":"msg.out","content":format!("<engram-src id=\"{uuid}\"/>")}),
+        dispatch_call_event(
+            "2026-09-25T11:01:00Z",
+            uuid,
+            "tightbeam dispatch --subject machine-a-to-machine-b",
+        ),
     ]);
     let receiver_id = "machine-b-receiver";
     let receiver_events = jsonl(&[
@@ -2205,7 +2223,11 @@ fn explain_peers_follows_three_machine_chain_and_excludes_sibling_receiver() {
     let a_id = "machine-a-origin";
     let a_events = jsonl(&[
         json!({"t":"2026-09-25T10:00:00Z","k":"meta","model":"peer-test"}),
-        json!({"t":"2026-09-25T10:01:00Z","k":"msg.out","content":format!("<engram-src id=\"{first_uuid}\"/>")}),
+        dispatch_call_event(
+            "2026-09-25T10:01:00Z",
+            first_uuid,
+            "tightbeam dispatch --subject origin-to-middle",
+        ),
     ]);
     let mut a = write_grep_owner(temp.path(), "machine-a", binary, &[(a_id, &a_events)]);
     ingest_owner_test_tape(
@@ -2224,7 +2246,11 @@ fn explain_peers_follows_three_machine_chain_and_excludes_sibling_receiver() {
     let b_events = jsonl(&[
         json!({"t":"2026-09-25T11:00:00Z","k":"meta","model":"peer-test"}),
         json!({"t":"2026-09-25T11:01:00Z","k":"msg.in","content":format!("<engram-src id=\"{first_uuid}\"/>")}),
-        json!({"t":"2026-09-25T11:02:00Z","k":"msg.out","content":format!("<engram-src id=\"{second_uuid}\"/>")}),
+        dispatch_call_event(
+            "2026-09-25T11:02:00Z",
+            second_uuid,
+            "tightbeam dispatch --subject middle-to-receiver",
+        ),
     ]);
     let sibling_id = "machine-b-sibling";
     let sibling_events = jsonl(&[
@@ -2527,7 +2553,11 @@ fn explain_peers_reports_missing_segment_and_missing_tape_without_dropping_sessi
     let sender_id = "complete-sender";
     let sender_events = jsonl(&[
         json!({"t":"2026-09-25T10:00:00Z","k":"meta","model":"peer-test"}),
-        json!({"t":"2026-09-25T10:01:00Z","k":"msg.out","content":format!("<engram-src id=\"{uuid}\"/>")}),
+        dispatch_call_event(
+            "2026-09-25T10:01:00Z",
+            uuid,
+            "tightbeam dispatch --subject complete-sender",
+        ),
     ]);
     let mut sender = write_grep_owner(
         temp.path(),
@@ -2683,7 +2713,10 @@ fn explain_peers_reports_missing_segment_and_missing_tape_without_dropping_sessi
     assert!(stderr.contains("receiver-owner/default"), "{stderr}");
     assert!(stderr.contains("phase=tape_facts"), "{stderr}");
     assert!(stderr.contains("tape_unavailable"), "{stderr}");
-    assert!(stderr.contains("tape is not present in this export"), "{stderr}");
+    assert!(
+        stderr.contains("tape is not present in this export"),
+        "{stderr}"
+    );
     assert!(
         !stderr.contains("deleted-predecessor-segment"),
         "optional history must not be reported as the strict failure: {stderr}"
@@ -2707,12 +2740,20 @@ fn explain_require_complete_keeps_candidate_only_incomplete_history_best_effort(
     let sender_tape = "sender-with-missing-predecessor";
     let sender_events = jsonl(&[
         json!({"t":"2026-09-25T10:00:00Z","k":"meta","model":"peer-test","ingest_continuation":{"previous_tape_id":"deleted-sender-predecessor"}}),
-        json!({"t":"2026-09-25T10:01:00Z","k":"msg.out","content":format!("<engram-src id=\"{uuid}\"/>")}),
+        dispatch_call_event(
+            "2026-09-25T10:01:00Z",
+            uuid,
+            "tightbeam dispatch --subject incomplete-history",
+        ),
     ]);
     let missing_sender_tape = "sender-with-missing-file";
     let missing_sender_events = jsonl(&[
         json!({"t":"2026-09-25T10:02:00Z","k":"meta","model":"peer-test"}),
-        json!({"t":"2026-09-25T10:03:00Z","k":"msg.out","content":format!("<engram-src id=\"{uuid}\"/>")}),
+        dispatch_call_event(
+            "2026-09-25T10:03:00Z",
+            uuid,
+            "tightbeam dispatch --subject unavailable-tape",
+        ),
     ]);
     let mut sender = write_grep_owner(
         temp.path(),
@@ -2805,24 +2846,42 @@ fn explain_require_complete_keeps_candidate_only_incomplete_history_best_effort(
             .expect("selected source");
         assert_eq!(source["status"], "ok");
     }
-    assert!(value["dispatch_unresolved"].as_array().unwrap().iter().any(|row| {
-        row["reason"] == "history_incomplete"
-            && row["phase"] == "dispatch_history"
-            && row["code"] == "history_incomplete"
-            && row["session_location"] == "sender-owner/default"
-            && row["session"] == sender_tape
-            && row["missing"] == "deleted-sender-predecessor"
-    }));
-    assert!(value["dispatch_unresolved"].as_array().unwrap().iter().any(|row| {
-        row["reason"] == "tape_unavailable"
-            && row["session_location"] == "sender-owner/default"
-            && row["session"] == missing_sender_tape
-    }));
-    assert!(value["dispatch_unresolved"].as_array().unwrap().iter().any(|row| {
-        row["uuid"] == uuid
-            && row["reason"] == "history_incomplete"
-            && row["selection_coverage"] == "partial"
-    }));
+    assert!(
+        value["dispatch_unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| {
+                row["reason"] == "history_incomplete"
+                    && row["phase"] == "dispatch_history"
+                    && row["code"] == "history_incomplete"
+                    && row["session_location"] == "sender-owner/default"
+                    && row["session"] == sender_tape
+                    && row["missing"] == "deleted-sender-predecessor"
+            })
+    );
+    assert!(
+        value["dispatch_unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| {
+                row["reason"] == "tape_unavailable"
+                    && row["session_location"] == "sender-owner/default"
+                    && row["session"] == missing_sender_tape
+            })
+    );
+    assert!(
+        value["dispatch_unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| {
+                row["uuid"] == uuid
+                    && row["reason"] == "history_incomplete"
+                    && row["selection_coverage"] == "partial"
+            })
+    );
 
     let required = Command::new(binary)
         .current_dir(&repo)
@@ -2844,22 +2903,40 @@ fn explain_require_complete_keeps_candidate_only_incomplete_history_best_effort(
     let strict: serde_json::Value =
         serde_json::from_slice(&required.stdout).expect("strict explain JSON");
     assert_eq!(strict["federation"]["coverage"], "complete");
-    assert!(strict["dispatch_unresolved"].as_array().unwrap().iter().any(|row| {
-        row["reason"] == "history_incomplete"
-            && row["session_location"] == "sender-owner/default"
-            && row["session"] == sender_tape
-            && row["missing"] == "deleted-sender-predecessor"
-    }));
-    assert!(strict["dispatch_unresolved"].as_array().unwrap().iter().any(|row| {
-        row["reason"] == "tape_unavailable"
-            && row["session_location"] == "sender-owner/default"
-            && row["session"] == missing_sender_tape
-    }));
-    assert!(strict["dispatch_unresolved"].as_array().unwrap().iter().any(|row| {
-        row["uuid"] == uuid
-            && row["reason"] == "history_incomplete"
-            && row["selection_coverage"] == "partial"
-    }));
+    assert!(
+        strict["dispatch_unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| {
+                row["reason"] == "history_incomplete"
+                    && row["session_location"] == "sender-owner/default"
+                    && row["session"] == sender_tape
+                    && row["missing"] == "deleted-sender-predecessor"
+            })
+    );
+    assert!(
+        strict["dispatch_unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| {
+                row["reason"] == "tape_unavailable"
+                    && row["session_location"] == "sender-owner/default"
+                    && row["session"] == missing_sender_tape
+            })
+    );
+    assert!(
+        strict["dispatch_unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| {
+                row["uuid"] == uuid
+                    && row["reason"] == "history_incomplete"
+                    && row["selection_coverage"] == "partial"
+            })
+    );
 }
 
 #[test]
@@ -2971,7 +3048,7 @@ fn explain_peers_reports_missing_sender_owner_without_inventing_a_hop() {
 }
 
 #[test]
-fn explain_peers_keeps_two_independent_remote_senders_ambiguous() {
+fn explain_peers_breaks_equal_sender_timestamps_deterministically() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = env!("CARGO_BIN_EXE_engram");
     let uuid = "523e4567-e89b-12d3-a456-426614174040";
@@ -2980,12 +3057,15 @@ fn explain_peers_keeps_two_independent_remote_senders_ambiguous() {
         "fn ambiguous_remote_edit() { let output = one + two; use_output(output); }\n".repeat(12);
     let before = source.replace("ambiguous_remote_edit", "before_ambiguous_remote_edit");
     let mut peers = serde_json::Map::new();
-    let mut senders = Vec::new();
     for machine in ["sender-alpha", "sender-beta"] {
         let tape_id = format!("{machine}-session");
         let events = jsonl(&[
             json!({"t":"2026-09-25T11:00:00Z","k":"meta","model":"peer-test"}),
-            json!({"t":"2026-09-25T11:01:00Z","k":"msg.out","content":format!("<engram-src id=\"{uuid}\"/>")}),
+            dispatch_call_event(
+                "2026-09-25T11:01:00Z",
+                uuid,
+                "tightbeam dispatch --subject equal-time-handoff",
+            ),
         ]);
         let peer = write_grep_owner(temp.path(), machine, binary, &[(tape_id.as_str(), &events)]);
         ingest_owner_test_tape(
@@ -3000,7 +3080,6 @@ fn explain_peers_keeps_two_independent_remote_senders_ambiguous() {
             }],
         );
         peers.insert(machine.into(), peer);
-        senders.push(tape_id);
     }
 
     let receiver_id = "ambiguous-receiver";
@@ -3044,26 +3123,265 @@ fn explain_peers_keeps_two_independent_remote_senders_ambiguous() {
     );
     assert!(
         output.status.success(),
-        "ambiguity query failed: {}",
+        "equal-timestamp sender query failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("explain JSON");
-    assert!(value["dispatch_lineage"].as_array().unwrap().is_empty());
-    let [ambiguity] = value["dispatch_ambiguous"].as_array().unwrap().as_slice() else {
-        panic!("expected one ambiguous marker: {value:#}");
+    assert!(value["dispatch_ambiguous"].as_array().unwrap().is_empty());
+    let [hop] = value["dispatch_lineage"].as_array().unwrap().as_slice() else {
+        panic!("expected one selected marker parent: {value:#}");
     };
-    assert_eq!(ambiguity["received_uuid"], uuid);
-    assert_eq!(ambiguity["received_session"], receiver_id);
-    let mut candidates = ambiguity["candidates"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|candidate| candidate["session"].as_str().unwrap().to_string())
-        .collect::<Vec<_>>();
-    candidates.sort();
-    let mut expected = senders;
-    expected.sort();
-    assert_eq!(candidates, expected);
+    assert_eq!(hop["received_uuid"], uuid);
+    assert_eq!(hop["session"], receiver_id);
+    assert_eq!(hop["parent_session"], "sender-alpha-session");
+    assert_eq!(hop["parent_sent_timestamp"], "2026-09-25T11:01:00Z");
+    let [also_mentioned] = hop["also_mentioned_by"].as_array().unwrap().as_slice() else {
+        panic!("expected the tied sender to remain visible: {hop:#}");
+    };
+    assert_eq!(also_mentioned["session"], "sender-beta-session");
+    assert_eq!(also_mentioned["reason"], "same_timestamp");
+}
+
+#[test]
+fn explain_peers_selects_earliest_global_sender_and_preserves_echoes_and_broken_links() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let uuid = "ccc7e8fa-6325-4110-98b5-95e5dffb6333";
+    let sender_genuine = "7078c947b533b4c6402e888e32e4832ad56368bf33b1a05baa63e27de4aca1a2";
+    let sender_quote_a = "1441e781777eadbf4e4ebd979499abcb451b871858c49a18aa5a43135e63ea98";
+    let sender_quote_b = "475031dd645495a5c092ca5e61f2560c76583d4bef829c6146954bd2e6ced16d";
+    let sender_report_echo = "bc6a3092eb436943deaafddf257189a52f0740b4365f26cff4d6a32cc62d0c11";
+    let receiver_id = "a17c63efd8f1e17cd89c584ef305618a25feac59f4df418af8dae32159bc0ff4";
+    let file = "quoted-dispatch.rs";
+    let source = "fn reported_dispatch_edit() { let value = first + second; use_value(value); }\n"
+        .repeat(12);
+    let before = source.replace("reported_dispatch_edit", "before_reported_dispatch_edit");
+
+    fn sender_tape(
+        uuid: &str,
+        turns: usize,
+        timestamp: &str,
+        command: &str,
+        missing_predecessor: Option<&str>,
+    ) -> (String, i64, u64) {
+        let mut meta = json!({
+            "t":"2026-09-28T13:30:00Z",
+            "k":"meta",
+            "model":"peer-test",
+            "ingest_continuation":{"message_turn_start":0},
+        });
+        if let Some(previous) = missing_predecessor {
+            meta["ingest_continuation"]["previous_tape_id"] = json!(previous);
+        }
+        let mut events = vec![meta];
+        events.extend((0..turns).map(|turn| {
+            json!({
+                "t":"2026-09-28T13:30:00Z",
+                "k":"msg.out",
+                "content":format!("assistant context {turn}"),
+            })
+        }));
+        let event_offset = events.len() as u64;
+        events.push(json!({
+            "t":timestamp,
+            "k":"tool.call",
+            "name":"exec_command",
+            "args":{"cmd":format!("{command} <engram-src id=\"{uuid}\"/>")},
+        }));
+        (jsonl(&events), turns as i64, event_offset)
+    }
+
+    let mut peers = serde_json::Map::new();
+    let sender_specs = [
+        (
+            "sender-gibson",
+            sender_genuine,
+            100,
+            "2026-09-28T13:38:51.535Z",
+            "tightbeam dispatch --subject handoff",
+            None,
+        ),
+        (
+            "sender-quote-a",
+            sender_quote_a,
+            100,
+            "2026-09-28T13:39:46.373Z",
+            "append captured conversation to report",
+            Some("6c330f1d95571b8a45d57aef06ce321f4430d8fee80ab4eb74049b213692a278"),
+        ),
+        (
+            "sender-quote-b",
+            sender_quote_b,
+            100,
+            "2026-09-28T14:38:08.517Z",
+            "summarize the quoted marker in report",
+            Some("b64eac946653daf5d8ed6dc62c1c14b6bc933dfc081c3d31eefc065c2f86f5e7"),
+        ),
+        (
+            "sender-report-echo",
+            sender_report_echo,
+            10,
+            "2026-09-28T20:16:02.116Z",
+            "write report containing transcript excerpt",
+            None,
+        ),
+    ];
+    let mut event_offsets = std::collections::HashMap::new();
+    for (machine, tape_id, turns, timestamp, command, missing) in sender_specs {
+        let (events, first_turn, event_offset) =
+            sender_tape(uuid, turns, timestamp, command, missing);
+        let owner = write_grep_owner(temp.path(), machine, binary, &[(tape_id, &events)]);
+        ingest_owner_test_tape(
+            temp.path(),
+            machine,
+            tape_id,
+            &events,
+            &[DispatchLink {
+                uuid: uuid.into(),
+                first_turn_index: first_turn,
+                direction: DispatchDirection::Sent,
+            }],
+        );
+        peers.insert(machine.into(), owner);
+        event_offsets.insert(tape_id, event_offset);
+    }
+
+    let mut receiver_events = vec![json!({
+        "t":"2026-09-28T20:20:00Z",
+        "k":"meta",
+        "model":"peer-test",
+        "ingest_continuation":{"message_turn_start":0},
+    })];
+    receiver_events.push(json!({
+        "t":"2026-09-28T20:20:01Z",
+        "k":"msg.in",
+        "content":format!("<engram-src id=\"{uuid}\"/>"),
+    }));
+    receiver_events.extend((0..1_682).map(|line| {
+        json!({"t":"2026-09-28T20:20:02Z","k":"note","content":format!("receiver context {line}")})
+    }));
+    assert_eq!(receiver_events.len(), 1_684);
+    receiver_events.push(edit_event(file, &before, &source));
+    assert_eq!(receiver_events[1_684]["k"], "code.edit");
+    let receiver_content = jsonl(&receiver_events);
+    let receiver_owner = write_grep_owner(
+        temp.path(),
+        "receiver-eezo",
+        binary,
+        &[(receiver_id, &receiver_content)],
+    );
+    ingest_owner_test_tape(
+        temp.path(),
+        "receiver-eezo",
+        receiver_id,
+        &receiver_content,
+        &[DispatchLink {
+            uuid: uuid.into(),
+            first_turn_index: 0,
+            direction: DispatchDirection::Received,
+        }],
+    );
+    peers.insert("receiver-eezo".into(), receiver_owner);
+
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "quoted-dispatch-caller",
+        "{\"t\":\"2026-09-28T20:00:00Z\",\"k\":\"note\",\"content\":\"no local edits\"}\n",
+    );
+    std::fs::write(repo.join(file), &source).expect("write query source");
+    set_peer_topology(&caller_home, serde_json::Value::Object(peers.clone()));
+    let peer_names = "sender-gibson,sender-quote-a,sender-quote-b,sender-report-echo,receiver-eezo";
+    let output = run_peer_explain(binary, &caller_home, &repo, file, peer_names);
+    assert!(
+        output.status.success(),
+        "best-effort query failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("explain JSON");
+    let [hop] = value["dispatch_lineage"].as_array().unwrap().as_slice() else {
+        panic!("expected one lineage hop: {value:#}");
+    };
+    assert_eq!(hop["received_uuid"], uuid);
+    assert_eq!(hop["session"], receiver_id);
+    assert_eq!(hop["parent_session"], sender_genuine);
+    assert_eq!(hop["parent_sent_turn_index"], 100);
+    assert_eq!(hop["parent_sent_timestamp"], "2026-09-28T13:38:51.535Z");
+    assert_eq!(hop["parent_event_offset"], event_offsets[sender_genuine]);
+    assert!(value["dispatch_ambiguous"].as_array().unwrap().is_empty());
+
+    let mentions = hop["also_mentioned_by"].as_array().unwrap();
+    let mention_for = |tape_id: &str| {
+        mentions
+            .iter()
+            .find(|mention| mention["session"] == tape_id)
+            .unwrap_or_else(|| panic!("missing mention for {tape_id}: {mentions:#?}"))
+    };
+    assert_eq!(mention_for(sender_report_echo)["reason"], "later_sender");
+    assert_eq!(
+        mention_for(sender_report_echo)["sent_timestamp"],
+        "2026-09-28T20:16:02.116Z"
+    );
+    let strict_broken_links = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["explain", file, "--peers", peer_names, "--require-complete"])
+        .output()
+        .expect("run strict query with only broken voluntary links");
+    assert!(
+        strict_broken_links.status.success(),
+        "broken voluntary links must remain best-effort under strict source coverage: {}",
+        String::from_utf8_lossy(&strict_broken_links.stderr)
+    );
+    for (tape_id, missing) in [
+        (
+            sender_quote_a,
+            "6c330f1d95571b8a45d57aef06ce321f4430d8fee80ab4eb74049b213692a278",
+        ),
+        (
+            sender_quote_b,
+            "b64eac946653daf5d8ed6dc62c1c14b6bc933dfc081c3d31eefc065c2f86f5e7",
+        ),
+    ] {
+        assert_eq!(mention_for(tape_id)["reason"], "history_incomplete");
+        assert_eq!(mention_for(tape_id)["missing"], missing);
+        assert!(
+            mention_for(tape_id)["location"]
+                .as_str()
+                .unwrap()
+                .ends_with("/default")
+        );
+    }
+    assert_eq!(
+        mention_for(sender_quote_a)["observed_sent_timestamp"],
+        "2026-09-28T13:39:46.373Z"
+    );
+    assert_eq!(
+        mention_for(sender_quote_b)["observed_sent_timestamp"],
+        "2026-09-28T14:38:08.517Z"
+    );
+
+    let mut peers_with_failure = peers;
+    peers_with_failure.insert(
+        "offline".into(),
+        json!({"command":["/bin/false"],"engram":binary,"exports":["default"]}),
+    );
+    set_peer_topology(&caller_home, serde_json::Value::Object(peers_with_failure));
+    let failed_strict = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "explain",
+            file,
+            "--peers",
+            "sender-gibson,sender-quote-a,sender-quote-b,sender-report-echo,receiver-eezo,offline",
+            "--require-complete",
+        ])
+        .output()
+        .expect("run strict query with an unavailable peer");
+    assert!(!failed_strict.status.success());
+    let stderr = String::from_utf8_lossy(&failed_strict.stderr);
+    assert!(stderr.contains("incomplete_results"), "{stderr}");
+    assert!(stderr.contains("offline/default"), "{stderr}");
 }
 
 #[test]
@@ -3082,7 +3400,11 @@ fn explain_peers_projects_two_remote_task_parents_for_one_session() {
         let tape_id = format!("{machine}-sender");
         let events = jsonl(&[
             json!({"t":"2026-09-25T10:00:00Z","k":"meta","model":"peer-test"}),
-            json!({"t":"2026-09-25T10:01:00Z","k":"msg.out","content":format!("<engram-src id=\"{uuid}\"/>")}),
+            dispatch_call_event(
+                "2026-09-25T10:01:00Z",
+                uuid,
+                "tightbeam dispatch --subject task-parent",
+            ),
         ]);
         let peer = write_grep_owner(temp.path(), machine, binary, &[(tape_id.as_str(), &events)]);
         ingest_owner_test_tape(
@@ -3199,7 +3521,11 @@ fn explain_peers_terminates_mutual_remote_dispatch_cycle() {
     let a_events = jsonl(&[
         json!({"t":"2026-09-25T12:00:00Z","k":"meta","model":"peer-test"}),
         json!({"t":"2026-09-25T12:01:00Z","k":"msg.in","content":format!("<engram-src id=\"{uuid_b}\"/>")}),
-        json!({"t":"2026-09-25T12:02:00Z","k":"msg.out","content":format!("<engram-src id=\"{uuid_a}\"/>")}),
+        dispatch_call_event(
+            "2026-09-25T12:02:00Z",
+            uuid_a,
+            "tightbeam dispatch --subject cycle-a-to-cycle-b",
+        ),
         a_edit,
     ]);
     let a = write_grep_owner(temp.path(), "cycle-a", binary, &[(a_id, &a_events)]);
@@ -3225,7 +3551,11 @@ fn explain_peers_terminates_mutual_remote_dispatch_cycle() {
     let b_events = jsonl(&[
         json!({"t":"2026-09-25T11:00:00Z","k":"meta","model":"peer-test"}),
         json!({"t":"2026-09-25T11:01:00Z","k":"msg.in","content":format!("<engram-src id=\"{uuid_a}\"/>")}),
-        json!({"t":"2026-09-25T11:02:00Z","k":"msg.out","content":format!("<engram-src id=\"{uuid_b}\"/>")}),
+        dispatch_call_event(
+            "2026-09-25T11:02:00Z",
+            uuid_b,
+            "tightbeam dispatch --subject cycle-b-to-cycle-a",
+        ),
     ]);
     let b = write_grep_owner(temp.path(), "cycle-b", binary, &[(b_id, &b_events)]);
     ingest_owner_test_tape(
@@ -5567,7 +5897,10 @@ fn grep_pages_a_large_real_peer_scan_with_complete_owner_attribution() {
             .expect("remote owner source");
         assert_eq!(remote_source["status"], "ok");
         assert_eq!(remote_source["grep_scan"]["total"], 60);
-        assert_eq!(remote_source["grep_scan"]["returned"], expected_scan_returned);
+        assert_eq!(
+            remote_source["grep_scan"]["returned"],
+            expected_scan_returned
+        );
         assert_eq!(remote_source["grep_scan"]["truncated"], expected_truncated);
     }
     assert_eq!(seen.len(), 60, "all owner matches span the three pages");
@@ -8762,7 +9095,12 @@ fn grep_scan_timeout_reason_is_kept_in_partial_and_require_complete_output() {
         .expect("failed remote source");
     assert_eq!(silent["phase"], "grep_scan");
     assert_eq!(silent["error"]["code"], "timeout");
-    assert!(silent["error"]["message"].as_str().unwrap().contains("grep_scan"));
+    assert!(
+        silent["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("grep_scan")
+    );
     assert!(scan_started.exists(), "the peer reached grep_scan");
 
     let required = Command::new(binary)
@@ -8784,8 +9122,14 @@ fn grep_scan_timeout_reason_is_kept_in_partial_and_require_complete_output() {
         serde_json::from_str(error_line).expect("require-complete error JSON");
     assert_eq!(error["error"]["code"], "incomplete_coverage");
     let message = error["error"]["message"].as_str().expect("error message");
-    assert!(message.contains("silent/default"), "missing peer: {message}");
-    assert!(message.contains("phase=grep_scan"), "missing phase: {message}");
+    assert!(
+        message.contains("silent/default"),
+        "missing peer: {message}"
+    );
+    assert!(
+        message.contains("phase=grep_scan"),
+        "missing phase: {message}"
+    );
     assert!(message.contains("timeout"), "missing reason: {message}");
     assert!(
         message.contains("timed out waiting for terminal response"),

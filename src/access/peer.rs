@@ -1013,6 +1013,7 @@ impl PeerSession {
                     })
                 })
                 .collect::<Vec<_>>();
+            let dispatch_event_times = crate::dispatch::first_dispatch_event_times(&rows, &turns);
             let recovery_binding = locator.map(|locator| {
                 json!({
                     "verified": true,
@@ -1145,6 +1146,7 @@ impl PeerSession {
                 "unresolved_predecessor": unresolved_predecessor,
                 "edit_offset_to_turn": edit_offset_to_turn,
                 "turn_to_offset": turn_to_offset,
+                "dispatch_event_times": dispatch_event_times,
                 "recovery_binding": recovery_binding,
                 "digest": digest,
                 "summary": summary,
