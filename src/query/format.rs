@@ -244,6 +244,13 @@ pub fn run_grep_scan(work: GrepScanWork, pattern: &str) -> Result<GrepScanOutput
             scan_grep_reader(file, None, pattern)
                 .map_err(|error| CliError::new(error.code, error.message))
         },
+        |result| match result {
+            Ok(summary) => summary.reorder_weight(),
+            Err(error) => (
+                std::mem::size_of::<CliError>().saturating_add(error.message.capacity()),
+                0,
+            ),
+        },
         |task, result| -> Result<(), CliError> {
             let summary = result?;
             if summary.match_count == 0 {

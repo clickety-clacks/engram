@@ -1260,6 +1260,13 @@ impl PeerSession {
                 };
                 scan_tape_for_grep(path, *compressed_size, &limits, pattern)
             },
+            |result| match result {
+                Ok(summary) => summary.reorder_weight(),
+                Err(error) => (
+                    std::mem::size_of::<PeerError>().saturating_add(error.message.capacity()),
+                    0,
+                ),
+            },
             |task, result| {
                 let tape_id = task.tape_id.as_str();
                 let summary = match result {

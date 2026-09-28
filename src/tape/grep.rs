@@ -9,6 +9,10 @@ use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor
 use serde_json::value::RawValue;
 
 const MAX_GREP_SCAN_WORKERS: usize = 4;
+const MAX_GREP_SCAN_UNCONSUMED: usize = 1_024;
+const MAX_GREP_SCAN_REORDER_BYTES: usize = 4 * 1024 * 1024;
+const MAX_GREP_SCAN_REORDER_MATCHES: usize = 64 * 1024;
+const GREP_SCAN_REORDER_ENTRY_OVERHEAD_BYTES: usize = 128;
 
 #[derive(Debug)]
 pub(crate) struct GrepTapeSummary {
@@ -19,6 +23,29 @@ pub(crate) struct GrepTapeSummary {
     pub(crate) total_lines: usize,
     pub(crate) anchor_line: usize,
     pub(crate) files_touched: Vec<String>,
+}
+
+impl GrepTapeSummary {
+    pub(crate) fn reorder_weight(&self) -> (usize, usize) {
+        let files_touched_bytes = self.files_touched.iter().fold(
+            self.files_touched
+                .capacity()
+                .saturating_mul(std::mem::size_of::<String>()),
+            |bytes, path| bytes.saturating_add(path.capacity()).saturating_add(16),
+        );
+        let timestamp_bytes = if self.timestamp.capacity() == 0 {
+            0
+        } else {
+            self.timestamp.capacity().saturating_add(16)
+        };
+
+        (
+            std::mem::size_of::<Self>()
+                .saturating_add(files_touched_bytes)
+                .saturating_add(timestamp_bytes),
+            self.match_count,
+        )
+    }
 }
 
 #[derive(Default)]
@@ -832,6 +859,7 @@ pub(crate) fn scan_grep_reader<R: Read>(
 pub(crate) fn scan_parallel_in_order<T, R, E>(
     tasks: &[T],
     scan: impl Fn(&T) -> R + Sync,
+    result_weight: impl Fn(&R) -> (usize, usize),
     mut consume: impl FnMut(&T, R) -> Result<(), E>,
 ) -> Result<usize, E>
 where
@@ -842,10 +870,11 @@ where
         return Ok(0);
     }
     let worker_count = grep_scan_worker_count(tasks.len());
-    // Keep at most one extra worker-width of ordered results and active work
-    // outstanding. This lets idle workers refill around a slow early tape,
-    // while decompression concurrency and retained summaries remain bounded.
-    let max_unconsumed = worker_count.saturating_mul(2);
+    // Keep a larger task window so short tapes can run ahead of a slow early
+    // tape. Bound completed summaries by estimated bytes, match volume, and a
+    // hard task count. At most the existing worker count can finish before the
+    // next admission check; active scans remain worker-capped.
+    let max_unconsumed = MAX_GREP_SCAN_UNCONSUMED.min(tasks.len());
 
     std::thread::scope(|scope| {
         let (job_tx, job_rx) = mpsc::sync_channel::<usize>(worker_count);
@@ -878,10 +907,14 @@ where
         let mut next_to_consume = 0usize;
         let mut in_flight = 0usize;
         let mut completed = BTreeMap::new();
+        let mut buffered_result_bytes = 0usize;
+        let mut buffered_match_count = 0usize;
         while next_to_consume < tasks.len() {
             while next_to_dispatch < tasks.len()
                 && in_flight < worker_count
                 && next_to_dispatch.saturating_sub(next_to_consume) < max_unconsumed
+                && buffered_result_bytes < MAX_GREP_SCAN_REORDER_BYTES
+                && buffered_match_count < MAX_GREP_SCAN_REORDER_MATCHES
             {
                 job_tx
                     .send(next_to_dispatch)
@@ -894,12 +927,22 @@ where
             in_flight = in_flight
                 .checked_sub(1)
                 .expect("grep worker returned a result that was not in flight");
+            let (result_bytes, result_matches) = result_weight(&result);
+            let result_bytes = result_bytes.saturating_add(GREP_SCAN_REORDER_ENTRY_OVERHEAD_BYTES);
+            buffered_result_bytes = buffered_result_bytes.saturating_add(result_bytes);
+            buffered_match_count = buffered_match_count.saturating_add(result_matches);
             assert!(
-                completed.insert(index, result).is_none(),
+                completed
+                    .insert(index, (result, result_bytes, result_matches))
+                    .is_none(),
                 "grep worker returned a duplicate result"
             );
 
-            while let Some(result) = completed.remove(&next_to_consume) {
+            while let Some((result, result_bytes, result_matches)) =
+                completed.remove(&next_to_consume)
+            {
+                buffered_result_bytes = buffered_result_bytes.saturating_sub(result_bytes);
+                buffered_match_count = buffered_match_count.saturating_sub(result_matches);
                 if let Err(error) = consume(&tasks[next_to_consume], result) {
                     cancelled.store(true, Ordering::Relaxed);
                     drop(job_tx);
@@ -1027,6 +1070,7 @@ mod tests {
         let workers = scan_parallel_in_order(
             &tasks,
             |task| task.saturating_mul(2),
+            |_| (std::mem::size_of::<usize>(), 0),
             |task, result| {
                 seen.push((*task, result));
                 Ok::<(), ()>(())
@@ -1079,6 +1123,7 @@ mod tests {
                     }
                     *task
                 },
+                |_| (std::mem::size_of::<usize>(), 0),
                 |task, result| {
                     assert_eq!(*task, result);
                     scan_consumed.lock().expect("consumed lock").push(*task);
@@ -1159,6 +1204,7 @@ mod tests {
                 };
                 *task
             },
+            |_| (std::mem::size_of::<usize>(), 0),
             |task, result| {
                 assert_eq!(*task, result);
                 scan_consumed.lock().expect("consumed lock").push(*task);
@@ -1184,5 +1230,136 @@ mod tests {
         let started = started.lock().expect("started lock");
         assert!(started.len() <= worker_count + 1);
         assert!(started.iter().all(|index| *index <= worker_count));
+    }
+
+    #[test]
+    fn parallel_scan_refills_a_large_small_result_window_and_preserves_order() {
+        let tasks = (0usize..MAX_GREP_SCAN_UNCONSUMED + 32).collect::<Vec<_>>();
+        let worker_count = grep_scan_worker_count(tasks.len());
+        if worker_count < 2 {
+            return;
+        }
+
+        let gate = Arc::new((Mutex::new((false, Vec::<usize>::new())), Condvar::new()));
+        let scan_gate = Arc::clone(&gate);
+        let consumed = Arc::new(Mutex::new(Vec::new()));
+        let scan_consumed = Arc::clone(&consumed);
+        let task_count = tasks.len();
+
+        let runner = std::thread::spawn(move || {
+            scan_parallel_in_order(
+                &tasks,
+                |task| {
+                    let (state_lock, changed) = &*scan_gate;
+                    let mut state = state_lock.lock().expect("test gate lock");
+                    state.1.push(*task);
+                    changed.notify_all();
+                    if *task == 0 {
+                        while !state.0 {
+                            state = changed.wait(state).expect("test gate wait");
+                        }
+                    }
+                    *task
+                },
+                |_| (std::mem::size_of::<usize>(), 0),
+                |task, result| {
+                    assert_eq!(*task, result);
+                    scan_consumed.lock().expect("consumed lock").push(*task);
+                    Ok::<(), ()>(())
+                },
+            )
+        });
+
+        let (state_lock, changed) = &*gate;
+        let state = state_lock.lock().expect("test gate lock");
+        let (mut state, _) = changed
+            .wait_timeout_while(state, std::time::Duration::from_secs(2), |state| {
+                state.1.len() < MAX_GREP_SCAN_UNCONSUMED
+            })
+            .expect("test gate wait");
+        let refilled_past_old_window = state.1.len() >= 20;
+        let started_before_release = state.1.len();
+        state.0 = true;
+        changed.notify_all();
+        drop(state);
+
+        runner.join().expect("scan runner").expect("parallel scan");
+        assert!(
+            refilled_past_old_window,
+            "small completed summaries should refill well beyond the old eight-task window"
+        );
+        assert_eq!(started_before_release, MAX_GREP_SCAN_UNCONSUMED);
+        assert_eq!(
+            *consumed.lock().expect("consumed lock"),
+            (0..task_count).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parallel_scan_bounds_refill_by_retained_bytes_and_match_count() {
+        fn assert_weight_limited_refill(weight: (usize, usize)) {
+            let tasks = (0usize..32).collect::<Vec<_>>();
+            let worker_count = grep_scan_worker_count(tasks.len());
+            if worker_count < 2 {
+                return;
+            }
+
+            let gate = Arc::new((Mutex::new((false, Vec::<usize>::new())), Condvar::new()));
+            let scan_gate = Arc::clone(&gate);
+            let consumed = Arc::new(Mutex::new(Vec::new()));
+            let scan_consumed = Arc::clone(&consumed);
+            let task_count = tasks.len();
+
+            let runner = std::thread::spawn(move || {
+                scan_parallel_in_order(
+                    &tasks,
+                    |task| {
+                        let (state_lock, changed) = &*scan_gate;
+                        let mut state = state_lock.lock().expect("test gate lock");
+                        state.1.push(*task);
+                        changed.notify_all();
+                        if *task == 0 {
+                            while !state.0 {
+                                state = changed.wait(state).expect("test gate wait");
+                            }
+                        }
+                        *task
+                    },
+                    |_| weight,
+                    |task, result| {
+                        assert_eq!(*task, result);
+                        scan_consumed.lock().expect("consumed lock").push(*task);
+                        Ok::<(), ()>(())
+                    },
+                )
+            });
+
+            let (state_lock, changed) = &*gate;
+            let state = state_lock.lock().expect("test gate lock");
+            let (mut state, _) = changed
+                .wait_timeout_while(state, std::time::Duration::from_secs(2), |state| {
+                    state.1.len() < worker_count + 1
+                })
+                .expect("test gate wait");
+            let refill_started = state.1.len() >= worker_count + 1;
+            let started_before_release = state.1.len();
+            state.0 = true;
+            changed.notify_all();
+            drop(state);
+
+            runner.join().expect("scan runner").expect("parallel scan");
+            assert!(refill_started, "one refill should fit below the weight cap");
+            assert!(
+                started_before_release <= worker_count + 1,
+                "the next refill should stop after retained weight reaches its cap"
+            );
+            assert_eq!(
+                *consumed.lock().expect("consumed lock"),
+                (0..task_count).collect::<Vec<_>>()
+            );
+        }
+
+        assert_weight_limited_refill((MAX_GREP_SCAN_REORDER_BYTES / 2, 0));
+        assert_weight_limited_refill((0, MAX_GREP_SCAN_REORDER_MATCHES / 2));
     }
 }
