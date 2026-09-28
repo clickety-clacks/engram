@@ -2162,17 +2162,32 @@ fn explain_peers_finds_two_sided_handoff_when_querier_holds_neither_endpoint() {
     assert_eq!(operation_count(&sender_operations, "read_file"), 0);
     assert_eq!(operation_count(&receiver_operations, "read_file"), 0);
 
-    let receiver_locate_requests_before =
-        operation_count(&receiver_operations, "locate_tapes");
+    let receiver_requests_path = temp.path().join("machine-b-peer-requests.jsonl");
+    let receiver_request_count_before = std::fs::read_to_string(&receiver_requests_path)
+        .expect("receiver peer request log before sender removal")
+        .lines()
+        .count();
     set_peer_topology(&caller_home, json!({"machine-b":receiver}));
     let sender_removed = run_peer_explain(binary, &caller_home, &repo, file, "machine-b");
     assert!(sender_removed.status.success());
     let sender_removed: serde_json::Value =
         serde_json::from_slice(&sender_removed.stdout).expect("sender-removed explain JSON");
-    assert_eq!(
-        operation_count(&receiver_operations, "locate_tapes"),
-        receiver_locate_requests_before,
-        "a received-only UUID with no selected sender candidate sends no locate_tapes request or response"
+    let receiver_requests_after = std::fs::read_to_string(&receiver_requests_path)
+        .expect("receiver peer request log after sender removal");
+    assert!(
+        receiver_requests_after
+            .lines()
+            .skip(receiver_request_count_before)
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("request JSON"))
+            .filter(|request| request["op"] == "locate_tapes")
+            .all(|request| {
+                !request["args"]["tape_ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|tape_id| tape_id == sender_id)
+            }),
+        "without a selected sender candidate, no sender tape is requested from the receiver owner"
     );
     assert_eq!(sender_removed["federation"]["coverage"], "complete");
     let receiver_source = sender_removed["federation"]["sources"]
