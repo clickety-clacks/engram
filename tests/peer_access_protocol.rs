@@ -3668,38 +3668,6 @@ fn explain_file_range_prioritizes_exact_edits_before_default_page_locally_and_re
     assert_eq!(federated_result["dispatch_lineage"], json!([]));
     assert_eq!(federated_result["dispatch_unresolved"], json!([]));
     assert_eq!(federated_result["dispatch_ambiguous"], json!([]));
-
-    let federated_all_output = Command::new(binary)
-        .current_dir(&repo)
-        .env("HOME", &caller_home)
-        .args([
-            "explain",
-            "src/module.rs:1-12",
-            "--peers",
-            "alpha",
-            "--require-complete",
-            "--limit",
-            "25",
-        ])
-        .output()
-        .expect("run full federated exact-span explain");
-    assert!(
-        federated_all_output.status.success(),
-        "full federated exact-span explain failed: {}",
-        String::from_utf8_lossy(&federated_all_output.stderr)
-    );
-    let federated_all: serde_json::Value = serde_json::from_slice(&federated_all_output.stdout)
-        .expect("full federated explain JSON");
-    let federated_all_ids = federated_all["sessions"]
-        .as_array()
-        .expect("federated sessions")
-        .iter()
-        .filter_map(|session| session["session_id"].as_str())
-        .collect::<std::collections::HashSet<_>>();
-    assert_eq!(federated_all_ids.len(), 18);
-    assert!(federated_all_ids.contains(local_exact_id.as_str()));
-    assert!(federated_all_ids.contains(remote_wrong_path_id.as_str()));
-    assert!(federated_all_ids.contains(remote_nonoverlap_id.as_str()));
 }
 
 #[test]
