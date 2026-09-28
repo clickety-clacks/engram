@@ -3,8 +3,8 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read};
 use std::sync::{Arc, Mutex, mpsc};
 
+use serde::Deserializer;
 use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer};
 use serde_json::value::RawValue;
 
 const MAX_GREP_SCAN_WORKERS: usize = 4;
@@ -24,15 +24,15 @@ pub(crate) struct GrepTapeSummary {
 struct GrepEvent<'a> {
     timestamp: Option<&'a RawValue>,
     kind: Option<&'a RawValue>,
-    content: Option<&'a RawValue>,
-    args: Option<&'a RawValue>,
-    stdout: Option<&'a RawValue>,
-    stderr: Option<&'a RawValue>,
-    tool: Option<&'a RawValue>,
-    text: Option<&'a RawValue>,
-    before_text: Option<&'a RawValue>,
-    after_text: Option<&'a RawValue>,
-    note: Option<&'a RawValue>,
+    content_matches: bool,
+    args_match: bool,
+    stdout_matches: bool,
+    stderr_matches: bool,
+    tool_matches: bool,
+    text_matches: bool,
+    before_text_matches: bool,
+    after_text_matches: bool,
+    note_matches: bool,
     file: Option<&'a RawValue>,
     from_file: Option<&'a RawValue>,
     to_file: Option<&'a RawValue>,
@@ -40,26 +40,20 @@ struct GrepEvent<'a> {
 
 impl GrepEvent<'_> {
     fn matches(&self, pattern: &str) -> bool {
-        self.content
-            .is_some_and(|raw| content_value_matches(raw, pattern))
-            || self
-                .args
-                .is_some_and(|raw| args_value_matches(raw, pattern))
-            || [
-                self.stdout,
-                self.stderr,
-                self.tool,
-                self.text,
-                self.before_text,
-                self.after_text,
-                self.note,
-                self.file,
-                self.from_file,
-                self.to_file,
-            ]
-            .into_iter()
-            .flatten()
-            .any(|raw| decoded_string(raw).is_some_and(|text| text.contains(pattern)))
+        self.content_matches
+            || self.args_match
+            || self.stdout_matches
+            || self.stderr_matches
+            || self.tool_matches
+            || self.text_matches
+            || self.before_text_matches
+            || self.after_text_matches
+            || self.note_matches
+            || [self.file, self.from_file, self.to_file]
+                .into_iter()
+                .flatten()
+                .filter_map(decoded_string)
+                .any(|text| text.contains(pattern))
     }
 }
 
@@ -67,120 +61,162 @@ pub fn grep_line_matches(line: &str, pattern: &str) -> Result<bool, GrepScanErro
     if line.trim().is_empty() {
         return Ok(false);
     }
-    let event: GrepEvent<'_> = serde_json::from_str(line)
-        .map_err(|error| GrepScanError::new("json_error", error.to_string()))?;
-    Ok(event.matches(pattern))
+    parse_grep_event(line.as_bytes(), pattern)
+        .map(|event| event.matches(pattern))
+        .map_err(|error| GrepScanError::new("json_error", error.to_string()))
 }
 
-impl<'de> Deserialize<'de> for GrepEvent<'de> {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+fn parse_grep_event<'de>(
+    bytes: &'de [u8],
+    pattern: &str,
+) -> Result<GrepEvent<'de>, serde_json::Error> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let event = GrepEventSeed { pattern }.deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(event)
+}
+
+struct GrepEventSeed<'p> {
+    pattern: &'p str,
+}
+
+impl<'de> DeserializeSeed<'de> for GrepEventSeed<'_> {
+    type Value = GrepEvent<'de>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
     where
         D: Deserializer<'de>,
     {
-        struct GrepEventVisitor;
+        deserializer.deserialize_any(GrepEventVisitor {
+            pattern: self.pattern,
+        })
+    }
+}
 
-        impl<'de> Visitor<'de> for GrepEventVisitor {
-            type Value = GrepEvent<'de>;
+struct GrepEventVisitor<'p> {
+    pattern: &'p str,
+}
 
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("a JSONL event")
-            }
+impl<'de> Visitor<'de> for GrepEventVisitor<'_> {
+    type Value = GrepEvent<'de>;
 
-            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
-            where
-                M: MapAccess<'de>,
-            {
-                let mut event = GrepEvent::default();
-                while let Some(field) = map.next_key_seed(GrepFieldSeed)? {
-                    match field {
-                        GrepField::Timestamp => event.timestamp = Some(map.next_value()?),
-                        GrepField::Kind => event.kind = Some(map.next_value()?),
-                        GrepField::Content => event.content = Some(map.next_value()?),
-                        GrepField::Args => event.args = Some(map.next_value()?),
-                        GrepField::Stdout => event.stdout = Some(map.next_value()?),
-                        GrepField::Stderr => event.stderr = Some(map.next_value()?),
-                        GrepField::Tool => event.tool = Some(map.next_value()?),
-                        GrepField::Text => event.text = Some(map.next_value()?),
-                        GrepField::BeforeText => event.before_text = Some(map.next_value()?),
-                        GrepField::AfterText => event.after_text = Some(map.next_value()?),
-                        GrepField::Note => event.note = Some(map.next_value()?),
-                        GrepField::File => event.file = Some(map.next_value()?),
-                        GrepField::FromFile => event.from_file = Some(map.next_value()?),
-                        GrepField::ToFile => event.to_file = Some(map.next_value()?),
-                        GrepField::Other => {
-                            let _: IgnoredAny = map.next_value()?;
-                        }
-                    }
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSONL event")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut event = GrepEvent::default();
+        let pattern = self.pattern;
+        while let Some(field) = map.next_key_seed(GrepFieldSeed)? {
+            match field {
+                GrepField::Timestamp => event.timestamp = Some(map.next_value()?),
+                GrepField::Kind => event.kind = Some(map.next_value()?),
+                GrepField::Content => {
+                    event.content_matches = map.next_value_seed(MatchSeed {
+                        pattern,
+                        mode: SearchMode::Content,
+                    })?;
                 }
-                Ok(event)
-            }
-
-            fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
-            where
-                S: SeqAccess<'de>,
-            {
-                while seq.next_element::<IgnoredAny>()?.is_some() {}
-                Ok(GrepEvent::default())
-            }
-
-            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(GrepEvent::default())
-            }
-
-            fn visit_borrowed_str<E>(self, _: &'de str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(GrepEvent::default())
-            }
-
-            fn visit_string<E>(self, _: String) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(GrepEvent::default())
-            }
-
-            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(GrepEvent::default())
-            }
-
-            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(GrepEvent::default())
-            }
-
-            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(GrepEvent::default())
-            }
-
-            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(GrepEvent::default())
-            }
-
-            fn visit_unit<E>(self) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(GrepEvent::default())
+                GrepField::Args => {
+                    event.args_match = map.next_value_seed(RootArgsMatchSeed { pattern })?;
+                }
+                GrepField::Stdout => {
+                    event.stdout_matches = map.next_value_seed(StringMatchSeed { pattern })?;
+                }
+                GrepField::Stderr => {
+                    event.stderr_matches = map.next_value_seed(StringMatchSeed { pattern })?;
+                }
+                GrepField::Tool => {
+                    event.tool_matches = map.next_value_seed(StringMatchSeed { pattern })?;
+                }
+                GrepField::Text => {
+                    event.text_matches = map.next_value_seed(StringMatchSeed { pattern })?;
+                }
+                GrepField::BeforeText => {
+                    event.before_text_matches = map.next_value_seed(StringMatchSeed { pattern })?;
+                }
+                GrepField::AfterText => {
+                    event.after_text_matches = map.next_value_seed(StringMatchSeed { pattern })?;
+                }
+                GrepField::Note => {
+                    event.note_matches = map.next_value_seed(StringMatchSeed { pattern })?;
+                }
+                GrepField::File => event.file = Some(map.next_value()?),
+                GrepField::FromFile => event.from_file = Some(map.next_value()?),
+                GrepField::ToFile => event.to_file = Some(map.next_value()?),
+                GrepField::Other => {
+                    let _: IgnoredAny = map.next_value()?;
+                }
             }
         }
+        Ok(event)
+    }
 
-        deserializer.deserialize_any(GrepEventVisitor)
+    fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+    where
+        S: SeqAccess<'de>,
+    {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(GrepEvent::default())
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(GrepEvent::default())
+    }
+
+    fn visit_borrowed_str<E>(self, _: &'de str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(GrepEvent::default())
+    }
+
+    fn visit_string<E>(self, _: String) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(GrepEvent::default())
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(GrepEvent::default())
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(GrepEvent::default())
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(GrepEvent::default())
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(GrepEvent::default())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(GrepEvent::default())
     }
 }
 
@@ -272,31 +308,232 @@ fn decoded_string<'a>(raw: &'a RawValue) -> Option<Cow<'a, str>> {
         .map(Cow::Owned)
 }
 
-fn args_value_matches(raw: &RawValue, pattern: &str) -> bool {
-    match raw.get().trim_start().as_bytes().first().copied() {
-        Some(b'"') => {
-            let Some(text) = decoded_string(raw) else {
-                return false;
-            };
-            if text
-                .trim_start()
-                .as_bytes()
-                .first()
-                .is_some_and(|byte| matches!(byte, b'{' | b'['))
-            {
-                return json_text_matches(text.as_ref(), pattern, SearchMode::Arguments)
-                    .unwrap_or_else(|| text.contains(pattern));
-            }
-            text.contains(pattern)
-        }
-        Some(b'{' | b'[') => json_raw_matches(raw, pattern, SearchMode::Arguments),
-        Some(b't' | b'f') | Some(b'-' | b'0'..=b'9') => raw.get().contains(pattern),
-        _ => false,
+struct StringMatchSeed<'p> {
+    pattern: &'p str,
+}
+
+impl<'de> DeserializeSeed<'de> for StringMatchSeed<'_> {
+    type Value = bool;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(StringMatchVisitor {
+            pattern: self.pattern,
+        })
     }
 }
 
-fn content_value_matches(raw: &RawValue, pattern: &str) -> bool {
-    json_raw_matches(raw, pattern, SearchMode::Content)
+struct StringMatchVisitor<'p> {
+    pattern: &'p str,
+}
+
+impl<'de> Visitor<'de> for StringMatchVisitor<'_> {
+    type Value = bool;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a string event field")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(value.contains(self.pattern))
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_str(value)
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_str(&value)
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(false)
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(false)
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(false)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(false)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(false)
+    }
+
+    fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+    where
+        S: SeqAccess<'de>,
+    {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(false)
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        while map.next_key::<IgnoredAny>()?.is_some() {
+            let _: IgnoredAny = map.next_value()?;
+        }
+        Ok(false)
+    }
+}
+
+struct RootArgsMatchSeed<'p> {
+    pattern: &'p str,
+}
+
+impl<'de> DeserializeSeed<'de> for RootArgsMatchSeed<'_> {
+    type Value = bool;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(RootArgsMatchVisitor {
+            pattern: self.pattern,
+        })
+    }
+}
+
+struct RootArgsMatchVisitor<'p> {
+    pattern: &'p str,
+}
+
+impl<'de> Visitor<'de> for RootArgsMatchVisitor<'_> {
+    type Value = bool;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("tool arguments")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        if value
+            .trim_start()
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| matches!(byte, b'{' | b'['))
+        {
+            Ok(
+                json_text_matches(value, self.pattern, SearchMode::Arguments)
+                    .unwrap_or_else(|| value.contains(self.pattern)),
+            )
+        } else {
+            Ok(value.contains(self.pattern))
+        }
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_str(value)
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_str(&value)
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(value.to_string().contains(self.pattern))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(value.to_string().contains(self.pattern))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(value.to_string().contains(self.pattern))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(value.to_string().contains(self.pattern))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(false)
+    }
+
+    fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+    where
+        S: SeqAccess<'de>,
+    {
+        let mut matched = false;
+        while let Some(item) = seq.next_element_seed(MatchSeed {
+            pattern: self.pattern,
+            mode: SearchMode::Arguments,
+        })? {
+            matched |= item;
+        }
+        Ok(matched)
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut matched = false;
+        while map.next_key::<IgnoredAny>()?.is_some() {
+            matched |= map.next_value_seed(MatchSeed {
+                pattern: self.pattern,
+                mode: SearchMode::Arguments,
+            })?;
+        }
+        Ok(matched)
+    }
 }
 
 fn json_text_matches(text: &str, pattern: &str, mode: SearchMode) -> Option<bool> {
@@ -305,10 +542,6 @@ fn json_text_matches(text: &str, pattern: &str, mode: SearchMode) -> Option<bool
         .deserialize(&mut deserializer)
         .and_then(|matched| deserializer.end().map(|()| matched));
     result.ok()
-}
-
-fn json_raw_matches(raw: &RawValue, pattern: &str, mode: SearchMode) -> bool {
-    json_text_matches(raw.get(), pattern, mode).unwrap_or(false)
 }
 
 #[derive(Clone, Copy)]
@@ -541,7 +774,7 @@ pub(crate) fn scan_grep_reader<R: Read>(
             continue;
         }
 
-        let event: GrepEvent<'_> = serde_json::from_slice(&line[..content_end])
+        let event = parse_grep_event(&line[..content_end], pattern)
             .map_err(|error| GrepScanError::new("json_error", error.to_string()))?;
         if let Some(row_timestamp) = event.timestamp.and_then(decoded_string)
             && row_timestamp.as_ref() > timestamp.as_str()
@@ -662,76 +895,65 @@ where
 mod tests {
     use super::*;
 
+    fn matches(line: &str, pattern: &str) -> bool {
+        grep_line_matches(line, pattern).expect("valid event")
+    }
+
     #[test]
     fn matches_decoded_text_without_matching_envelope_keys_or_storage_escapes() {
-        let event: GrepEvent<'_> = serde_json::from_str(
-            r#"{"t":"2026-09-27T00:00:00Z","k":"msg.in","content":"café \u2603 literal\\n"}"#,
-        )
-        .expect("valid event");
+        let line =
+            r#"{"t":"2026-09-27T00:00:00Z","k":"msg.in","content":"café \u2603 literal\\n"}"#;
 
-        assert!(event.matches("café ☃"));
-        assert!(event.matches(r"literal\n"));
-        assert!(!event.matches("CAFÉ ☃"));
-        assert!(!event.matches("\n"));
-        assert!(!event.matches("content"));
-        assert!(!event.matches("msg.in"));
+        assert!(matches(line, "café ☃"));
+        assert!(matches(line, r"literal\n"));
+        assert!(!matches(line, "CAFÉ ☃"));
+        assert!(!matches(line, "\n"));
+        assert!(!matches(line, "content"));
+        assert!(!matches(line, "msg.in"));
     }
 
     #[test]
     fn searches_native_and_normalized_tool_arguments_without_joining_keys_or_fields() {
-        let normalized: GrepEvent<'_> = serde_json::from_str(
-            r#"{"k":"tool.call","tool":"exec_command","args":"{\"payload_key\":\"printf \\\"hello\\\"\",\"other\":\"world\"}"}"#,
-        )
-        .expect("valid normalized arguments");
-        assert!(normalized.matches("hello"));
-        assert!(normalized.matches("world"));
-        assert!(!normalized.matches("payload_key"));
-        assert!(!normalized.matches("helloworld"));
+        let normalized = r#"{"k":"tool.call","tool":"exec_command","args":"{\"payload_key\":\"printf \\\"hello\\\"\",\"other\":\"world\"}"}"#;
+        assert!(matches(normalized, "hello"));
+        assert!(matches(normalized, "world"));
+        assert!(!matches(normalized, "payload_key"));
+        assert!(!matches(normalized, "helloworld"));
 
-        let native: GrepEvent<'_> = serde_json::from_str(
-            r#"{"k":"tool.call","args":{"parameter_name":["echo","nested"],"count":12}}"#,
-        )
-        .expect("valid native arguments");
-        assert!(native.matches("nested"));
-        assert!(native.matches("12"));
-        assert!(!native.matches("parameter_name"));
-        assert!(!native.matches("echonested"));
+        let native = r#"{"k":"tool.call","args":{"parameter_name":["echo","nested"],"count":12}}"#;
+        assert!(matches(native, "nested"));
+        assert!(matches(native, "12"));
+        assert!(!matches(native, "parameter_name"));
+        assert!(!matches(native, "echonested"));
     }
 
     #[test]
     fn does_not_recursively_decode_json_text_inside_an_argument_value() {
-        let event: GrepEvent<'_> =
-            serde_json::from_str(r#"{"k":"tool.call","args":"{\"cmd\":\"literal \\\\u2603\"}"}"#)
-                .expect("valid normalized arguments");
+        let line = r#"{"k":"tool.call","args":"{\"cmd\":\"literal \\\\u2603\"}"}"#;
 
-        assert!(event.matches(r"\u2603"));
-        assert!(!event.matches("☃"));
+        assert!(matches(line, r"\u2603"));
+        assert!(!matches(line, "☃"));
     }
 
     #[test]
     fn malformed_json_shaped_argument_text_remains_searchable_as_text() {
-        let event: GrepEvent<'_> = serde_json::from_str(r#"{"k":"tool.call","args":"{needle"}"#)
-            .expect("valid normalized argument string");
+        let line = r#"{"k":"tool.call","args":"{needle"}"#;
 
-        assert!(event.matches("needle"));
+        assert!(matches(line, "needle"));
+        assert!(!matches(line, "NEEDLE"));
     }
 
     #[test]
     fn keeps_stdout_stderr_and_content_block_boundaries() {
-        let result: GrepEvent<'_> =
-            serde_json::from_str(r#"{"k":"tool.result","stdout":"left","stderr":"right"}"#)
-                .expect("valid result");
-        assert!(result.matches("left"));
-        assert!(result.matches("right"));
-        assert!(!result.matches("leftright"));
+        let result = r#"{"k":"tool.result","stdout":"left","stderr":"right"}"#;
+        assert!(matches(result, "left"));
+        assert!(matches(result, "right"));
+        assert!(!matches(result, "leftright"));
 
-        let message: GrepEvent<'_> = serde_json::from_str(
-            r#"{"k":"msg.out","content":[{"type":"output_text","text":"first"},{"type":"output_text","text":"second"}]}"#,
-        )
-        .expect("valid message");
-        assert!(message.matches("first"));
-        assert!(message.matches("second"));
-        assert!(!message.matches("firstsecond"));
+        let message = r#"{"k":"msg.out","content":[{"type":"output_text","text":"first"},{"type":"output_text","text":"second"}]}"#;
+        assert!(matches(message, "first"));
+        assert!(matches(message, "second"));
+        assert!(!matches(message, "firstsecond"));
     }
 
     #[test]
