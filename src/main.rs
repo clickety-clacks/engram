@@ -640,6 +640,7 @@ fn query_remote_tape_facts(
     }
 
     let mut facts = HashMap::new();
+    let mut returned = std::collections::HashSet::new();
     for (machine, export, outcome) in
         run_federated_peer_rounds(requests, owners, topology, deadline, cancelled)
     {
@@ -695,18 +696,60 @@ fn query_remote_tape_facts(
                         );
                         continue;
                     }
+                    returned.insert((store.clone(), tape_id.to_string()));
                     if row.get("status").and_then(Value::as_str) != Some("ok") {
-                        *peer_failed = true;
+                        let status = row.get("status").and_then(Value::as_str);
                         let code = row
                             .get("error")
                             .and_then(|error| error.get("code"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("tape_unavailable");
+                            .and_then(Value::as_str);
                         let message = row
                             .get("error")
                             .and_then(|error| error.get("message"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("owner could not read tape facts");
+                            .and_then(Value::as_str);
+                        let valid_context_absence = status == Some("unavailable")
+                            && code == Some("tape_unavailable")
+                            && row.get("indexed").and_then(Value::as_bool).is_some()
+                            && message.is_some_and(|message| !message.trim().is_empty());
+                        if valid_context_absence {
+                            facts.insert((store.clone(), tape_id.to_string()), row);
+                            continue;
+                        }
+                        *peer_failed = true;
+                        if status == Some("unavailable") && code == Some("tape_unavailable") {
+                            mark_source_phase(
+                                sources,
+                                &store,
+                                "tape_facts",
+                                "protocol_error",
+                                "peer returned malformed tape_unavailable facts",
+                            );
+                            continue;
+                        }
+                        let (code, message) = match (status, code, message) {
+                            (Some("failed" | "unavailable"), Some(code), Some(message))
+                                if !message.trim().is_empty() =>
+                            {
+                                (code, message)
+                            }
+                            (Some("failed" | "unavailable"), None, _) => (
+                                "protocol_error",
+                                "peer tape facts failure omitted error.code",
+                            ),
+                            (Some("failed" | "unavailable"), _, None | Some("")) => (
+                                "protocol_error",
+                                "peer tape facts failure omitted error.message",
+                            ),
+                            (Some("failed" | "unavailable"), _, Some(message))
+                                if message.trim().is_empty() =>
+                            {
+                                ("protocol_error", "peer tape facts failure omitted error.message")
+                            }
+                            _ => (
+                                "protocol_error",
+                                "peer returned an invalid tape facts status",
+                            ),
+                        };
                         mark_source_phase(sources, &store, "tape_facts", code, message);
                         continue;
                     }
@@ -717,7 +760,7 @@ fn query_remote_tape_facts(
     }
     for (store, tapes) in expected {
         for tape_id in tapes {
-            if !facts.contains_key(&(store.clone(), tape_id.clone())) {
+            if !returned.contains(&(store.clone(), tape_id.clone())) {
                 *peer_failed = true;
                 mark_source_phase(
                     sources,
@@ -1184,6 +1227,13 @@ fn collect_federated_dispatch(
                     Ok(history) => history,
                     Err(message) => {
                         *peer_failed = true;
+                        mark_source_phase(
+                            sources,
+                            &current_store,
+                            "tape_facts",
+                            "protocol_error",
+                            &format!("peer returned malformed tape facts: {message}"),
+                        );
                         if unresolved_seen.insert((
                             current_store.clone(),
                             current_tape.clone(),
@@ -1212,7 +1262,6 @@ fn collect_federated_dispatch(
                     break;
                 }
                 if !current_history.complete {
-                    *peer_failed = true;
                     let missing = current_history.missing.clone();
                     if unresolved_seen.insert((
                         current_store.clone(),
@@ -1437,6 +1486,14 @@ fn collect_federated_dispatch(
                         Ok(history) => history,
                         Err(message) => {
                             candidate_partial = true;
+                            *peer_failed = true;
+                            mark_source_phase(
+                                sources,
+                                store,
+                                "tape_facts",
+                                "protocol_error",
+                                &format!("peer returned malformed tape facts: {message}"),
+                            );
                             if unresolved_seen.insert((
                                 store.clone(),
                                 tape_id.clone(),
@@ -1608,23 +1665,94 @@ fn collect_federated_dispatch(
                                     }
                                     continue;
                                 }
-                                if let Some(context_facts) =
-                                    context_facts.get(&(store.clone(), context_tape.to_string()))
-                                {
-                                    match FederatedDispatchHistory::from_tape_facts(context_facts) {
-                                        Ok(context_history) if context_history.complete => {
-                                            history = context_history;
-                                            selected_facts = context_facts.clone();
-                                            selected_store = store.clone();
-                                        }
-                                        _ => {
-                                            candidate_partial = true;
-                                            continue;
-                                        }
-                                    }
-                                } else {
+                                let Some(context_facts) = context_facts
+                                    .get(&(store.clone(), context_tape.to_string()))
+                                else {
                                     candidate_partial = true;
+                                    if unresolved_seen.insert((
+                                        store.clone(),
+                                        context_tape.to_string(),
+                                        "recovery_binding_incomplete".into(),
+                                    )) {
+                                        result.unresolved.push(json!({
+                                            "reason":"recovery_binding_incomplete",
+                                            "session":context_tape,
+                                            "candidate_uuid":received.row.uuid,
+                                            "session_location":store,
+                                        }));
+                                    }
                                     continue;
+                                };
+                                if context_facts.get("status").and_then(Value::as_str)
+                                    != Some("ok")
+                                {
+                                    candidate_partial = true;
+                                    if unresolved_seen.insert((
+                                        store.clone(),
+                                        context_tape.to_string(),
+                                        "tape_unavailable".into(),
+                                    )) {
+                                        result.unresolved.push(json!({
+                                            "reason":"tape_unavailable",
+                                            "session":context_tape,
+                                            "candidate_uuid":received.row.uuid,
+                                            "session_location":store,
+                                            "code":context_facts.pointer("/error/code"),
+                                            "message":context_facts.pointer("/error/message"),
+                                        }));
+                                    }
+                                    continue;
+                                }
+                                match FederatedDispatchHistory::from_tape_facts(context_facts) {
+                                    Ok(context_history) if context_history.complete => {
+                                        history = context_history;
+                                        selected_facts = context_facts.clone();
+                                        selected_store = store.clone();
+                                    }
+                                    Ok(context_history) => {
+                                        candidate_partial = true;
+                                        if unresolved_seen.insert((
+                                            store.clone(),
+                                            context_history.tip.clone(),
+                                            "history_incomplete".into(),
+                                        )) {
+                                            result.unresolved.push(dispatch_history_incomplete(
+                                                store,
+                                                &context_history.tip,
+                                                Some(json!(context_history.missing)),
+                                                None,
+                                                Some(&received.row.uuid),
+                                            ));
+                                        }
+                                        continue;
+                                    }
+                                    Err(message) => {
+                                        candidate_partial = true;
+                                        *peer_failed = true;
+                                        mark_source_phase(
+                                            sources,
+                                            store,
+                                            "tape_facts",
+                                            "protocol_error",
+                                            &format!(
+                                                "peer returned malformed tape facts: {message}"
+                                            ),
+                                        );
+                                        if unresolved_seen.insert((
+                                            store.clone(),
+                                            context_tape.to_string(),
+                                            "history_incomplete".into(),
+                                        )) {
+                                            result.unresolved.push(dispatch_history_incomplete(
+                                                store,
+                                                context_tape,
+                                                None,
+                                                Some(&message),
+                                                Some(&received.row.uuid),
+                                            ));
+                                        }
+                                        continue;
+                                    }
                                 }
                             } else {
                                 candidate_partial = true;
@@ -1684,10 +1812,6 @@ fn collect_federated_dispatch(
                                 .map(ToOwned::to_owned),
                         });
                     }
-                }
-
-                if candidate_partial {
-                    *peer_failed = true;
                 }
 
                 let all_candidates = candidates;
@@ -5892,7 +6016,7 @@ fn cmd_explain_with_peers_inner(
         context.explain_default_limit,
     );
     if any_peer_failure && args.require_complete {
-        return Err(explain_require_complete_error(&sources, &dispatch_unresolved));
+        return Err(explain_require_complete_error(&sources));
     }
     let no_results = sessions.is_empty() && tombstones.is_empty() && lineage.is_empty();
     let complete = !any_peer_failure;
@@ -7177,69 +7301,10 @@ fn format_peer_error_value(error: &Value) -> String {
     format!("{code}: {message}")
 }
 
-fn format_dispatch_history_failures(unresolved_rows: &[Value]) -> Vec<String> {
-    const MAX_HISTORY_DETAILS: usize = 5;
-
-    let history_rows = unresolved_rows
-        .iter()
-        .filter(|row| row.get("reason").and_then(Value::as_str) == Some("history_incomplete"))
-        .collect::<Vec<_>>();
-    let mut failures = history_rows
-        .iter()
-        .take(MAX_HISTORY_DETAILS)
-        .map(|row| {
-            let store = row
-                .get("session_location")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown store");
-            let phase = row
-                .get("phase")
-                .and_then(Value::as_str)
-                .unwrap_or("dispatch_history");
-            let code = row
-                .get("code")
-                .and_then(Value::as_str)
-                .unwrap_or("history_incomplete");
-            let session = row
-                .get("session")
-                .or_else(|| row.get("received_session"))
-                .and_then(Value::as_str)
-                .unwrap_or("unknown session");
-            let reason = match row.get("missing") {
-                Some(Value::String(missing)) => {
-                    format!("missing predecessor segment {missing}")
-                }
-                Some(Value::Array(missing)) => {
-                    let segments = missing
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!("missing predecessor segment(s) [{segments}]")
-                }
-                _ => row
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("dispatch history is incomplete")
-                    .to_string(),
-            };
-            format!("{store} phase={phase} code={code} session={session}: {reason}")
-        })
-        .collect::<Vec<_>>();
-    if history_rows.len() > MAX_HISTORY_DETAILS {
-        failures.push(format!(
-            "{} additional history_incomplete record(s) in dispatch_unresolved",
-            history_rows.len() - MAX_HISTORY_DETAILS
-        ));
-    }
-    failures
-}
-
-fn explain_require_complete_error(source_rows: &[Value], unresolved_rows: &[Value]) -> CliError {
+fn explain_require_complete_error(source_rows: &[Value]) -> CliError {
     let failures = source_rows
         .iter()
         .filter_map(format_source_failure)
-        .chain(format_dispatch_history_failures(unresolved_rows))
         .collect::<Vec<_>>();
     let detail = if failures.is_empty() {
         "one or more selected sources did not complete".to_string()
@@ -8060,7 +8125,7 @@ mod tests {
                 "code": "protocol_error",
                 "message": "peer omitted one or more requested tape locations",
             },
-        })], &[]);
+        })]);
 
         assert_eq!(error.code, "incomplete_results");
         assert!(error.message.contains("eezo/default"));
@@ -8071,41 +8136,6 @@ mod tests {
                 .message
                 .contains("peer omitted one or more requested tape locations")
         );
-    }
-
-    #[test]
-    fn explain_require_complete_error_reports_missing_history_from_healthy_sources() {
-        let issue = dispatch_history_incomplete(
-            "gibson/local:0",
-            "edit-tape-8936",
-            Some(json!("missing-predecessor-4950")),
-            None,
-            Some("candidate-uuid"),
-        );
-        assert_eq!(issue["reason"], "history_incomplete");
-        assert_eq!(issue["phase"], "dispatch_history");
-        assert_eq!(issue["code"], "history_incomplete");
-        assert_eq!(issue["session_location"], "gibson/local:0");
-        assert_eq!(issue["missing"], "missing-predecessor-4950");
-
-        let error = explain_require_complete_error(
-            &[
-                json!({"store":"gibson/local:0","status":"ok"}),
-                json!({"store":"eezo/default","status":"ok"}),
-            ],
-            &[
-                issue,
-                json!({"reason":"no_sender_observed","uuid":"unrelated-uuid"}),
-            ],
-        );
-
-        assert_eq!(error.code, "incomplete_results");
-        assert!(error.message.contains("gibson/local:0"));
-        assert!(error.message.contains("phase=dispatch_history"));
-        assert!(error.message.contains("code=history_incomplete"));
-        assert!(error.message.contains("edit-tape-8936"));
-        assert!(error.message.contains("missing predecessor segment missing-predecessor-4950"));
-        assert!(!error.message.contains("unrelated-uuid"));
     }
 
     #[test]

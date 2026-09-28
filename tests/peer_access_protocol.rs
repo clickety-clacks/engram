@@ -2613,11 +2613,20 @@ fn explain_peers_reports_missing_segment_and_missing_tape_without_dropping_sessi
     );
     assert!(
         output.status.success(),
-        "partial history should remain explainable: {}",
+        "broken voluntary links should remain visible without failing query coverage: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("explain JSON");
-    assert_eq!(value["federation"]["coverage"], "partial");
+    assert_eq!(value["federation"]["coverage"], "complete");
+    for store in ["sender-owner/default", "receiver-owner/default"] {
+        let source = value["federation"]["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|source| source["store"] == store)
+            .expect("selected source");
+        assert_eq!(source["status"], "ok");
+    }
     assert!(value["dispatch_lineage"].as_array().unwrap().is_empty());
     assert!(
         value["sessions"]
@@ -2663,18 +2672,28 @@ fn explain_peers_reports_missing_segment_and_missing_tape_without_dropping_sessi
         ])
         .output()
         .expect("run require-complete explain with incomplete dispatch history");
-    assert!(!required.status.success());
-    assert!(required.stdout.is_empty());
-    let stderr = String::from_utf8_lossy(&required.stderr);
-    assert!(stderr.contains("incomplete_results"), "{stderr}");
-    assert!(stderr.contains("receiver-owner/default"), "{stderr}");
-    assert!(stderr.contains("phase=dispatch_history"), "{stderr}");
-    assert!(stderr.contains("code=history_incomplete"), "{stderr}");
-    assert!(stderr.contains("deleted-predecessor-segment"), "{stderr}");
+    assert!(
+        required.status.success(),
+        "a broken voluntary link should not fail strict query completion: {}",
+        String::from_utf8_lossy(&required.stderr)
+    );
+    let strict: serde_json::Value =
+        serde_json::from_slice(&required.stdout).expect("strict explain JSON");
+    assert_eq!(strict["federation"]["coverage"], "complete");
+    let strict_unresolved = strict["dispatch_unresolved"].as_array().unwrap();
+    assert!(strict_unresolved.iter().any(|row| {
+        row["reason"] == "history_incomplete"
+            && row["session_location"] == "receiver-owner/default"
+            && row["session"] == missing_predecessor_id
+            && row["missing"] == "deleted-predecessor-segment"
+    }));
+    assert!(strict_unresolved.iter().any(|row| {
+        row["reason"] == "tape_unavailable" && row["session"] == missing_tape_id
+    }));
 }
 
 #[test]
-fn explain_require_complete_rejects_candidate_only_incomplete_history() {
+fn explain_require_complete_keeps_candidate_only_incomplete_history_best_effort() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = env!("CARGO_BIN_EXE_engram");
     let uuid = "423e4567-e89b-12d3-a456-426614174031";
@@ -2754,12 +2773,12 @@ fn explain_require_complete_rejects_candidate_only_incomplete_history() {
     );
     assert!(
         partial.status.success(),
-        "relaxed explain should retain partial results: {}",
+        "relaxed explain should retain unresolved dispatch evidence: {}",
         String::from_utf8_lossy(&partial.stderr)
     );
     let value: serde_json::Value =
         serde_json::from_slice(&partial.stdout).expect("partial explain JSON");
-    assert_eq!(value["federation"]["coverage"], "partial");
+    assert_eq!(value["federation"]["coverage"], "complete");
     for store in ["sender-owner/default", "receiver-owner/default"] {
         let source = value["federation"]["sources"]
             .as_array()
@@ -2777,6 +2796,11 @@ fn explain_require_complete_rejects_candidate_only_incomplete_history() {
             && row["session"] == sender_tape
             && row["missing"] == "deleted-sender-predecessor"
     }));
+    assert!(value["dispatch_unresolved"].as_array().unwrap().iter().any(|row| {
+        row["uuid"] == uuid
+            && row["reason"] == "history_incomplete"
+            && row["selection_coverage"] == "partial"
+    }));
 
     let required = Command::new(binary)
         .current_dir(&repo)
@@ -2790,14 +2814,25 @@ fn explain_require_complete_rejects_candidate_only_incomplete_history() {
         ])
         .output()
         .expect("run strict explain with candidate-only incomplete history");
-    assert!(!required.status.success());
-    assert!(required.stdout.is_empty());
-    let stderr = String::from_utf8_lossy(&required.stderr);
-    assert!(stderr.contains("incomplete_results"), "{stderr}");
-    assert!(stderr.contains("sender-owner/default"), "{stderr}");
-    assert!(stderr.contains("phase=dispatch_history"), "{stderr}");
-    assert!(stderr.contains("code=history_incomplete"), "{stderr}");
-    assert!(stderr.contains("deleted-sender-predecessor"), "{stderr}");
+    assert!(
+        required.status.success(),
+        "a candidate-only broken link should not fail strict query completion: {}",
+        String::from_utf8_lossy(&required.stderr)
+    );
+    let strict: serde_json::Value =
+        serde_json::from_slice(&required.stdout).expect("strict explain JSON");
+    assert_eq!(strict["federation"]["coverage"], "complete");
+    assert!(strict["dispatch_unresolved"].as_array().unwrap().iter().any(|row| {
+        row["reason"] == "history_incomplete"
+            && row["session_location"] == "sender-owner/default"
+            && row["session"] == sender_tape
+            && row["missing"] == "deleted-sender-predecessor"
+    }));
+    assert!(strict["dispatch_unresolved"].as_array().unwrap().iter().any(|row| {
+        row["uuid"] == uuid
+            && row["reason"] == "history_incomplete"
+            && row["selection_coverage"] == "partial"
+    }));
 }
 
 #[test]
