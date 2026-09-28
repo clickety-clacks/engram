@@ -3552,7 +3552,7 @@ fn explain_file_range_prioritizes_exact_edits_before_default_page_locally_and_re
         local_nonoverlap_id
     );
     assert_eq!(local_result["dispatch_lineage"], json!([]));
-    assert_eq!(local_result["dispatch_unresolved"], json!([]));
+    assert!(local_result.get("dispatch_unresolved").is_none());
     assert_eq!(local_ids.len(), 15);
 
     let local_all_output = Command::new(binary)
