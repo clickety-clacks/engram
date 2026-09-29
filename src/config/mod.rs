@@ -120,6 +120,7 @@ pub fn load_topology(home: &Path) -> Result<Option<Topology>, ConfigError> {
         "items_per_batch",
         "non_file_response_bytes",
         "grep_k",
+        "grep_record_bytes",
         "dispatch_hops_per_edit",
         "predecessor_segments_per_history",
         "decompressed_bytes_per_tape",

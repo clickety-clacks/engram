@@ -753,23 +753,55 @@ impl GrepScanError {
     }
 }
 
+fn read_grep_record<R: BufRead>(
+    reader: &mut R,
+    record: &mut Vec<u8>,
+    limit: Option<u64>,
+) -> Result<usize, GrepScanError> {
+    loop {
+        let available = reader
+            .fill_buf()
+            .map_err(|error| GrepScanError::new("decompress_error", error.to_string()))?;
+        if available.is_empty() {
+            return Ok(record.len());
+        }
+        let length = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        let complete = available.get(length - 1) == Some(&b'\n');
+        let next_length = record.len().checked_add(length).ok_or_else(|| {
+            GrepScanError::new("over_limit", "decompressed JSONL record length overflow")
+        })?;
+        if limit.is_some_and(|limit| next_length as u64 > limit) {
+            return Err(GrepScanError::new(
+                "over_limit",
+                format!(
+                    "decompressed JSONL record exceeds {} byte limit (including newline)",
+                    limit.unwrap_or_default()
+                ),
+            ));
+        }
+        record.extend_from_slice(&available[..length]);
+        reader.consume(length);
+        if complete {
+            return Ok(record.len());
+        }
+    }
+}
+
 /// Scan one compressed JSONL tape without retaining the complete decompressed tape.
-/// A missing decompressed limit is used only for the local path, whose existing
-/// contract has no configured per-tape limit.
+/// A missing record limit is used only for the local path, whose existing
+/// contract has no configured per-record limit.
 pub(crate) fn scan_grep_reader<R: Read>(
     compressed: R,
-    decompressed_limit: Option<u64>,
+    record_limit: Option<u64>,
     pattern: &str,
 ) -> Result<GrepTapeSummary, GrepScanError> {
     let decoder = zstd::stream::read::Decoder::new(compressed)
         .map_err(|error| GrepScanError::new("decompress_error", error.to_string()))?;
-    let decoded: Box<dyn Read> = match decompressed_limit {
-        Some(limit) => Box::new(decoder.take(limit.saturating_add(1))),
-        None => Box::new(decoder),
-    };
-    let mut reader = BufReader::new(decoded);
+    let mut reader = BufReader::new(decoder);
     let mut line = Vec::new();
-    let mut bytes_read = 0u64;
     let mut total_lines = 0usize;
     let mut match_count = 0usize;
     let mut provenance_match_count = 0usize;
@@ -781,19 +813,9 @@ pub(crate) fn scan_grep_reader<R: Read>(
 
     loop {
         line.clear();
-        let bytes = reader
-            .read_until(b'\n', &mut line)
-            .map_err(|error| GrepScanError::new("decompress_error", error.to_string()))?;
+        let bytes = read_grep_record(&mut reader, &mut line, record_limit)?;
         if bytes == 0 {
             break;
-        }
-        bytes_read = bytes_read.saturating_add(bytes as u64);
-        if decompressed_limit.is_some_and(|limit| bytes_read > limit) {
-            let limit = decompressed_limit.unwrap_or_default();
-            return Err(GrepScanError::new(
-                "over_limit",
-                format!("decompressed tape exceeds {limit} byte limit"),
-            ));
         }
 
         let mut content_end = line.len();
@@ -1070,6 +1092,22 @@ mod tests {
             zstd::stream::encode_all(&b"{bad json}\n"[..], 0).expect("compress bad tape");
         let error = scan_grep_reader(&malformed[..], Some(1024), "needle").unwrap_err();
         assert_eq!(error.code, "json_error");
+    }
+
+    #[test]
+    fn scan_limits_each_record_without_limiting_the_whole_tape() {
+        let record = b"{\"k\":\"msg.in\",\"content\":\"needle\"}\n";
+        let content = record.repeat(64);
+        let compressed = zstd::stream::encode_all(&content[..], 0).expect("compress tape");
+        let summary = scan_grep_reader(&compressed[..], Some(record.len() as u64), "needle")
+            .expect("complete tape exceeds per-record limit but each record fits");
+        assert_eq!(summary.total_lines, 64);
+        assert_eq!(summary.match_count, 64);
+
+        let error = scan_grep_reader(&compressed[..], Some(record.len() as u64 - 1), "needle")
+            .expect_err("one over-limit record fails the whole tape");
+        assert_eq!(error.code, "over_limit");
+        assert!(error.message.contains("including newline"));
     }
 
     #[test]
