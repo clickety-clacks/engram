@@ -6524,7 +6524,7 @@ fn cmd_grep_with_peer(
     let mut grep_scan_incomplete = false;
     let mut completed_scan_proves_truncated = false;
     let mut peer_store_count = 0usize;
-    let mut peer_owners = Vec::new();
+    let mut scanned_peers = Vec::new();
     let mut peer_round_jobs = Vec::new();
     let mut connections =
         connect_peers_concurrently(&selected_machines, &topology, query_deadline, &cancelled);
@@ -6663,7 +6663,7 @@ fn cmd_grep_with_peer(
     ) {
         let PeerRoundResult {
             machine,
-            owner,
+            owner: _,
             exports: active_exports,
             outcomes,
         } = result;
@@ -6797,10 +6797,8 @@ fn cmd_grep_with_peer(
             peer_session_records.extend(store_records);
             grep_succeeded.push(export.clone());
         }
-        if let Some(owner) = owner {
-            peer_store_count = peer_store_count.saturating_add(grep_succeeded.len());
-            peer_owners.push((machine, owner, grep_succeeded));
-        }
+        peer_store_count = peer_store_count.saturating_add(grep_succeeded.len());
+        scanned_peers.push((machine, grep_succeeded));
     }
 
     let local_scan = local_scan
@@ -6914,11 +6912,115 @@ fn cmd_grep_with_peer(
         // never requested. Their aggregates remain valid; page references
         // are made unknown below because coverage is partial.
         if !cancelled.load(Ordering::SeqCst) {
-            for (machine, owner, grep_ok_exports) in peer_owners.drain(..) {
+            for (machine, grep_ok_exports) in scanned_peers.drain(..) {
                 if grep_ok_exports.is_empty() {
                     continue;
                 }
-                let requests = grep_ok_exports
+                // The local scan and page merge can outlast a fast owner's idle
+                // window. Start page metadata on a fresh session, even if the
+                // scan session has already exited, and bind it to the same store.
+                let first_store = format!("{machine}/{}", grep_ok_exports[0]);
+                let prior_source = source_rows.iter().find(|source| {
+                    source.get("store").and_then(Value::as_str)
+                        == Some(first_store.as_str())
+                });
+                let prior_build = prior_source
+                    .and_then(|source| source.get("build"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let prior_semantics = prior_source
+                    .and_then(|source| source.get("semantics"))
+                    .and_then(Value::as_u64);
+                let peer = &topology.peers[&machine];
+                let timeout = configured_connect_open_timeout(&topology)
+                    .min(query_deadline.saturating_duration_since(Instant::now()));
+                let fresh = RemoteOwner::connect_cancellable(
+                    &machine,
+                    &topology.self_label,
+                    peer,
+                    timeout,
+                    &cancelled,
+                );
+                let fresh = match fresh {
+                    Ok(fresh) => fresh,
+                    Err(failure) => {
+                        any_source_failure = true;
+                        for export in &grep_ok_exports {
+                            mark_source_phase(
+                                &mut source_rows,
+                                &format!("{machine}/{export}"),
+                                "dispatch_rows",
+                                &failure.code,
+                                &failure.message,
+                            );
+                        }
+                        continue;
+                    }
+                };
+                if fresh.build != prior_build || Some(fresh.query_semantics) != prior_semantics {
+                    any_source_failure = true;
+                    for export in &grep_ok_exports {
+                        mark_source_phase(
+                            &mut source_rows,
+                            &format!("{machine}/{export}"),
+                            "dispatch_rows",
+                            "incompatible",
+                            "peer build or query semantics changed between grep_scan and dispatch_rows",
+                        );
+                    }
+                    continue;
+                }
+                let mut metadata_exports = Vec::new();
+                for export in grep_ok_exports {
+                    match fresh.exports.get(&export) {
+                        Some(Ok(opened)) => {
+                            let store_name = format!("{machine}/{export}");
+                            let same_db = source_rows.iter().any(|source| {
+                                source.get("store").and_then(Value::as_str)
+                                    == Some(store_name.as_str())
+                                    && source.get("db").and_then(Value::as_str)
+                                        == Some(opened.db.as_str())
+                            });
+                            if same_db {
+                                metadata_exports.push(export);
+                            } else {
+                                any_source_failure = true;
+                                mark_source_phase(
+                                    &mut source_rows,
+                                    &store_name,
+                                    "dispatch_rows",
+                                    "incompatible",
+                                    "peer export DB changed between grep_scan and dispatch_rows",
+                                );
+                            }
+                        }
+                        Some(Err(failure)) => {
+                            any_source_failure = true;
+                            mark_source_phase(
+                                &mut source_rows,
+                                &format!("{machine}/{export}"),
+                                "dispatch_rows",
+                                &failure.code,
+                                &failure.message,
+                            );
+                        }
+                        None => {
+                            any_source_failure = true;
+                            mark_source_phase(
+                                &mut source_rows,
+                                &format!("{machine}/{export}"),
+                                "dispatch_rows",
+                                "protocol_error",
+                                "peer omitted configured export on metadata reconnect",
+                            );
+                        }
+                    }
+                }
+                if metadata_exports.is_empty() {
+                    continue;
+                }
+                let requests = metadata_exports
                     .iter()
                     .map(|export| {
                         PeerRequest::new(
@@ -6930,8 +7032,8 @@ fn cmd_grep_with_peer(
                     .collect::<Vec<_>>();
                 dispatch_jobs.push(PeerRoundJob {
                     machine,
-                    owner,
-                    exports: grep_ok_exports,
+                    owner: fresh,
+                    exports: metadata_exports,
                     requests,
                 });
             }
