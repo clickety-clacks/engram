@@ -1424,7 +1424,17 @@ mod tests {
     #[test]
     fn codex_filechange_relative_patch_binds_against_recorded_cwd() {
         let patch = "*** Begin Patch\n*** Add File: relative.txt\n+new\n*** End Patch\n";
-        let meta = serde_json::json!({"type":"session_meta","payload":{"id":"session_relative","cwd":"/tmp/work"}});
+        let cwd = if cfg!(windows) {
+            r"C:\tmp\work"
+        } else {
+            "/tmp/work"
+        };
+        let native_path = if cfg!(windows) {
+            r"C:\tmp\work\relative.txt"
+        } else {
+            "/tmp/work/relative.txt"
+        };
+        let meta = serde_json::json!({"type":"session_meta","payload":{"id":"session_relative","cwd":cwd}});
         let call = serde_json::json!({"type":"response_item","payload":{
             "type":"custom_tool_call","call_id":"call_relative","name":"exec",
             "input":format!("text(await tools.apply_patch({}));", serde_json::to_string(patch).unwrap()),
@@ -1433,7 +1443,7 @@ mod tests {
         let native = serde_json::json!({"type":"event_msg","payload":{
             "type":"item_completed","turn_id":"turn_relative","item":{
                 "type":"FileChange","id":"exec_relative","status":"completed",
-                "changes":{"/tmp/work/relative.txt":{"type":"add","content":"new\n"}},
+                "changes":{(native_path):{"type":"add","content":"new\n"}},
                 "stdout":"Success. Updated the following files:\nA relative.txt\n","stderr":""
             }
         }});
@@ -1455,7 +1465,7 @@ mod tests {
             .filter(|event| event["k"] == "code.edit")
             .collect::<Vec<_>>();
         assert_eq!(edits.len(), 1);
-        assert_eq!(edits[0]["file"], "/tmp/work/relative.txt");
+        assert_eq!(edits[0]["file"], native_path);
         assert_eq!(edits[0]["call_id"], "call_relative");
     }
 
