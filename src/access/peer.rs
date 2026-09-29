@@ -416,6 +416,11 @@ impl PeerSession {
                     "decompressed_bytes_per_tape",
                     512 * 1024 * 1024,
                 ),
+                "grep_record_bytes": configured_limit(
+                    &self.topology.limits,
+                    "grep_record_bytes",
+                    16 * 1024 * 1024,
+                ),
                 "owner_session_max_secs": configured_limit(
                     &self.topology.limits,
                     "owner_session_max_secs",
@@ -1911,14 +1916,6 @@ fn scan_tape_for_grep(
     limits: &BTreeMap<String, u64>,
     pattern: &str,
 ) -> Result<GrepTapeSummary, PeerError> {
-    let compressed_limit =
-        configured_limit(limits, "read_file_compressed_bytes", MAX_READ_FILE_BYTES);
-    if expected_size > compressed_limit {
-        return Err(PeerError::new(
-            "budget_exceeded",
-            format!("compressed tape exceeds {compressed_limit} byte limit"),
-        ));
-    }
     let file = crate::platform::open_read_nofollow(path)
         .map_err(|error| PeerError::new("tape_unavailable", error.to_string()))?;
     let metadata = file
@@ -1937,14 +1934,8 @@ fn scan_tape_for_grep(
         ));
     }
 
-    let decompressed_limit =
-        configured_limit(limits, "decompressed_bytes_per_tape", 512 * 1024 * 1024);
-    scan_grep_reader(
-        file.take(compressed_limit.saturating_add(1)),
-        Some(decompressed_limit),
-        pattern,
-    )
-    .map_err(|error| {
+    let record_limit = configured_limit(limits, "grep_record_bytes", 16 * 1024 * 1024);
+    scan_grep_reader(file, Some(record_limit), pattern).map_err(|error| {
         let code = if error.code == "over_limit" {
             "over_limit"
         } else {

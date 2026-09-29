@@ -8004,7 +8004,7 @@ fn peer_tape_facts_verifies_and_returns_native_recovery_binding() {
 }
 
 #[test]
-fn peer_decompression_caps_are_reported_as_over_limit() {
+fn peer_read_file_cap_and_grep_record_cap_are_reported_as_over_limit() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = env!("CARGO_BIN_EXE_engram");
     let tape_id = "decompression-cap-tape";
@@ -8019,7 +8019,7 @@ fn peer_decompression_caps_are_reported_as_over_limit() {
     let topology = std::fs::read_to_string(&topology_path).expect("read owner topology");
     std::fs::write(
         &topology_path,
-        format!("{topology}limits:\n  decompressed_bytes_per_tape: 32\n"),
+        format!("{topology}limits:\n  decompressed_bytes_per_tape: 32\n  grep_record_bytes: 32\n"),
     )
     .expect("set owner decompression cap");
 
@@ -8067,6 +8067,35 @@ fn peer_decompression_caps_are_reported_as_over_limit() {
         .expect("per-tape cap failure is reported in data");
     assert_eq!(grep.data[0]["type"], "failure");
     assert_eq!(grep.data[0]["error"]["code"], "over_limit");
+    assert!(
+        grep.data[0]["error"]["message"]
+            .as_str()
+            .expect("grep failure reason")
+            .contains("line 1 at byte offset 0")
+    );
+    drop(owner);
+
+    let topology = std::fs::read_to_string(&topology_path).expect("read owner topology");
+    std::fs::write(
+        &topology_path,
+        topology.replace("grep_record_bytes: 32", "grep_record_bytes: 1024"),
+    )
+    .expect("raise only the grep record cap");
+    let mut owner = RemoteOwner::connect("limited-owner", "querier", &peer, Duration::from_secs(5))
+        .expect("reconnect limited owner");
+    let grep = owner
+        .round(
+            &[PeerRequest::new(
+                "grep_scan",
+                vec!["default".into()],
+                json!({"pattern":"needle", "k":10}),
+            )],
+            Duration::from_secs(5),
+        )
+        .pop()
+        .expect("grep outcome")
+        .expect("whole-tape read_file cap does not restrict streaming grep");
+    assert_eq!(grep.data[0]["type"], "match");
     drop(owner);
 
     let (caller_home, repo) = write_local_grep_source(
