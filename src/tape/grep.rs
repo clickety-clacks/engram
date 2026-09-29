@@ -481,8 +481,17 @@ impl<'de> Visitor<'de> for RootArgsMatchVisitor<'_> {
                 json_text_matches(value, self.pattern, SearchMode::Arguments)
                     .unwrap_or_else(|| value.contains(self.pattern)),
             )
+        } else if value.contains(self.pattern) {
+            Ok(true)
+        } else if value.trim_start().starts_with("const ") {
+            let Some(arguments) =
+                crate::tape::adapters::codex::assigned_exec_command_arguments(value)
+            else {
+                return Ok(false);
+            };
+            Ok(json_text_matches(&arguments, self.pattern, SearchMode::Arguments).unwrap_or(false))
         } else {
-            Ok(value.contains(self.pattern))
+            Ok(false)
         }
     }
 

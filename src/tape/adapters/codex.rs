@@ -629,6 +629,35 @@ fn literal_command_arguments(input: &str) -> Option<(String, usize)> {
     }
 }
 
+/// Extract the JSON-literal arguments from the recorded assigned exec wrapper.
+/// This recognizes syntax only; it never evaluates the tool-call source.
+pub(crate) fn assigned_exec_command_arguments(code: &str) -> Option<String> {
+    let rest = code.trim_start().strip_prefix("const ")?;
+    let (binding, rest) = rest.split_once('=')?;
+    let binding = binding.trim();
+    if !is_ascii_identifier(binding) {
+        return None;
+    }
+
+    let call_arguments = rest
+        .trim_start()
+        .strip_prefix("await tools.exec_command(")?;
+    let (arguments, consumed) = literal_command_arguments(call_arguments)?;
+    let rest = call_arguments[consumed..]
+        .trim_start()
+        .strip_prefix(");")?
+        .trim_start();
+    let rest = rest
+        .strip_prefix("text(")?
+        .strip_prefix(binding)?
+        .strip_prefix(".output)")?
+        .trim_start();
+    rest.strip_prefix(';')?
+        .trim()
+        .is_empty()
+        .then_some(arguments)
+}
+
 fn nested_results(output: &Value, calls: &[CodexCall]) -> Option<Vec<Value>> {
     let blocks = output.as_array()?;
     if blocks.len() != calls.len() + 1 || !blocks.iter().all(|b| b["type"] == "input_text") {
@@ -729,7 +758,29 @@ fn to_jsonl(events: &[Value]) -> Result<String, serde_json::Error> {
 mod tests {
     use serde_json::Value;
 
-    use super::codex_jsonl_to_tape_jsonl;
+    use super::{assigned_exec_command_arguments, codex_jsonl_to_tape_jsonl};
+
+    #[test]
+    fn assigned_exec_argument_projection_accepts_only_literal_wrapper() {
+        let code = r#"const r = await tools.exec_command({cmd:"echo marker",workdir:"/tmp"}); text(r.output);"#;
+        let arguments = assigned_exec_command_arguments(code).expect("literal exec wrapper");
+        let arguments: Value = serde_json::from_str(&arguments).expect("normalized arguments");
+        assert_eq!(arguments["cmd"], "echo marker");
+        assert_eq!(arguments["workdir"], "/tmp");
+
+        assert!(
+            assigned_exec_command_arguments(
+                "const r = await tools.exec_command({cmd:command}); text(r.output);"
+            )
+            .is_none()
+        );
+        assert!(
+            assigned_exec_command_arguments(
+                r#"const r = await tools.exec_command({cmd:"echo marker"}); text(other.output);"#
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn codex_adapter_emits_patch_from_recorded_assigned_exec_wrapper() {
