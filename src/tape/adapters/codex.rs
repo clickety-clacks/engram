@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -136,6 +137,7 @@ pub(crate) fn codex_jsonl_incremental(
                             tool,
                             call_id.as_deref(),
                             &args,
+                            session_cwd.as_deref(),
                             payload
                                 .and_then(|obj| {
                                     obj.get("internal_chat_message_metadata_passthrough")
@@ -166,6 +168,7 @@ pub(crate) fn codex_jsonl_incremental(
                             tool,
                             call_id.as_deref(),
                             &args,
+                            session_cwd.as_deref(),
                             payload
                                 .and_then(|obj| {
                                     obj.get("internal_chat_message_metadata_passthrough")
@@ -283,6 +286,11 @@ pub(crate) fn codex_jsonl_incremental(
             }
             "event_msg" => {
                 let payload = &row["payload"];
+                if payload["type"] == "turn_context" {
+                    if let Some(cwd) = payload["cwd"].as_str() {
+                        session_cwd = Some(cwd.to_owned());
+                    }
+                }
                 if payload["type"] == "item_completed" && payload["item"]["type"] == "FileChange" {
                     let item = &payload["item"];
                     let Some(id) = item["id"].as_str().filter(|id| !id.is_empty()) else {
@@ -526,7 +534,10 @@ fn match_native_call(
             continue;
         }
         let operations = if call.tool == "exec" {
-            nested_calls(&call.args)?
+            let Some(operations) = nested_calls_for_native_binding(&call.args) else {
+                continue;
+            };
+            operations
         } else {
             vec![call.clone()]
         };
@@ -536,17 +547,69 @@ fn match_native_call(
             {
                 continue;
             }
-            let patch_paths = parse_patch(&patch_body(&operation.args))
-                .into_iter()
-                .map(|edit| edit.file)
-                .collect::<Vec<_>>();
-            if paths.iter().all(|path| patch_paths.contains(path)) {
+            let patch_paths =
+                declared_patch_paths(&patch_body(&operation.args), call.cwd.as_deref());
+            if paths
+                .iter()
+                .all(|path| patch_paths.contains(&PathBuf::from(path)))
+            {
                 matching.push((call_id.clone(), index));
-                break;
             }
         }
     }
     (matching.len() == 1).then(|| matching.remove(0))
+}
+
+/// Header paths describe the operation even when a path-only delete has no
+/// content for the legacy patch parser to emit. They are used only to bind a
+/// completed native item to its recorded call, never as edit evidence.
+fn declared_patch_paths(patch: &str, cwd: Option<&str>) -> Vec<PathBuf> {
+    if !patch_has_envelope(patch) {
+        return Vec::new();
+    }
+    patch
+        .lines()
+        .filter_map(|line| {
+            [
+                "*** Add File: ",
+                "*** Update File: ",
+                "*** Delete File: ",
+                "*** Move to: ",
+            ]
+            .iter()
+            .find_map(|prefix| line.strip_prefix(prefix))
+        })
+        .filter_map(|raw| {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                return None;
+            }
+            if is_absolute_path(raw) {
+                return Some(PathBuf::from(raw));
+            }
+            let cwd = cwd?;
+            let base = Path::new(cwd);
+            base.is_absolute().then(|| base.join(raw))
+        })
+        .collect()
+}
+
+fn patch_has_envelope(patch: &str) -> bool {
+    patch.trim_start().starts_with("*** Begin Patch\n")
+        && patch.trim_end().ends_with("*** End Patch")
+}
+
+fn patch_allowed(patch: &str, native_binding: bool) -> bool {
+    if native_binding {
+        patch_has_envelope(patch)
+            && patch.lines().any(|line| {
+                line.starts_with("*** Add File: ")
+                    || line.starts_with("*** Update File: ")
+                    || line.starts_with("*** Delete File: ")
+            })
+    } else {
+        patch_is_complete(patch) && !parse_patch(patch).is_empty()
+    }
 }
 
 fn native_file_changes(
@@ -843,6 +906,7 @@ fn emit_tool_call(
     tool: &str,
     call_id: Option<&str>,
     args: &str,
+    cwd: Option<&str>,
     turn_id: Option<&str>,
 ) {
     if let Some(call_id) = call_id {
@@ -851,6 +915,7 @@ fn emit_tool_call(
             CodexCall {
                 tool: tool.to_string(),
                 args: args.to_string(),
+                cwd: cwd.map(str::to_owned),
                 turn_id: turn_id.map(str::to_owned),
             },
         );
@@ -880,6 +945,8 @@ struct CodexCall {
     tool: String,
     args: String,
     #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
     turn_id: Option<String>,
 }
 
@@ -899,12 +966,23 @@ fn patch_body(arguments: &str) -> String {
 /// Exact straight-line wrapper only. Never evaluate JavaScript, infer execution
 /// from mentioned source, or associate ambiguous result blocks with operations.
 fn nested_calls(code: &str) -> Option<Vec<CodexCall>> {
+    nested_calls_with_mode(code, false)
+}
+
+/// Native success can bind to an exact patch call whose declared paths are
+/// known even when the legacy content parser cannot describe every edit.
+fn nested_calls_for_native_binding(code: &str) -> Option<Vec<CodexCall>> {
+    nested_calls_with_mode(code, true)
+}
+
+fn nested_calls_with_mode(code: &str, native_binding: bool) -> Option<Vec<CodexCall>> {
     let mut rest = code.trim();
     if rest.starts_with("// @exec:") {
         rest = rest.split_once('\n')?.1.trim_start();
     }
     if rest.starts_with("const ") {
-        return assigned_apply_patch_call(rest).or_else(|| bound_patch_literal_call(rest));
+        return assigned_apply_patch_call_with_mode(rest, native_binding)
+            .or_else(|| bound_patch_literal_call_with_mode(rest, native_binding));
     }
     let mut calls = Vec::new();
     while !rest.is_empty() {
@@ -915,7 +993,7 @@ fn nested_calls(code: &str) -> Option<Vec<CodexCall>> {
                 let mut values =
                     serde_json::Deserializer::from_str(arguments).into_iter::<String>();
                 let patch = values.next()?.ok()?;
-                if !patch_is_complete(&patch) || parse_patch(&patch).is_empty() {
+                if !patch_allowed(&patch, native_binding) {
                     return None;
                 }
                 (patch, values.byte_offset())
@@ -930,6 +1008,7 @@ fn nested_calls(code: &str) -> Option<Vec<CodexCall>> {
         calls.push(CodexCall {
             tool: tool.into(),
             args,
+            cwd: None,
             turn_id: None,
         });
     }
@@ -938,7 +1017,7 @@ fn nested_calls(code: &str) -> Option<Vec<CodexCall>> {
 
 /// The recorded code-mode form may name a literal patch before passing it to
 /// apply_patch. Accept only this single, straight-line binding and call.
-fn bound_patch_literal_call(code: &str) -> Option<Vec<CodexCall>> {
+fn bound_patch_literal_call_with_mode(code: &str, native_binding: bool) -> Option<Vec<CodexCall>> {
     let rest = code.strip_prefix("const ")?;
     let (binding, rest) = rest.split_once('=')?;
     let binding = binding.trim();
@@ -949,7 +1028,7 @@ fn bound_patch_literal_call(code: &str) -> Option<Vec<CodexCall>> {
     let literal = rest.trim_start();
     let mut values = serde_json::Deserializer::from_str(literal).into_iter::<String>();
     let patch = values.next()?.ok()?;
-    if !patch_is_complete(&patch) || parse_patch(&patch).is_empty() {
+    if !patch_allowed(&patch, native_binding) {
         return None;
     }
     let rest = literal[values.byte_offset()..]
@@ -965,13 +1044,14 @@ fn bound_patch_literal_call(code: &str) -> Option<Vec<CodexCall>> {
     Some(vec![CodexCall {
         tool: "apply_patch".into(),
         args: patch,
+        cwd: None,
         turn_id: None,
     }])
 }
 
 /// Accept the recorded exec wrapper only when it binds one literal patch and
 /// echoes that same result. This parses syntax; it never evaluates JavaScript.
-fn assigned_apply_patch_call(code: &str) -> Option<Vec<CodexCall>> {
+fn assigned_apply_patch_call_with_mode(code: &str, native_binding: bool) -> Option<Vec<CodexCall>> {
     let rest = code.strip_prefix("const ")?;
     let (binding, rest) = rest.split_once('=')?;
     let binding = binding.trim();
@@ -982,7 +1062,7 @@ fn assigned_apply_patch_call(code: &str) -> Option<Vec<CodexCall>> {
     let arguments = rest.trim_start().strip_prefix("await tools.apply_patch(")?;
     let mut values = serde_json::Deserializer::from_str(arguments).into_iter::<String>();
     let patch = values.next()?.ok()?;
-    if !patch_is_complete(&patch) || parse_patch(&patch).is_empty() {
+    if !patch_allowed(&patch, native_binding) {
         return None;
     }
     let rest = arguments[values.byte_offset()..]
@@ -998,6 +1078,7 @@ fn assigned_apply_patch_call(code: &str) -> Option<Vec<CodexCall>> {
     Some(vec![CodexCall {
         tool: "apply_patch".into(),
         args: patch,
+        cwd: None,
         turn_id: None,
     }])
 }
@@ -1338,6 +1419,85 @@ mod tests {
         assert_eq!(edits.len(), 2);
         assert!(edits.iter().any(|event| event["file"] == "/tmp/first.txt"));
         assert!(edits.iter().any(|event| event["file"] == "/tmp/second.txt"));
+    }
+
+    #[test]
+    fn codex_filechange_relative_patch_binds_against_recorded_cwd() {
+        let patch = "*** Begin Patch\n*** Add File: relative.txt\n+new\n*** End Patch\n";
+        let meta = serde_json::json!({"type":"session_meta","payload":{"id":"session_relative","cwd":"/tmp/work"}});
+        let call = serde_json::json!({"type":"response_item","payload":{
+            "type":"custom_tool_call","call_id":"call_relative","name":"exec",
+            "input":format!("text(await tools.apply_patch({}));", serde_json::to_string(patch).unwrap()),
+            "internal_chat_message_metadata_passthrough":{"turn_id":"turn_relative"}
+        }});
+        let native = serde_json::json!({"type":"event_msg","payload":{
+            "type":"item_completed","turn_id":"turn_relative","item":{
+                "type":"FileChange","id":"exec_relative","status":"completed",
+                "changes":{"/tmp/work/relative.txt":{"type":"add","content":"new\n"}},
+                "stdout":"Success. Updated the following files:\nA relative.txt\n","stderr":""
+            }
+        }});
+        let output = serde_json::json!({"type":"response_item","payload":{
+            "type":"custom_tool_call_output","call_id":"call_relative","output":[
+                {"type":"input_text","text":"Script completed\nWall time 0.1s\nOutput:\n"},
+                {"type":"input_text","text":"{}"}
+            ]
+        }});
+        let out = codex_jsonl_to_tape_jsonl(
+            &[meta, call, native, output]
+                .map(|v| v.to_string())
+                .join("\n"),
+        )
+        .unwrap();
+        let edits = out
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["k"] == "code.edit")
+            .collect::<Vec<_>>();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0]["file"], "/tmp/work/relative.txt");
+        assert_eq!(edits[0]["call_id"], "call_relative");
+    }
+
+    #[test]
+    fn codex_filechange_path_only_delete_still_binds_its_patch() {
+        let patch = "*** Begin Patch\n*** Update File: /tmp/edit.txt\n@@\n-old\n+new\n*** Delete File: /tmp/remove.txt\n*** End Patch\n";
+        assert_eq!(super::declared_patch_paths(patch, None).len(), 2);
+        let call = serde_json::json!({"type":"response_item","payload":{
+            "type":"custom_tool_call","call_id":"call_delete","name":"exec",
+            "input":format!("text(await tools.apply_patch({}));", serde_json::to_string(patch).unwrap()),
+            "internal_chat_message_metadata_passthrough":{"turn_id":"turn_delete"}
+        }});
+        let native = serde_json::json!({"type":"event_msg","payload":{
+            "type":"item_completed","turn_id":"turn_delete","item":{
+                "type":"FileChange","id":"exec_delete","status":"completed",
+                "changes":{
+                    "/tmp/edit.txt":{"type":"update","unified_diff":"@@ -1 +1 @@\n-old\n+new\n"},
+                    "/tmp/remove.txt":{"type":"delete"}
+                },
+                "stdout":"Success. Updated the following files:\nM /tmp/edit.txt\nD /tmp/remove.txt\n","stderr":""
+            }
+        }});
+        let output = serde_json::json!({"type":"response_item","payload":{
+            "type":"custom_tool_call_output","call_id":"call_delete","output":[
+                {"type":"input_text","text":"Script completed\nWall time 0.1s\nOutput:\n"},
+                {"type":"input_text","text":"{}"}
+            ]
+        }});
+        let out =
+            codex_jsonl_to_tape_jsonl(&[call, native, output].map(|v| v.to_string()).join("\n"))
+                .unwrap();
+        let edits = out
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["k"] == "code.edit")
+            .collect::<Vec<_>>();
+        assert_eq!(edits.len(), 2);
+        assert!(
+            edits.iter().all(|event| event["call_id"] == "call_delete"),
+            "{edits:?}"
+        );
+        assert!(edits.iter().any(|event| event["file"] == "/tmp/remove.txt"));
     }
 
     #[test]
