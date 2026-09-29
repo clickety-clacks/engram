@@ -52,12 +52,13 @@ fn peer_client_drop_does_not_join_readers_held_open_outside_peer_group() {
     fs::write(
         &script,
         r##"#!/bin/sh
-set -m
 marker="$1"
 IFS= read -r request || exit 0
 id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-sleep 60 &
-printf '%s\n' "$!" > "$marker"
+# Noninteractive shells do not consistently put background jobs in their own
+# process group. Start a new session explicitly so this child keeps the pipe
+# open after PeerClient terminates the peer group.
+python3 -c 'import os, sys, time; os.setsid(); open(sys.argv[1], "w").write(str(os.getpid())); time.sleep(60)' "$marker" &
 printf 'PEER_TAIL_SENTINEL\n' >&2
 printf '{"id":%s,"data":{"partial":"preserved"}}\n' "$id"
 printf '{"id":%s,"end":true,"ok":true,"stats":{"done":true}}\n' "$id"
