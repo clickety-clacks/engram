@@ -509,7 +509,7 @@ fn nested_calls(code: &str) -> Option<Vec<CodexCall>> {
         rest = rest.split_once('\n')?.1.trim_start();
     }
     if rest.starts_with("const ") {
-        return assigned_apply_patch_call(rest);
+        return assigned_apply_patch_call(rest).or_else(|| bound_patch_literal_call(rest));
     }
     let mut calls = Vec::new();
     while !rest.is_empty() {
@@ -538,6 +538,38 @@ fn nested_calls(code: &str) -> Option<Vec<CodexCall>> {
         });
     }
     (!calls.is_empty()).then_some(calls)
+}
+
+/// The recorded code-mode form may name a literal patch before passing it to
+/// apply_patch. Accept only this single, straight-line binding and call.
+fn bound_patch_literal_call(code: &str) -> Option<Vec<CodexCall>> {
+    let rest = code.strip_prefix("const ")?;
+    let (binding, rest) = rest.split_once('=')?;
+    let binding = binding.trim();
+    if !is_ascii_identifier(binding) {
+        return None;
+    }
+
+    let literal = rest.trim_start();
+    let mut values = serde_json::Deserializer::from_str(literal).into_iter::<String>();
+    let patch = values.next()?.ok()?;
+    if !patch_is_complete(&patch) || parse_patch(&patch).is_empty() {
+        return None;
+    }
+    let rest = literal[values.byte_offset()..]
+        .trim_start()
+        .strip_prefix(';')?
+        .trim_start()
+        .strip_prefix("text(await tools.apply_patch(")?;
+    let (argument, rest) = rest.split_once(')')?;
+    if argument.trim() != binding || rest.trim_start().strip_prefix(");")?.trim().len() != 0 {
+        return None;
+    }
+
+    Some(vec![CodexCall {
+        tool: "apply_patch".into(),
+        args: patch,
+    }])
 }
 
 /// Accept the recorded exec wrapper only when it binds one literal patch and
@@ -758,7 +790,7 @@ fn to_jsonl(events: &[Value]) -> Result<String, serde_json::Error> {
 mod tests {
     use serde_json::Value;
 
-    use super::{assigned_exec_command_arguments, codex_jsonl_to_tape_jsonl};
+    use super::{assigned_exec_command_arguments, codex_jsonl_to_tape_jsonl, nested_calls};
 
     #[test]
     fn assigned_exec_argument_projection_accepts_only_literal_wrapper() {
@@ -834,6 +866,59 @@ mod tests {
 
         assert_eq!(events[0]["coverage.edit"], "partial");
         assert!(events.iter().all(|event| event["k"] != "code.edit"));
+    }
+
+    #[test]
+    fn codex_adapter_recognizes_bound_literal_patch_in_exec() {
+        let patch =
+            "*** Begin Patch\n*** Add File: /tmp/e2/fixture.txt\n+receiver edit\n*** End Patch\n";
+        let code = format!(
+            "const patch = {}; text(await tools.apply_patch(patch));",
+            serde_json::to_string(patch).unwrap()
+        );
+        let input = [
+            serde_json::json!({"type":"response_item","payload":{
+                "type":"custom_tool_call","name":"exec","call_id":"edit","input":code
+            }}),
+            serde_json::json!({"type":"response_item","payload":{
+                "type":"custom_tool_call_output","call_id":"edit","output":[
+                    {"type":"input_text","text":"Script completed\nWall time 0.1s\nOutput:\n"},
+                    {"type":"input_text","text":"{}"}
+                ]
+            }}),
+        ]
+        .map(|value| value.to_string())
+        .join("\n");
+        let out = codex_jsonl_to_tape_jsonl(&input).unwrap();
+        let events: Vec<Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events[0]["coverage.edit"], "full");
+        let edit = events
+            .iter()
+            .find(|event| event["k"] == "code.edit")
+            .unwrap();
+        assert_eq!(edit["file"], "/tmp/e2/fixture.txt");
+        assert_eq!(edit["after_text"], "receiver edit\n");
+
+        for rejected in [
+            format!(
+                "const other = {}; text(await tools.apply_patch(patch));",
+                serde_json::to_string(patch).unwrap()
+            ),
+            format!(
+                "const patch = {}; text(await tools.apply_patch(other));",
+                serde_json::to_string(patch).unwrap()
+            ),
+            format!(
+                "const patch = {}; extra(); text(await tools.apply_patch(patch));",
+                serde_json::to_string(patch).unwrap()
+            ),
+            "const patch = `${value}`; text(await tools.apply_patch(patch));".into(),
+        ] {
+            assert!(nested_calls(&rejected).is_none(), "accepted {rejected}");
+        }
     }
 
     #[test]
