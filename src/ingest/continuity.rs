@@ -5,7 +5,8 @@ use crate::tape::adapter::AdapterId;
 use crate::tape::adapters::codex::{CodexState, codex_jsonl_incremental};
 use crate::tape::harness::{ClaudeState, claude_jsonl_incremental};
 
-/// Only unfinished native calls and session identity survive a poll, not prior events.
+/// Unfinished calls, session identity, and bounded native-edit correlations
+/// survive a poll; prior normalized events stay in the immutable tape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "harness", content = "state")]
 pub(super) enum NativeState {
