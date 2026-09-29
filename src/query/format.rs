@@ -370,6 +370,90 @@ pub fn compare_explain_sessions(a: &Value, b: &Value) -> std::cmp::Ordering {
         .then_with(|| a_session_id.cmp(b_session_id))
 }
 
+pub fn compare_explain_sessions_with_span_priority(
+    a: &Value,
+    b: &Value,
+    exact_edit_sessions: &HashSet<String>,
+) -> std::cmp::Ordering {
+    let a_session_id = a.get("session_id").and_then(Value::as_str).unwrap_or("");
+    let b_session_id = b.get("session_id").and_then(Value::as_str).unwrap_or("");
+    exact_edit_sessions
+        .contains(b_session_id)
+        .cmp(&exact_edit_sessions.contains(a_session_id))
+        .then_with(|| compare_explain_sessions(a, b))
+}
+
+pub fn structured_edit_overlaps_span(event: &Value, file: &str, start: u32, end: u32) -> bool {
+    if event.get("k").and_then(Value::as_str) != Some("code.edit")
+        || event.get("file").and_then(Value::as_str) != Some(file)
+    {
+        return false;
+    }
+
+    ["before_range", "after_range"].into_iter().any(|key| {
+        let Some(range) = event.get(key).and_then(Value::as_array) else {
+            return false;
+        };
+        let (Some(edit_start), Some(edit_end)) = (
+            range.first().and_then(Value::as_u64),
+            range.get(1).and_then(Value::as_u64),
+        ) else {
+            return false;
+        };
+        edit_start > 0
+            && edit_end >= edit_start
+            && edit_start <= u64::from(end)
+            && u64::from(start) <= edit_end
+    })
+}
+
+pub fn exact_span_edit_sessions(
+    raw_sessions: &[Value],
+    file: &str,
+    start: u32,
+    end: u32,
+) -> HashSet<String> {
+    raw_sessions
+        .iter()
+        .filter_map(|session| {
+            let tape_id = session.get("tape_id")?.as_str()?;
+            let edit_offsets = session
+                .get("touches")?
+                .as_array()?
+                .iter()
+                .filter(|touch| {
+                    touch.get("kind").and_then(Value::as_str) == Some("edit")
+                        && touch.get("file_path").and_then(Value::as_str) == Some(file)
+                })
+                .filter_map(|touch| touch.get("event_offset").and_then(Value::as_u64))
+                .collect::<HashSet<_>>();
+            if edit_offsets.is_empty() {
+                return None;
+            }
+
+            let matches = session
+                .get("windows")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|window| window.get("events").and_then(Value::as_array))
+                .flatten()
+                .any(|entry| {
+                    entry
+                        .get("offset")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|offset| {
+                            edit_offsets.contains(&offset)
+                                && entry.get("event").is_some_and(|event| {
+                                    structured_edit_overlaps_span(event, file, start, end)
+                                })
+                        })
+                });
+            matches.then(|| tape_id.to_string())
+        })
+        .collect()
+}
+
 pub fn format_sessions_for_agent(
     context: &RuntimeContext,
     indexes: &[SqliteIndex],

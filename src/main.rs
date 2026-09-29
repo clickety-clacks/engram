@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
+use engram::access::QUERY_FEATURE_EXACT_SPAN_EDIT_RANKING;
 use engram::access::client::{
     DEFAULT_DECOMPRESSED_BYTES_PER_TAPE, DEFAULT_READ_FILE_COMPRESSED_BYTES, PeerFailure,
     PeerRequest, PeerResponse, RemoteOwner, decode_base64_chunk,
@@ -37,9 +38,10 @@ use engram::query::format::MAX_QUERY_WINDOW_ANCHORS;
 use engram::query::format::{
     DateFilter, ExplainTarget, GrepRank, annotate_chain_fields, apply_session_truncation,
     build_chain_metadata, build_session_windows, classify_explain_target, collect_anchor_scores,
-    collect_touch_evidence, compact_event, compare_explain_sessions, compare_grep_sessions,
-    default_peek_anchor_line, derive_anchor_candidates, dispatch_ref_counts, edge_to_json,
-    emit_query_result, explain_across_indexes, extract_latest_timestamp_from_rows,
+    collect_touch_evidence, compact_event, compare_explain_sessions_with_span_priority,
+    compare_grep_sessions, default_peek_anchor_line,
+    derive_anchor_candidates, dispatch_ref_counts, edge_to_json, emit_query_result,
+    exact_span_edit_sessions, explain_across_indexes, extract_latest_timestamp_from_rows,
     format_sessions_for_agent, grep_line_matches, open_query_indexes, prepare_grep_scan,
     prepare_grep_scan_with_tape_ids, print_pretty_explain, read_file_span_variants,
     referenced_grep_tape_ids, run_grep_scan, session_matches_date_filter,
@@ -749,7 +751,10 @@ fn query_remote_tape_facts(
                             (Some("failed" | "unavailable"), _, Some(message))
                                 if message.trim().is_empty() =>
                             {
-                                ("protocol_error", "peer tape facts failure omitted error.message")
+                                (
+                                    "protocol_error",
+                                    "peer tape facts failure omitted error.message",
+                                )
                             }
                             _ => (
                                 "protocol_error",
@@ -984,7 +989,99 @@ struct FederatedSenderCandidate {
     facts: Value,
     history: FederatedDispatchHistory,
     first: engram::dispatch::federated::FirstOccurrence,
+    event_time: FederatedSenderEventTime,
     digest: Option<String>,
+}
+
+#[derive(Clone)]
+struct FederatedSenderEventTime {
+    instant: chrono::DateTime<chrono::Utc>,
+    timestamp: String,
+    event_offset: u64,
+}
+
+fn sender_turn_fact(facts: &Value, turn: i64) -> Option<&Value> {
+    facts
+        .get("turn_to_offset")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|row| row.get("turn").and_then(Value::as_i64) == Some(turn))
+}
+
+fn sender_event_fact<'a>(facts: &'a Value, uuid: &str, turn: i64) -> Option<&'a Value> {
+    facts
+        .get("dispatch_event_times")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|row| {
+            row.get("uuid").and_then(Value::as_str) == Some(uuid)
+                && row.get("direction").and_then(Value::as_str) == Some("sent")
+                && row.get("turn").and_then(Value::as_i64) == Some(turn)
+        })
+}
+
+fn sender_event_time(
+    facts: &Value,
+    uuid: &str,
+    turn: i64,
+    expected_global_turn: i64,
+) -> Option<FederatedSenderEventTime> {
+    let mapping = sender_turn_fact(facts, turn)?;
+    if mapping.get("global_turn").and_then(Value::as_i64) != Some(expected_global_turn) {
+        return None;
+    }
+    let event = sender_event_fact(facts, uuid, turn)?;
+    let timestamp = event.get("timestamp").and_then(Value::as_str)?.to_string();
+    let instant = chrono::DateTime::parse_from_rfc3339(&timestamp)
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    Some(FederatedSenderEventTime {
+        instant,
+        timestamp,
+        event_offset: event.get("event_offset").and_then(Value::as_u64)?,
+    })
+}
+
+fn candidate_issue_key(
+    store: &str,
+    tape_id: &str,
+    reason: &str,
+    uuid: &str,
+) -> (String, String, String) {
+    (store.to_string(), tape_id.to_string(), format!("{reason}:{uuid}"))
+}
+
+fn sender_candidate_mention(candidate: &FederatedSenderCandidate, reason: &str) -> Value {
+    json!({
+        "session":candidate.first.row.tape_id,
+        "location":candidate.store,
+        "reason":reason,
+        "sent_turn_index":candidate.first.global_turn,
+        "sent_timestamp":candidate.event_time.timestamp,
+        "event_offset":candidate.event_time.event_offset,
+    })
+}
+
+fn unresolved_sender_mention(issue: &Value) -> Value {
+    let mut mention = json!({
+        "session":issue.get("session").cloned().unwrap_or(Value::Null),
+        "location":issue.get("session_location").cloned().unwrap_or(Value::Null),
+        "reason":issue.get("reason").cloned().unwrap_or(Value::Null),
+    });
+    for field in [
+        "code",
+        "phase",
+        "missing",
+        "message",
+        "observed_sent_timestamp",
+        "observed_turn_index",
+        "observed_event_offset",
+    ] {
+        if let Some(value) = issue.get(field) {
+            mention[field] = value.clone();
+        }
+    }
+    mention
 }
 
 fn collect_federated_dispatch(
@@ -1008,7 +1105,6 @@ fn collect_federated_dispatch(
         ambiguous: Vec::new(),
     };
     let mut unresolved_seen = std::collections::HashSet::<(String, String, String)>::new();
-    let mut ambiguous_seen = std::collections::HashSet::<(String, String)>::new();
     let mut hop_seen =
         std::collections::HashSet::<(String, String, i64, String, String, String)>::new();
     let mut parent_seen = std::collections::HashSet::<(String, String)>::new();
@@ -1472,16 +1568,18 @@ fn collect_federated_dispatch(
 
                 let mut candidates = Vec::<FederatedSenderCandidate>::new();
                 let mut candidate_partial = false;
+                let mut timestamp_unavailable = Vec::<Value>::new();
                 for ((store, tape_id), facts) in &candidate_facts {
                     let Some(rows) = row_by_candidate.get(&(store.clone(), tape_id.clone())) else {
                         continue;
                     };
                     if facts.get("status").and_then(Value::as_str) != Some("ok") {
                         candidate_partial = true;
-                        if unresolved_seen.insert((
-                            store.clone(),
-                            tape_id.clone(),
-                            "tape_unavailable".into(),
+                        if unresolved_seen.insert(candidate_issue_key(
+                            store,
+                            tape_id,
+                            "tape_unavailable",
+                            &received.row.uuid,
                         )) {
                             result.unresolved.push(json!({
                                 "reason":"tape_unavailable",
@@ -1504,10 +1602,11 @@ fn collect_federated_dispatch(
                                 "protocol_error",
                                 &format!("peer returned malformed tape facts: {message}"),
                             );
-                            if unresolved_seen.insert((
-                                store.clone(),
-                                tape_id.clone(),
-                                "history_incomplete".into(),
+                            if unresolved_seen.insert(candidate_issue_key(
+                                store,
+                                tape_id,
+                                "history_incomplete",
+                                &received.row.uuid,
                             )) {
                                 result.unresolved.push(dispatch_history_incomplete(
                                     store,
@@ -1522,18 +1621,34 @@ fn collect_federated_dispatch(
                     };
                     if !history.complete {
                         candidate_partial = true;
-                        if unresolved_seen.insert((
-                            store.clone(),
-                            tape_id.clone(),
-                            "history_incomplete".into(),
+                        if unresolved_seen.insert(candidate_issue_key(
+                            store,
+                            tape_id,
+                            "history_incomplete",
+                            &received.row.uuid,
                         )) {
-                            result.unresolved.push(dispatch_history_incomplete(
+                            let mut issue = dispatch_history_incomplete(
                                 store,
                                 tape_id,
                                 Some(json!(history.missing)),
                                 None,
                                 Some(&received.row.uuid),
-                            ));
+                            );
+                            if let Some(row) = rows.iter().find(|row| row.uuid == received.row.uuid)
+                            {
+                                issue["observed_turn_index"] = json!(row.first_turn_index);
+                                if let Some(event) = sender_event_fact(
+                                    facts,
+                                    &received.row.uuid,
+                                    row.first_turn_index,
+                                ) {
+                                    issue["observed_sent_timestamp"] =
+                                        event.get("timestamp").cloned().unwrap_or(Value::Null);
+                                    issue["observed_event_offset"] =
+                                        event.get("event_offset").cloned().unwrap_or(Value::Null);
+                                }
+                            }
+                            result.unresolved.push(issue);
                         }
                         continue;
                     }
@@ -1666,23 +1781,25 @@ fn collect_federated_dispatch(
                                 });
                                 if !verified_points {
                                     candidate_partial = true;
-                                    if unresolved_seen.insert((
-                                        store.clone(),
-                                        tape_id.clone(),
-                                        "recovery_binding_incomplete".into(),
+                                    if unresolved_seen.insert(candidate_issue_key(
+                                        store,
+                                        tape_id,
+                                        "recovery_binding_incomplete",
+                                        &received.row.uuid,
                                     )) {
                                         result.unresolved.push(json!({"reason":"recovery_binding_incomplete","session":tape_id,"candidate_uuid":received.row.uuid,"session_location":store}));
                                     }
                                     continue;
                                 }
-                                let Some(context_facts) = context_facts
-                                    .get(&(store.clone(), context_tape.to_string()))
+                                let Some(context_facts) =
+                                    context_facts.get(&(store.clone(), context_tape.to_string()))
                                 else {
                                     candidate_partial = true;
-                                    if unresolved_seen.insert((
-                                        store.clone(),
-                                        context_tape.to_string(),
-                                        "recovery_binding_incomplete".into(),
+                                    if unresolved_seen.insert(candidate_issue_key(
+                                        store,
+                                        context_tape,
+                                        "recovery_binding_incomplete",
+                                        &received.row.uuid,
                                     )) {
                                         result.unresolved.push(json!({
                                             "reason":"recovery_binding_incomplete",
@@ -1693,14 +1810,14 @@ fn collect_federated_dispatch(
                                     }
                                     continue;
                                 };
-                                if context_facts.get("status").and_then(Value::as_str)
-                                    != Some("ok")
+                                if context_facts.get("status").and_then(Value::as_str) != Some("ok")
                                 {
                                     candidate_partial = true;
-                                    if unresolved_seen.insert((
-                                        store.clone(),
-                                        context_tape.to_string(),
-                                        "tape_unavailable".into(),
+                                    if unresolved_seen.insert(candidate_issue_key(
+                                        store,
+                                        context_tape,
+                                        "tape_unavailable",
+                                        &received.row.uuid,
                                     )) {
                                         result.unresolved.push(json!({
                                             "reason":"tape_unavailable",
@@ -1721,10 +1838,11 @@ fn collect_federated_dispatch(
                                     }
                                     Ok(context_history) => {
                                         candidate_partial = true;
-                                        if unresolved_seen.insert((
-                                            store.clone(),
-                                            context_history.tip.clone(),
-                                            "history_incomplete".into(),
+                                        if unresolved_seen.insert(candidate_issue_key(
+                                            store,
+                                            &context_history.tip,
+                                            "history_incomplete",
+                                            &received.row.uuid,
                                         )) {
                                             result.unresolved.push(dispatch_history_incomplete(
                                                 store,
@@ -1748,10 +1866,11 @@ fn collect_federated_dispatch(
                                                 "peer returned malformed tape facts: {message}"
                                             ),
                                         );
-                                        if unresolved_seen.insert((
-                                            store.clone(),
-                                            context_tape.to_string(),
-                                            "history_incomplete".into(),
+                                        if unresolved_seen.insert(candidate_issue_key(
+                                            store,
+                                            context_tape,
+                                            "history_incomplete",
+                                            &received.row.uuid,
                                         )) {
                                             result.unresolved.push(dispatch_history_incomplete(
                                                 store,
@@ -1766,10 +1885,11 @@ fn collect_federated_dispatch(
                                 }
                             } else {
                                 candidate_partial = true;
-                                if unresolved_seen.insert((
-                                    store.clone(),
-                                    tape_id.clone(),
-                                    "recovery_binding_incomplete".into(),
+                                if unresolved_seen.insert(candidate_issue_key(
+                                    store,
+                                    tape_id,
+                                    "recovery_binding_incomplete",
+                                    &received.row.uuid,
                                 )) {
                                     result.unresolved.push(json!({"reason":"recovery_binding_incomplete","session":tape_id,"candidate_uuid":received.row.uuid,"session_location":store}));
                                 }
@@ -1801,6 +1921,43 @@ fn collect_federated_dispatch(
                         .remove(&received.row.uuid)
                         && first.row.direction == FederatedDispatchDirection::Sent
                     {
+                        let sender_facts =
+                            candidate_facts.get(&(store.clone(), first.row.tape_id.clone()));
+                        let event_time = sender_facts.and_then(|facts| {
+                            sender_event_time(
+                                facts,
+                                &received.row.uuid,
+                                first.row.first_turn_index,
+                                first.global_turn,
+                            )
+                        });
+                        let Some(event_time) = event_time else {
+                            candidate_partial = true;
+                            let mut issue = json!({
+                                "reason":"sender_timestamp_unavailable",
+                                "phase":"dispatch_history",
+                                "code":"sender_timestamp_unavailable",
+                                "session":first.row.tape_id,
+                                "session_location":store,
+                                "candidate_uuid":received.row.uuid,
+                                "sent_turn_index":first.global_turn,
+                            });
+                            if let Some(event) = sender_facts.and_then(|facts| {
+                                sender_event_fact(
+                                    facts,
+                                    &received.row.uuid,
+                                    first.row.first_turn_index,
+                                )
+                            }) {
+                                issue["observed_sent_timestamp"] =
+                                    event.get("timestamp").cloned().unwrap_or(Value::Null);
+                                issue["observed_event_offset"] =
+                                    event.get("event_offset").cloned().unwrap_or(Value::Null);
+                            }
+                            timestamp_unavailable.push(issue.clone());
+                            result.unresolved.push(issue);
+                            continue;
+                        };
                         let file = located
                             .get(&first.row.tape_id)
                             .and_then(|locations| {
@@ -1816,6 +1973,7 @@ fn collect_federated_dispatch(
                             facts: selected_facts.clone(),
                             history,
                             first,
+                            event_time,
                             digest: selected_facts
                                 .get("digest")
                                 .and_then(Value::as_str)
@@ -1836,10 +1994,17 @@ fn collect_federated_dispatch(
                     .cloned()
                     .collect::<Vec<_>>();
                 candidates.sort_by(|left, right| {
-                    left.store
-                        .cmp(&right.store)
+                    left.event_time
+                        .instant
+                        .cmp(&right.event_time.instant)
+                        .then_with(|| left.store.cmp(&right.store))
+                        .then_with(|| left.first.row.tape_id.cmp(&right.first.row.tape_id))
+                        .then_with(|| {
+                            left.event_time
+                                .event_offset
+                                .cmp(&right.event_time.event_offset)
+                        })
                         .then_with(|| left.history.tip.cmp(&right.history.tip))
-                        .then_with(|| left.first.global_turn.cmp(&right.first.global_turn))
                 });
                 let mut merged = Vec::<FederatedSenderCandidate>::new();
                 for candidate in candidates {
@@ -1859,154 +2024,201 @@ fn collect_federated_dispatch(
                     }
                 }
 
-                match merged.as_slice() {
-                    [] => {
-                        let unavailable =
-                            sources
-                                .iter()
-                                .filter(|source| {
-                                    source.get("kind").and_then(Value::as_str) == Some("peer")
-                                })
-                                .filter(|source| {
-                                    source.get("status").and_then(Value::as_str).is_some_and(
-                                        |status| status != "ok" && status != "not_selected",
-                                    )
-                                })
-                                .filter_map(|source| source.get("store").and_then(Value::as_str))
-                                .collect::<Vec<_>>();
-                        let reason = if candidate_partial {
-                            "history_incomplete"
-                        } else {
-                            "no_sender_observed"
-                        };
-                        if unresolved_seen.insert((
-                            current_store.clone(),
-                            received.row.uuid.clone(),
-                            reason.into(),
-                        )) {
-                            result.unresolved.push(json!({
-                                "reason":reason,
-                                "uuid":received.row.uuid,
-                                "received_session":current_tape,
-                                "stores_unavailable":unavailable,
-                                "selection_coverage":if candidate_partial || *peer_failed {"partial"} else {"complete"},
-                            }));
-                        }
-                        break;
-                    }
-                    [parent] => {
-                        let parent_tape = parent.first.row.tape_id.clone();
-                        let hop_key = (
-                            current_store.clone(),
-                            current_tape.clone(),
-                            cutoff_global_turn,
-                            received.row.uuid.clone(),
-                            parent.store.clone(),
-                            parent_tape.clone(),
-                        );
-                        if !hop_seen.insert(hop_key) {
-                            break;
-                        }
-                        let mut hop = json!({
-                            "session":current_tape,
-                            "edit_turn_index":cutoff_global_turn,
-                            "received_uuid":received.row.uuid,
-                            "received_turn_index":received.global_turn,
-                            "parent_session":parent_tape,
-                            "parent_sent_turn_index":parent.first.global_turn,
-                            "session_location":current_store,
-                            "parent_location":parent.store,
-                            "selection_coverage":if candidate_partial || *peer_failed {"partial"} else {"complete"},
-                        });
-                        if hops == 0 && current_tape != edit_tape {
-                            hop["edit_session"] = json!(edit_tape);
-                            hop["edit_event_offset"] = json!(edit_offset);
-                        }
-                        if received.row.tape_id != current_tape {
-                            hop["received_session"] = json!(received.row.tape_id);
-                        }
-                        result.lineage.push(hop);
-                        let parent_key = (parent.store.clone(), parent_tape.clone());
-                        if parent_seen.insert(parent_key.clone()) {
-                            if local_stores.iter().any(|store| store == &parent.store) {
-                                let link = engram::index::DispatchLinkRow {
-                                    tape_id: parent_tape.clone(),
-                                    uuid: received.row.uuid.clone(),
-                                    first_turn_index: parent.first.row.first_turn_index,
-                                    direction: DispatchDirection::Sent,
-                                };
-                                if let Some(mut parent_session) =
-                                    build_dispatch_session_for_link(context, &link)?
-                                {
-                                    parent_session["store"] = json!(parent.store);
-                                    result.local_parent_sessions.push(parent_session);
-                                }
-                            } else {
-                                let parent_fact = remote_facts
-                                    .get(&(parent.store.clone(), parent_tape.clone()))
-                                    .or_else(|| {
-                                        remote_facts.get(&(
-                                            parent.store.clone(),
-                                            parent.history.tip.clone(),
-                                        ))
-                                    })
-                                    .cloned()
-                                    .unwrap_or_else(|| parent.facts.clone());
-                                let summary = parent_fact
-                                    .get("summary")
-                                    .cloned()
-                                    .unwrap_or_else(|| json!({}));
-                                let (machine, export) =
-                                    parent.store.split_once('/').unwrap_or(("", ""));
-                                result.remote_parent_sessions.push(json!({
-                                    "session_id":parent_tape,
-                                    "tape_id":parent_tape,
-                                    "store":parent.store,
-                                    "location":{"machine":machine,"store":parent.store,"export":export},
-                                    "physical_identity":{"machine":machine,"store":parent.store,"tape_id":parent_tape,"db":null,"file":parent.file},
-                                    "timestamp":summary.get("latest_timestamp").cloned().unwrap_or_else(||json!("")),
-                                    "window_start":summary.get("window_start").cloned().unwrap_or_else(||json!(0)),
-                                    "window_end":summary.get("window_end").cloned().unwrap_or_else(||json!(0)),
-                                    "total_lines":summary.get("total_lines").cloned().unwrap_or_else(||json!(0)),
-                                    "confidence":0.0,
-                                    "refs_up":0,
-                                    "refs_down":0,
-                                    "files_touched":summary.get("files_touched").cloned().unwrap_or_else(||json!([])),
-                                    "touches":[],
-                                    "tape_facts":parent_fact,
-                                    "dispatch":{"uuid":received.row.uuid,"direction":"sent","first_turn_index":parent.first.row.first_turn_index},
-                                }));
-                            }
-                        }
-                        hops += 1;
-                        current_store = parent.store.clone();
-                        current_tape = parent_tape;
-                        cutoff_global_turn = parent.first.global_turn;
-                        current_history = parent.history.clone();
-                    }
-                    _ => {
-                        let rows = merged
-                            .iter()
-                            .map(|candidate| {
-                                json!({
-                                    "session":candidate.first.row.tape_id,
-                                    "sent_turn_index":candidate.first.global_turn,
-                                    "location":candidate.store,
-                                })
+                if !timestamp_unavailable.is_empty() {
+                    let mut candidate_refs = merged
+                        .iter()
+                        .map(|candidate| sender_candidate_mention(candidate, "sender_observed"))
+                        .collect::<Vec<_>>();
+                    candidate_refs
+                        .extend(timestamp_unavailable.iter().map(unresolved_sender_mention));
+                    candidate_refs.sort_by(|left, right| {
+                        left.get("location")
+                            .and_then(Value::as_str)
+                            .cmp(&right.get("location").and_then(Value::as_str))
+                            .then_with(|| {
+                                left.get("session")
+                                    .and_then(Value::as_str)
+                                    .cmp(&right.get("session").and_then(Value::as_str))
                             })
-                            .collect::<Vec<_>>();
-                        if ambiguous_seen.insert((current_store.clone(), received.row.uuid.clone()))
+                    });
+                    if unresolved_seen.insert((
+                        current_store.clone(),
+                        received.row.uuid.clone(),
+                        "sender_order_unavailable".into(),
+                    )) {
+                        result.unresolved.push(json!({
+                            "reason":"sender_order_unavailable",
+                            "phase":"dispatch_history",
+                            "code":"sender_timestamp_unavailable",
+                            "uuid":received.row.uuid,
+                            "received_session":current_tape,
+                            "candidates":candidate_refs,
+                            "selection_coverage":"partial",
+                        }));
+                    }
+                    break;
+                }
+
+                let Some(parent) = merged.first() else {
+                    let unavailable = sources
+                        .iter()
+                        .filter(|source| source.get("kind").and_then(Value::as_str) == Some("peer"))
+                        .filter(|source| {
+                            source
+                                .get("status")
+                                .and_then(Value::as_str)
+                                .is_some_and(|status| status != "ok" && status != "not_selected")
+                        })
+                        .filter_map(|source| source.get("store").and_then(Value::as_str))
+                        .collect::<Vec<_>>();
+                    let reason = if candidate_partial {
+                        "history_incomplete"
+                    } else {
+                        "no_sender_observed"
+                    };
+                    if unresolved_seen.insert((
+                        current_store.clone(),
+                        received.row.uuid.clone(),
+                        reason.into(),
+                    )) {
+                        result.unresolved.push(json!({
+                            "reason":reason,
+                            "uuid":received.row.uuid,
+                            "received_session":current_tape,
+                            "stores_unavailable":unavailable,
+                            "selection_coverage":if candidate_partial || *peer_failed {"partial"} else {"complete"},
+                        }));
+                    }
+                    break;
+                };
+
+                let parent_tape = parent.first.row.tape_id.clone();
+                let hop_key = (
+                    current_store.clone(),
+                    current_tape.clone(),
+                    cutoff_global_turn,
+                    received.row.uuid.clone(),
+                    parent.store.clone(),
+                    parent_tape.clone(),
+                );
+                if !hop_seen.insert(hop_key) {
+                    break;
+                }
+
+                let mut also_mentioned_by = merged
+                    .iter()
+                    .skip(1)
+                    .map(|candidate| {
+                        let reason = if candidate.event_time.instant == parent.event_time.instant {
+                            "same_timestamp"
+                        } else {
+                            "later_sender"
+                        };
+                        sender_candidate_mention(candidate, reason)
+                    })
+                    .collect::<Vec<_>>();
+                let mut unresolved_mentions = result
+                    .unresolved
+                    .iter()
+                    .filter(|issue| {
+                        issue.get("candidate_uuid").and_then(Value::as_str)
+                            == Some(received.row.uuid.as_str())
+                    })
+                    .map(unresolved_sender_mention)
+                    .collect::<Vec<_>>();
+                unresolved_mentions.sort_by(|left, right| {
+                    left.get("location")
+                        .and_then(Value::as_str)
+                        .cmp(&right.get("location").and_then(Value::as_str))
+                        .then_with(|| {
+                            left.get("session")
+                                .and_then(Value::as_str)
+                                .cmp(&right.get("session").and_then(Value::as_str))
+                        })
+                        .then_with(|| {
+                            left.get("reason")
+                                .and_then(Value::as_str)
+                                .cmp(&right.get("reason").and_then(Value::as_str))
+                        })
+                });
+                also_mentioned_by.extend(unresolved_mentions);
+
+                let mut hop = json!({
+                    "session":current_tape,
+                    "edit_turn_index":cutoff_global_turn,
+                    "received_uuid":received.row.uuid,
+                    "received_turn_index":received.global_turn,
+                    "parent_session":parent_tape,
+                    "parent_sent_turn_index":parent.first.global_turn,
+                    "parent_sent_timestamp":parent.event_time.timestamp,
+                    "parent_event_offset":parent.event_time.event_offset,
+                    "also_mentioned_by":also_mentioned_by,
+                    "session_location":current_store,
+                    "parent_location":parent.store,
+                    "selection_coverage":if candidate_partial || *peer_failed {"partial"} else {"complete"},
+                });
+                if hops == 0 && current_tape != edit_tape {
+                    hop["edit_session"] = json!(edit_tape);
+                    hop["edit_event_offset"] = json!(edit_offset);
+                }
+                if received.row.tape_id != current_tape {
+                    hop["received_session"] = json!(received.row.tape_id);
+                }
+                result.lineage.push(hop);
+                let parent_key = (parent.store.clone(), parent_tape.clone());
+                if parent_seen.insert(parent_key.clone()) {
+                    if local_stores.iter().any(|store| store == &parent.store) {
+                        let link = engram::index::DispatchLinkRow {
+                            tape_id: parent_tape.clone(),
+                            uuid: received.row.uuid.clone(),
+                            first_turn_index: parent.first.row.first_turn_index,
+                            direction: DispatchDirection::Sent,
+                        };
+                        if let Some(mut parent_session) =
+                            build_dispatch_session_for_link(context, &link)?
                         {
-                            result.ambiguous.push(json!({
-                                "received_uuid":received.row.uuid,
-                                "received_session":current_tape,
-                                "candidates":rows,
-                                "selection_coverage":if candidate_partial || *peer_failed {"partial"} else {"complete"},
-                            }));
+                            parent_session["store"] = json!(parent.store);
+                            result.local_parent_sessions.push(parent_session);
                         }
-                        break;
+                    } else {
+                        let parent_fact = remote_facts
+                            .get(&(parent.store.clone(), parent_tape.clone()))
+                            .or_else(|| {
+                                remote_facts
+                                    .get(&(parent.store.clone(), parent.history.tip.clone()))
+                            })
+                            .cloned()
+                            .unwrap_or_else(|| parent.facts.clone());
+                        let summary = parent_fact
+                            .get("summary")
+                            .cloned()
+                            .unwrap_or_else(|| json!({}));
+                        let (machine, export) = parent.store.split_once('/').unwrap_or(("", ""));
+                        result.remote_parent_sessions.push(json!({
+                            "session_id":parent_tape,
+                            "tape_id":parent_tape,
+                            "store":parent.store,
+                            "location":{"machine":machine,"store":parent.store,"export":export},
+                            "physical_identity":{"machine":machine,"store":parent.store,"tape_id":parent_tape,"db":null,"file":parent.file},
+                            "timestamp":summary.get("latest_timestamp").cloned().unwrap_or_else(||json!("")),
+                            "window_start":summary.get("window_start").cloned().unwrap_or_else(||json!(0)),
+                            "window_end":summary.get("window_end").cloned().unwrap_or_else(||json!(0)),
+                            "total_lines":summary.get("total_lines").cloned().unwrap_or_else(||json!(0)),
+                            "confidence":0.0,
+                            "refs_up":0,
+                            "refs_down":0,
+                            "files_touched":summary.get("files_touched").cloned().unwrap_or_else(||json!([])),
+                            "touches":[],
+                            "tape_facts":parent_fact,
+                            "dispatch":{"uuid":received.row.uuid,"direction":"sent","first_turn_index":parent.first.row.first_turn_index},
+                        }));
                     }
                 }
+                hops += 1;
+                current_store = parent.store.clone();
+                current_tape = parent_tape;
+                cutoff_global_turn = parent.first.global_turn;
+                current_history = parent.history.clone();
             }
         }
     }
@@ -4877,13 +5089,14 @@ fn cmd_explain(
     let mut tombstones = Vec::new();
     let touched_anchors;
     let score_by_session;
+    let mut exact_edit_sessions = HashSet::new();
     #[cfg(feature = "t1772-proof")]
     let mut proof_direct_touches: Option<Value> = None;
     let date_filter = DateFilter::parse(args.since.as_deref(), args.until.as_deref())?;
 
     match target_kind {
         ExplainTarget::FileRange { file, start, end } => {
-            let span_texts = read_file_span_variants(&cwd.join(file), start, end)?;
+            let span_texts = read_file_span_variants(&cwd.join(&file), start, end)?;
             query_anchors = derive_anchor_candidates(&span_texts);
             let traversal = ExplainTraversal {
                 min_confidence: args.min_confidence,
@@ -4897,6 +5110,7 @@ fn cmd_explain(
             let touches =
                 collect_touch_evidence(&indexes, &result.direct, &result.touched_anchors)?;
             raw_sessions = build_session_windows(context, touches)?;
+            exact_edit_sessions.extend(exact_span_edit_sessions(&raw_sessions, &file, start, end));
             let (chain, dispatch_sessions, unresolved, ambiguous) =
                 collect_dispatch_upstream_sessions(context, &indexes, &raw_sessions)?;
             dispatch_lineage = chain;
@@ -5016,7 +5230,8 @@ fn cmd_explain(
     )?;
     sessions.retain(|session| session_matches_date_filter(session, &date_filter));
     annotate_chain_fields(&mut sessions, &dispatch_lineage);
-    sessions.sort_by(compare_explain_sessions);
+    sessions
+        .sort_by(|a, b| compare_explain_sessions_with_span_priority(a, b, &exact_edit_sessions));
     if sessions.is_empty() && tombstones.is_empty() && lineage.is_empty() {
         return Err(CliError::new("no_results", target));
     }
@@ -5074,9 +5289,7 @@ fn cmd_explain(
 }
 
 #[cfg(feature = "t1772-proof")]
-fn direct_touch_projection(
-    touches: &[engram::index::lineage::EvidenceFragmentRef],
-) -> Value {
+fn direct_touch_projection(touches: &[engram::index::lineage::EvidenceFragmentRef]) -> Value {
     let mut rows = touches
         .iter()
         .map(|touch| {
@@ -5129,6 +5342,11 @@ fn cmd_explain_with_peers_inner(
     cancelled: &Arc<AtomicBool>,
 ) -> Result<(), CliError> {
     let query_deadline = Instant::now() + PEER_QUERY_TIMEOUT;
+    let exact_span_target = match &target_kind {
+        ExplainTarget::FileRange { file, start, end } => Some((file.clone(), *start, *end)),
+        ExplainTarget::FileWhole { .. } | ExplainTarget::Literal(_) => None,
+    };
+    let mut exact_edit_sessions = HashSet::new();
     let home = home_dir()?;
     let topology = load_topology(&home)
         .map_err(|error| CliError::new("config_error", error.to_string()))?
@@ -5693,6 +5911,14 @@ fn cmd_explain_with_peers_inner(
     let local_touches =
         collect_local_federated_touches(&indexes, &local_stores, &query_anchors, &visited_anchors)?;
     let mut local_raw_sessions = build_session_windows(context, local_touches)?;
+    if let Some((file, start, end)) = exact_span_target.as_ref() {
+        exact_edit_sessions.extend(exact_span_edit_sessions(
+            &local_raw_sessions,
+            file,
+            *start,
+            *end,
+        ));
+    }
     for session in &mut local_raw_sessions {
         if let Some(tape_id) = session
             .get("tape_id")
@@ -5739,14 +5965,27 @@ fn cmd_explain_with_peers_inner(
                     .collect::<Vec<_>>();
                 edit_offsets.sort_unstable();
                 edit_offsets.dedup();
-                items.push(json!({
+                let mut item = json!({
                     "tape_id": tape_id,
                     "edit_offsets": edit_offsets,
                     "anchor_offsets": offsets,
                     "grep_filter": args.grep_filter,
                     "window_lines": context.peek_default_lines.max(1),
                     "include_digest": false,
-                }));
+                });
+                if owner
+                    .features
+                    .contains(QUERY_FEATURE_EXACT_SPAN_EDIT_RANKING)
+                    && let Some((file, start, end)) = exact_span_target.as_ref()
+                    && fragments.iter().any(|fragment| {
+                        fragment.get("kind").and_then(Value::as_str) == Some("edit")
+                            && fragment.get("file_path").and_then(Value::as_str)
+                                == Some(file.as_str())
+                    })
+                {
+                    item["rank_span"] = json!({"file": file, "start": start, "end": end});
+                }
+                items.push(item);
                 tape_ids.push(tape_id.clone());
             }
             for chunk in items.chunks(peer_item_cap(&owner)) {
@@ -5807,7 +6046,7 @@ fn cmd_explain_with_peers_inner(
                     );
                 }
                 Ok(response) => {
-                    for row in response.data {
+                    for mut row in response.data {
                         if row.get("store").and_then(Value::as_str) != Some(store.as_str()) {
                             any_peer_failure = true;
                             mark_source_phase(
@@ -5820,7 +6059,11 @@ fn cmd_explain_with_peers_inner(
                             continue;
                         }
                         if row.get("type").and_then(Value::as_str) == Some("tape_facts") {
-                            let Some(tape_id) = row.get("tape_id").and_then(Value::as_str) else {
+                            let Some(tape_id) = row
+                                .get("tape_id")
+                                .and_then(Value::as_str)
+                                .map(ToOwned::to_owned)
+                            else {
                                 any_peer_failure = true;
                                 mark_source_phase(
                                     &mut sources,
@@ -5850,6 +6093,14 @@ fn cmd_explain_with_peers_inner(
                                     code,
                                     message,
                                 );
+                            }
+                            if row.get("status").and_then(Value::as_str) == Some("ok")
+                                && row.get("span_edit_match").and_then(Value::as_bool) == Some(true)
+                            {
+                                exact_edit_sessions.insert(tape_id.to_string());
+                            }
+                            if let Some(fields) = row.as_object_mut() {
+                                fields.remove("span_edit_match");
                             }
                             remote_facts.insert((store.clone(), tape_id.to_string()), row);
                         } else if let Some(tape_id) = row.get("tape_id").and_then(Value::as_str) {
@@ -5987,7 +6238,8 @@ fn cmd_explain_with_peers_inner(
     sessions.extend(dispatch.remote_parent_sessions);
     sessions.retain(|session| session_matches_date_filter(session, &date_filter));
     annotate_chain_fields(&mut sessions, &dispatch_lineage);
-    sessions.sort_by(compare_explain_sessions);
+    sessions
+        .sort_by(|a, b| compare_explain_sessions_with_span_priority(a, b, &exact_edit_sessions));
 
     let mut tombstones = Vec::new();
     if args.include_deleted {
@@ -7434,11 +7686,13 @@ fn mark_anchor_batch_failures(
             .iter_mut()
             .find(|source| source.get("store").and_then(Value::as_str) == Some(store))
     {
-        source["failures"] = json!(failures
-            .iter()
-            .skip(1)
-            .map(|failure| json!({"code": failure.code, "message": failure.message}))
-            .collect::<Vec<_>>());
+        source["failures"] = json!(
+            failures
+                .iter()
+                .skip(1)
+                .map(|failure| json!({"code": failure.code, "message": failure.message}))
+                .collect::<Vec<_>>()
+        );
     }
 }
 

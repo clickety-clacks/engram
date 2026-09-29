@@ -399,6 +399,7 @@ impl PeerSession {
             "protocol": PROTOCOL_VERSION,
             "schema": SCHEMA_VERSION,
             "query_semantics": QUERY_SEMANTICS_VERSION,
+            "features": [crate::access::QUERY_FEATURE_EXACT_SPAN_EDIT_RANKING],
             "limits": {
                 "request_timeout_ms": configured_limit(
                     &self.topology.limits,
@@ -746,6 +747,7 @@ impl PeerSession {
                     "grep_filter",
                     "window_lines",
                     "include_digest",
+                    "rank_span",
                 ],
             )?;
             let tape_id = item.get("tape_id").and_then(Value::as_str).ok_or_else(|| {
@@ -767,6 +769,7 @@ impl PeerSession {
                 "anchor_offsets",
                 self.batch_cap(),
             )?;
+            let rank_span = item.get("rank_span").map(parse_rank_span).transpose()?;
             let grep_filter = optional_string(item.get("grep_filter"), "grep_filter")?;
             let window_lines = optional_usize(item.get("window_lines"), "window_lines")?
                 .unwrap_or(30)
@@ -840,6 +843,17 @@ impl PeerSession {
                     continue;
                 }
             };
+            let span_edit_match = rank_span.as_ref().is_some_and(|(file, start, end)| {
+                edit_offsets.iter().any(|offset| {
+                    rows.iter()
+                        .find(|row| row.offset == *offset)
+                        .is_some_and(|row| {
+                            crate::query::format::structured_edit_overlaps_span(
+                                &row.value, file, *start, *end,
+                            )
+                        })
+                })
+            });
             let (segment, previous_tape_id) = match tape_segment_metadata(tape_id, &rows) {
                 Ok(segment) => segment,
                 Err(error) => {
@@ -999,6 +1013,7 @@ impl PeerSession {
                     })
                 })
                 .collect::<Vec<_>>();
+            let dispatch_event_times = crate::dispatch::first_dispatch_event_times(&rows, &turns);
             let recovery_binding = locator.map(|locator| {
                 json!({
                     "verified": true,
@@ -1119,28 +1134,27 @@ impl PeerSession {
             if chain_status == "failed" {
                 continue;
             }
-            write_data_limited(
-                output,
-                id,
-                json!({
-                    "type": "tape_facts",
-                    "store": store_ref.clone(),
-                    "tape_id": tape_id,
-                    "status": "ok",
-                    "indexed": indexed,
-                    "segment": segment,
-                    "predecessor_chain": predecessor_chain,
-                    "chain_status": chain_status,
-                    "unresolved_predecessor": unresolved_predecessor,
-                    "edit_offset_to_turn": edit_offset_to_turn,
-                    "turn_to_offset": turn_to_offset,
-                    "recovery_binding": recovery_binding,
-                    "digest": digest,
-                    "summary": summary,
-                }),
-                &mut response_bytes,
-                response_limit,
-            )?;
+            let mut tape_fact = json!({
+                "type": "tape_facts",
+                "store": store_ref.clone(),
+                "tape_id": tape_id,
+                "status": "ok",
+                "indexed": indexed,
+                "segment": segment,
+                "predecessor_chain": predecessor_chain,
+                "chain_status": chain_status,
+                "unresolved_predecessor": unresolved_predecessor,
+                "edit_offset_to_turn": edit_offset_to_turn,
+                "turn_to_offset": turn_to_offset,
+                "dispatch_event_times": dispatch_event_times,
+                "recovery_binding": recovery_binding,
+                "digest": digest,
+                "summary": summary,
+            });
+            if span_edit_match {
+                tape_fact["span_edit_match"] = json!(true);
+            }
+            write_data_limited(output, id, tape_fact, &mut response_bytes, response_limit)?;
         }
         Ok(json!({"items": items.len()}))
     }
@@ -2203,6 +2217,32 @@ fn validate_tape_id(id: &str) -> Result<(), PeerError> {
         ));
     }
     Ok(())
+}
+
+fn parse_rank_span(value: &Value) -> Result<(String, u32, u32), PeerError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| PeerError::new("invalid_request", "rank_span must be an object"))?;
+    reject_unknown_keys(object, &["file", "start", "end"])?;
+    let file = object
+        .get("file")
+        .and_then(Value::as_str)
+        .filter(|file| !file.is_empty())
+        .ok_or_else(|| PeerError::new("invalid_request", "rank_span.file must be a string"))?
+        .to_string();
+    let start = object
+        .get("start")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| PeerError::new("invalid_request", "rank_span.start must be positive"))?;
+    let end = object
+        .get("end")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value >= start)
+        .ok_or_else(|| PeerError::new("invalid_request", "rank_span.end must be >= start"))?;
+    Ok((file, start, end))
 }
 
 fn optional_u64_array(
