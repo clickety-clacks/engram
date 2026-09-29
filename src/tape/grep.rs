@@ -757,6 +757,8 @@ fn read_grep_record<R: BufRead>(
     reader: &mut R,
     record: &mut Vec<u8>,
     limit: Option<u64>,
+    line_number: usize,
+    start_offset: u64,
 ) -> Result<usize, GrepScanError> {
     loop {
         let available = reader
@@ -777,8 +779,8 @@ fn read_grep_record<R: BufRead>(
             return Err(GrepScanError::new(
                 "over_limit",
                 format!(
-                    "decompressed JSONL record exceeds {} byte limit (including newline)",
-                    limit.unwrap_or_default()
+                    "decompressed JSONL record line {line_number} at byte offset {start_offset} exceeds {} byte limit (including newline); observed at least {next_length} bytes",
+                    limit.unwrap_or_default(),
                 ),
             ));
         }
@@ -802,6 +804,7 @@ pub(crate) fn scan_grep_reader<R: Read>(
         .map_err(|error| GrepScanError::new("decompress_error", error.to_string()))?;
     let mut reader = BufReader::new(decoder);
     let mut line = Vec::new();
+    let mut bytes_read = 0u64;
     let mut total_lines = 0usize;
     let mut match_count = 0usize;
     let mut provenance_match_count = 0usize;
@@ -813,10 +816,17 @@ pub(crate) fn scan_grep_reader<R: Read>(
 
     loop {
         line.clear();
-        let bytes = read_grep_record(&mut reader, &mut line, record_limit)?;
+        let bytes = read_grep_record(
+            &mut reader,
+            &mut line,
+            record_limit,
+            total_lines.saturating_add(1),
+            bytes_read,
+        )?;
         if bytes == 0 {
             break;
         }
+        bytes_read = bytes_read.saturating_add(bytes as u64);
 
         let mut content_end = line.len();
         if line.get(content_end.saturating_sub(1)) == Some(&b'\n') {
@@ -1108,6 +1118,24 @@ mod tests {
             .expect_err("one over-limit record fails the whole tape");
         assert_eq!(error.code, "over_limit");
         assert!(error.message.contains("including newline"));
+        assert!(error.message.contains("line 1 at byte offset 0"));
+        assert!(
+            error
+                .message
+                .contains(&format!("observed at least {} bytes", record.len()))
+        );
+
+        let unterminated = [record.as_slice(), &vec![b'x'; record.len() + 1]].concat();
+        let compressed = zstd::stream::encode_all(&unterminated[..], 0).expect("compress tape");
+        let error = scan_grep_reader(&compressed[..], Some(record.len() as u64), "needle")
+            .expect_err("unterminated record must be bounded too");
+        assert_eq!(error.code, "over_limit");
+        assert!(
+            error
+                .message
+                .contains(&format!("line 2 at byte offset {}", record.len()))
+        );
+        assert!(error.message.contains("observed at least"));
     }
 
     #[test]

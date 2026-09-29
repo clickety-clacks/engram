@@ -8067,6 +8067,12 @@ fn peer_read_file_cap_and_grep_record_cap_are_reported_as_over_limit() {
         .expect("per-tape cap failure is reported in data");
     assert_eq!(grep.data[0]["type"], "failure");
     assert_eq!(grep.data[0]["error"]["code"], "over_limit");
+    assert!(
+        grep.data[0]["error"]["message"]
+            .as_str()
+            .expect("grep failure reason")
+            .contains("line 1 at byte offset 0")
+    );
     drop(owner);
 
     let topology = std::fs::read_to_string(&topology_path).expect("read owner topology");
