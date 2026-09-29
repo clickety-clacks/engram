@@ -40,6 +40,16 @@ pub(crate) fn codex_jsonl_incremental(
     let mut first_timestamp: Option<String> = None;
     let mut emitted_meta = false;
     let mut session_cwd = state.session_cwd.clone();
+    let filechange_ids = input
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|row| {
+            row["type"] == "event_msg"
+                && row["payload"]["type"] == "item_completed"
+                && row["payload"]["item"]["type"] == "FileChange"
+        })
+        .filter_map(|row| row["payload"]["item"]["id"].as_str().map(str::to_owned))
+        .collect::<HashSet<_>>();
 
     for line in input.lines() {
         if line.trim().is_empty() {
@@ -297,72 +307,47 @@ pub(crate) fn codex_jsonl_incremental(
                         state.native_partial = true;
                         continue;
                     };
-                    let digest = Sha256::digest(item.to_string().as_bytes()).to_vec();
-                    if let Some((_, previous)) =
-                        state.native_items.iter().find(|(seen, _)| seen == id)
-                    {
-                        if previous != &digest {
-                            state.native_partial = true;
-                        }
+                    emit_native_file_changes(
+                        &mut out,
+                        state,
+                        &calls,
+                        timestamp,
+                        session_id.as_deref(),
+                        item,
+                        id,
+                        payload["turn_id"].as_str(),
+                    );
+                }
+                if payload["type"] == "patch_apply_end" {
+                    let Some(id) = payload["call_id"].as_str().filter(|id| !id.is_empty()) else {
+                        state.native_partial = true;
+                        continue;
+                    };
+                    // When both native forms are in one input chunk, defer to the
+                    // completed FileChange representation even if patch_apply_end
+                    // appeared first in source order.
+                    if filechange_ids.contains(id) {
                         continue;
                     }
-                    state.native_items.push_back((id.to_string(), digest));
-                    if state.native_items.len() > 512 {
-                        state.native_items.pop_front();
-                    }
-                    match native_file_changes(item, timestamp, session_id.as_deref()) {
-                        Ok((mut edits, partial)) => {
-                            state.native_partial |= partial;
-                            let turn_id = payload["turn_id"].as_str();
-                            let paths = edit_paths(&edits);
-                            if let Some((call_id, index)) =
-                                match_native_call(&calls, &state.native_calls, turn_id, &paths)
-                            {
-                                state
-                                    .native_calls
-                                    .entry(call_id.clone())
-                                    .or_default()
-                                    .insert(index);
-                                for edit in &mut edits {
-                                    edit["call_id"] = json!(call_id);
-                                }
-                            } else if turn_id.is_some() && !paths.is_empty() {
-                                // An unrelated equal-text edit must never be silently discarded.
-                                state.native_partial = true;
-                            }
-                            if let Some(turn_id) = turn_id {
-                                if state.fallback_edits.iter().any(|(seen_turn, seen_paths)| {
-                                    seen_turn == turn_id
-                                        && paths.iter().any(|p| seen_paths.contains(p))
-                                }) {
-                                    state.native_partial = true;
-                                }
-                            }
-                            out.extend(edits);
-                        }
-                        Err(()) => {
-                            state.native_partial = true;
-                            // A completed tool result must not turn an explicitly failed
-                            // native operation into a guessed successful patch.
-                            let mut described = item.clone();
-                            described["status"] = json!("completed");
-                            described["stdout"] = json!("Success.");
-                            described["stderr"] = json!("");
-                            if let Ok((edits, _)) =
-                                native_file_changes(&described, timestamp, session_id.as_deref())
-                            {
-                                let paths = edit_paths(&edits);
-                                if let Some((call_id, index)) = match_native_call(
-                                    &calls,
-                                    &state.native_calls,
-                                    payload["turn_id"].as_str(),
-                                    &paths,
-                                ) {
-                                    state.native_calls.entry(call_id).or_default().insert(index);
-                                }
-                            }
-                        }
-                    }
+                    let success = payload["success"].as_bool() == Some(true)
+                        && payload["status"].as_str() == Some("completed");
+                    let item = json!({
+                        "status": payload["status"].as_str().unwrap_or_default(),
+                        "success": success,
+                        "stdout": payload["stdout"].as_str().unwrap_or_default(),
+                        "stderr": payload["stderr"].as_str().unwrap_or_default(),
+                        "changes": payload["changes"].clone()
+                    });
+                    emit_native_file_changes(
+                        &mut out,
+                        state,
+                        &calls,
+                        timestamp,
+                        session_id.as_deref(),
+                        &item,
+                        id,
+                        payload["turn_id"].as_str(),
+                    );
                 }
             }
             _ => {}
@@ -518,6 +503,97 @@ fn remember_fallback_edits(state: &mut CodexState, turn_id: Option<&str>, events
     }
 }
 
+fn native_change_digest(item: &Value) -> Vec<u8> {
+    let status = item["status"].as_str().unwrap_or_default();
+    let successful = item["success"].as_bool().unwrap_or(true)
+        && status == "completed"
+        && item["stderr"].as_str().is_some_and(str::is_empty)
+        && item["stdout"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("Success."));
+    Sha256::digest(
+        json!({"successful": successful, "changes": item["changes"]})
+            .to_string()
+            .as_bytes(),
+    )
+    .to_vec()
+}
+
+fn native_change_paths(item: &Value) -> Vec<String> {
+    item["changes"]
+        .as_object()
+        .into_iter()
+        .flat_map(|changes| changes.keys())
+        .filter(|path| is_absolute_path(path))
+        .cloned()
+        .collect()
+}
+
+fn emit_native_file_changes(
+    out: &mut Vec<Value>,
+    state: &mut CodexState,
+    calls: &HashMap<String, CodexCall>,
+    timestamp: &str,
+    session_id: Option<&str>,
+    item: &Value,
+    id: &str,
+    turn_id: Option<&str>,
+) {
+    let digest = native_change_digest(item);
+    if let Some((_, previous)) = state.native_items.iter().find(|(seen, _)| seen == id) {
+        if previous != &digest {
+            state.native_partial = true;
+        }
+        return;
+    }
+
+    match native_file_changes(item, timestamp, session_id) {
+        Ok((mut edits, partial)) => {
+            state.native_partial |= partial;
+            state.native_items.push_back((id.to_owned(), digest));
+            if state.native_items.len() > 512 {
+                state.native_items.pop_front();
+            }
+            let paths = edit_paths(&edits);
+            if let Some((call_id, index)) =
+                match_native_call(calls, &state.native_calls, turn_id, &paths)
+            {
+                state
+                    .native_calls
+                    .entry(call_id.clone())
+                    .or_default()
+                    .insert(index);
+                for edit in &mut edits {
+                    edit["call_id"] = json!(call_id);
+                }
+            } else if turn_id.is_some() && !paths.is_empty() {
+                // An unrelated equal-text edit must never be silently discarded.
+                state.native_partial = true;
+            }
+            if let Some(turn_id) = turn_id {
+                if state.fallback_edits.iter().any(|(seen_turn, seen_paths)| {
+                    seen_turn == turn_id && paths.iter().any(|path| seen_paths.contains(path))
+                }) {
+                    state.native_partial = true;
+                }
+            }
+            out.extend(edits);
+        }
+        Err(()) => {
+            state.native_partial = true;
+            // A failed or malformed structured operation must not turn its
+            // request text into a guessed successful patch. Bind the recorded
+            // operation where its absolute change paths permit that proof.
+            let paths = native_change_paths(item);
+            if let Some((call_id, index)) =
+                match_native_call(calls, &state.native_calls, turn_id, &paths)
+            {
+                state.native_calls.entry(call_id).or_default().insert(index);
+            }
+        }
+    }
+}
+
 fn match_native_call(
     calls: &HashMap<String, CodexCall>,
     used: &HashMap<String, HashSet<usize>>,
@@ -618,6 +694,9 @@ fn native_file_changes(
     session_id: Option<&str>,
 ) -> Result<(Vec<Value>, bool), ()> {
     if item["status"] != "completed"
+        || item
+            .get("success")
+            .is_some_and(|success| success.as_bool() != Some(true))
         || !item["stderr"].as_str().is_some_and(str::is_empty)
         || !item["stdout"]
             .as_str()
@@ -981,7 +1060,8 @@ fn nested_calls_with_mode(code: &str, native_binding: bool) -> Option<Vec<CodexC
         rest = rest.split_once('\n')?.1.trim_start();
     }
     if rest.starts_with("const ") {
-        return assigned_apply_patch_call_with_mode(rest, native_binding)
+        return assigned_apply_patch_result_call_with_mode(rest, native_binding)
+            .or_else(|| assigned_apply_patch_call_with_mode(rest, native_binding))
             .or_else(|| bound_patch_literal_call_with_mode(rest, native_binding));
     }
     let mut calls = Vec::new();
@@ -1013,6 +1093,55 @@ fn nested_calls_with_mode(code: &str, native_binding: bool) -> Option<Vec<CodexC
         });
     }
     (!calls.is_empty()).then_some(calls)
+}
+
+/// Accept the recorded wrapper that binds the apply_patch result before
+/// printing it. This is syntax-only recognition of one literal patch and one
+/// straight-line call; it never evaluates JavaScript.
+fn assigned_apply_patch_result_call_with_mode(
+    code: &str,
+    native_binding: bool,
+) -> Option<Vec<CodexCall>> {
+    let rest = code.strip_prefix("const ")?;
+    let (patch_binding, rest) = rest.split_once('=')?;
+    let patch_binding = patch_binding.trim();
+    if !is_ascii_identifier(patch_binding) {
+        return None;
+    }
+
+    let literal = rest.trim_start();
+    let mut values = serde_json::Deserializer::from_str(literal).into_iter::<String>();
+    let patch = values.next()?.ok()?;
+    if !patch_allowed(&patch, native_binding) {
+        return None;
+    }
+    let rest = literal[values.byte_offset()..]
+        .trim_start()
+        .strip_prefix(';')?
+        .trim_start()
+        .strip_prefix("const ")?;
+    let (result_binding, rest) = rest.split_once('=')?;
+    let result_binding = result_binding.trim();
+    if !is_ascii_identifier(result_binding) {
+        return None;
+    }
+    let rest = rest.trim_start().strip_prefix("await tools.apply_patch(")?;
+    let (argument, rest) = rest.split_once(");")?;
+    if argument.trim() != patch_binding {
+        return None;
+    }
+    let rest = rest.trim_start().strip_prefix("text(")?;
+    let (printed, rest) = rest.split_once(");")?;
+    if printed.trim() != result_binding || !rest.trim().is_empty() {
+        return None;
+    }
+
+    Some(vec![CodexCall {
+        tool: "apply_patch".into(),
+        args: patch,
+        cwd: None,
+        turn_id: None,
+    }])
 }
 
 /// The recorded code-mode form may name a literal patch before passing it to
@@ -1820,5 +1949,205 @@ mod tests {
             .collect();
 
         assert!(events.iter().all(|event| event["k"] != "code.edit"));
+    }
+
+    #[test]
+    fn codex_real_patch_apply_end_add_emits_structured_edit() {
+        let patch = "*** Begin Patch\n*** Add File: /Users/mike/.tightbeam/work/d009fb9f2357/e3-three-host-endpoint-20260929.txt\n+e3-three-host-endpoint-20260929\n*** End Patch";
+        let call = serde_json::json!({
+            "timestamp":"2026-09-29T08:44:22.604Z",
+            "type":"response_item",
+            "payload":{
+                "type":"custom_tool_call",
+                "call_id":"call_hY8QXqvjPUQJpqBNHfOT8CHx",
+                "name":"exec",
+                "input":format!(
+                    "const patch = {};\nconst result = await tools.apply_patch(patch);\ntext(result);\n",
+                    serde_json::to_string(patch).unwrap()
+                ),
+                "internal_chat_message_metadata_passthrough":{"turn_id":"turn_e3"}
+            }
+        });
+        let native = serde_json::json!({
+            "timestamp":"2026-09-29T08:44:22.645Z",
+            "type":"event_msg",
+            "payload":{
+                "type":"patch_apply_end",
+                "call_id":"exec-2b58799a-5969-491a-af28-b95497286561",
+                "turn_id":"turn_e3",
+                "stdout":"Success. Updated the following files:\nA /Users/mike/.tightbeam/work/d009fb9f2357/e3-three-host-endpoint-20260929.txt\n",
+                "stderr":"",
+                "success":true,
+                "changes":{
+                    "/Users/mike/.tightbeam/work/d009fb9f2357/e3-three-host-endpoint-20260929.txt":{
+                        "type":"add",
+                        "content":"e3-three-host-endpoint-20260929\n"
+                    }
+                },
+                "status":"completed"
+            }
+        });
+        let output = serde_json::json!({
+            "timestamp":"2026-09-29T08:44:22.688Z",
+            "type":"response_item",
+            "payload":{
+                "type":"custom_tool_call_output",
+                "call_id":"call_hY8QXqvjPUQJpqBNHfOT8CHx",
+                "output":[
+                    {"type":"input_text","text":"Script completed\nWall time 0.0s\nOutput:\n"},
+                    {"type":"input_text","text":"{}"}
+                ]
+            }
+        });
+        let input = [call, native, output]
+            .into_iter()
+            .map(|row| row.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = codex_jsonl_to_tape_jsonl(&input).expect("adapter should parse");
+        let edits = out
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["k"] == "code.edit")
+            .collect::<Vec<_>>();
+
+        assert_eq!(edits.len(), 1, "events={out}");
+        assert_eq!(
+            edits[0]["file"],
+            "/Users/mike/.tightbeam/work/d009fb9f2357/e3-three-host-endpoint-20260929.txt"
+        );
+        assert_eq!(edits[0]["after_text"], "e3-three-host-endpoint-20260929\n");
+        assert_eq!(edits[0]["call_id"], "call_hY8QXqvjPUQJpqBNHfOT8CHx");
+    }
+
+    #[test]
+    fn codex_noncompleted_patch_apply_end_blocks_wrapper_edit_guess() {
+        let patch = "*** Begin Patch\n*** Add File: /tmp/failed-native.txt\n+wrong\n*** End Patch";
+        let call = serde_json::json!({
+            "type":"response_item",
+            "payload":{
+                "type":"custom_tool_call",
+                "call_id":"call_failed_native",
+                "name":"exec",
+                "input":format!(
+                    "const patch = {};\nconst result = await tools.apply_patch(patch);\ntext(result);",
+                    serde_json::to_string(patch).unwrap()
+                ),
+                "internal_chat_message_metadata_passthrough":{"turn_id":"turn_failed_native"}
+            }
+        });
+        let failed = serde_json::json!({
+            "type":"event_msg",
+            "payload":{
+                "type":"patch_apply_end",
+                "call_id":"exec-failed-native",
+                "turn_id":"turn_failed_native",
+                "stdout":"Success. Updated the following files:\nA /tmp/failed-native.txt\n",
+                "stderr":"",
+                "success":true,
+                "changes":{
+                    "/tmp/failed-native.txt":{"type":"add","content":"wrong\n"}
+                },
+                "status":"canceled"
+            }
+        });
+        let output = serde_json::json!({
+            "type":"response_item",
+            "payload":{
+                "type":"custom_tool_call_output",
+                "call_id":"call_failed_native",
+                "output":[
+                    {"type":"input_text","text":"Script completed\nWall time 0.0s\nOutput:\n"},
+                    {"type":"input_text","text":"{}"}
+                ]
+            }
+        });
+        let input = [call, failed, output].map(|row| row.to_string()).join("\n");
+        let out = codex_jsonl_to_tape_jsonl(&input).expect("adapter should parse");
+        let events = out
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(events.iter().all(|event| event["k"] != "code.edit"));
+        assert_eq!(events[0]["coverage.edit"], "partial");
+    }
+
+    #[test]
+    fn codex_filechange_has_priority_over_same_identity_patch_apply_end_and_duplicates() {
+        let patch =
+            "*** Begin Patch\n*** Add File: /tmp/authoritative.txt\n+wrapper\n*** End Patch";
+        let call = serde_json::json!({
+            "type":"response_item",
+            "payload":{
+                "type":"custom_tool_call",
+                "call_id":"call_authoritative",
+                "name":"exec",
+                "input":format!(
+                    "const patch = {};\nconst result = await tools.apply_patch(patch);\ntext(result);",
+                    serde_json::to_string(patch).unwrap()
+                ),
+                "internal_chat_message_metadata_passthrough":{"turn_id":"turn_authoritative"}
+            }
+        });
+        let patch_event = serde_json::json!({
+            "type":"event_msg",
+            "payload":{
+                "type":"patch_apply_end",
+                "call_id":"exec-authoritative",
+                "turn_id":"turn_authoritative",
+                "stdout":"Success. Updated the following files:\nA /tmp/authoritative.txt\n",
+                "stderr":"",
+                "success":true,
+                "changes":{
+                    "/tmp/authoritative.txt":{"type":"add","content":"wrapper\n"}
+                },
+                "status":"completed"
+            }
+        });
+        let filechange = serde_json::json!({
+            "type":"event_msg",
+            "payload":{
+                "type":"item_completed",
+                "turn_id":"turn_authoritative",
+                "item":{
+                    "type":"FileChange",
+                    "id":"exec-authoritative",
+                    "status":"completed",
+                    "changes":{
+                        "/tmp/authoritative.txt":{"type":"add","content":"authoritative\n"}
+                    },
+                    "stdout":"Success. Updated the following files:\nA /tmp/authoritative.txt\n",
+                    "stderr":""
+                }
+            }
+        });
+        let duplicate = filechange.clone();
+        let output = serde_json::json!({
+            "type":"response_item",
+            "payload":{
+                "type":"custom_tool_call_output",
+                "call_id":"call_authoritative",
+                "output":[
+                    {"type":"input_text","text":"Script completed\nWall time 0.0s\nOutput:\n"},
+                    {"type":"input_text","text":"{}"}
+                ]
+            }
+        });
+        let input = [call, patch_event, filechange, duplicate, output]
+            .into_iter()
+            .map(|row| row.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = codex_jsonl_to_tape_jsonl(&input).expect("adapter should parse");
+        let edits = out
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["k"] == "code.edit")
+            .collect::<Vec<_>>();
+
+        assert_eq!(edits.len(), 1, "events={out}");
+        assert_eq!(edits[0]["after_text"], "authoritative\n");
+        assert_eq!(edits[0]["call_id"], "call_authoritative");
     }
 }
