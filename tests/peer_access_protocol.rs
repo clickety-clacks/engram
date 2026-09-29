@@ -8863,7 +8863,7 @@ fn grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer
     assert_eq!(complete["grep_scan"]["total"], 1);
     assert!(complete_scan_started.is_file());
     assert!(broken_scan_released.is_file());
-    assert_eq!(operation_count(&complete_peer_requests, "open"), 1);
+    assert_eq!(operation_count(&complete_peer_requests, "open"), 2);
     assert_eq!(operation_count(&complete_peer_requests, "grep_scan"), 1);
 }
 
@@ -9515,4 +9515,80 @@ fn grep_keeps_completed_scan_aggregates_when_dispatch_response_disconnects() {
         .expect("selected peer source in count mode");
     assert_eq!(count_source["status"], "ok");
     assert_eq!(count_source["grep_scan"]["total"], 1);
+}
+
+#[test]
+fn grep_reopens_peer_for_page_metadata_after_scan_session_exits() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "local-reconnect-nonmatch",
+        "{\"t\":\"2026-09-24T10:00:00Z\",\"k\":\"msg.in\",\"content\":\"unrelated\"}\n",
+    );
+    let state = temp.path().join("first-scan-completed");
+    let script_path = temp.path().join("scan-then-exit-peer.sh");
+    let script = [
+        "#!/bin/sh",
+        "while IFS= read -r request; do",
+        r#"  id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"#,
+        r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
+        r#"  case "$op" in"#,
+        "    open)",
+        r#"      printf '{"id":%s,"data":{"store":"alpha/default","status":"ok","db":"/fixture/alpha.sqlite","tape_dirs":[],"reader_mode":"live","snapshot_at":"2026-09-25T14:00:00Z"}}\n' "$id""#,
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"alpha","build":"@BUILD@","protocol":1,"schema":@SCHEMA@,"query_semantics":@SEMANTICS@,"limits":{"grep_k":10000}}}\n' "$id""#,
+        "      ;;",
+        "    grep_scan)",
+        r#"      printf '{"id":%s,"data":{"type":"match","tape_id":"alpha-tape","timestamp":"2026-09-24T12:00:00Z","total_lines":1,"anchor_line":1,"match_count":1,"provenance_match_count":0,"provenance_event_count":1,"refs_up":0,"refs_down":0,"files_touched":[]}}\n' "$id""#,
+        "      touch @STATE@",
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"total":1,"returned":1,"time_range":{"start":"2026-09-24T12:00:00Z","end":"2026-09-24T12:00:00Z"},"truncated":false}}\n' "$id""#,
+        "      exit 0",
+        "      ;;",
+        "    dispatch_rows)",
+        "      test -f @STATE@ || exit 2",
+        r#"      printf '{"id":%s,"data":{"tape_id":"alpha-tape","uuid":"handoff-1","direction":"received"}}\n' "$id""#,
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"records":1}}\n' "$id""#,
+        "      ;;",
+        "  esac",
+        "done",
+    ]
+    .join("\n")
+    .replace("@BUILD@", env!("CARGO_PKG_VERSION"))
+    .replace("@SCHEMA@", &SCHEMA_VERSION.to_string())
+    .replace("@SEMANTICS@", &QUERY_SEMANTICS_VERSION.to_string())
+    .replace("@STATE@", &state.to_string_lossy());
+    std::fs::write(&script_path, script).expect("write peer script");
+    std::fs::write(
+        caller_home.join(".engram/topology.yml"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "self": "caller",
+            "peers": {
+                "alpha": {
+                    "command": ["/bin/sh", script_path],
+                    "engram": binary,
+                    "exports": ["default"],
+                }
+            }
+        }))
+        .expect("serialize topology"),
+    )
+    .expect("write topology");
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["grep", "reconnect-needle", "--peers", "alpha", "--require-complete"])
+        .output()
+        .expect("run grep after first peer process exits");
+    assert!(
+        output.status.success(),
+        "grep should reopen for page metadata: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(state.exists(), "first peer process completed its scan");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("grep JSON");
+    assert_eq!(result["federation"]["coverage"], "complete");
+    assert_eq!(result["sessions"][0]["refs_up"], 1);
+    assert_eq!(result["sessions"][0]["refs_down"], 0);
 }
