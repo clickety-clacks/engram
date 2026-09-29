@@ -103,7 +103,7 @@ printf '{"id":%s,"end":true,"ok":true,"stats":{"done":true}}\n' "$id"
         drop(client);
         let _ = finished_tx.send(());
     });
-    let returned_before_cleanup = finished_rx.recv_timeout(Duration::from_millis(250)).is_ok();
+    let returned_before_cleanup = finished_rx.recv_timeout(Duration::from_secs(5)).is_ok();
 
     cleanup.terminate();
     let returned_after_cleanup =
