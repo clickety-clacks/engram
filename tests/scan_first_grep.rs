@@ -168,3 +168,121 @@ fn decoded_local_and_peer_matches_keep_pages_and_per_tape_failure_coverage() {
         "all decoded local and peer matches span pages"
     );
 }
+
+#[test]
+fn decoded_marker_grep_finds_native_exec_argument_on_peer_without_joining_fields() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let uuid = "ccc7e8fa-6325-4110-98b5-95e5dffb6333";
+    let marker = format!("<engram-src id=\"{uuid}\"/>");
+    let escaped_marker = marker.replace('"', "\\\"");
+    let native_call = format!(
+        r#"const r = await tools.exec_command({{cmd:"tightbeam dispatch --to agent:example --subject 'Marker handoff' --brief 'Send {escaped_marker}' --work-item wi_example",yield_time_ms:10000,max_output_tokens:1500}}); text(r.output);"#
+    );
+    assert!(!native_call.contains(&marker));
+    assert!(native_call.contains(&escaped_marker));
+    let sender_event = format!(
+        "{}\n",
+        serde_json::to_string(&json!({
+            "t": "2026-09-28T13:38:51.535Z",
+            "k": "tool.call",
+            "source": {"harness": "codex-cli", "session_id": "01a0e710-b907-7f82-a0ac-bc4647ff3317"},
+            "tool": "exec",
+            "call_id": "call_1c2DyppcQad9Cq1BX1XF6iF9",
+            "args": native_call,
+        }))
+        .expect("serialize native Codex tool event")
+    );
+    let split_fields_event = format!(
+        "{}\n",
+        serde_json::to_string(&json!({
+            "t": "2026-09-28T13:38:52Z",
+            "k": "tool.call",
+            "tool": "exec_command",
+            "args": {
+                "prefix": format!("<engram-src id=\"{uuid}"),
+                "suffix": "\"/>",
+            },
+        }))
+        .expect("serialize split-field decoy")
+    );
+    let nested_split_call = format!(
+        r#"const r = await tools.exec_command({{cmd:"<engram-src id=\"{uuid}",workdir:"\"/>"}}); text(r.output);"#
+    );
+    let nested_split_event = format!(
+        "{}\n",
+        serde_json::to_string(&json!({
+            "t": "2026-09-28T13:38:53Z",
+            "k": "tool.call",
+            "source": {"harness": "codex-cli", "session_id": "split-sender"},
+            "tool": "exec",
+            "args": nested_split_call,
+        }))
+        .expect("serialize nested split-field decoy")
+    );
+    let remote = write_grep_owner(
+        temp.path(),
+        "remote",
+        binary,
+        &[
+            ("genuine-sender", sender_event.as_str()),
+            ("split-fields", split_fields_event.as_str()),
+            ("nested-split-fields", nested_split_event.as_str()),
+        ],
+    );
+    let receiver_event = format!(
+        "{}\n",
+        serde_json::to_string(&json!({
+            "t": "2026-09-28T13:41:14.986Z",
+            "k": "msg.in",
+            "content": format!("Received {marker}"),
+        }))
+        .expect("serialize receiver event")
+    );
+    let (caller_home, repo) = write_local_source(temp.path(), "receiver", receiver_event.as_str());
+    set_peer_topology(&caller_home, json!({"remote": remote}));
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "grep",
+            marker.as_str(),
+            "--peers",
+            "remote",
+            "--require-complete",
+            "--limit",
+            "10",
+        ])
+        .output()
+        .expect("run decoded marker grep");
+    assert!(
+        output.status.success(),
+        "grep failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).expect("grep JSON");
+    assert_eq!(
+        result["federation"]["coverage"], "complete",
+        "unexpected grep result: {result}"
+    );
+    assert_eq!(result["returned"], 2);
+    let sessions = result["sessions"].as_array().expect("grep sessions");
+    let mut tape_ids = sessions
+        .iter()
+        .map(|session| session["tape_id"].as_str().expect("tape ID"))
+        .collect::<Vec<_>>();
+    tape_ids.sort_unstable();
+    assert_eq!(tape_ids, ["genuine-sender", "receiver"]);
+
+    let peer = result["federation"]["sources"]
+        .as_array()
+        .expect("federation source rows")
+        .iter()
+        .find(|source| source["store"] == "remote/default")
+        .expect("remote source row");
+    assert_eq!(peer["status"], "ok");
+    assert_eq!(peer["grep_scan"]["truncated"], false);
+    assert_eq!(peer["grep_scan"]["total"], 1);
+    assert_eq!(peer["grep_scan"]["returned"], 1);
+}
