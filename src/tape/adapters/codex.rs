@@ -18,11 +18,9 @@ pub(crate) struct CodexState {
     #[serde(default)]
     native_items: VecDeque<(String, Vec<u8>)>,
     #[serde(default)]
-    native_calls: HashSet<String>,
+    native_calls: HashMap<String, HashSet<usize>>,
     #[serde(default)]
-    fallback_edits: VecDeque<(Vec<u8>, u64)>,
-    #[serde(default)]
-    row_number: u64,
+    fallback_edits: VecDeque<(String, Vec<String>)>,
     #[serde(default)]
     native_partial: bool,
 }
@@ -46,7 +44,6 @@ pub(crate) fn codex_jsonl_incremental(
         if line.trim().is_empty() {
             continue;
         }
-        state.row_number = state.row_number.saturating_add(1);
         let row: Value = serde_json::from_str(line)?;
         if session_id.is_none() {
             session_id = extract_codex_session_id(&row);
@@ -139,6 +136,12 @@ pub(crate) fn codex_jsonl_incremental(
                             tool,
                             call_id.as_deref(),
                             &args,
+                            payload
+                                .and_then(|obj| {
+                                    obj.get("internal_chat_message_metadata_passthrough")
+                                })
+                                .and_then(|value| value.get("turn_id"))
+                                .and_then(Value::as_str),
                         );
                     }
                     "custom_tool_call" => {
@@ -163,6 +166,12 @@ pub(crate) fn codex_jsonl_incremental(
                             tool,
                             call_id.as_deref(),
                             &args,
+                            payload
+                                .and_then(|obj| {
+                                    obj.get("internal_chat_message_metadata_passthrough")
+                                })
+                                .and_then(|value| value.get("turn_id"))
+                                .and_then(Value::as_str),
                         );
                     }
                     "function_call_output" | "custom_tool_call_output" => {
@@ -212,9 +221,10 @@ pub(crate) fn codex_jsonl_incremental(
                         result_event.insert("stdout".to_string(), json!(output));
                         result_event.insert("stderr".to_string(), json!(""));
                         out.push(Value::Object(result_event));
-                        let native_call = call_id
+                        let native_indices = call_id
                             .as_ref()
-                            .is_some_and(|id| state.native_calls.remove(id));
+                            .and_then(|id| state.native_calls.remove(id))
+                            .unwrap_or_default();
                         if exit == Some(0)
                             && let Some(context) = context
                         {
@@ -222,9 +232,13 @@ pub(crate) fn codex_jsonl_incremental(
                                 if let Some(nested) = nested_calls(&context.args)
                                     && let Some(results) = nested_results(&raw_output, &nested)
                                 {
-                                    for (call, result) in nested.iter().zip(results) {
+                                    for (nested_index, (call, result)) in
+                                        nested.iter().zip(results).enumerate()
+                                    {
                                         let stdout = result["output"].as_str().unwrap_or_default();
-                                        if native_call && call.tool == "apply_patch" {
+                                        if native_indices.contains(&nested_index)
+                                            && call.tool == "apply_patch"
+                                        {
                                             continue;
                                         }
                                         let before = out.len();
@@ -236,12 +250,16 @@ pub(crate) fn codex_jsonl_incremental(
                                             call,
                                             stdout,
                                         );
-                                        remember_fallback_edits(state, &out[before..]);
+                                        remember_fallback_edits(
+                                            state,
+                                            context.turn_id.as_deref(),
+                                            &out[before..],
+                                        );
                                     }
                                 }
                             } else {
                                 let before = out.len();
-                                if native_call && context.tool == "apply_patch" {
+                                if native_indices.contains(&0) && context.tool == "apply_patch" {
                                     continue;
                                 }
                                 emit_structured_after_result(
@@ -252,7 +270,11 @@ pub(crate) fn codex_jsonl_incremental(
                                     &context,
                                     command_stdout(&output),
                                 );
-                                remember_fallback_edits(state, &out[before..]);
+                                remember_fallback_edits(
+                                    state,
+                                    context.turn_id.as_deref(),
+                                    &out[before..],
+                                );
                             }
                         }
                     }
@@ -283,29 +305,28 @@ pub(crate) fn codex_jsonl_incremental(
                     match native_file_changes(item, timestamp, session_id.as_deref()) {
                         Ok((mut edits, partial)) => {
                             state.native_partial |= partial;
-                            if let Some(signature) = edit_signature(&edits) {
-                                if let Some(position) =
-                                    state.fallback_edits.iter().position(|(seen, at)| {
-                                        seen == &signature
-                                            && state.row_number.saturating_sub(*at) <= 64
-                                    })
-                                {
-                                    state.fallback_edits.remove(position);
-                                    continue;
+                            let turn_id = payload["turn_id"].as_str();
+                            let paths = edit_paths(&edits);
+                            if let Some((call_id, index)) =
+                                match_native_call(&calls, &state.native_calls, turn_id, &paths)
+                            {
+                                state
+                                    .native_calls
+                                    .entry(call_id.clone())
+                                    .or_default()
+                                    .insert(index);
+                                for edit in &mut edits {
+                                    edit["call_id"] = json!(call_id);
                                 }
-                                let matching = calls
-                                    .iter()
-                                    .filter(|(_, call)| {
-                                        fallback_call_signature(call).as_ref() == Some(&signature)
-                                    })
-                                    .map(|(id, _)| id.clone())
-                                    .collect::<Vec<_>>();
-                                if matching.len() == 1 {
-                                    state.native_calls.insert(matching[0].clone());
-                                    for edit in &mut edits {
-                                        edit["call_id"] = json!(matching[0]);
-                                    }
-                                } else if matching.len() > 1 {
+                            } else if turn_id.is_some() && !paths.is_empty() {
+                                // An unrelated equal-text edit must never be silently discarded.
+                                state.native_partial = true;
+                            }
+                            if let Some(turn_id) = turn_id {
+                                if state.fallback_edits.iter().any(|(seen_turn, seen_paths)| {
+                                    seen_turn == turn_id
+                                        && paths.iter().any(|p| seen_paths.contains(p))
+                                }) {
                                     state.native_partial = true;
                                 }
                             }
@@ -321,17 +342,15 @@ pub(crate) fn codex_jsonl_incremental(
                             described["stderr"] = json!("");
                             if let Ok((edits, _)) =
                                 native_file_changes(&described, timestamp, session_id.as_deref())
-                                && let Some(signature) = edit_signature(&edits)
                             {
-                                let matching = calls
-                                    .iter()
-                                    .filter(|(_, call)| {
-                                        fallback_call_signature(call).as_ref() == Some(&signature)
-                                    })
-                                    .map(|(id, _)| id.clone())
-                                    .collect::<Vec<_>>();
-                                if matching.len() == 1 {
-                                    state.native_calls.insert(matching[0].clone());
+                                let paths = edit_paths(&edits);
+                                if let Some((call_id, index)) = match_native_call(
+                                    &calls,
+                                    &state.native_calls,
+                                    payload["turn_id"].as_str(),
+                                    &paths,
+                                ) {
+                                    state.native_calls.entry(call_id).or_default().insert(index);
                                 }
                             }
                         }
@@ -471,40 +490,63 @@ fn codex_coverage(events: &[Value], native_partial: bool) -> (&'static str, &'st
     )
 }
 
-fn remember_fallback_edits(state: &mut CodexState, events: &[Value]) {
-    if let Some(signature) = edit_signature(events) {
-        state
-            .fallback_edits
-            .push_back((signature, state.row_number));
-        while state.fallback_edits.len() > 64 {
-            state.fallback_edits.pop_front();
-        }
-    }
-}
-
-fn edit_signature(events: &[Value]) -> Option<Vec<u8>> {
-    let edits = events
+fn edit_paths(events: &[Value]) -> Vec<String> {
+    events
         .iter()
         .filter(|event| event["k"] == "code.edit")
-        .map(|event| json!([event["file"], event["before_text"], event["after_text"]]))
-        .collect::<Vec<_>>();
-    (!edits.is_empty()).then(|| Sha256::digest(Value::Array(edits).to_string().as_bytes()).to_vec())
+        .filter_map(|event| event["file"].as_str().map(str::to_owned))
+        .collect()
 }
 
-fn fallback_call_signature(call: &CodexCall) -> Option<Vec<u8>> {
-    let calls = if call.tool == "exec" {
-        nested_calls(&call.args)?
-    } else {
-        vec![call.clone()]
-    };
-    let mut events = Vec::new();
-    for nested in calls {
-        if nested.tool != "apply_patch" {
-            return None;
+fn remember_fallback_edits(state: &mut CodexState, turn_id: Option<&str>, events: &[Value]) {
+    if let Some(turn_id) = turn_id {
+        let paths = edit_paths(events);
+        if !paths.is_empty() {
+            state.fallback_edits.push_back((turn_id.to_owned(), paths));
+            while state.fallback_edits.len() > 64 {
+                state.fallback_edits.pop_front();
+            }
         }
-        emit_structured_after_result(&mut events, "", None, None, &nested, "");
     }
-    edit_signature(&events)
+}
+
+fn match_native_call(
+    calls: &HashMap<String, CodexCall>,
+    used: &HashMap<String, HashSet<usize>>,
+    turn_id: Option<&str>,
+    paths: &[String],
+) -> Option<(String, usize)> {
+    let turn_id = turn_id?;
+    if paths.is_empty() {
+        return None;
+    }
+    let mut matching = Vec::new();
+    for (call_id, call) in calls {
+        if call.turn_id.as_deref() != Some(turn_id) {
+            continue;
+        }
+        let operations = if call.tool == "exec" {
+            nested_calls(&call.args)?
+        } else {
+            vec![call.clone()]
+        };
+        for (index, operation) in operations.iter().enumerate() {
+            if operation.tool != "apply_patch"
+                || used.get(call_id).is_some_and(|set| set.contains(&index))
+            {
+                continue;
+            }
+            let patch_paths = parse_patch(&patch_body(&operation.args))
+                .into_iter()
+                .map(|edit| edit.file)
+                .collect::<Vec<_>>();
+            if paths.iter().all(|path| patch_paths.contains(path)) {
+                matching.push((call_id.clone(), index));
+                break;
+            }
+        }
+    }
+    (matching.len() == 1).then(|| matching.remove(0))
 }
 
 fn native_file_changes(
@@ -801,6 +843,7 @@ fn emit_tool_call(
     tool: &str,
     call_id: Option<&str>,
     args: &str,
+    turn_id: Option<&str>,
 ) {
     if let Some(call_id) = call_id {
         calls.insert(
@@ -808,6 +851,7 @@ fn emit_tool_call(
             CodexCall {
                 tool: tool.to_string(),
                 args: args.to_string(),
+                turn_id: turn_id.map(str::to_owned),
             },
         );
     }
@@ -835,6 +879,8 @@ fn value_to_argument_string(value: &Value) -> String {
 struct CodexCall {
     tool: String,
     args: String,
+    #[serde(default)]
+    turn_id: Option<String>,
 }
 
 fn patch_body(arguments: &str) -> String {
@@ -884,6 +930,7 @@ fn nested_calls(code: &str) -> Option<Vec<CodexCall>> {
         calls.push(CodexCall {
             tool: tool.into(),
             args,
+            turn_id: None,
         });
     }
     (!calls.is_empty()).then_some(calls)
@@ -918,6 +965,7 @@ fn bound_patch_literal_call(code: &str) -> Option<Vec<CodexCall>> {
     Some(vec![CodexCall {
         tool: "apply_patch".into(),
         args: patch,
+        turn_id: None,
     }])
 }
 
@@ -950,6 +998,7 @@ fn assigned_apply_patch_call(code: &str) -> Option<Vec<CodexCall>> {
     Some(vec![CodexCall {
         tool: "apply_patch".into(),
         args: patch,
+        turn_id: None,
     }])
 }
 
@@ -1153,7 +1202,8 @@ mod tests {
             serde_json::to_string(patch).unwrap()
         );
         let call = serde_json::json!({"timestamp":"2026-09-29T03:12:09.460Z","type":"response_item","payload":{
-            "type":"custom_tool_call","name":"exec","call_id":"call_E2","input":code
+            "type":"custom_tool_call","name":"exec","call_id":"call_E2","input":code,
+            "internal_chat_message_metadata_passthrough":{"turn_id":"turn_E2"}
         }});
         let native = serde_json::json!({"timestamp":"2026-09-29T03:12:09.580Z","type":"event_msg","payload":{
             "type":"item_completed","turn_id":"turn_E2","item":{
@@ -1183,10 +1233,11 @@ mod tests {
     }
 
     #[test]
-    fn codex_filechange_after_fallback_does_not_duplicate_an_edit() {
+    fn codex_filechange_after_unbound_fallback_is_retained_as_partial() {
         let patch = "*** Begin Patch\n*** Add File: /tmp/late.txt\n+same edit\n*** End Patch\n";
         let call = serde_json::json!({"type":"response_item","payload":{
             "type":"custom_tool_call","call_id":"call_late","name":"exec",
+            "internal_chat_message_metadata_passthrough":{"turn_id":"turn_late"},
             "input":format!("text(await tools.apply_patch({}));", serde_json::to_string(patch).unwrap())
         }});
         let output = serde_json::json!({"type":"response_item","payload":{
@@ -1196,20 +1247,97 @@ mod tests {
             ]
         }});
         let native = serde_json::json!({"type":"event_msg","payload":{
-            "type":"item_completed","item":{"type":"FileChange","id":"exec_late","status":"completed",
+            "type":"item_completed","turn_id":"turn_late","item":{"type":"FileChange","id":"exec_late","status":"completed",
                 "changes":{"/tmp/late.txt":{"type":"add","content":"same edit\n"}},
                 "stdout":"Success. Updated the following files:\nA /tmp/late.txt\n","stderr":""}
         }});
         let mut state = CodexState::default();
         let first = codex_jsonl_incremental(&format!("{call}\n{output}\n"), &mut state).unwrap();
         let second = codex_jsonl_incremental(&format!("{native}\n"), &mut state).unwrap();
+        let events = format!("{first}{second}");
         assert_eq!(
-            format!("{first}{second}")
+            events
                 .lines()
                 .filter(|line| line.contains("\"k\":\"code.edit\""))
                 .count(),
-            1
+            2
         );
+        assert!(events.contains("\"coverage.edit\":\"partial\""));
+    }
+
+    #[test]
+    fn codex_filechange_update_uses_turn_and_path_not_text_equality() {
+        let patch =
+            "*** Begin Patch\n*** Update File: /tmp/update.txt\n@@\n-old\n+new\n*** End Patch\n";
+        let call = serde_json::json!({"type":"response_item","payload":{
+            "type":"custom_tool_call","call_id":"call_update","name":"exec",
+            "input":format!("text(await tools.apply_patch({}));", serde_json::to_string(patch).unwrap()),
+            "internal_chat_message_metadata_passthrough":{"turn_id":"turn_update"}
+        }});
+        let native = serde_json::json!({"type":"event_msg","payload":{
+            "type":"item_completed","turn_id":"turn_update","item":{
+                "type":"FileChange","id":"exec_update","status":"completed",
+                "changes":{"/tmp/update.txt":{"type":"update","unified_diff":"@@ -1,2 +1,2 @@\n context\n-old\n+new\n"}},
+                "stdout":"Success. Updated the following files:\nM /tmp/update.txt\n","stderr":""
+            }
+        }});
+        let output = serde_json::json!({"type":"response_item","payload":{
+            "type":"custom_tool_call_output","call_id":"call_update","output":[
+                {"type":"input_text","text":"Script completed\nWall time 0.1s\nOutput:\n"},
+                {"type":"input_text","text":"{}"}
+            ]
+        }});
+        let out =
+            codex_jsonl_to_tape_jsonl(&[call, native, output].map(|v| v.to_string()).join("\n"))
+                .unwrap();
+        let edits = out
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["k"] == "code.edit")
+            .collect::<Vec<_>>();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0]["before_text"], "context\nold\n");
+        assert_eq!(edits[0]["call_id"], "call_update");
+    }
+
+    #[test]
+    fn codex_filechange_only_suppresses_its_bound_nested_patch() {
+        let first = "*** Begin Patch\n*** Add File: /tmp/first.txt\n+one\n*** End Patch\n";
+        let second = "*** Begin Patch\n*** Add File: /tmp/second.txt\n+two\n*** End Patch\n";
+        let code = format!(
+            "text(await tools.apply_patch({})); text(await tools.apply_patch({}));",
+            serde_json::to_string(first).unwrap(),
+            serde_json::to_string(second).unwrap()
+        );
+        let call = serde_json::json!({"type":"response_item","payload":{
+            "type":"custom_tool_call","call_id":"call_multi","name":"exec","input":code,
+            "internal_chat_message_metadata_passthrough":{"turn_id":"turn_multi"}
+        }});
+        let native = serde_json::json!({"type":"event_msg","payload":{
+            "type":"item_completed","turn_id":"turn_multi","item":{
+                "type":"FileChange","id":"exec_first","status":"completed",
+                "changes":{"/tmp/first.txt":{"type":"add","content":"one\n"}},
+                "stdout":"Success. Updated the following files:\nA /tmp/first.txt\n","stderr":""
+            }
+        }});
+        let output = serde_json::json!({"type":"response_item","payload":{
+            "type":"custom_tool_call_output","call_id":"call_multi","output":[
+                {"type":"input_text","text":"Script completed\nWall time 0.1s\nOutput:\n"},
+                {"type":"input_text","text":"{}"},
+                {"type":"input_text","text":"{}"}
+            ]
+        }});
+        let out =
+            codex_jsonl_to_tape_jsonl(&[call, native, output].map(|v| v.to_string()).join("\n"))
+                .unwrap();
+        let edits = out
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["k"] == "code.edit")
+            .collect::<Vec<_>>();
+        assert_eq!(edits.len(), 2);
+        assert!(edits.iter().any(|event| event["file"] == "/tmp/first.txt"));
+        assert!(edits.iter().any(|event| event["file"] == "/tmp/second.txt"));
     }
 
     #[test]
@@ -1284,10 +1412,11 @@ mod tests {
         let patch = "*** Begin Patch\n*** Add File: /tmp/no-edit.txt\n+wrong\n*** End Patch\n";
         let call = serde_json::json!({"type":"response_item","payload":{
             "type":"custom_tool_call","call_id":"call_fail","name":"exec",
+            "internal_chat_message_metadata_passthrough":{"turn_id":"turn_fail"},
             "input":format!("text(await tools.apply_patch({}));", serde_json::to_string(patch).unwrap())
         }});
         let failed = serde_json::json!({"type":"event_msg","payload":{
-            "type":"item_completed","item":{"type":"FileChange","id":"exec_fail","status":"failed",
+            "type":"item_completed","turn_id":"turn_fail","item":{"type":"FileChange","id":"exec_fail","status":"failed",
                 "changes":{"/tmp/no-edit.txt":{"type":"add","content":"wrong\n"}},
                 "stdout":"Failed to apply patch","stderr":"conflict"}
         }});
