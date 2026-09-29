@@ -2,12 +2,15 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::process::{Child, ChildStdin, ChildStdout};
-use std::sync::atomic::AtomicBool;
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 
 use serde_json::{Value, json};
 
@@ -18,6 +21,10 @@ use super::peer::{MAX_FRAME_BYTES, PROTOCOL_VERSION};
 use super::transport;
 
 const MAX_STDERR_BYTES: usize = 16 * 1024;
+const PIPE_READER_POLL_INTERVAL: Duration = Duration::from_millis(50);
+// After process-group termination, drain final output briefly before ending
+// readers even if an escaped descendant still owns an inherited pipe.
+const PIPE_READER_STOP_DRAIN: Duration = Duration::from_millis(50);
 pub const DEFAULT_READ_FILE_COMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
 pub const DEFAULT_DECOMPRESSED_BYTES_PER_TAPE: u64 = 512 * 1024 * 1024;
 
@@ -75,6 +82,7 @@ pub struct PeerClient {
     response_limit: usize,
     stdout_thread: Option<JoinHandle<()>>,
     stderr_thread: Option<JoinHandle<()>>,
+    stop_readers: Arc<AtomicBool>,
     stderr: Arc<Mutex<Vec<u8>>>,
     command: String,
 }
@@ -487,10 +495,24 @@ impl PeerClient {
         let stderr = child.stderr.take().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "peer stderr was not piped")
         })?;
+        // Pollable reads let the reader threads observe shutdown even when a
+        // surviving descendant keeps an inherited pipe open after the peer exits.
+        if let Err(error) =
+            set_pipe_nonblocking(&stdout).and_then(|()| set_pipe_nonblocking(&stderr))
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
         let (sender, responses) = mpsc::channel();
-        let stdout_thread = Some(read_responses(stdout, sender));
+        let stop_readers = Arc::new(AtomicBool::new(false));
+        let stdout_thread = Some(read_responses(stdout, sender, Arc::clone(&stop_readers)));
         let stderr_bytes = Arc::new(Mutex::new(Vec::new()));
-        let stderr_thread = Some(drain_stderr(stderr, Arc::clone(&stderr_bytes)));
+        let stderr_thread = Some(drain_stderr(
+            stderr,
+            Arc::clone(&stderr_bytes),
+            Arc::clone(&stop_readers),
+        ));
 
         Ok(Self {
             child,
@@ -502,6 +524,7 @@ impl PeerClient {
             response_limit: MAX_NON_FILE_RESPONSE_BYTES,
             stdout_thread,
             stderr_thread,
+            stop_readers,
             stderr: stderr_bytes,
             command,
         })
@@ -880,6 +903,7 @@ impl PeerClient {
                 ),
             },
         };
+        self.stop_pipe_readers();
         if let Some(thread) = self.stdout_thread.take() {
             let _ = thread.join();
         }
@@ -909,9 +933,14 @@ impl PeerClient {
         )
     }
 
+    fn stop_pipe_readers(&self) {
+        self.stop_readers.store(true, Ordering::SeqCst);
+    }
+
     fn abort(&mut self) {
         self.input.take();
         self.terminate_child_process_group();
+        self.stop_pipe_readers();
     }
 
     fn terminate_child_process_group(&mut self) {
@@ -927,6 +956,7 @@ impl Drop for PeerClient {
         self.input.take();
         self.terminate_child_process_group();
         let _ = self.child.wait();
+        self.stop_pipe_readers();
         if let Some(thread) = self.stdout_thread.take() {
             let _ = thread.join();
         }
@@ -1003,11 +1033,16 @@ fn read_file_response_byte_limit(request: &PeerRequest) -> usize {
         .saturating_add(MAX_FRAME_BYTES)
 }
 
-fn read_responses(stdout: ChildStdout, sender: Sender<ReaderMessage>) -> JoinHandle<()> {
+fn read_responses(
+    stdout: ChildStdout,
+    sender: Sender<ReaderMessage>,
+    stop_readers: Arc<AtomicBool>,
+) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut input = BufReader::new(stdout);
+        let mut stop_started = None;
         loop {
-            match read_frame(&mut input) {
+            match read_frame(&mut input, &stop_readers, &mut stop_started) {
                 Ok(Some(frame)) => match serde_json::from_slice::<Value>(&frame) {
                     Ok(value) => {
                         if sender
@@ -1037,10 +1072,38 @@ fn read_responses(stdout: ChildStdout, sender: Sender<ReaderMessage>) -> JoinHan
     })
 }
 
-fn read_frame<R: BufRead>(input: &mut R) -> io::Result<Option<Vec<u8>>> {
+fn read_frame(
+    input: &mut BufReader<ChildStdout>,
+    stop_readers: &AtomicBool,
+    stop_started: &mut Option<Instant>,
+) -> io::Result<Option<Vec<u8>>> {
     let mut frame = Vec::new();
     loop {
-        let available = input.fill_buf()?;
+        if pipe_reader_stop_deadline_reached(stop_readers, stop_started) {
+            if frame.is_empty() {
+                return Ok(None);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "unterminated response frame",
+            ));
+        }
+        let available = match input.fill_buf() {
+            Ok(available) => available,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if wait_for_pipe_readable(input.get_ref(), stop_readers, stop_started)? {
+                    continue;
+                }
+                if frame.is_empty() {
+                    return Ok(None);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "unterminated response frame",
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         if available.is_empty() {
             if frame.is_empty() {
                 return Ok(None);
@@ -1073,13 +1136,103 @@ fn read_frame<R: BufRead>(input: &mut R) -> io::Result<Option<Vec<u8>>> {
     }
 }
 
-fn drain_stderr(stderr: impl Read + Send + 'static, saved: Arc<Mutex<Vec<u8>>>) -> JoinHandle<()> {
+#[cfg(unix)]
+fn set_pipe_nonblocking(pipe: &impl AsRawFd) -> io::Result<()> {
+    let fd = pipe.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_pipe_nonblocking<T>(_pipe: &T) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn wait_for_pipe_readable(
+    pipe: &impl AsRawFd,
+    stop_readers: &AtomicBool,
+    stop_started: &mut Option<Instant>,
+) -> io::Result<bool> {
+    let fd = pipe.as_raw_fd();
+    loop {
+        let stopping = stop_readers.load(Ordering::SeqCst);
+        if pipe_reader_stop_deadline_reached(stop_readers, stop_started) {
+            return Ok(false);
+        }
+        let timeout_ms = if let Some(started) = stop_started {
+            let deadline = *started + PIPE_READER_STOP_DRAIN;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            remaining.as_millis().clamp(1, i32::MAX as u128) as i32
+        } else {
+            PIPE_READER_POLL_INTERVAL
+                .as_millis()
+                .clamp(1, i32::MAX as u128) as i32
+        };
+        let mut descriptor = libc::pollfd {
+            fd,
+            events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+        if result > 0 {
+            return Ok(true);
+        }
+        if result == 0 {
+            if stopping {
+                return Ok(false);
+            }
+            continue;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn pipe_reader_stop_deadline_reached(
+    stop_readers: &AtomicBool,
+    stop_started: &mut Option<Instant>,
+) -> bool {
+    if stop_readers.load(Ordering::SeqCst) && stop_started.is_none() {
+        *stop_started = Some(Instant::now());
+    }
+    stop_started.is_some_and(|started| started.elapsed() >= PIPE_READER_STOP_DRAIN)
+}
+
+fn drain_stderr(
+    stderr: ChildStderr,
+    saved: Arc<Mutex<Vec<u8>>>,
+    stop_readers: Arc<AtomicBool>,
+) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut stderr = stderr;
         let mut buffer = [0u8; 4096];
+        let mut stop_started = None;
         loop {
+            if pipe_reader_stop_deadline_reached(&stop_readers, &mut stop_started) {
+                return;
+            }
             let count = match stderr.read(&mut buffer) {
-                Ok(0) | Err(_) => return,
+                Ok(0) => return,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    match wait_for_pipe_readable(&stderr, &stop_readers, &mut stop_started) {
+                        Ok(true) => continue,
+                        Ok(false) | Err(_) => return,
+                    }
+                }
+                Err(_) => return,
                 Ok(count) => count,
             };
             if let Ok(mut saved) = saved.lock() {
@@ -1099,6 +1252,15 @@ fn drain_stderr(stderr: impl Read + Send + 'static, saved: Arc<Mutex<Vec<u8>>>) 
             }
         }
     })
+}
+
+#[cfg(not(unix))]
+fn wait_for_pipe_readable<T>(
+    _pipe: &T,
+    stop_readers: &AtomicBool,
+    _stop_started: &mut Option<Instant>,
+) -> io::Result<bool> {
+    Ok(!stop_readers.load(Ordering::SeqCst))
 }
 
 #[cfg(test)]
