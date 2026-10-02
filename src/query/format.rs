@@ -537,6 +537,7 @@ pub fn format_sessions_for_agent(
     raw_sessions: Vec<Value>,
     score_by_session: &HashMap<String, f32>,
     grep: Option<&str>,
+    date_filter: &DateFilter,
 ) -> Result<Vec<Value>, CliError> {
     let mut out = Vec::new();
     let line_count = context.peek_default_lines.max(1);
@@ -593,11 +594,38 @@ pub fn format_sessions_for_agent(
             )
         };
 
+        let eligible_window_offsets =
+            if grep.is_some() && !grep_prepared && date_filter.is_bounded() {
+                let window_start_offset = window_start.saturating_sub(1) as u64;
+                let window_end_offset = window_end as u64;
+                Some(
+                    rows.iter()
+                        .filter(|row| {
+                            row.offset >= window_start_offset
+                                && row.offset < window_end_offset
+                                && matches!(
+                                    date_filter
+                                        .event_time(row.value.get("t").and_then(Value::as_str)),
+                                    EventTimeDecision::Included
+                                )
+                        })
+                        .map(|row| row.offset)
+                        .collect::<HashSet<_>>(),
+                )
+            } else {
+                None
+            };
+
         let window_texts = if total_lines == 0 || window_end == 0 {
             Vec::new()
         } else {
             ((window_start - 1)..window_end)
-                .map(|idx| content_lines.get(idx).copied().unwrap_or_default())
+                .map(|idx| {
+                    (
+                        idx as u64,
+                        content_lines.get(idx).copied().unwrap_or_default(),
+                    )
+                })
                 .collect::<Vec<_>>()
         };
 
@@ -606,7 +634,13 @@ pub fn format_sessions_for_agent(
                 raw.get("grep_pattern").and_then(Value::as_str) == Some(pattern)
             } else {
                 let mut matched = false;
-                for text in &window_texts {
+                for (offset, text) in &window_texts {
+                    if eligible_window_offsets
+                        .as_ref()
+                        .is_some_and(|eligible| !eligible.contains(offset))
+                    {
+                        continue;
+                    }
                     if decoded_grep_line_matches(text, pattern)
                         .map_err(|error| CliError::new(error.code, error.message))?
                     {

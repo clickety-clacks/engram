@@ -6575,6 +6575,130 @@ fn bounded_federated_explain_uses_event_time_for_remote_touches_and_lineage() {
 }
 
 #[test]
+fn bounded_federated_explain_grep_filter_uses_only_date_eligible_window_lines() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let source = "fn bounded_peer_context_target() { inspect(); }\n".repeat(12);
+    let tape_id = "bounded-peer-context-tape";
+    let tape = [
+        json!({
+            "t":"2026-09-30T12:00:00Z",
+            "k":"meta",
+            "model":"event-time-test",
+        }),
+        json!({
+            "t":"2026-10-01T12:00:00Z",
+            "k":"code.read",
+            "file":"src/context.rs",
+            "range":[1,12],
+            "text":source,
+        }),
+        json!({
+            "t":"2026-10-01T23:00:00Z",
+            "k":"msg.in",
+            "content":"eligible-window-token",
+        }),
+        json!({
+            "t":"2026-10-02T00:00:00Z",
+            "k":"msg.out",
+            "content":"post-bound-only-token",
+        }),
+    ]
+    .iter()
+    .map(serde_json::Value::to_string)
+    .collect::<Vec<_>>()
+    .join("\n")
+        + "\n";
+    let remote = write_grep_owner(
+        temp.path(),
+        "bounded-context-peer",
+        binary,
+        &[(tape_id, &tape)],
+    );
+    let owner_home = temp.path().join("bounded-context-peer-home");
+    let owner_db = owner_home.join(".engram/index.sqlite");
+    let index = SqliteIndex::open_writer(owner_db.to_str().expect("owner DB path"))
+        .expect("open owner index");
+    let parsed = engram::tape::event::parse_jsonl_events(&tape).expect("parse owner tape");
+    index
+        .ingest_tape_events(
+            tape_id,
+            &parsed,
+            engram::index::lineage::LINK_THRESHOLD_DEFAULT,
+        )
+        .expect("index peer read and in-window messages");
+    drop(index);
+
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "bounded-context-caller",
+        "{\"t\":\"2026-09-30T12:00:00Z\",\"k\":\"note\",\"content\":\"quiet local tape\"}\n",
+    );
+    std::fs::create_dir_all(repo.join("src")).expect("source directory");
+    std::fs::write(repo.join("src/context.rs"), &source).expect("write query source");
+    set_peer_topology(&caller_home, json!({"bounded-context-peer": remote}));
+
+    let post_bound_only = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "explain",
+            "src/context.rs:1-12",
+            "--peers",
+            "bounded-context-peer",
+            "--until",
+            "2026-10-01",
+            "--grep-filter",
+            "post-bound-only-token",
+        ])
+        .output()
+        .expect("run bounded peer explain with post-bound-only context");
+    assert!(!post_bound_only.status.success());
+    assert!(
+        String::from_utf8_lossy(&post_bound_only.stderr).contains("no_results"),
+        "post-bound-only peer context unexpectedly matched: {}",
+        String::from_utf8_lossy(&post_bound_only.stderr)
+    );
+    assert!(
+        post_bound_only.stdout.is_empty(),
+        "post-bound-only query emitted sessions: {}",
+        String::from_utf8_lossy(&post_bound_only.stdout)
+    );
+
+    let eligible = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "explain",
+            "src/context.rs:1-12",
+            "--peers",
+            "bounded-context-peer",
+            "--until",
+            "2026-10-01",
+            "--grep-filter",
+            "eligible-window-token",
+        ])
+        .output()
+        .expect("run bounded peer explain with eligible context");
+    assert!(
+        eligible.status.success(),
+        "eligible peer context was dropped: {}",
+        String::from_utf8_lossy(&eligible.stderr)
+    );
+    let eligible_result: serde_json::Value =
+        serde_json::from_slice(&eligible.stdout).expect("eligible explain JSON");
+    let sessions = eligible_result["sessions"].as_array().expect("sessions");
+    assert_eq!(sessions.len(), 1, "eligible={eligible_result:#}");
+    assert_eq!(sessions[0]["session_id"], tape_id);
+    assert_eq!(sessions[0]["window_start"], 1);
+    assert_eq!(sessions[0]["window_end"], 4);
+    assert_eq!(
+        sessions[0]["tape_facts"]["summary"]["grep_filter_hits_window"],
+        true
+    );
+}
+
+#[test]
 fn bounded_explain_rejects_peer_without_event_time_semantics() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = env!("CARGO_BIN_EXE_engram");

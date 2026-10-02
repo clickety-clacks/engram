@@ -1288,6 +1288,79 @@ fn explain_date_bounds_filter_mixed_reads_edits_before_scoring_and_diagnose_unkn
 }
 
 #[test]
+fn explain_grep_filter_uses_only_date_eligible_lines_inside_the_context_window() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = home.join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    let source = "fn bounded_context_target() { inspect(); }\n".repeat(12);
+    write_repo_file(&repo, "src/context.rs", &source);
+    let _ = run_json(&repo, &["init"], None, &home);
+
+    let transcript = [
+        json!({
+            "t": "2026-09-30T12:00:00Z", "k": "meta", "model": "context-test",
+        }),
+        json!({
+            "t": "2026-10-01T12:00:00Z", "k": "code.read", "file": "src/context.rs",
+            "range": [1, 12], "text": source,
+        }),
+        json!({
+            "t": "2026-10-01T23:00:00Z", "k": "msg.in", "content": "eligible-window-token",
+        }),
+        json!({
+            "t": "2026-10-02T00:00:00Z", "k": "msg.out", "content": "post-bound-only-token",
+        }),
+    ]
+    .into_iter()
+    .map(|row| row.to_string())
+    .collect::<Vec<_>>()
+    .join("\n")
+        + "\n";
+    let recorded = run_json(&repo, &["record", "--stdin"], Some(&transcript), &home);
+    let tape_id = recorded["tape_id"].as_str().expect("recorded tape id");
+
+    let post_bound_only = run_cli(
+        &repo,
+        &[
+            "explain",
+            "src/context.rs:1-12",
+            "--until",
+            "2026-10-01",
+            "--grep-filter",
+            "post-bound-only-token",
+        ],
+        None,
+        &home,
+    );
+    assert!(!post_bound_only.status.success());
+    assert!(
+        String::from_utf8_lossy(&post_bound_only.stderr).contains("no_results"),
+        "post-bound-only context unexpectedly matched: {}",
+        String::from_utf8_lossy(&post_bound_only.stderr)
+    );
+
+    let eligible = run_json(
+        &repo,
+        &[
+            "explain",
+            "src/context.rs:1-12",
+            "--until",
+            "2026-10-01",
+            "--grep-filter",
+            "eligible-window-token",
+        ],
+        None,
+        &home,
+    );
+    let sessions = eligible["sessions"].as_array().expect("sessions");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["session_id"], tape_id);
+    assert_eq!(sessions[0]["window_start"], 1);
+    assert_eq!(sessions[0]["window_end"], 4);
+}
+
+#[test]
 fn explain_direct_string_query_returns_fingerprint_matches() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");

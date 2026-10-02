@@ -5512,6 +5512,7 @@ fn cmd_explain(
         raw_sessions,
         &score_by_session,
         args.grep_filter.as_deref(),
+        &date_filter,
     )?;
     annotate_chain_fields(&mut sessions, &dispatch_lineage);
     annotate_explain_inspection(
@@ -6685,6 +6686,7 @@ fn cmd_explain_with_peers_inner(
         local_raw_sessions,
         &local_scores,
         args.grep_filter.as_deref(),
+        &date_filter,
     )?;
     for session in &mut sessions {
         if let Some(tape_id) = session
@@ -6884,6 +6886,7 @@ fn cmd_grep(_paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Res
         local_scan.raw_sessions,
         &score_by_session,
         None,
+        &date_filter,
     )?;
     sessions.sort_by(|a, b| compare_grep_sessions(a, b, &local_scan.ranks));
     if args.require_complete
@@ -7400,6 +7403,7 @@ fn cmd_grep_with_peer(
         local_scan.raw_sessions,
         &local_score_by_session,
         None,
+        &date_filter,
     )?;
     for session in &mut local_sessions {
         let session_id = session
