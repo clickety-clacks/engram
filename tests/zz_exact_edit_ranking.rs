@@ -393,3 +393,99 @@ fn explain_file_range_prioritizes_exact_edits_before_default_page_locally_and_re
     assert!(federated_all_ids.contains(remote_wrong_path_id.as_str()));
     assert!(federated_all_ids.contains(remote_nonoverlap_id.as_str()));
 }
+
+#[test]
+fn federated_match_strength_precedes_weak_read_volume_and_recency() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let span = r##"# ELIXIR_ERL_OPTIONS would leak the name into child BEAMs spawned by tests.
+gate_marker=$(mktemp -d "${TMPDIR:-/tmp}/tightbeam-mix-gate.XXXXXXXX")
+trap 'rmdir "$gate_marker" 2>/dev/null || :' EXIT HUP INT TERM
+gate_node="tightbeam_mix_gate_${gate_marker##*.}"
+
+export TIGHTBEAM_AUTHORITATIVE_GATE=1
+export TIGHTBEAM_GATE_NODE="$gate_node""##;
+    let prefix = (1..=18)
+        .map(|line| format!("# prefix {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let source = format!("{prefix}\n{span}\n");
+    let meta = json!({"t":"2026-08-09T02:00:00Z","k":"meta","model":"rank-test"});
+    let (strong_id, strong_content) = content_addressed_test_tape(&[
+        meta.clone(),
+        json!({
+            "t":"2026-08-09T02:40:31Z",
+            "k":"code.read",
+            "file":"scripts/verify_mix.sh",
+            "range":[19,25],
+            "text":span,
+        }),
+    ]);
+    let (caller_home, repo, _) =
+        write_ranked_explain_source(temp.path(), &[(strong_id.clone(), strong_content)]);
+    let source_file = repo.join("scripts/verify_mix.sh");
+    std::fs::create_dir_all(source_file.parent().expect("source parent"))
+        .expect("create source directory");
+    std::fs::write(&source_file, source).expect("write query source");
+
+    let weak_line = r##"gate_node="tightbeam_mix_gate_${gate_marker##*.}""##;
+    let mut weak_events = vec![meta];
+    for minute in 0..8 {
+        weak_events.push(json!({
+            "t":format!("2026-08-13T10:{minute:02}:00Z"),
+            "k":"code.read",
+            "file":"scripts/verify_mix.sh",
+            "range":[22,22],
+            "text":weak_line,
+        }));
+    }
+    let (weak_id, weak_content) = content_addressed_test_tape(&weak_events);
+    let remote_tapes = [(weak_id.as_str(), weak_content.as_str())];
+    let remote_peer = write_grep_owner(temp.path(), "alpha", binary, &remote_tapes);
+    ingest_owner_test_tape(
+        temp.path(),
+        "alpha",
+        weak_id.as_str(),
+        weak_content.as_str(),
+        &[],
+    );
+    set_peer_topology(&caller_home, json!({"alpha": remote_peer}));
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "explain",
+            "scripts/verify_mix.sh:19-25",
+            "--peers",
+            "alpha",
+            "--require-complete",
+        ])
+        .output()
+        .expect("run federated weak-read/strong-match explain");
+    assert!(
+        output.status.success(),
+        "federated explain failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("federated explain JSON");
+    assert_eq!(result["federation"]["coverage"], "complete");
+    assert_eq!(result["total"], 2);
+    let sessions = result["sessions"].as_array().expect("sessions");
+    let strong = sessions
+        .iter()
+        .find(|session| session["session_id"] == strong_id)
+        .expect("strong local match");
+    let weak = sessions
+        .iter()
+        .find(|session| session["session_id"] == weak_id)
+        .expect("weak remote reads");
+    assert!(strong["confidence"].as_f64().unwrap() > weak["confidence"].as_f64().unwrap());
+    assert!(
+        weak["touches"].as_array().unwrap().len() > strong["touches"].as_array().unwrap().len()
+    );
+    assert_eq!(sessions[0]["session_id"], strong_id);
+    assert!(strong["tape_facts"].get("span_edit_match").is_none());
+    assert!(weak["tape_facts"].get("span_edit_match").is_none());
+}
