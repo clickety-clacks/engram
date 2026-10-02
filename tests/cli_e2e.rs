@@ -704,7 +704,7 @@ fn record_command_captures_tool_events_and_exit_status() {
 }
 
 #[test]
-fn explain_orders_sessions_by_touch_count_then_recency() {
+fn explain_orders_sessions_by_match_strength_then_touch_count_then_recency() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();
     let _ = run_json(repo, &["init"], None);
@@ -746,6 +746,17 @@ fn explain_orders_sessions_by_touch_count_then_recency() {
             "2026-02-22T00:00:05Z",
         )),
     );
+    let one_touch_partial_text = format!(
+        "{}\n",
+        serde_json::json!({
+            "t": "2026-02-22T00:00:06Z",
+            "k": "code.read",
+            "file": "src/one-touch.rs",
+            "range": [1, 4],
+            "text": partial_text,
+        })
+    );
+    let one_touch_partial = run_json(repo, &["record", "--stdin"], Some(&one_touch_partial_text));
     let tied_two_a = run_json(
         repo,
         &["record", "--stdin"],
@@ -778,11 +789,17 @@ fn explain_orders_sessions_by_touch_count_then_recency() {
 
     let explain = run_json(repo, &["explain", query_text], None);
     let sessions = explain["sessions"].as_array().expect("sessions");
-    assert_eq!(sessions.len(), 4, "sessions={sessions:?}");
-    assert_eq!(sessions[0]["session_id"], recent_two["tape_id"]);
-    assert_eq!(sessions[0]["touches"].as_array().unwrap().len(), 2);
+    assert_eq!(sessions.len(), 5, "sessions={sessions:?}");
+    assert_eq!(sessions[0]["session_id"], newest_one["tape_id"]);
+    assert_eq!(sessions[0]["touches"].as_array().unwrap().len(), 1);
     assert_eq!(
         sessions[0]["timestamp"],
+        Value::String("2026-02-22T00:00:10Z".to_string())
+    );
+    assert_eq!(sessions[1]["session_id"], recent_two["tape_id"]);
+    assert_eq!(sessions[1]["touches"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        sessions[1]["timestamp"],
         Value::String("2026-02-22T00:00:05Z".to_string())
     );
 
@@ -791,22 +808,29 @@ fn explain_orders_sessions_by_touch_count_then_recency() {
         tied_two_b["tape_id"].as_str().unwrap().to_string(),
     ];
     tied_ids.sort();
-    assert_eq!(sessions[1]["session_id"], tied_ids[0]);
-    assert_eq!(sessions[2]["session_id"], tied_ids[1]);
-    assert_eq!(
-        sessions[1]["timestamp"],
-        Value::String("2026-02-22T00:00:02Z".to_string())
-    );
+    assert_eq!(sessions[2]["session_id"], tied_ids[0]);
+    assert_eq!(sessions[3]["session_id"], tied_ids[1]);
     assert_eq!(
         sessions[2]["timestamp"],
         Value::String("2026-02-22T00:00:02Z".to_string())
     );
+    assert_eq!(
+        sessions[3]["timestamp"],
+        Value::String("2026-02-22T00:00:02Z".to_string())
+    );
 
-    assert_eq!(sessions[3]["session_id"], newest_one["tape_id"]);
-    assert_eq!(sessions[3]["touches"].as_array().unwrap().len(), 1);
+    assert_eq!(sessions[4]["session_id"], one_touch_partial["tape_id"]);
+    assert_eq!(sessions[4]["touches"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        sessions[4]["timestamp"],
+        Value::String("2026-02-22T00:00:06Z".to_string())
+    );
+    assert_eq!(sessions[1]["confidence"], sessions[2]["confidence"]);
+    assert_eq!(sessions[2]["confidence"], sessions[3]["confidence"]);
+    assert_eq!(sessions[3]["confidence"], sessions[4]["confidence"]);
     assert!(
-        sessions[3]["confidence"].as_f64().unwrap() > sessions[0]["confidence"].as_f64().unwrap(),
-        "higher feature score must not outrank an older session with more touches: {sessions:?}"
+        sessions[0]["confidence"].as_f64().unwrap() > sessions[1]["confidence"].as_f64().unwrap(),
+        "higher match strength must outrank touch count: {sessions:?}"
     );
 }
 
