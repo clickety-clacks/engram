@@ -1384,6 +1384,8 @@ fn explain_errors_when_additional_store_is_not_sqlite_database() {
     assert_eq!(err["error"]["code"], "reader_unavailable");
     let message = err["error"]["message"].as_str().expect("reader message");
     assert!(message.contains(&bad_store.to_string_lossy().to_string()));
-    assert!(message.contains("grant SQLite write access"));
+    assert!(message.contains("owner-side Engram writer"));
+    assert!(message.contains("keep the query read-only"));
+    assert!(!message.contains("grant SQLite write access"));
     assert!(message.contains("frozen_stores"));
 }

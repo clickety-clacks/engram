@@ -50,6 +50,14 @@ engram watch
 - `engram explain <file>:<start>-<end>`: computes anchors for the selected span, searches resolved local stores, follows lineage and dispatch-marker links, and returns evidence sessions/windows. Add `--peers <name[,name]>` to search selected owners too.
 - `engram grep <pattern>`, `engram peek <session>`, and `engram show <tape-id>`: search conversation text, read a session, or read a tape. Pass `--peers <name[,name]>` to `grep` or `show` when you want to search selected peers. Pass `--store <machine/export>` to `peek` or `show` when you want one remote export.
 
+Explain labels direct span edits, same-file reads, recorded handoffs, and
+matching evidence found at another file path separately. A `root` is only a
+session with no parent link in the returned graph; it does not prove origin or
+intent. Each result's `next_lookup` contains its machine, store, tape file,
+timestamp, bounded transcript window, and an `argv` array for the supported
+`peek` command. Review that transcript window before deciding why the code was
+kept or changed.
+
 Dispatch markers are traversed during normal explain:
 
 ```text

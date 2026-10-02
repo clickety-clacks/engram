@@ -133,6 +133,28 @@ impl From<rusqlite::Error> for ReaderOpenError {
     }
 }
 
+fn enable_persistent_wal(connection: &Connection) -> rusqlite::Result<()> {
+    let mut enabled = 1;
+    // SAFETY: this runs during exclusive writer initialization; SQLite consumes
+    // the integer synchronously and does not retain its pointer.
+    let result = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            connection.handle(),
+            std::ptr::null(),
+            rusqlite::ffi::SQLITE_FCNTL_PERSIST_WAL,
+            (&mut enabled as *mut i32).cast(),
+        )
+    };
+    if result == rusqlite::ffi::SQLITE_OK {
+        Ok(())
+    } else {
+        Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(result),
+            None,
+        ))
+    }
+}
+
 pub struct ReadSnapshot<'a> {
     index: &'a SqliteIndex,
 }
@@ -151,6 +173,16 @@ impl SqliteIndex {
     }
 
     pub fn open_writer(path: &str) -> rusqlite::Result<Self> {
+        Self::open_writer_with_wal_policy(path, false)
+    }
+
+    /// Open an owner store for normal Engram writes and preserve its WAL
+    /// sidecars so read-only clients can attach without directory write access.
+    pub fn open_owner_writer(path: &str) -> rusqlite::Result<Self> {
+        Self::open_writer_with_wal_policy(path, true)
+    }
+
+    fn open_writer_with_wal_policy(path: &str, preserve_wal: bool) -> rusqlite::Result<Self> {
         let existed = Path::new(path).exists();
         let conn = Connection::open(path)?;
         let index = Self {
@@ -162,7 +194,7 @@ impl SqliteIndex {
         if existed && version != SCHEMA_VERSION {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        index.configure_writer()?;
+        index.configure_writer(preserve_wal)?;
         if !existed {
             index.create_schema_v4()?;
         }
@@ -219,7 +251,7 @@ impl SqliteIndex {
             access_kind: AccessKind::Writer,
             reader_mode: None,
         };
-        index.configure_writer()?;
+        index.configure_writer(false)?;
         index.create_schema_v4()?;
         Ok(index)
     }
@@ -278,14 +310,24 @@ impl SqliteIndex {
         }
     }
 
-    fn configure_writer(&self) -> rusqlite::Result<()> {
-        self.conn.execute_batch(
-            "
-            PRAGMA foreign_keys = ON;
-            PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = FULL;
-            ",
-        )
+    fn configure_writer(&self, preserve_wal: bool) -> rusqlite::Result<()> {
+        self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        let journal_mode = self.conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
+            row.get::<_, String>(0)
+        })?;
+        self.conn.execute_batch("PRAGMA synchronous = FULL;")?;
+        if preserve_wal {
+            if !journal_mode.eq_ignore_ascii_case("wal") {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                    Some(format!(
+                        "owner store did not enter WAL mode (SQLite reported `{journal_mode}`)"
+                    )),
+                ));
+            }
+            enable_persistent_wal(&self.conn)?;
+        }
+        Ok(())
     }
 
     fn user_version(&self) -> rusqlite::Result<i64> {

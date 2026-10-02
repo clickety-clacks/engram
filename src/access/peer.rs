@@ -345,7 +345,7 @@ impl PeerSession {
                             "unavailable",
                             "reader_unavailable",
                             format!(
-                                "cannot open Live reader for {}: {error}; grant SQLite write access to the parent directory so it can create -shm, or declare a stable captured copy under frozen_stores",
+                                "cannot open Live reader for {}: {error}; have the owner-side Engram writer initialize persistent readable -wal/-shm sidecars; keep this peer reader read-only, or declare a stable captured copy under frozen_stores",
                                 config.db.display()
                             ),
                         )?;
@@ -361,7 +361,7 @@ impl PeerSession {
                         "unavailable",
                         "reader_unavailable",
                         format!(
-                            "cannot pin Live reader snapshot for {}: {error}; grant SQLite write access to the parent directory so it can create -shm, or declare a stable captured copy under frozen_stores",
+                            "cannot pin Live reader snapshot for {}: {error}; have the owner-side Engram writer initialize persistent readable -wal/-shm sidecars; keep this peer reader read-only, or declare a stable captured copy under frozen_stores",
                             config.db.display()
                         ),
                     )?;

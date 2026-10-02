@@ -67,6 +67,12 @@ engram show TAPE_ID --store build-host/default
 engram peek SESSION_ID --store build-host/default
 ```
 
+For an explain result, use its `next_lookup.argv` to inspect the returned
+transcript window. The result keeps the machine, exported store, tape file,
+timestamp, and window bounds together; the argument vector uses the supported
+`peek --store MACHINE/EXPORT` route and does not require a raw SSH path. A
+matching root or alternate-path occurrence is not an origin or intent claim.
+
 Use only the peer set needed to answer the question. `--peers all` explicitly
 selects every peer configured in `~/.engram/topology.yml` for that command; it
 does not discover machines or change the local default. `topology status`

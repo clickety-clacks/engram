@@ -63,7 +63,7 @@ fn open_query_index(path: &Path, mode: ReaderMode) -> Result<SqliteIndex, CliErr
     };
     let fix = match mode {
         ReaderMode::Live => {
-            "grant SQLite write access to the parent directory so it can create -shm, or declare a stable captured copy in ~/.engram/topology.yml under frozen_stores"
+            "have the owner-side Engram writer open the live store once to create persistent readable -wal/-shm sidecars; keep the query read-only, or declare a stable captured copy in ~/.engram/topology.yml under frozen_stores"
         }
         ReaderMode::Frozen => {
             "verify the declared frozen copy exists, is readable, and has the expected schema"
