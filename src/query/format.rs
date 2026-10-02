@@ -15,6 +15,7 @@ use crate::query::explain::{
     ExplainResult, ExplainTraversal, PrettyConfidenceTier, explain_across_indexes_by_anchor,
     pretty_tier,
 };
+use crate::query::file_identity::{FileIdentityRelation, FileIdentityResolver};
 pub use crate::store::tapes::{TapeRow, parse_jsonl_rows, print_json};
 use crate::store::tapes::{event_window, read_tape_content, resolve_tape_path, tape_id_from_path};
 use crate::tape::grep::{
@@ -408,22 +409,40 @@ pub fn exact_span_edit_sessions(
     file: &str,
     start: u32,
     end: u32,
+    cwd: &Path,
 ) -> HashSet<String> {
+    let mut identity_resolver = FileIdentityResolver::default();
+    let target_identity = identity_resolver.identity_for_query_path(cwd, file);
     raw_sessions
         .iter()
         .filter_map(|session| {
             let tape_id = session.get("tape_id")?.as_str()?;
-            let edit_offsets = session
+            let source_repo_head = session.get("repo_head").and_then(Value::as_str);
+            let edit_touches = session
                 .get("touches")?
                 .as_array()?
                 .iter()
-                .filter(|touch| {
-                    touch.get("kind").and_then(Value::as_str) == Some("edit")
-                        && touch.get("file_path").and_then(Value::as_str) == Some(file)
+                .filter(|touch| touch.get("kind").and_then(Value::as_str) == Some("edit"))
+                .filter_map(|touch| {
+                    let evidence_file = touch.get("file_path")?.as_str()?;
+                    let event_offset = touch.get("event_offset")?.as_u64()?;
+                    let relation = identity_resolver.relation(cwd, file, evidence_file);
+                    let same_path = match relation {
+                        // A session-start HEAD may lag the current checkout for this same file.
+                        FileIdentityRelation::SamePhysicalPath => true,
+                        FileIdentityRelation::SameRepositoryFile => matches!(
+                            (
+                                source_repo_head,
+                                target_identity.as_ref().and_then(|identity| identity.head()),
+                            ),
+                            (Some(source), Some(target)) if source == target
+                        ),
+                        _ => false,
+                    };
+                    same_path.then(|| (event_offset, evidence_file.to_owned()))
                 })
-                .filter_map(|touch| touch.get("event_offset").and_then(Value::as_u64))
-                .collect::<HashSet<_>>();
-            if edit_offsets.is_empty() {
+                .collect::<Vec<_>>();
+            if edit_touches.is_empty() {
                 return None;
             }
 
@@ -435,15 +454,19 @@ pub fn exact_span_edit_sessions(
                 .filter_map(|window| window.get("events").and_then(Value::as_array))
                 .flatten()
                 .any(|entry| {
-                    entry
-                        .get("offset")
-                        .and_then(Value::as_u64)
-                        .is_some_and(|offset| {
-                            edit_offsets.contains(&offset)
-                                && entry.get("event").is_some_and(|event| {
-                                    structured_edit_overlaps_span(event, file, start, end)
-                                })
-                        })
+                    let Some(offset) = entry.get("offset").and_then(Value::as_u64) else {
+                        return false;
+                    };
+                    let Some((_, evidence_file)) = edit_touches
+                        .iter()
+                        .find(|(touch_offset, _)| *touch_offset == offset)
+                    else {
+                        return false;
+                    };
+                    let Some(event) = entry.get("event") else {
+                        return false;
+                    };
+                    structured_edit_overlaps_span(event, evidence_file, start, end)
                 });
             matches.then(|| tape_id.to_string())
         })
@@ -597,6 +620,7 @@ pub fn format_sessions_for_agent(
             "confidence": score_by_session.get(session_id).copied().unwrap_or(0.0),
             "refs_up": refs_up,
             "refs_down": refs_down,
+            "repo_head": raw.get("repo_head").cloned().unwrap_or(Value::Null),
             "files_touched": files_touched,
             "touches": touches,
         }));
@@ -1216,17 +1240,18 @@ pub fn build_session_windows(
     for (tape_id, mut tape_touches) in by_tape {
         tape_touches.sort_by_key(|t| t.event_offset);
         let tape_path = resolve_tape_path(context, &tape_id);
-        let windows = if let Some(tape_path) = tape_path.as_ref() {
+        let (windows, repo_head) = if let Some(tape_path) = tape_path.as_ref() {
             let content = read_tape_content(&tape_path)?;
             let rows = parse_jsonl_rows(&content)?;
-            tape_touches
+            let windows = tape_touches
                 .iter()
                 .filter_map(|touch| {
                     event_window(&rows, touch.event_offset, TRANSCRIPT_WINDOW_RADIUS)
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (windows, unique_tape_repo_head(&rows))
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
 
         let latest_touch_timestamp = tape_touches
@@ -1253,6 +1278,7 @@ pub fn build_session_windows(
             "tape_present_locally": tape_path.is_some(),
             "touch_count": tape_touches.len(),
             "latest_touch_timestamp": latest_touch_timestamp,
+            "repo_head": repo_head,
             "touches": touches_json,
             "windows": windows,
         }));
@@ -1275,6 +1301,25 @@ pub fn build_session_windows(
     });
 
     Ok(sessions)
+}
+
+fn unique_tape_repo_head(rows: &[TapeRow]) -> Option<String> {
+    let mut meta_rows = rows
+        .iter()
+        .filter(|row| row.value.get("k").and_then(Value::as_str) == Some("meta"));
+    let first_meta = meta_rows.next()?;
+    let repo_head = first_meta.value.get("repo_head").and_then(Value::as_str)?;
+    if repo_head.len() > 128 {
+        return None;
+    }
+    meta_rows
+        .all(|row| {
+            row.value
+                .get("repo_head")
+                .and_then(Value::as_str)
+                .is_some_and(|other| other.len() <= 128 && other == repo_head)
+        })
+        .then(|| repo_head.to_owned())
 }
 
 pub fn print_pretty_explain(
@@ -1661,5 +1706,215 @@ mod chain_graph_tests {
         assert_eq!(chains[0]["descendants"][0]["depth"], 0);
         assert_eq!(chains[0]["descendants"][1]["session_id"], "b");
         assert_eq!(chains[0]["descendants"][1]["depth"], 1);
+    }
+}
+
+#[cfg(test)]
+mod file_identity_span_tests {
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+
+    use serde_json::{Value, json};
+
+    use super::exact_span_edit_sessions;
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("git is available for worktree span tests");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("git stdout is UTF-8")
+            .trim()
+            .to_string()
+    }
+
+    fn init_repo(root: &Path) -> String {
+        fs::create_dir_all(root.join("scripts")).expect("scripts");
+        fs::write(
+            root.join("scripts/verify_mix.sh"),
+            "line one\nline two\nline three\nline four\n",
+        )
+        .expect("verify_mix fixture");
+        let output = Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .arg(root)
+            .output()
+            .expect("git is available for worktree span tests");
+        assert!(output.status.success(), "git init failed");
+        let _ = git(root, &["config", "user.name", "Span Test"]);
+        let _ = git(root, &["config", "user.email", "span-test@example.invalid"]);
+        let _ = git(root, &["add", "scripts/verify_mix.sh"]);
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["-c", "commit.gpgsign=false", "commit", "-m", "initial"])
+            .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z")
+            .output()
+            .expect("git is available for worktree span tests");
+        assert!(
+            output.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        git(root, &["rev-parse", "HEAD"])
+    }
+
+    fn add_worktree(root: &Path, worktree: &Path) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["worktree", "add", "--quiet", "-b", "span-source"])
+            .arg(worktree)
+            .arg("HEAD")
+            .output()
+            .expect("git is available for worktree span tests");
+        assert!(
+            output.status.success(),
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn edit_session(tape_id: &str, repo_head: &str, file: &Path, start: u64, end: u64) -> Value {
+        let file = file.to_string_lossy().to_string();
+        json!({
+            "tape_id": tape_id,
+            "repo_head": repo_head,
+            "touches": [{
+                "kind": "edit",
+                "file_path": file,
+                "event_offset": 7,
+            }],
+            "windows": [{
+                "events": [{
+                    "offset": 7,
+                    "event": {
+                        "k": "code.edit",
+                        "file": file,
+                        "before_range": [start, end],
+                        "after_range": [start, end],
+                    }
+                }]
+            }]
+        })
+    }
+
+    #[test]
+    fn exact_span_priority_requires_same_worktree_revision_and_overlapping_range() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("repository");
+        let worktree = temp.path().join("second-worktree");
+        let target_head = init_repo(&root);
+        add_worktree(&root, &worktree);
+
+        let target = root.join("scripts/verify_mix.sh");
+        let source = worktree.join("scripts/verify_mix.sh");
+        let overlapping = edit_session("same-revision-overlap", &target_head, &source, 1, 1);
+        assert_eq!(
+            exact_span_edit_sessions(
+                std::slice::from_ref(&overlapping),
+                &target.to_string_lossy(),
+                1,
+                1,
+                &root,
+            ),
+            ["same-revision-overlap".to_string()].into()
+        );
+
+        let non_overlapping =
+            edit_session("same-revision-other-range", &target_head, &source, 3, 3);
+        assert!(
+            exact_span_edit_sessions(
+                std::slice::from_ref(&non_overlapping),
+                &target.to_string_lossy(),
+                1,
+                1,
+                &root,
+            )
+            .is_empty()
+        );
+
+        fs::write(
+            &source,
+            "line one\nline two\nline three changed\nline four\n",
+        )
+        .expect("update second worktree");
+        let _ = git(&worktree, &["add", "scripts/verify_mix.sh"]);
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&worktree)
+            .args(["-c", "commit.gpgsign=false", "commit", "-m", "new revision"])
+            .env("GIT_AUTHOR_DATE", "2026-01-02T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2026-01-02T00:00:00Z")
+            .output()
+            .expect("git is available for worktree span tests");
+        assert!(
+            output.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let source_head = git(&worktree, &["rev-parse", "HEAD"]);
+        assert_ne!(target_head, source_head);
+        let different_revision = edit_session("different-revision", &source_head, &source, 1, 1);
+        assert!(
+            exact_span_edit_sessions(
+                std::slice::from_ref(&different_revision),
+                &target.to_string_lossy(),
+                1,
+                1,
+                &root,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn same_physical_path_edit_remains_exact_after_later_commit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("repository");
+        let session_head = init_repo(&root);
+        let target = root.join("scripts/verify_mix.sh");
+        let session = edit_session("same-path-after-commit", &session_head, &target, 1, 1);
+
+        fs::write(root.join("README.md"), "a later commit after the edit\n")
+            .expect("write unrelated later-commit file");
+        let _ = git(&root, &["add", "README.md"]);
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["-c", "commit.gpgsign=false", "commit", "-m", "later commit"])
+            .env("GIT_AUTHOR_DATE", "2026-01-02T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2026-01-02T00:00:00Z")
+            .output()
+            .expect("git is available for same-path span tests");
+        assert!(
+            output.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let current_head = git(&root, &["rev-parse", "HEAD"]);
+        assert_ne!(session_head, current_head);
+
+        assert_eq!(
+            exact_span_edit_sessions(
+                std::slice::from_ref(&session),
+                &target.to_string_lossy(),
+                1,
+                1,
+                &root,
+            ),
+            ["same-path-after-commit".to_string()].into()
+        );
     }
 }

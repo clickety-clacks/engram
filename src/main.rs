@@ -33,18 +33,18 @@ use engram::index::lineage::LINK_THRESHOLD_DEFAULT;
 use engram::index::{DispatchDirection, ReaderMode, SqliteIndex};
 use engram::ingest::{extract_meta, git_head, now_iso8601, record_transcript, run_ingest};
 use engram::query::explain::ExplainTraversal;
+use engram::query::file_identity::{FileIdentityRelation, FileIdentityResolver};
 #[cfg(test)]
 use engram::query::format::MAX_QUERY_WINDOW_ANCHORS;
 use engram::query::format::{
     DateFilter, ExplainTarget, GrepRank, annotate_chain_fields, apply_session_truncation,
     build_chain_metadata, build_session_windows, classify_explain_target, collect_anchor_scores,
     collect_touch_evidence, compact_event, compare_explain_sessions_with_span_priority,
-    compare_grep_sessions, default_peek_anchor_line,
-    derive_anchor_candidates, dispatch_ref_counts, edge_to_json, emit_query_result,
-    exact_span_edit_sessions, explain_across_indexes, extract_latest_timestamp_from_rows,
-    format_sessions_for_agent, grep_line_matches, open_query_indexes, prepare_grep_scan,
-    prepare_grep_scan_with_tape_ids, print_pretty_explain, read_file_span_variants,
-    referenced_grep_tape_ids, run_grep_scan, session_matches_date_filter,
+    compare_grep_sessions, default_peek_anchor_line, derive_anchor_candidates, dispatch_ref_counts,
+    edge_to_json, emit_query_result, exact_span_edit_sessions, explain_across_indexes,
+    extract_latest_timestamp_from_rows, format_sessions_for_agent, grep_line_matches,
+    open_query_indexes, prepare_grep_scan, prepare_grep_scan_with_tape_ids, print_pretty_explain,
+    read_file_span_variants, referenced_grep_tape_ids, run_grep_scan, session_matches_date_filter,
 };
 use engram::store::atomic::atomic_write;
 use engram::store::tapes::{
@@ -5153,7 +5153,13 @@ fn cmd_explain(
             let touches =
                 collect_touch_evidence(&indexes, &result.direct, &result.touched_anchors)?;
             raw_sessions = build_session_windows(context, touches)?;
-            exact_edit_sessions.extend(exact_span_edit_sessions(&raw_sessions, &file, start, end));
+            exact_edit_sessions.extend(exact_span_edit_sessions(
+                &raw_sessions,
+                &file,
+                start,
+                end,
+                cwd,
+            ));
             let (chain, dispatch_sessions, unresolved, ambiguous) =
                 collect_dispatch_upstream_sessions(context, &indexes, &raw_sessions)?;
             dispatch_lineage = chain;
@@ -5394,6 +5400,8 @@ fn cmd_explain_with_peers_inner(
     cancelled: &Arc<AtomicBool>,
 ) -> Result<(), CliError> {
     let query_deadline = Instant::now() + PEER_QUERY_TIMEOUT;
+    let self_machine = local_machine_label();
+    let mut file_identity_resolver = FileIdentityResolver::default();
     let target_file = match &target_kind {
         ExplainTarget::FileRange { file, .. } | ExplainTarget::FileWhole { file } => {
             Some(file.clone())
@@ -5975,6 +5983,7 @@ fn cmd_explain_with_peers_inner(
             file,
             *start,
             *end,
+            cwd,
         ));
     }
     for session in &mut local_raw_sessions {
@@ -6035,13 +6044,32 @@ fn cmd_explain_with_peers_inner(
                     .features
                     .contains(QUERY_FEATURE_EXACT_SPAN_EDIT_RANKING)
                     && let Some((file, start, end)) = exact_span_target.as_ref()
+                    && machine == self_machine
                     && fragments.iter().any(|fragment| {
                         fragment.get("kind").and_then(Value::as_str) == Some("edit")
-                            && fragment.get("file_path").and_then(Value::as_str)
-                                == Some(file.as_str())
+                            && fragment
+                                .get("file_path")
+                                .and_then(Value::as_str)
+                                .is_some_and(|evidence_file| {
+                                    matches!(
+                                        file_identity_resolver.relation(cwd, file, evidence_file),
+                                        FileIdentityRelation::SamePhysicalPath
+                                            | FileIdentityRelation::SameRepositoryFile
+                                    )
+                                })
                     })
                 {
-                    item["rank_span"] = json!({"file": file, "start": start, "end": end});
+                    let target_path = Path::new(file);
+                    let target_path = if target_path.is_absolute() {
+                        target_path.to_path_buf()
+                    } else {
+                        cwd.join(target_path)
+                    };
+                    item["rank_span"] = json!({
+                        "file": target_path.to_string_lossy(),
+                        "start": start,
+                        "end": end,
+                    });
                 }
                 items.push(item);
                 tape_ids.push(tape_id.clone());
@@ -6238,6 +6266,7 @@ fn cmd_explain_with_peers_inner(
             "window_end": summary.get("window_end").cloned().unwrap_or_else(|| json!(0)),
             "total_lines": summary.get("total_lines").cloned().unwrap_or_else(|| json!(0)),
             "confidence": score,
+            "repo_head": fact.and_then(|row| row.get("repo_head")).cloned().unwrap_or(Value::Null),
             "refs_up": 0,
             "refs_down": 0,
             "files_touched": summary.get("files_touched").cloned().unwrap_or_else(|| json!([])),
@@ -7669,56 +7698,52 @@ fn local_machine_label() -> String {
         .unwrap_or_else(|| "local".to_string())
 }
 
-fn explain_path_key(cwd: &Path, path: &str) -> Vec<String> {
-    let candidate = Path::new(path);
-    let candidate = if candidate.is_absolute() {
-        candidate.to_path_buf()
-    } else {
-        cwd.join(candidate)
-    };
-    let candidate = fs::canonicalize(&candidate).unwrap_or(candidate);
-    candidate
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy().into_owned())
-        .collect()
-}
-
-fn same_path_suffix(left: &[String], right: &[String], component_count: usize) -> bool {
-    if left.len() < component_count || right.len() < component_count {
-        return false;
-    }
-    left[left.len() - component_count..] == right[right.len() - component_count..]
-}
-
 fn explain_evidence_label(
     cwd: &Path,
+    self_machine: &str,
     session: &Value,
     target_file: Option<&str>,
     exact_edit_sessions: &HashSet<String>,
     handoff_tape_ids: &HashSet<String>,
-) -> (&'static str, &'static str) {
+    identity_resolver: &mut FileIdentityResolver,
+) -> (&'static str, &'static str, &'static str, &'static str) {
     let Some(tape_id) = session.get("session_id").and_then(Value::as_str) else {
-        return ("unclassified_match", "the result has no stable tape ID");
+        return (
+            "unclassified_match",
+            "the result has no stable tape ID",
+            "unknown",
+            "unknown",
+        );
     };
-    if exact_edit_sessions.contains(tape_id) {
-        return (
-            "exact_span_edit",
-            "the indexed edit event matches the requested file span",
-        );
-    }
-    if handoff_tape_ids.contains(tape_id) {
-        return (
-            "recorded_handoff_context",
-            "a dispatch link names this tape as a handoff endpoint",
-        );
-    }
 
-    let target_key = target_file.map(|path| explain_path_key(cwd, path));
     let mut same_file_read = false;
     let mut same_file_edit = false;
     let mut alternate_path = false;
+    let mut unknown_path_identity = false;
+    let mut same_physical_path = false;
+    let mut same_repository_file = false;
+    let mut different_repository = false;
+    let mut different_repository_path = false;
     let mut has_read = false;
     let mut has_edit = false;
+    let source_revision = session.get("repo_head").and_then(Value::as_str);
+    let target_revision = target_file
+        .and_then(|file| identity_resolver.identity_for_query_path(cwd, file))
+        .and_then(|identity| identity.head().map(ToOwned::to_owned));
+    let revision_mismatch = source_revision
+        .zip(target_revision.as_deref())
+        .is_some_and(|(source, target)| source != target);
+    let evidence_machine = session
+        .get("location")
+        .and_then(|location| location.get("machine"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            session
+                .get("store")
+                .and_then(Value::as_str)
+                .and_then(|store| store.split_once('/').map(|(machine, _)| machine))
+        })
+        .unwrap_or(self_machine);
     for touch in session
         .get("touches")
         .and_then(Value::as_array)
@@ -7732,49 +7757,180 @@ fn explain_evidence_label(
         has_read |= kind == "read";
         has_edit |= kind == "edit";
         let Some(file) = touch.get("file_path").and_then(Value::as_str) else {
+            if target_file.is_some() && (kind == "read" || kind == "edit") {
+                unknown_path_identity = true;
+            }
             continue;
         };
-        let Some(target_key) = target_key.as_ref() else {
+        let Some(target_file) = target_file else {
             continue;
         };
-        let file_key = explain_path_key(cwd, file);
-        if &file_key == target_key {
-            same_file_read |= kind == "read";
-            same_file_edit |= kind == "edit";
-        } else if same_path_suffix(&file_key, target_key, 2) {
-            alternate_path = true;
+        let relation = if evidence_machine == self_machine {
+            identity_resolver.relation(cwd, target_file, file)
+        } else {
+            FileIdentityRelation::Unknown
+        };
+        match relation {
+            FileIdentityRelation::SamePhysicalPath => {
+                same_physical_path = true;
+                same_file_read |= kind == "read";
+                same_file_edit |= kind == "edit";
+            }
+            FileIdentityRelation::SameRepositoryFile => {
+                same_repository_file = true;
+                same_file_read |= kind == "read";
+                same_file_edit |= kind == "edit";
+            }
+            FileIdentityRelation::DifferentRepositorySameRelativePath => {
+                different_repository = true;
+                alternate_path = true;
+            }
+            FileIdentityRelation::DifferentRepositoryDifferentPath => {
+                different_repository = true;
+            }
+            FileIdentityRelation::DifferentPathSameRepository => {
+                different_repository_path = true;
+                alternate_path = true;
+            }
+            FileIdentityRelation::Unknown => {
+                unknown_path_identity = true;
+            }
         }
     }
 
-    if same_file_edit {
+    let file_identity = if same_physical_path {
+        "same_physical_path"
+    } else if same_repository_file {
+        "same_repository_worktree_file"
+    } else if unknown_path_identity {
+        "unknown"
+    } else if different_repository {
+        "different_repository"
+    } else if different_repository_path {
+        "different_repository_path"
+    } else if target_file.is_none() {
+        "not_applicable"
+    } else if same_file_read {
+        "same_repository_worktree_file"
+    } else if alternate_path {
+        "different_file"
+    } else {
+        "unknown"
+    };
+    let matched_kind = match (has_edit, has_read) {
+        (true, true) => "edit_and_read",
+        (true, false) => "edit",
+        (false, true) => "read",
+        (false, false) => "anchor_only",
+    };
+
+    if exact_edit_sessions.contains(tape_id) {
+        (
+            "exact_span_edit",
+            "the indexed edit path and range match; revision equality is required only for cross-worktree identity",
+            file_identity,
+            "edit",
+        )
+    } else if handoff_tape_ids.contains(tape_id) {
+        (
+            "recorded_handoff_context",
+            "a dispatch link names this tape as a handoff endpoint",
+            file_identity,
+            matched_kind,
+        )
+    } else if same_file_edit {
         (
             "same_file_edit_not_exact_span",
-            "an edit on the requested file was observed, but not a verified edit of this span",
+            if revision_mismatch {
+                "the source revision differs from the current checkout; the edit is not treated as an exact current-span match"
+            } else if same_repository_file {
+                "Git resolved both paths to the same repository-relative file; an edit of this span was not verified"
+            } else {
+                "an edit on the same physical file path was observed, but an edit of this span was not verified"
+            },
+            file_identity,
+            "edit",
         )
     } else if same_file_read {
         (
             "same_file_read",
-            "a read event names the requested file; it does not establish an edit or rationale",
-        )
-    } else if alternate_path {
-        (
-            "alternate_path_occurrence",
-            "matching evidence names a different file path with the same trailing path components",
+            if revision_mismatch {
+                "the source revision differs from the current checkout; this read does not establish current contents or rationale"
+            } else if same_repository_file {
+                "Git resolved both paths to the same repository-relative file; the read does not establish an edit or rationale"
+            } else {
+                "a read event names this same absolute file path; it does not establish an edit or rationale"
+            },
+            file_identity,
+            "read",
         )
     } else if has_edit {
-        (
-            "edit_match_not_exact_span",
-            "an edit event matched the query anchors, but an exact edit of this span was not verified",
-        )
+        if unknown_path_identity {
+            (
+                "file_identity_unknown",
+                "an edit event matched the query, but no retained or queryable repository identity proves which file it names",
+                file_identity,
+                "edit",
+            )
+        } else if alternate_path {
+            (
+                "alternate_path_occurrence",
+                if different_repository {
+                    "Git resolved this evidence to a different repository; matching path text does not establish file identity"
+                } else {
+                    "Git resolved this evidence to a different repository-relative path"
+                },
+                file_identity,
+                "edit",
+            )
+        } else {
+            (
+                "edit_match_not_exact_span",
+                "an edit event matched the query anchors, but an exact edit of this span was not verified",
+                file_identity,
+                "edit",
+            )
+        }
     } else if has_read {
+        if unknown_path_identity {
+            (
+                "file_identity_unknown",
+                "a read event matched the query, but no retained or queryable repository identity proves which file it names",
+                file_identity,
+                "read",
+            )
+        } else if alternate_path {
+            (
+                "alternate_path_occurrence",
+                if different_repository {
+                    "Git resolved this evidence to a different repository; matching path text does not establish file identity"
+                } else {
+                    "Git resolved this evidence to a different repository-relative path"
+                },
+                file_identity,
+                "read",
+            )
+        } else {
+            (
+                "read_match",
+                "a read event matched the query anchors; it does not establish origination or rationale",
+                file_identity,
+                "read",
+            )
+        }
+    } else if unknown_path_identity && target_file.is_some() {
         (
-            "read_match",
-            "a read event matched the query anchors; it does not establish origination or rationale",
+            "file_identity_unknown",
+            "content anchors matched, but no retained or queryable repository identity proves which file they came from",
+            file_identity,
+            "anchor_only",
         )
     } else {
         (
             "anchor_match",
             "content anchors matched; no direct edit or decision is established by this match",
+            file_identity,
+            matched_kind,
         )
     }
 }
@@ -7797,6 +7953,7 @@ fn annotate_explain_inspection(
         }
     }
 
+    let mut identity_resolver = FileIdentityResolver::default();
     for session in sessions {
         let Some(tape_id) = session
             .get("session_id")
@@ -7810,16 +7967,13 @@ fn annotate_explain_inspection(
             .filter(|value| value.is_object())
             .cloned()
             .or_else(|| {
-                session
-                    .get("store")
-                    .and_then(Value::as_str)
-                    .map(|store| {
-                        let machine = store
-                            .split_once('/')
-                            .map(|(machine, _)| machine)
-                            .unwrap_or(self_machine);
-                        json!({"machine": machine, "store": store})
-                    })
+                session.get("store").and_then(Value::as_str).map(|store| {
+                    let machine = store
+                        .split_once('/')
+                        .map(|(machine, _)| machine)
+                        .unwrap_or(self_machine);
+                    json!({"machine": machine, "store": store})
+                })
             })
             .unwrap_or_else(|| local_grep_location(context, self_machine, &tape_id));
         let machine = location
@@ -7912,16 +8066,21 @@ fn annotate_explain_inspection(
             .get("files_touched")
             .cloned()
             .unwrap_or_else(|| json!([]));
-        let (evidence_label, evidence_basis) = explain_evidence_label(
+        let (evidence_label, evidence_basis, file_identity, matched_kind) = explain_evidence_label(
             cwd,
+            self_machine,
             session,
             target_file,
             exact_edit_sessions,
             &handoff_tape_ids,
+            &mut identity_resolver,
         );
         session["evidence"] = json!({
             "label": evidence_label,
             "basis": evidence_basis,
+            "file_identity": file_identity,
+            "matched_kind": matched_kind,
+            "source_revision": session.get("repo_head").cloned().unwrap_or(Value::Null),
             "recorded_handoff": handoff_tape_ids.contains(&tape_id),
             "rationale_status": "not_established_by_provenance_links",
             "rationale_note": "A matching anchor, edit touch, or graph root does not establish the original decision or intent.",
@@ -8831,6 +8990,72 @@ mod tests {
             .collect()
     }
 
+    fn init_identity_test_repo(root: &Path, content: &str) -> String {
+        fs::create_dir_all(root.join("scripts")).expect("scripts directory");
+        fs::write(root.join("scripts/verify_mix.sh"), content).expect("source file");
+        let output = ProcessCommand::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .arg(root)
+            .output()
+            .expect("git is available for evidence-label tests");
+        assert!(output.status.success(), "git init failed");
+        let _ = git_identity_test(root, &["config", "user.name", "Identity Test"]);
+        let _ = git_identity_test(
+            root,
+            &["config", "user.email", "identity-test@example.invalid"],
+        );
+        let _ = git_identity_test(root, &["add", "scripts/verify_mix.sh"]);
+        let output = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["-c", "commit.gpgsign=false", "commit", "-m", "initial"])
+            .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z")
+            .output()
+            .expect("git is available for evidence-label tests");
+        assert!(
+            output.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        git_identity_test(root, &["rev-parse", "HEAD"])
+    }
+
+    fn git_identity_test(root: &Path, args: &[&str]) -> String {
+        let output = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("git is available for evidence-label tests");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("git stdout is UTF-8")
+            .trim()
+            .to_string()
+    }
+
+    fn add_identity_test_worktree(root: &Path, worktree: &Path) {
+        let output = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["worktree", "add", "--quiet", "-b", "identity-checkout"])
+            .arg(worktree)
+            .arg("HEAD")
+            .output()
+            .expect("git is available for evidence-label tests");
+        assert!(
+            output.status.success(),
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn explain_require_complete_error_names_source_phase_code_and_reason() {
         let error = explain_require_complete_error(&[json!({
@@ -8851,6 +9076,204 @@ mod tests {
             error
                 .message
                 .contains("peer omitted one or more requested tape locations")
+        );
+    }
+
+    #[test]
+    fn explain_file_identity_uses_git_worktrees_and_keeps_unknown_paths_unknown() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repository = temp.path().join("repository");
+        let second_worktree = temp.path().join("second-worktree");
+        let unrelated_repository = temp.path().join("unrelated");
+        let content = "line one\nline two\n";
+        let head = init_identity_test_repo(&repository, content);
+        add_identity_test_worktree(&repository, &second_worktree);
+        let unrelated_head = init_identity_test_repo(&unrelated_repository, content);
+        assert_eq!(head, unrelated_head, "fixtures share content and commit");
+
+        let mut resolver = FileIdentityResolver::default();
+        let same_repository = json!({
+            "session_id": "same-repository-worktree",
+            "repo_head": head,
+            "touches": [{
+                "kind": "read",
+                "file_path": second_worktree.join("scripts/verify_mix.sh").to_string_lossy(),
+            }],
+        });
+        let same = explain_evidence_label(
+            &repository,
+            "local",
+            &same_repository,
+            Some("scripts/verify_mix.sh"),
+            &HashSet::new(),
+            &HashSet::new(),
+            &mut resolver,
+        );
+        assert_eq!(same.0, "same_file_read");
+        assert_eq!(same.2, "same_repository_worktree_file");
+
+        fs::write(
+            second_worktree.join("scripts/verify_mix.sh"),
+            "line one\nline two changed\n",
+        )
+        .expect("change source worktree revision");
+        let _ = git_identity_test(&second_worktree, &["add", "scripts/verify_mix.sh"]);
+        let output = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(&second_worktree)
+            .args(["-c", "commit.gpgsign=false", "commit", "-m", "new revision"])
+            .env("GIT_AUTHOR_DATE", "2026-01-02T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2026-01-02T00:00:00Z")
+            .output()
+            .expect("git is available for evidence-label tests");
+        assert!(
+            output.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let different_revision = git_identity_test(&second_worktree, &["rev-parse", "HEAD"]);
+        let different_revision_session = json!({
+            "session_id": "same-repository-different-revision",
+            "repo_head": different_revision,
+            "touches": [{
+                "kind": "edit",
+                "file_path": second_worktree.join("scripts/verify_mix.sh").to_string_lossy(),
+            }],
+        });
+        let mut changed_identity_resolver = FileIdentityResolver::default();
+        let changed_revision_label = explain_evidence_label(
+            &repository,
+            "local",
+            &different_revision_session,
+            Some("scripts/verify_mix.sh"),
+            &HashSet::new(),
+            &HashSet::new(),
+            &mut changed_identity_resolver,
+        );
+        assert_eq!(changed_revision_label.0, "same_file_edit_not_exact_span");
+        assert_eq!(changed_revision_label.2, "same_repository_worktree_file");
+        assert!(changed_revision_label.1.contains("source revision differs"));
+
+        let unrelated = json!({
+            "session_id": "unrelated-same-suffix",
+            "touches": [{
+                "kind": "edit",
+                "file_path": unrelated_repository.join("scripts/verify_mix.sh").to_string_lossy(),
+            }],
+        });
+        let unrelated_label = explain_evidence_label(
+            &repository,
+            "local",
+            &unrelated,
+            Some("scripts/verify_mix.sh"),
+            &HashSet::new(),
+            &HashSet::new(),
+            &mut resolver,
+        );
+        assert_eq!(unrelated_label.0, "alternate_path_occurrence");
+        assert_eq!(unrelated_label.2, "different_repository");
+
+        let unknown_path = temp.path().join("removed-checkout/scripts/verify_mix.sh");
+        let unknown = json!({
+            "session_id": "unavailable-repository-identity",
+            "touches": [{
+                "kind": "edit",
+                "file_path": unknown_path.to_string_lossy(),
+            }],
+        });
+        let unknown_label = explain_evidence_label(
+            &repository,
+            "local",
+            &unknown,
+            Some("scripts/verify_mix.sh"),
+            &HashSet::new(),
+            &HashSet::new(),
+            &mut resolver,
+        );
+        assert_eq!(unknown_label.0, "file_identity_unknown");
+        assert_eq!(unknown_label.2, "unknown");
+        assert_eq!(unknown_label.3, "edit");
+        assert_eq!(
+            unknown["touches"][0]["file_path"],
+            unknown_path.to_string_lossy().as_ref()
+        );
+    }
+
+    #[test]
+    fn same_physical_exact_span_survives_checkout_head_advance() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repository = temp.path().join("repository");
+        let session_head = init_identity_test_repo(&repository, "line one\nline two\n");
+        let source_file = repository.join("scripts/verify_mix.sh");
+        let source_path = source_file.to_string_lossy().to_string();
+        let session = json!({
+            "session_id": "same-physical-path-after-commit",
+            "tape_id": "same-physical-path-after-commit",
+            "repo_head": session_head,
+            "touches": [{
+                "kind": "edit",
+                "file_path": source_path.clone(),
+                "event_offset": 7,
+            }],
+            "windows": [{
+                "events": [{
+                    "offset": 7,
+                    "event": {
+                        "k": "code.edit",
+                        "file": source_path,
+                        "after_range": [1, 1],
+                    }
+                }]
+            }]
+        });
+
+        fs::write(
+            repository.join("README.md"),
+            "a later commit after the edit\n",
+        )
+        .expect("write later-commit file");
+        let _ = git_identity_test(&repository, &["add", "README.md"]);
+        let output = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(["-c", "commit.gpgsign=false", "commit", "-m", "later commit"])
+            .env("GIT_AUTHOR_DATE", "2026-01-02T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2026-01-02T00:00:00Z")
+            .output()
+            .expect("git is available for exact-span label tests");
+        assert!(
+            output.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let current_head = git_identity_test(&repository, &["rev-parse", "HEAD"]);
+        assert_ne!(session_head, current_head);
+
+        let exact_sessions = exact_span_edit_sessions(
+            std::slice::from_ref(&session),
+            "scripts/verify_mix.sh",
+            1,
+            1,
+            &repository,
+        );
+        assert!(exact_sessions.contains("same-physical-path-after-commit"));
+
+        let mut resolver = FileIdentityResolver::default();
+        let label = explain_evidence_label(
+            &repository,
+            "local",
+            &session,
+            Some("scripts/verify_mix.sh"),
+            &exact_sessions,
+            &HashSet::new(),
+            &mut resolver,
+        );
+        assert_eq!(label.0, "exact_span_edit");
+        assert_eq!(label.2, "same_physical_path");
+        assert!(
+            label
+                .1
+                .contains("revision equality is required only for cross-worktree identity")
         );
     }
 

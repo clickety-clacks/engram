@@ -23,9 +23,10 @@ use crate::config::{Topology, TopologyExport, load_topology};
 use crate::index::{
     QUERY_SEMANTICS_VERSION, ReaderMode, SCHEMA_VERSION, SqliteIndex, semantic_edge_key,
 };
+use crate::query::file_identity::{FileIdentityRelation, FileIdentityResolver};
 use crate::query::format::{
     DateFilter, collect_files_touched_from_rows, edge_to_json, extract_latest_timestamp_from_rows,
-    session_matches_date_filter,
+    session_matches_date_filter, structured_edit_overlaps_span,
 };
 use crate::store::tapes::{TapeRow, parse_jsonl_rows};
 use crate::tape::compress::decompress_jsonl_with_limit;
@@ -737,6 +738,8 @@ impl PeerSession {
         let mut response_bytes = 0u64;
         let mut seen_tapes = HashSet::new();
         let mut recovery = crate::ingest::recovery::QueryRecovery::default();
+        let mut identity_resolver = FileIdentityResolver::default();
+        let peer_cwd = std::env::current_dir().ok();
 
         for item in items {
             let item = item.as_object().ok_or_else(|| {
@@ -848,14 +851,43 @@ impl PeerSession {
                     continue;
                 }
             };
+            let repo_head = unique_repo_head(&rows);
             let span_edit_match = rank_span.as_ref().is_some_and(|(file, start, end)| {
+                let Some(peer_cwd) = peer_cwd.as_deref() else {
+                    return false;
+                };
+                let target_identity = identity_resolver.identity_for_query_path(peer_cwd, file);
                 edit_offsets.iter().any(|offset| {
                     rows.iter()
                         .find(|row| row.offset == *offset)
                         .is_some_and(|row| {
-                            crate::query::format::structured_edit_overlaps_span(
-                                &row.value, file, *start, *end,
-                            )
+                            let Some(evidence_file) = row.value.get("file").and_then(Value::as_str)
+                            else {
+                                return false;
+                            };
+                            let relation =
+                                identity_resolver.relation(peer_cwd, file, evidence_file);
+                            let same_file_identity = match relation {
+                                // The physical file remains the same when its checkout advances.
+                                FileIdentityRelation::SamePhysicalPath => true,
+                                FileIdentityRelation::SameRepositoryFile => matches!(
+                                    (
+                                        repo_head.as_deref(),
+                                        target_identity
+                                            .as_ref()
+                                            .and_then(|identity| identity.head()),
+                                    ),
+                                    (Some(source), Some(target)) if source == target
+                                ),
+                                _ => false,
+                            };
+                            same_file_identity
+                                && structured_edit_overlaps_span(
+                                    &row.value,
+                                    evidence_file,
+                                    *start,
+                                    *end,
+                                )
                         })
                 })
             });
@@ -1154,6 +1186,7 @@ impl PeerSession {
                 "dispatch_event_times": dispatch_event_times,
                 "recovery_binding": recovery_binding,
                 "digest": digest,
+                "repo_head": repo_head,
                 "summary": summary,
             });
             if span_edit_match {
@@ -2208,6 +2241,25 @@ fn validate_tape_id(id: &str) -> Result<(), PeerError> {
         ));
     }
     Ok(())
+}
+
+fn unique_repo_head(rows: &[TapeRow]) -> Option<String> {
+    let mut meta_rows = rows
+        .iter()
+        .filter(|row| row.value.get("k").and_then(Value::as_str) == Some("meta"));
+    let first_meta = meta_rows.next()?;
+    let head = first_meta.value.get("repo_head").and_then(Value::as_str)?;
+    if head.len() > 128 {
+        return None;
+    }
+    meta_rows
+        .all(|row| {
+            row.value
+                .get("repo_head")
+                .and_then(Value::as_str)
+                .is_some_and(|other| other.len() <= 128 && other == head)
+        })
+        .then(|| head.to_owned())
 }
 
 fn parse_rank_span(value: &Value) -> Result<(String, u32, u32), PeerError> {

@@ -1,5 +1,6 @@
 #![cfg(unix)]
 
+use std::path::Path;
 use std::process::Command;
 
 use engram::index::{DispatchLink, SqliteIndex};
@@ -111,6 +112,66 @@ fn jsonl(events: &[serde_json::Value]) -> String {
         + "\n"
 }
 
+fn init_git_repo(root: &Path, file: &Path, content: &str) -> String {
+    std::fs::create_dir_all(file.parent().expect("source parent"))
+        .expect("create source directory");
+    std::fs::write(file, content).expect("write query source");
+    let output = Command::new("git")
+        .arg("init")
+        .arg("--quiet")
+        .arg(root)
+        .output()
+        .expect("git is available for exact-rank tests");
+    assert!(output.status.success(), "git init failed");
+    for args in [
+        vec!["config", "user.name", "Exact Rank Test"],
+        vec!["config", "user.email", "exact-rank@example.invalid"],
+        vec![
+            "add",
+            file.strip_prefix(root)
+                .expect("file under repo")
+                .to_str()
+                .unwrap(),
+        ],
+    ] {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("git is available for exact-rank tests");
+        assert!(
+            output.status.success(),
+            "git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["-c", "commit.gpgsign=false", "commit", "-m", "initial"])
+        .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z")
+        .output()
+        .expect("git is available for exact-rank tests");
+    assert!(
+        output.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("git is available for exact-rank tests");
+    assert!(output.status.success(), "git rev-parse HEAD failed");
+    String::from_utf8(output.stdout)
+        .expect("git HEAD is UTF-8")
+        .trim()
+        .to_string()
+}
+
 fn set_peer_topology(caller_home: &std::path::Path, peers: serde_json::Value) {
     std::fs::write(
         caller_home.join(".engram/topology.yml"),
@@ -152,7 +213,13 @@ fn explain_file_range_prioritizes_exact_edits_before_default_page_locally_and_re
             )
         })
         .collect::<String>();
-    let meta = json!({"t":"2026-09-28T09:00:00Z","k":"meta","model":"rank-test"});
+    let repo = temp.path().join("rank-repo");
+    let source_file = repo.join("src/module.rs");
+    let source_path = source_file.to_string_lossy().to_string();
+    let wrong_path = repo.join("other/module.rs").to_string_lossy().to_string();
+    let repo_head = init_git_repo(&repo, &source_file, &source);
+    let meta =
+        json!({"t":"2026-09-28T09:00:00Z","k":"meta","model":"rank-test","repo_head":repo_head});
     let mut local_tapes = Vec::new();
 
     let (local_exact_id, local_exact_content) = content_addressed_test_tape(&[
@@ -160,7 +227,7 @@ fn explain_file_range_prioritizes_exact_edits_before_default_page_locally_and_re
         json!({
             "t":"2026-09-28T10:00:00Z",
             "k":"code.edit",
-            "file":"src/module.rs",
+            "file":source_path,
             "after_range":[1,12],
             "after_text":source,
         }),
@@ -172,7 +239,7 @@ fn explain_file_range_prioritizes_exact_edits_before_default_page_locally_and_re
         json!({
             "t":"2026-09-28T10:02:00Z",
             "k":"code.edit",
-            "file":"other/module.rs",
+            "file":wrong_path,
             "after_range":[1,12],
             "after_text":source,
         }),
@@ -184,7 +251,7 @@ fn explain_file_range_prioritizes_exact_edits_before_default_page_locally_and_re
         json!({
             "t":"2026-09-28T10:03:00Z",
             "k":"code.edit",
-            "file":"src/module.rs",
+            "file":source_path,
             "before_range":[30,41],
             "after_range":[30,41],
             "after_text":source,
@@ -204,7 +271,7 @@ fn explain_file_range_prioritizes_exact_edits_before_default_page_locally_and_re
             json!({
                 "t":format!("2026-09-28T11:{minute:02}:01Z"),
                 "k":"code.read",
-                "file":"src/module.rs",
+                "file":source_path,
                 "range":[1,12],
                 "text":source,
             }),
@@ -212,11 +279,9 @@ fn explain_file_range_prioritizes_exact_edits_before_default_page_locally_and_re
         local_tapes.push((tape_id, content));
     }
 
-    let (caller_home, repo, local_ids) = write_ranked_explain_source(temp.path(), &local_tapes);
-    let source_file = repo.join("src/module.rs");
-    std::fs::create_dir_all(source_file.parent().expect("source parent"))
-        .expect("create source directory");
-    std::fs::write(&source_file, &source).expect("write query source");
+    let (caller_home, indexed_repo, local_ids) =
+        write_ranked_explain_source(temp.path(), &local_tapes);
+    assert_eq!(repo, indexed_repo);
 
     let local_output = Command::new(binary)
         .current_dir(&repo)
@@ -275,7 +340,7 @@ fn explain_file_range_prioritizes_exact_edits_before_default_page_locally_and_re
         json!({
             "t":"2026-09-28T12:00:00Z",
             "k":"code.edit",
-            "file":"src/module.rs",
+            "file":source_path,
             "after_range":[1,12],
             "after_text":source,
         }),
@@ -285,7 +350,7 @@ fn explain_file_range_prioritizes_exact_edits_before_default_page_locally_and_re
         json!({
             "t":"2026-09-28T13:00:00Z",
             "k":"code.edit",
-            "file":"other/module.rs",
+            "file":wrong_path,
             "after_range":[1,12],
             "after_text":source,
         }),
@@ -295,7 +360,7 @@ fn explain_file_range_prioritizes_exact_edits_before_default_page_locally_and_re
         json!({
             "t":"2026-09-28T14:00:00Z",
             "k":"code.edit",
-            "file":"src/module.rs",
+            "file":source_path,
             "before_range":[30,41],
             "after_range":[30,41],
             "after_text":source,
@@ -341,17 +406,35 @@ fn explain_file_range_prioritizes_exact_edits_before_default_page_locally_and_re
     assert_eq!(federated_result["total"], 18);
     assert_eq!(federated_result["returned"], 10);
     assert_eq!(federated_result["truncated"], true);
+    // A different machine cannot prove the caller's local Git/worktree
+    // identity for a peer's physical source path. Keep the local exact match
+    // first and retain the remote session as ordinary evidence.
     assert_eq!(
         federated_result["sessions"][0]["session_id"],
-        remote_exact_id
+        local_exact_id
     );
     assert!(
         federated_result["sessions"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|session| session["session_id"] == local_exact_id)
+            .any(|session| session["session_id"] == remote_exact_id)
     );
+    let remote_exact_position = federated_result["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|session| session["session_id"] == remote_exact_id)
+        .expect("remote exact-shaped edit remains in ordinary results");
+    assert!(
+        remote_exact_position > 0,
+        "unknown remote path identity must not receive exact-span priority"
+    );
+    let remote_exact = &federated_result["sessions"][remote_exact_position];
+    assert_eq!(remote_exact["evidence"]["label"], "file_identity_unknown");
+    assert_eq!(remote_exact["evidence"]["file_identity"], "unknown");
+    assert_eq!(remote_exact["evidence"]["matched_kind"], "edit");
+    assert!(remote_exact["tape_facts"].get("span_edit_match").is_none());
     assert!(
         federated_result["sessions"][0]["tape_facts"]
             .get("span_edit_match")
@@ -380,8 +463,8 @@ fn explain_file_range_prioritizes_exact_edits_before_default_page_locally_and_re
         "full federated exact-span explain failed: {}",
         String::from_utf8_lossy(&federated_all_output.stderr)
     );
-    let federated_all: serde_json::Value = serde_json::from_slice(&federated_all_output.stdout)
-        .expect("full federated explain JSON");
+    let federated_all: serde_json::Value =
+        serde_json::from_slice(&federated_all_output.stdout).expect("full federated explain JSON");
     let federated_all_ids = federated_all["sessions"]
         .as_array()
         .expect("federated sessions")
@@ -392,6 +475,23 @@ fn explain_file_range_prioritizes_exact_edits_before_default_page_locally_and_re
     assert!(federated_all_ids.contains(local_exact_id.as_str()));
     assert!(federated_all_ids.contains(remote_wrong_path_id.as_str()));
     assert!(federated_all_ids.contains(remote_nonoverlap_id.as_str()));
+    let remote_exact_session = federated_all["sessions"]
+        .as_array()
+        .expect("federated sessions")
+        .iter()
+        .find(|session| session["session_id"] == remote_exact_id)
+        .expect("remote exact-shaped session");
+    assert_eq!(
+        remote_exact_session["evidence"]["label"],
+        "file_identity_unknown"
+    );
+    assert_eq!(remote_exact_session["evidence"]["file_identity"], "unknown");
+    assert_eq!(remote_exact_session["evidence"]["matched_kind"], "edit");
+    assert!(remote_exact_session["tape_facts"]["span_edit_match"].is_null());
+    assert_eq!(
+        remote_exact_session["evidence"]["source_revision"],
+        repo_head
+    );
 }
 
 #[test]
