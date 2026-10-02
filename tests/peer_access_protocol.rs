@@ -1755,10 +1755,9 @@ fn explain_peers_attributes_remote_only_edits_to_their_physical_owner() {
         session["physical_identity"]["file"]["path"],
         expected_owner_tape_path.to_str().expect("owner tape path")
     );
-    assert_eq!(
-        session["evidence"]["label"],
-        "same_file_edit_not_exact_span"
-    );
+    assert_eq!(session["evidence"]["label"], "file_identity_unknown");
+    assert_eq!(session["evidence"]["file_identity"], "unknown");
+    assert_eq!(session["evidence"]["matched_kind"], "edit");
     assert_eq!(
         session["evidence"]["rationale_status"],
         "not_established_by_provenance_links"
@@ -1770,22 +1769,18 @@ fn explain_peers_attributes_remote_only_edits_to_their_physical_owner() {
         session["next_lookup"]["file"]["path"],
         expected_owner_tape_path.to_str().expect("owner tape path")
     );
-    assert_eq!(
-        session["next_lookup"]["time"],
-        "2026-09-25T12:01:00Z"
+    assert_eq!(session["next_lookup"]["time"], "2026-09-25T12:01:00Z");
+    assert!(
+        session["next_lookup"]["transcript_window"]["start"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1
     );
-    assert!(session["next_lookup"]["transcript_window"]["start"]
-        .as_u64()
-        .unwrap_or(0)
-        >= 1);
     assert_eq!(session["next_lookup"]["argv"][0], "engram");
     assert_eq!(session["next_lookup"]["argv"][1], "peek");
     assert_eq!(session["next_lookup"]["argv"][2], tape_id);
     assert_eq!(session["next_lookup"]["argv"][3], "--store");
-    assert_eq!(
-        session["next_lookup"]["argv"][4],
-        "remote-owner/default"
-    );
+    assert_eq!(session["next_lookup"]["argv"][4], "remote-owner/default");
     assert_eq!(session["next_lookup"]["argv"][5], "--start");
     assert_eq!(value["federation"]["coverage"], "complete");
     assert_eq!(operation_count(&remote_operations, "lookup_edges"), 2);
@@ -1825,8 +1820,7 @@ fn explain_peers_attributes_remote_only_edits_to_their_physical_owner() {
         "emitted next lookup failed: {}",
         String::from_utf8_lossy(&peek_output.stderr)
     );
-    let peek: serde_json::Value =
-        serde_json::from_slice(&peek_output.stdout).expect("peek JSON");
+    let peek: serde_json::Value = serde_json::from_slice(&peek_output.stdout).expect("peek JSON");
     assert_eq!(peek["session"]["session_id"], tape_id);
     assert_eq!(
         peek["session"]["window_start"],

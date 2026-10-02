@@ -156,14 +156,16 @@ fn init_record_tapes_show_and_explain_roundtrip() {
 
     let span_anchor = fingerprint_text(span_text).fingerprint;
     let span_json = serde_json::to_string(span_text).expect("span json");
+    let source_file = repo.join("src/lib.rs").to_string_lossy().to_string();
     let transcript = format!(
         concat!(
             "{{\"t\":\"2026-02-22T00:00:00Z\",\"k\":\"meta\",\"model\":\"gpt-5\",\"repo_head\":\"abc123\",\"label\":\"lane-c\"}}\n",
-            "{{\"t\":\"2026-02-22T00:00:01Z\",\"k\":\"code.read\",\"file\":\"src/lib.rs\",\"range\":[2,2],\"text\":{0}}}\n",
-            "{{\"t\":\"2026-02-22T00:00:02Z\",\"k\":\"code.edit\",\"file\":\"src/lib.rs\",\"before_range\":[2,2],\"after_range\":[2,2],\"before_text\":\"fn old() {{ return legacy + 1; }}\",\"after_text\":{0}}}\n",
-            "{{\"t\":\"2026-02-22T00:00:03Z\",\"k\":\"code.edit\",\"file\":\"src/lib.rs\",\"before_range\":[4,5],\"before_text\":\"fn removed() {{ return legacy + 2; }}\"}}\n"
+            "{{\"t\":\"2026-02-22T00:00:01Z\",\"k\":\"code.read\",\"file\":{1},\"range\":[2,2],\"text\":{0}}}\n",
+            "{{\"t\":\"2026-02-22T00:00:02Z\",\"k\":\"code.edit\",\"file\":{1},\"before_range\":[2,2],\"after_range\":[2,2],\"before_text\":\"fn old() {{ return legacy + 1; }}\",\"after_text\":{0}}}\n",
+            "{{\"t\":\"2026-02-22T00:00:03Z\",\"k\":\"code.edit\",\"file\":{1},\"before_range\":[4,5],\"before_text\":\"fn removed() {{ return legacy + 2; }}\"}}\n"
         ),
-        span_json
+        span_json,
+        serde_json::to_string(&source_file).expect("source path json")
     );
 
     let record = run_json(repo, &["record", "--stdin"], Some(&transcript));
@@ -208,6 +210,7 @@ fn init_record_tapes_show_and_explain_roundtrip() {
     assert!(sessions[0]["window_start"].as_u64().unwrap_or(0) >= 1);
     assert!(sessions[0]["window_end"].as_u64().unwrap_or(0) >= 1);
     assert_eq!(sessions[0]["evidence"]["label"], "exact_span_edit");
+    assert_eq!(sessions[0]["evidence"]["source_revision"], "abc123");
     assert_eq!(
         sessions[0]["evidence"]["rationale_status"],
         "not_established_by_provenance_links"
@@ -243,18 +246,20 @@ fn init_record_tapes_show_and_explain_roundtrip() {
 }
 
 #[test]
-fn explain_labels_alternate_path_evidence_without_calling_it_an_origin() {
+fn explain_labels_unknown_path_identity_without_calling_it_an_origin() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();
     run_json(repo, &["init"], None);
     let span = "fn stable_gate() { use_unique_node_and_ephemeral_port(); }";
     fs::create_dir_all(repo.join("src")).expect("src");
     fs::write(repo.join("src/lib.rs"), format!("{span}\n")).expect("target source");
+    let direct_file = repo.join("src/lib.rs").to_string_lossy().to_string();
+    let alternate_file = repo.join("copy/src/lib.rs").to_string_lossy().to_string();
 
     let direct = serde_json::json!({
         "t": "2026-09-21T00:00:01Z",
         "k": "code.edit",
-        "file": "src/lib.rs",
+        "file": direct_file,
         "before_range": [1, 1],
         "after_range": [1, 1],
         "before_text": "fn old_gate() {}",
@@ -265,7 +270,7 @@ fn explain_labels_alternate_path_evidence_without_calling_it_an_origin() {
     let alternate = serde_json::json!({
         "t": "2026-09-21T00:00:02Z",
         "k": "code.read",
-        "file": "copy/src/lib.rs",
+        "file": alternate_file,
         "range": [1, 1],
         "text": span
     })
@@ -291,10 +296,9 @@ fn explain_labels_alternate_path_evidence_without_calling_it_an_origin() {
         .find(|session| session["session_id"] == alternate_id)
         .expect("alternate-path read hit");
     assert_eq!(direct_hit["evidence"]["label"], "exact_span_edit");
-    assert_eq!(
-        alternate_hit["evidence"]["label"],
-        "alternate_path_occurrence"
-    );
+    assert_eq!(alternate_hit["evidence"]["label"], "file_identity_unknown");
+    assert_eq!(alternate_hit["evidence"]["file_identity"], "unknown");
+    assert_eq!(alternate_hit["evidence"]["matched_kind"], "read");
     assert_eq!(
         alternate_hit["evidence"]["rationale_status"],
         "not_established_by_provenance_links"
