@@ -213,7 +213,7 @@ fn git_file_identity(path: &Path) -> Option<GitFileIdentity> {
     let probe = existing_directory(path)?;
     let output = Command::new("git")
         .args(["-C"])
-        .arg(probe)
+        .arg(git_compatible_path(&probe))
         .args([
             "rev-parse",
             "--path-format=absolute",
@@ -258,6 +258,21 @@ fn git_file_identity(path: &Path) -> Option<GitFileIdentity> {
         relative_path,
         head,
     })
+}
+
+fn git_compatible_path(path: &Path) -> PathBuf {
+    if cfg!(windows) {
+        let text = path.to_string_lossy();
+        if let Some(unc_path) = text.strip_prefix(r"\\?\UNC\") {
+            PathBuf::from(format!(r"\\{unc_path}"))
+        } else if let Some(path) = text.strip_prefix(r"\\?\") {
+            PathBuf::from(path)
+        } else {
+            path.to_path_buf()
+        }
+    } else {
+        path.to_path_buf()
+    }
 }
 
 #[cfg(test)]
@@ -427,5 +442,26 @@ mod tests {
             Path::new(r"\\server\share\repo\scripts\verify_mix.sh"),
             Path::new(r"\\?\UNC\server\share\repo\scripts\verify_mix.sh")
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_verbatim_paths_still_resolve_git_identity() {
+        use super::{FileIdentityRelation, FileIdentityResolver};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let _head = init_repo(&repo, "line\n");
+        let worktree = temp.path().join("second-checkout");
+        add_worktree(&repo, &worktree, "second-checkout");
+        let normal = repo.join("scripts/verify_mix.sh");
+        let canonical = fs::canonicalize(worktree.join("scripts/verify_mix.sh"))
+            .expect("canonical worktree source path");
+
+        let mut resolver = FileIdentityResolver::default();
+        assert_eq!(
+            resolver.relation_absolute(&normal, &canonical),
+            FileIdentityRelation::SameRepositoryFile
+        );
     }
 }
