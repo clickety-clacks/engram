@@ -5272,8 +5272,10 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
         &mut available,
     );
     let available_identity_complete = temp.path().join("available-show-responses.identity.ready");
-    // Let the offline peer open normally, then disconnect its identity query
-    // only after the healthy peer has completed the same discovery round.
+    // Let the offline peer open normally, then fail its identity queries only
+    // after the healthy peer has completed the same discovery round. Returning
+    // terminal errors keeps this coverage test independent of shell SIGPIPE
+    // timing; other protocol tests exercise abrupt disconnects.
     let offline_script_path = temp.path().join("offline-after-available-discovery.sh");
     let offline_script = [
         "#!/bin/sh",
@@ -5292,7 +5294,7 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
         "      attempts=$((attempts + 1))",
         "      sleep 0.05",
         "    done",
-        "    exit 1",
+        r#"    printf '{"id":%s,"end":true,"ok":false,"error":{"code":"unavailable","message":"fixture owner unavailable"}}\n' "$id""#,
         "  fi",
         "done",
     ]
