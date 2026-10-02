@@ -227,9 +227,25 @@ fn live_reader_in_read_only_directory_reports_unavailability_and_fix() {
         .expect("live reader should require -shm access");
     assert_eq!(error.code, "reader_unavailable");
     assert!(error.message.contains(&primary.display().to_string()));
-    assert!(error.message.contains("owner-side Engram writer"));
-    assert!(error.message.contains("keep the query read-only"));
+    assert!(
+        error
+            .message
+            .contains("owner's normal initialization or recovery")
+    );
+    assert!(error.message.contains("query remains read-only"));
+    assert!(
+        error
+            .message
+            .contains("does not initialize or repair the store")
+    );
+    assert!(
+        error
+            .message
+            .contains("ask the store owner to check readiness and readability")
+    );
     assert!(!error.message.contains("grant SQLite write access"));
+    assert!(!error.message.contains("open the live store once"));
+    assert!(!error.message.contains("-shm"));
     assert!(error.message.contains("frozen_stores"));
     assert_eq!(fs::read(&primary).expect("primary after"), before);
 }

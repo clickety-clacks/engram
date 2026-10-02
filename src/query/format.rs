@@ -61,9 +61,9 @@ fn open_query_index(path: &Path, mode: ReaderMode) -> Result<SqliteIndex, CliErr
         ReaderMode::Live => "live",
         ReaderMode::Frozen => "frozen",
     };
-    let fix = match mode {
+    let guidance = match mode {
         ReaderMode::Live => {
-            "have the owner-side Engram writer open the live store once to create persistent readable -wal/-shm sidecars; keep the query read-only, or declare a stable captured copy in ~/.engram/topology.yml under frozen_stores"
+            "a managed live store must complete its owner's normal initialization or recovery before it is considered ready. This query remains read-only and does not initialize or repair the store. If it is expected to be ready, ask the store owner to check readiness and readability; declare only a stable captured copy in ~/.engram/topology.yml under frozen_stores"
         }
         ReaderMode::Frozen => {
             "verify the declared frozen copy exists, is readable, and has the expected schema"
@@ -81,7 +81,7 @@ fn open_query_index(path: &Path, mode: ReaderMode) -> Result<SqliteIndex, CliErr
         Err(ReaderOpenError::Sqlite(error)) => Err(CliError::new(
             "reader_unavailable",
             format!(
-                "store `{}` could not be opened in {mode_label} read-only mode: {error}. Fix: {fix}.",
+                "store `{}` could not be opened in {mode_label} read-only mode: {error}. Guidance: {guidance}.",
                 path.display()
             ),
         )),
