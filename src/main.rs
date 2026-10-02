@@ -3523,7 +3523,7 @@ fn cmd_fingerprint(paths: &RepoPaths, context: &RuntimeContext) -> Result<(), Cl
     ensure_local_store(paths)?;
     print_context_conspicuity(context);
     ensure_db_parent(&context.db_path)?;
-    let index = SqliteIndex::open_owner_writer(&path_string(&context.db_path))?;
+    let index = SqliteIndex::open_writer(&path_string(&context.db_path))?;
 
     let mut scanned = 0usize;
     let mut fingerprinted = 0usize;
@@ -7809,18 +7809,6 @@ fn annotate_explain_inspection(
             .get("location")
             .filter(|value| value.is_object())
             .cloned()
-            .or_else(|| {
-                session
-                    .get("store")
-                    .and_then(Value::as_str)
-                    .map(|store| {
-                        let machine = store
-                            .split_once('/')
-                            .map(|(machine, _)| machine)
-                            .unwrap_or(self_machine);
-                        json!({"machine": machine, "store": store})
-                    })
-            })
             .unwrap_or_else(|| local_grep_location(context, self_machine, &tape_id));
         let machine = location
             .get("machine")

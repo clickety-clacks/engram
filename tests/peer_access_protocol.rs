@@ -1089,7 +1089,6 @@ fn explain_reference_projection(mut value: serde_json::Value) -> serde_json::Val
                 session.remove("store");
                 session.remove("tape_facts");
                 session.remove("tape_present_locally");
-                session.remove("next_lookup");
             }
         }
     }
@@ -1943,7 +1942,7 @@ fn explain_peers_matches_local_multi_store_reference() {
     assert_eq!(
         explain_reference_projection(federated),
         explain_reference_projection(local),
-        "federated result must match the same local two-store reference after removing physical lookup-route and federation-only fields"
+        "federated result must match the same local two-store reference after removing physical and federation-only fields"
     );
 }
 

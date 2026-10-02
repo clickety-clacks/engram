@@ -53,7 +53,7 @@ pub fn run_ingest(
     candidates.sort();
     candidates.dedup();
     ensure_db_parent(&context.db_path)?;
-    let index = SqliteIndex::open_owner_writer(&path_string(&context.db_path))?;
+    let index = SqliteIndex::open_writer(&path_string(&context.db_path))?;
 
     let mut scanned = 0usize;
     let mut imported = 0usize;
@@ -824,7 +824,7 @@ pub fn record_transcript(
         panic!("injected interruption after tape publication and before indexing");
     }
 
-    let index = SqliteIndex::open_owner_writer(&path_string(db_path))?;
+    let index = SqliteIndex::open_writer(&path_string(db_path))?;
     let already_indexed = index.has_tape(&tape_id)?;
 
     if !already_indexed {
