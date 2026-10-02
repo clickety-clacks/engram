@@ -254,7 +254,7 @@ fn live_reader_first_use_and_restart_survive_wal_sidecar_lifecycle() {
     // Copy a committed WAL database while its source writer remains open, but
     // omit the transient WAL index. All subsequent changes happen on the copy.
     let source_writer =
-        SqliteIndex::open_writer(source_path.to_str().unwrap()).expect("source writer");
+        SqliteIndex::open_owner_writer(source_path.to_str().unwrap()).expect("source writer");
     source_writer
         .ingest_tape_events(
             "before-copy",
@@ -303,7 +303,8 @@ fn live_reader_first_use_and_restart_survive_wal_sidecar_lifecycle() {
     set_readonly(&copy_dir, false);
     set_readonly(&copy_path, false);
     set_readonly(&copy_wal, false);
-    let copy_writer = SqliteIndex::open_writer(copy_path.to_str().unwrap()).expect("copy writer");
+    let copy_writer =
+        SqliteIndex::open_owner_writer(copy_path.to_str().unwrap()).expect("copy writer");
     assert!(
         copy_wal.exists() && copy_shm.exists(),
         "owner writer should establish WAL sidecars"
