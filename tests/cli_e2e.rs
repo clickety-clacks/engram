@@ -84,7 +84,15 @@ fn explain_literal_colon_hyphen_matches_file_contents() {
         let literal = run_json(repo, &["explain", "--", text], None);
         let file = run_json(repo, &["explain", "fixture.txt"], None);
         assert_eq!(literal["query"]["anchors"], file["query"]["anchors"]);
-        assert_eq!(literal["sessions"], file["sessions"]);
+        let ids = |result: &Value| {
+            result["sessions"]
+                .as_array()
+                .expect("sessions")
+                .iter()
+                .map(|session| session["session_id"].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&literal), ids(&file));
         assert!(!literal["sessions"].as_array().unwrap().is_empty());
     }
 }
@@ -111,7 +119,16 @@ fn explain_file_ranges_keep_selection_and_validation() {
     run_json(repo, &["record", "--stdin"], Some(&transcript));
     let literal = run_json(repo, &["explain", "--", text], None);
     let range = run_json(repo, &["explain", &format!("{name}:2-2")], None);
-    assert_eq!(range["sessions"], literal["sessions"]);
+    let ids = |result: &Value| {
+        result["sessions"]
+            .as_array()
+            .expect("sessions")
+            .iter()
+            .map(|session| session["session_id"].clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(range["query"]["anchors"], literal["query"]["anchors"]);
+    assert_eq!(ids(&range), ids(&literal));
     assert!(!range["sessions"].as_array().unwrap().is_empty());
     for suffix in ["2-a", "a-2", "0-2", "3-2", "2-99", "4294967296-4294967297"] {
         let output = run_cli(repo, &["explain", &format!("{name}:{suffix}")], None);
@@ -190,6 +207,28 @@ fn init_record_tapes_show_and_explain_roundtrip() {
     assert!(sessions[0]["confidence"].as_f64().unwrap_or(0.0) >= 0.0);
     assert!(sessions[0]["window_start"].as_u64().unwrap_or(0) >= 1);
     assert!(sessions[0]["window_end"].as_u64().unwrap_or(0) >= 1);
+    assert_eq!(sessions[0]["evidence"]["label"], "exact_span_edit");
+    assert_eq!(
+        sessions[0]["evidence"]["rationale_status"],
+        "not_established_by_provenance_links"
+    );
+    let lookup = &sessions[0]["next_lookup"];
+    assert_eq!(lookup["status"], "ready");
+    assert_eq!(lookup["machine"], "local");
+    assert_eq!(lookup["store"], sessions[0]["store"]);
+    assert!(lookup["store"]
+        .as_str()
+        .is_some_and(|store| store.starts_with("local/")));
+    assert!(lookup["file"]["path"]
+        .as_str()
+        .is_some_and(|path| path.ends_with(&format!("{tape_id}.jsonl.zst"))));
+    assert!(lookup["time"].is_string());
+    assert!(lookup["transcript_window"]["start"].as_u64().unwrap_or(0) >= 1);
+    assert_eq!(lookup["argv"][0], "engram");
+    assert_eq!(lookup["argv"][1], "peek");
+    assert_eq!(lookup["argv"][2], tape_id);
+    assert_eq!(lookup["argv"][3], "--start");
+    assert_eq!(lookup["argv"][5], "--lines");
 
     let conn = Connection::open(repo.join(".home/.engram/index.sqlite")).expect("sqlite");
     let feedback_tables: i64 = conn
@@ -201,6 +240,80 @@ fn init_record_tapes_show_and_explain_roundtrip() {
         )
         .expect("feedback tables");
     assert_eq!(feedback_tables, 0);
+}
+
+#[test]
+fn explain_labels_alternate_path_evidence_without_calling_it_an_origin() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+    run_json(repo, &["init"], None);
+    let span = "fn stable_gate() { use_unique_node_and_ephemeral_port(); }";
+    fs::create_dir_all(repo.join("src")).expect("src");
+    fs::write(repo.join("src/lib.rs"), format!("{span}\n")).expect("target source");
+
+    let direct = serde_json::json!({
+        "t": "2026-09-21T00:00:01Z",
+        "k": "code.edit",
+        "file": "src/lib.rs",
+        "before_range": [1, 1],
+        "after_range": [1, 1],
+        "before_text": "fn old_gate() {}",
+        "after_text": span
+    })
+    .to_string()
+        + "\n";
+    let alternate = serde_json::json!({
+        "t": "2026-09-21T00:00:02Z",
+        "k": "code.read",
+        "file": "copy/src/lib.rs",
+        "range": [1, 1],
+        "text": span
+    })
+    .to_string()
+        + "\n";
+    let direct_id = run_json(repo, &["record", "--stdin"], Some(&direct))["tape_id"]
+        .as_str()
+        .expect("direct tape")
+        .to_string();
+    let alternate_id = run_json(repo, &["record", "--stdin"], Some(&alternate))["tape_id"]
+        .as_str()
+        .expect("alternate tape")
+        .to_string();
+
+    let explain = run_json(repo, &["explain", "src/lib.rs:1-1"], None);
+    let sessions = explain["sessions"].as_array().expect("sessions");
+    let direct_hit = sessions
+        .iter()
+        .find(|session| session["session_id"] == direct_id)
+        .expect("exact edit hit");
+    let alternate_hit = sessions
+        .iter()
+        .find(|session| session["session_id"] == alternate_id)
+        .expect("alternate-path read hit");
+    assert_eq!(direct_hit["evidence"]["label"], "exact_span_edit");
+    assert_eq!(
+        alternate_hit["evidence"]["label"],
+        "alternate_path_occurrence"
+    );
+    assert_eq!(
+        alternate_hit["evidence"]["rationale_status"],
+        "not_established_by_provenance_links"
+    );
+    assert_eq!(alternate_hit["next_lookup"]["argv"][1], "peek");
+}
+
+#[test]
+fn public_explain_help_shows_peer_selection_and_limits_root_claims() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let output = run_cli(temp.path(), &["explain", "--help"], None);
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).expect("utf8 help");
+    assert!(help.contains("--peers <selection>"));
+    assert!(help.contains("all` or comma-separated configured peer labels"));
+    assert!(help.contains("--peers build-host"));
+    assert!(help.contains("--store build-host/default"));
+    assert!(help.contains("does not establish the original decision or WHY"));
+    assert!(!help.contains("the root is WHY"));
 }
 
 #[test]

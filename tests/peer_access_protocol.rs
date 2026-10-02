@@ -1089,6 +1089,7 @@ fn explain_reference_projection(mut value: serde_json::Value) -> serde_json::Val
                 session.remove("store");
                 session.remove("tape_facts");
                 session.remove("tape_present_locally");
+                session.remove("next_lookup");
             }
         }
     }
@@ -1754,6 +1755,38 @@ fn explain_peers_attributes_remote_only_edits_to_their_physical_owner() {
         session["physical_identity"]["file"]["path"],
         expected_owner_tape_path.to_str().expect("owner tape path")
     );
+    assert_eq!(
+        session["evidence"]["label"],
+        "same_file_edit_not_exact_span"
+    );
+    assert_eq!(
+        session["evidence"]["rationale_status"],
+        "not_established_by_provenance_links"
+    );
+    assert_eq!(session["next_lookup"]["status"], "ready");
+    assert_eq!(session["next_lookup"]["machine"], "remote-owner");
+    assert_eq!(session["next_lookup"]["store"], "remote-owner/default");
+    assert_eq!(
+        session["next_lookup"]["file"]["path"],
+        expected_owner_tape_path.to_str().expect("owner tape path")
+    );
+    assert_eq!(
+        session["next_lookup"]["time"],
+        "2026-09-25T12:01:00Z"
+    );
+    assert!(session["next_lookup"]["transcript_window"]["start"]
+        .as_u64()
+        .unwrap_or(0)
+        >= 1);
+    assert_eq!(session["next_lookup"]["argv"][0], "engram");
+    assert_eq!(session["next_lookup"]["argv"][1], "peek");
+    assert_eq!(session["next_lookup"]["argv"][2], tape_id);
+    assert_eq!(session["next_lookup"]["argv"][3], "--store");
+    assert_eq!(
+        session["next_lookup"]["argv"][4],
+        "remote-owner/default"
+    );
+    assert_eq!(session["next_lookup"]["argv"][5], "--start");
     assert_eq!(value["federation"]["coverage"], "complete");
     assert_eq!(operation_count(&remote_operations, "lookup_edges"), 2);
     assert!(
@@ -1773,6 +1806,36 @@ fn explain_peers_attributes_remote_only_edits_to_their_physical_owner() {
     assert_eq!(operation_count(&remote_operations, "tape_facts"), 1);
     assert_eq!(operation_count(&remote_operations, "locate_tapes"), 1);
     assert_eq!(operation_count(&remote_operations, "read_file"), 0);
+
+    let lookup_args = session["next_lookup"]["argv"]
+        .as_array()
+        .expect("next lookup argv")
+        .iter()
+        .skip(1)
+        .map(|arg| arg.as_str().expect("argv string"))
+        .collect::<Vec<_>>();
+    let peek_output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(lookup_args)
+        .output()
+        .expect("run the emitted next lookup");
+    assert!(
+        peek_output.status.success(),
+        "emitted next lookup failed: {}",
+        String::from_utf8_lossy(&peek_output.stderr)
+    );
+    let peek: serde_json::Value =
+        serde_json::from_slice(&peek_output.stdout).expect("peek JSON");
+    assert_eq!(peek["session"]["session_id"], tape_id);
+    assert_eq!(
+        peek["session"]["window_start"],
+        session["next_lookup"]["transcript_window"]["start"]
+    );
+    assert_eq!(
+        peek["session"]["window_end"],
+        session["next_lookup"]["transcript_window"]["end"]
+    );
 }
 
 #[test]
@@ -1880,7 +1943,7 @@ fn explain_peers_matches_local_multi_store_reference() {
     assert_eq!(
         explain_reference_projection(federated),
         explain_reference_projection(local),
-        "federated result must match the same local two-store reference after removing physical and federation-only fields"
+        "federated result must match the same local two-store reference after removing physical lookup-route and federation-only fields"
     );
 }
 

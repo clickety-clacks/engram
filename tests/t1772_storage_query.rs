@@ -189,7 +189,15 @@ fn live_reader_in_read_only_directory_reports_unavailability_and_fix() {
     let live_dir = temp.path().join("live");
     fs::create_dir(&live_dir).expect("live directory");
     let primary = live_dir.join("primary.sqlite");
-    drop(SqliteIndex::open_writer(primary.to_str().unwrap()).expect("writer"));
+    let legacy_writer = Connection::open(&primary).expect("legacy WAL writer");
+    legacy_writer
+        .execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA user_version = 4; CREATE TABLE tapes (tape_id TEXT PRIMARY KEY);",
+        )
+        .expect("seed legacy WAL store");
+    drop(legacy_writer);
+    assert!(!std::path::PathBuf::from(format!("{}-wal", primary.display())).exists());
+    assert!(!std::path::PathBuf::from(format!("{}-shm", primary.display())).exists());
     let before = fs::read(&primary).expect("primary bytes");
     set_readonly(&primary, true);
     set_readonly(&live_dir, true);
@@ -219,9 +227,204 @@ fn live_reader_in_read_only_directory_reports_unavailability_and_fix() {
         .expect("live reader should require -shm access");
     assert_eq!(error.code, "reader_unavailable");
     assert!(error.message.contains(&primary.display().to_string()));
-    assert!(error.message.contains("grant SQLite write access"));
+    assert!(
+        error
+            .message
+            .contains("owner's normal initialization or recovery")
+    );
+    assert!(error.message.contains("query remains read-only"));
+    assert!(
+        error
+            .message
+            .contains("does not initialize or repair the store")
+    );
+    assert!(
+        error
+            .message
+            .contains("ask the store owner to check readiness and readability")
+    );
+    assert!(!error.message.contains("grant SQLite write access"));
+    assert!(!error.message.contains("open the live store once"));
+    assert!(!error.message.contains("-shm"));
     assert!(error.message.contains("frozen_stores"));
     assert_eq!(fs::read(&primary).expect("primary after"), before);
+}
+
+#[test]
+fn live_reader_first_use_and_restart_survive_wal_sidecar_lifecycle() {
+    if std::env::consts::FAMILY != "unix" {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source_dir = temp.path().join("source");
+    let copy_dir = temp.path().join("isolated-copy");
+    fs::create_dir(&source_dir).expect("source directory");
+    fs::create_dir(&copy_dir).expect("copy directory");
+    let source_path = source_dir.join("index.sqlite");
+    let copy_path = copy_dir.join("index.sqlite");
+    let sidecar = |path: &std::path::Path, suffix: &str| {
+        std::path::PathBuf::from(format!("{}{suffix}", path.display()))
+    };
+
+    // Copy a committed WAL database while its source writer remains open, but
+    // omit the transient WAL index. All subsequent changes happen on the copy.
+    let source_writer =
+        SqliteIndex::open_owner_writer(source_path.to_str().unwrap()).expect("source writer");
+    source_writer
+        .ingest_tape_events(
+            "before-copy",
+            &[event(
+                1,
+                TapeEventData::CodeRead(CodeReadEvent {
+                    file: "src/example.rs".into(),
+                    range: FileRange { start: 1, end: 1 },
+                    text: Some("fn before_copy() {}\n".into()),
+                    anchor_hashes: Vec::new(),
+                }),
+            )],
+            LINK_THRESHOLD_DEFAULT,
+        )
+        .expect("seed source WAL");
+    let source_wal = sidecar(&source_path, "-wal");
+    let source_shm = sidecar(&source_path, "-shm");
+    assert!(source_wal.exists(), "source writer should retain a live WAL");
+    assert!(source_shm.exists(), "source writer should have a WAL index");
+    let wal_bytes = fs::metadata(&source_wal).expect("source WAL metadata").len();
+    assert!(wal_bytes > 0, "source WAL should contain committed frames");
+    fs::copy(&source_path, &copy_path).expect("copy main database");
+    let copy_wal = sidecar(&copy_path, "-wal");
+    let copy_shm = sidecar(&copy_path, "-shm");
+    fs::copy(&source_wal, &copy_wal).expect("copy WAL without its index");
+    assert!(!copy_shm.exists(), "isolated copy omits transient WAL index");
+
+    // The first normal read-only open has neither a usable WAL index nor
+    // permission to create one. Capture its exact outcome, then let an owner
+    // writer establish sidecars on this disposable copy.
+    set_readonly(&copy_path, true);
+    set_readonly(&copy_wal, true);
+    set_readonly(&copy_dir, true);
+    let first_read = SqliteIndex::open_reader_mode(
+        copy_path.to_str().unwrap(),
+        engram::index::ReaderMode::Live,
+    )
+        .map(|reader| {
+            reader.with_read_transaction(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM tapes", [], |row| row.get::<_, i64>(0))
+            })
+        })
+        .and_then(|rows| rows)
+        .map_err(|error| error.to_string());
+
+    set_readonly(&copy_dir, false);
+    set_readonly(&copy_path, false);
+    set_readonly(&copy_wal, false);
+    let copy_writer =
+        SqliteIndex::open_owner_writer(copy_path.to_str().unwrap()).expect("copy writer");
+    assert!(
+        copy_wal.exists() && copy_shm.exists(),
+        "owner writer should establish WAL sidecars"
+    );
+
+    set_readonly(&copy_path, true);
+    set_readonly(&copy_wal, true);
+    set_readonly(&copy_shm, true);
+    set_readonly(&copy_dir, true);
+    let mut concurrent_rows = None;
+    let concurrent_reader = SqliteIndex::open_reader_mode(
+        copy_path.to_str().unwrap(),
+        engram::index::ReaderMode::Live,
+    )
+    .map_err(|error| error.to_string())
+    .and_then(|reader| {
+        let before = reader
+            .with_read_transaction(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM tapes", [], |row| row.get::<_, i64>(0))
+            })
+            .map_err(|error| error.to_string())?;
+        copy_writer
+            .ingest_tape_events(
+                "writer-while-reader-attached",
+                &[event(
+                    2,
+                    TapeEventData::CodeRead(CodeReadEvent {
+                        file: "src/example.rs".into(),
+                        range: FileRange { start: 2, end: 2 },
+                        text: Some("fn writer_while_reader_attached() {}\n".into()),
+                        anchor_hashes: Vec::new(),
+                    }),
+                )],
+                LINK_THRESHOLD_DEFAULT,
+            )
+            .map_err(|error| error.to_string())?;
+        concurrent_rows = Some((
+            before,
+            reader
+                .with_read_transaction(|conn| {
+                    conn.query_row("SELECT COUNT(*) FROM tapes", [], |row| row.get::<_, i64>(0))
+                })
+                .map_err(|error| error.to_string())?,
+        ));
+        Ok(())
+    });
+
+    // The owner writer checkpoints on close but preserves both sidecars for a
+    // restarted read-only client with no directory write permission.
+    set_readonly(&copy_dir, false);
+    set_readonly(&copy_path, false);
+    set_readonly(&copy_wal, false);
+    set_readonly(&copy_shm, false);
+    drop(copy_writer);
+    let sidecars_after_writer_close = (copy_wal.exists(), copy_shm.exists());
+    set_readonly(&copy_path, true);
+    if copy_wal.exists() {
+        set_readonly(&copy_wal, true);
+    }
+    if copy_shm.exists() {
+        set_readonly(&copy_shm, true);
+    }
+    set_readonly(&copy_dir, true);
+    let restart_read = SqliteIndex::open_reader_mode(
+        copy_path.to_str().unwrap(),
+        engram::index::ReaderMode::Live,
+    )
+    .map(|reader| {
+        reader.with_read_transaction(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM tapes", [], |row| row.get::<_, i64>(0))
+        })
+    })
+    .and_then(|rows| rows)
+    .map_err(|error| error.to_string());
+    set_readonly(&copy_dir, false);
+    set_readonly(&copy_path, false);
+    if copy_wal.exists() {
+        set_readonly(&copy_wal, false);
+    }
+    if copy_shm.exists() {
+        set_readonly(&copy_shm, false);
+    }
+
+    println!(
+        "isolated WAL reproduction: source_wal_bytes={wal_bytes}, copied_shm=false, first_read={first_read:?}, writer_created_sidecars=true, concurrent_reader={concurrent_reader:?}, concurrent_rows={concurrent_rows:?}, sidecars_after_writer_close={sidecars_after_writer_close:?}, restart_read={restart_read:?}"
+    );
+    assert!(
+        first_read.as_ref().is_err_and(|error| error == "unable to open database file"),
+        "a copied WAL missing -shm in a read-only parent should report the known first-use limitation"
+    );
+    assert!(
+        concurrent_reader.is_ok() && concurrent_rows == Some((1, 2)),
+        "an existing WAL/SHM pair must support coherent read-only access alongside a live writer"
+    );
+    assert_eq!(
+        sidecars_after_writer_close,
+        (true, true),
+        "Engram writers must retain readable WAL/SHM sidecars for later read-only clients"
+    );
+    assert!(
+        restart_read.is_ok(),
+        "a restarted read-only client must work after the owner writer closes"
+    );
+    drop(source_writer);
 }
 
 #[test]

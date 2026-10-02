@@ -345,7 +345,7 @@ impl PeerSession {
                             "unavailable",
                             "reader_unavailable",
                             format!(
-                                "cannot open Live reader for {}: {error}; grant SQLite write access to the parent directory so it can create -shm, or declare a stable captured copy under frozen_stores",
+                                "cannot open Live reader for {}: {error}; a managed live store must complete its owner's normal initialization or recovery before it is considered ready. This peer remains read-only and will not initialize or repair the store; ask the owner to check readiness and readability, or declare only a stable captured copy under frozen_stores",
                                 config.db.display()
                             ),
                         )?;
@@ -361,7 +361,7 @@ impl PeerSession {
                         "unavailable",
                         "reader_unavailable",
                         format!(
-                            "cannot pin Live reader snapshot for {}: {error}; grant SQLite write access to the parent directory so it can create -shm, or declare a stable captured copy under frozen_stores",
+                            "cannot pin Live reader snapshot for {}: {error}; a managed live store must complete its owner's normal initialization or recovery before it is considered ready. This peer remains read-only and will not initialize or repair the store; ask the owner to check readiness and readability, or declare only a stable captured copy under frozen_stores",
                             config.db.display()
                         ),
                     )?;
@@ -3291,6 +3291,33 @@ mod tests {
                 .uuid,
             "u-later"
         );
+    }
+
+    #[test]
+    fn unavailable_live_export_directs_readiness_to_owner_without_guessing_the_cause() {
+        let (_temp, home, db, _tapes) = configured_home();
+        fs::remove_file(&db).expect("remove initialized fixture DB");
+
+        let output = run(&home, &request(1, "open", &["default"], json!({})));
+        let frames = output
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("frame JSON"))
+            .collect::<Vec<_>>();
+        let unavailable = frames
+            .iter()
+            .find(|frame| frame["data"]["phase"] == "open")
+            .expect("open failure data frame");
+
+        assert_eq!(unavailable["data"]["status"], "unavailable");
+        assert_eq!(unavailable["data"]["error"]["code"], "reader_unavailable");
+        let message = unavailable["data"]["error"]["message"]
+            .as_str()
+            .expect("unavailable message");
+        assert!(message.contains("owner's normal initialization or recovery"));
+        assert!(message.contains("peer remains read-only"));
+        assert!(message.contains("ask the owner to check readiness and readability"));
+        assert!(!message.contains("-shm"));
+        assert!(!message.contains("open the live store once"));
     }
 
     #[test]

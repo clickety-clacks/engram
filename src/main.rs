@@ -2587,7 +2587,11 @@ enum TopologyCommand {
 
 #[derive(Args, Debug)]
 struct TopologyStatusArgs {
-    #[arg(long, value_name = "PEER")]
+    #[arg(
+        long,
+        value_name = "SELECTION",
+        help = "Select `all` or a comma-separated list of configured peer labels"
+    )]
     peers: Option<String>,
     #[arg(long)]
     check_exports: bool,
@@ -2626,7 +2630,11 @@ struct ShowArgs {
     raw: bool,
     #[arg(long, value_name = "MACHINE/EXPORT")]
     store: Option<String>,
-    #[arg(long, value_name = "PEER")]
+    #[arg(
+        long,
+        value_name = "SELECTION",
+        help = "Select `all` or a comma-separated list of configured peer labels"
+    )]
     peers: Option<String>,
     #[arg(long)]
     require_complete: bool,
@@ -2681,7 +2689,11 @@ struct ExplainArgs {
     forensics: bool,
     #[arg(long, hide = true)]
     pretty: bool,
-    #[arg(long, value_name = "PEER")]
+    #[arg(
+        long,
+        value_name = "SELECTION",
+        help = "Select `all` or a comma-separated list of configured peer labels; omitted means local stores only"
+    )]
     peers: Option<String>,
     #[arg(long)]
     require_complete: bool,
@@ -2700,7 +2712,11 @@ struct GrepArgs {
     until: Option<String>,
     #[arg(long)]
     count: bool,
-    #[arg(long, value_name = "PEER")]
+    #[arg(
+        long,
+        value_name = "SELECTION",
+        help = "Select `all` or a comma-separated list of configured peer labels; omitted means local stores only"
+    )]
     peers: Option<String>,
     #[arg(long)]
     require_complete: bool,
@@ -2719,7 +2735,11 @@ struct PeekArgs {
     after: Option<usize>,
     #[arg(long)]
     grep_filter: Option<String>,
-    #[arg(long, value_name = "MACHINE/EXPORT")]
+    #[arg(
+        long,
+        value_name = "MACHINE/EXPORT",
+        help = "Read this one configured remote export"
+    )]
     store: Option<String>,
 }
 
@@ -2844,10 +2864,13 @@ fn error_payload(err: &CliError) -> Value {
 
 const HELP_ENGRAM: &str = r#"Engram indexes agent conversations that produced your code.
 
-Results are organized as provenance chains: the root is WHY
-(product decisions, design rationale), descendants are HOW
-(specs, implementation). Use explain to find chains, peek to
-read them.
+Explain returns matching transcript evidence and recorded handoff links.
+A root means no parent link was found in the searched stores; it does not
+prove that the root contains the original decision or explains WHY. Use
+explain to find evidence and peek to inspect its transcript window.
+
+Queries use local stores by default. Add --peers to explain or grep when the
+needed transcript may be in another configured machine's exported stores.
 
 COMMANDS:
   explain    Find provenance for code (by fingerprint)
@@ -2862,10 +2885,12 @@ Run engram <command> --help for details.
 
 const HELP_EXPLAIN: &str = r#"Find the conversations that produced this code.
 
-Returns the root of each provenance chain — the highest-level
-context explaining WHY this code exists. Results include chain
-metadata (children, depth) so you can walk down to HOW with peek.
-Returns metadata only. Use peek <session_id> to read content.
+Returns matching transcript evidence and recorded handoff links from the
+searched stores. A root has no parent link in the returned graph; that alone
+does not establish the original decision or WHY. Results include stable tape
+IDs, evidence labels, and a next_lookup with the machine, store, file, time,
+transcript window, and supported peek argv. Review that window before drawing
+a conclusion about intent.
 
 USAGE:
   engram explain <file>:<start>-<end>   Provenance for a code span
@@ -2880,11 +2905,16 @@ OPTIONS:
   --since <date>            Only sessions after this date
   --until <date>            Only sessions before this date
   --count                   Show counts only, no content (token budgeting)
+  --peers <selection>       Select `all` or comma-separated configured peer labels;
+                            omitted means local stores only
+  --require-complete        Exit nonzero if a selected source is incomplete
 
 EXAMPLES:
   engram explain src/server.ts:40-78
   engram explain src/server.ts:40-78 --grep-filter "retry"
   engram explain src/server.ts --since 2026-03-01 --limit 5
+  engram explain src/server.ts:40-78 --peers build-host
+  engram peek TAPE_ID --store build-host/default --start 421 --lines 30
 "#;
 
 const HELP_GREP: &str = r#"Search all provenance sessions for a term.
@@ -2901,10 +2931,14 @@ OPTIONS:
   --since <date>  Only sessions after this date
   --until <date>  Only sessions before this date
   --count         Show counts only, no content
+  --peers <selection>  Select `all` or comma-separated configured peer labels;
+                       omitted means local stores only
+  --require-complete   Exit nonzero if a selected source is incomplete
 
 EXAMPLES:
   engram grep "maxMessageBytes"
   engram grep "retry logic" --since 2026-03-01
+  engram grep "retry logic" --peers build-host
 "#;
 
 const HELP_PEEK: &str = r#"Read content from a provenance session.
@@ -2923,10 +2957,12 @@ OPTIONS:
   --before N                Lines before the anchor point [default: 30]
   --after N                 Lines after the anchor point [default: 10]
   --grep-filter <pattern>   Find lines matching this term within the session
+  --store <MACHINE/EXPORT>  Read this one configured remote export
 
 EXAMPLES:
   engram peek af156abd
   engram peek af156abd --start 421 --lines 30
+  engram peek af156abd --store build-host/default --start 421 --lines 30
   engram peek af156abd --grep-filter "NO_REPLY"
 "#;
 
@@ -3487,7 +3523,7 @@ fn cmd_fingerprint(paths: &RepoPaths, context: &RuntimeContext) -> Result<(), Cl
     ensure_local_store(paths)?;
     print_context_conspicuity(context);
     ensure_db_parent(&context.db_path)?;
-    let index = SqliteIndex::open_writer(&path_string(&context.db_path))?;
+    let index = SqliteIndex::open_owner_writer(&path_string(&context.db_path))?;
 
     let mut scanned = 0usize;
     let mut fingerprinted = 0usize;
@@ -5075,6 +5111,13 @@ fn cmd_explain(
         .clone()
         .ok_or_else(|| CliError::new("invalid_explain_target", "target is required"))?;
     let target_kind = classify_explain_target(cwd, context, &[], &target, args.anchor)?;
+    let target_file = match &target_kind {
+        ExplainTarget::FileRange { file, .. } | ExplainTarget::FileWhole { file } => {
+            Some(file.clone())
+        }
+        ExplainTarget::Literal(_) => None,
+    };
+    let self_machine = local_machine_label();
     if args.peers.is_some() {
         return cmd_explain_with_peers(cwd, context, target, target_kind, args);
     }
@@ -5230,6 +5273,15 @@ fn cmd_explain(
     )?;
     sessions.retain(|session| session_matches_date_filter(session, &date_filter));
     annotate_chain_fields(&mut sessions, &dispatch_lineage);
+    annotate_explain_inspection(
+        context,
+        cwd,
+        &self_machine,
+        &mut sessions,
+        target_file.as_deref(),
+        &exact_edit_sessions,
+        &dispatch_lineage,
+    );
     sessions
         .sort_by(|a, b| compare_explain_sessions_with_span_priority(a, b, &exact_edit_sessions));
     if sessions.is_empty() && tombstones.is_empty() && lineage.is_empty() {
@@ -5342,6 +5394,12 @@ fn cmd_explain_with_peers_inner(
     cancelled: &Arc<AtomicBool>,
 ) -> Result<(), CliError> {
     let query_deadline = Instant::now() + PEER_QUERY_TIMEOUT;
+    let target_file = match &target_kind {
+        ExplainTarget::FileRange { file, .. } | ExplainTarget::FileWhole { file } => {
+            Some(file.clone())
+        }
+        ExplainTarget::Literal(_) => None,
+    };
     let exact_span_target = match &target_kind {
         ExplainTarget::FileRange { file, start, end } => Some((file.clone(), *start, *end)),
         ExplainTarget::FileWhole { .. } | ExplainTarget::Literal(_) => None,
@@ -6238,6 +6296,15 @@ fn cmd_explain_with_peers_inner(
     sessions.extend(dispatch.remote_parent_sessions);
     sessions.retain(|session| session_matches_date_filter(session, &date_filter));
     annotate_chain_fields(&mut sessions, &dispatch_lineage);
+    annotate_explain_inspection(
+        context,
+        cwd,
+        &topology.self_label,
+        &mut sessions,
+        target_file.as_deref(),
+        &exact_edit_sessions,
+        &dispatch_lineage,
+    );
     sessions
         .sort_by(|a, b| compare_explain_sessions_with_span_priority(a, b, &exact_edit_sessions));
 
@@ -7592,6 +7659,289 @@ fn local_grep_location(context: &RuntimeContext, machine: &str, tape_id: &str) -
         }
     }
     json!({"machine": machine, "store": format!("{machine}/local-files")})
+}
+
+fn local_machine_label() -> String {
+    home_dir()
+        .ok()
+        .and_then(|home| load_topology(&home).ok().flatten())
+        .map(|topology| topology.self_label)
+        .unwrap_or_else(|| "local".to_string())
+}
+
+fn explain_path_key(cwd: &Path, path: &str) -> Vec<String> {
+    let candidate = Path::new(path);
+    let candidate = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        cwd.join(candidate)
+    };
+    let candidate = fs::canonicalize(&candidate).unwrap_or(candidate);
+    candidate
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect()
+}
+
+fn same_path_suffix(left: &[String], right: &[String], component_count: usize) -> bool {
+    if left.len() < component_count || right.len() < component_count {
+        return false;
+    }
+    left[left.len() - component_count..] == right[right.len() - component_count..]
+}
+
+fn explain_evidence_label(
+    cwd: &Path,
+    session: &Value,
+    target_file: Option<&str>,
+    exact_edit_sessions: &HashSet<String>,
+    handoff_tape_ids: &HashSet<String>,
+) -> (&'static str, &'static str) {
+    let Some(tape_id) = session.get("session_id").and_then(Value::as_str) else {
+        return ("unclassified_match", "the result has no stable tape ID");
+    };
+    if exact_edit_sessions.contains(tape_id) {
+        return (
+            "exact_span_edit",
+            "the indexed edit event matches the requested file span",
+        );
+    }
+    if handoff_tape_ids.contains(tape_id) {
+        return (
+            "recorded_handoff_context",
+            "a dispatch link names this tape as a handoff endpoint",
+        );
+    }
+
+    let target_key = target_file.map(|path| explain_path_key(cwd, path));
+    let mut same_file_read = false;
+    let mut same_file_edit = false;
+    let mut alternate_path = false;
+    let mut has_read = false;
+    let mut has_edit = false;
+    for touch in session
+        .get("touches")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let kind = touch
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        has_read |= kind == "read";
+        has_edit |= kind == "edit";
+        let Some(file) = touch.get("file_path").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(target_key) = target_key.as_ref() else {
+            continue;
+        };
+        let file_key = explain_path_key(cwd, file);
+        if &file_key == target_key {
+            same_file_read |= kind == "read";
+            same_file_edit |= kind == "edit";
+        } else if same_path_suffix(&file_key, target_key, 2) {
+            alternate_path = true;
+        }
+    }
+
+    if same_file_edit {
+        (
+            "same_file_edit_not_exact_span",
+            "an edit on the requested file was observed, but not a verified edit of this span",
+        )
+    } else if same_file_read {
+        (
+            "same_file_read",
+            "a read event names the requested file; it does not establish an edit or rationale",
+        )
+    } else if alternate_path {
+        (
+            "alternate_path_occurrence",
+            "matching evidence names a different file path with the same trailing path components",
+        )
+    } else if has_edit {
+        (
+            "edit_match_not_exact_span",
+            "an edit event matched the query anchors, but an exact edit of this span was not verified",
+        )
+    } else if has_read {
+        (
+            "read_match",
+            "a read event matched the query anchors; it does not establish origination or rationale",
+        )
+    } else {
+        (
+            "anchor_match",
+            "content anchors matched; no direct edit or decision is established by this match",
+        )
+    }
+}
+
+fn annotate_explain_inspection(
+    context: &RuntimeContext,
+    cwd: &Path,
+    self_machine: &str,
+    sessions: &mut [Value],
+    target_file: Option<&str>,
+    exact_edit_sessions: &HashSet<String>,
+    dispatch_lineage: &[Value],
+) {
+    let mut handoff_tape_ids = HashSet::new();
+    for edge in dispatch_lineage {
+        for field in ["session", "parent_session", "received_session"] {
+            if let Some(tape_id) = edge.get(field).and_then(Value::as_str) {
+                handoff_tape_ids.insert(tape_id.to_string());
+            }
+        }
+    }
+
+    for session in sessions {
+        let Some(tape_id) = session
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+        else {
+            continue;
+        };
+        let location = session
+            .get("location")
+            .filter(|value| value.is_object())
+            .cloned()
+            .or_else(|| {
+                session
+                    .get("store")
+                    .and_then(Value::as_str)
+                    .map(|store| {
+                        let machine = store
+                            .split_once('/')
+                            .map(|(machine, _)| machine)
+                            .unwrap_or(self_machine);
+                        json!({"machine": machine, "store": store})
+                    })
+            })
+            .unwrap_or_else(|| local_grep_location(context, self_machine, &tape_id));
+        let machine = location
+            .get("machine")
+            .and_then(Value::as_str)
+            .unwrap_or(self_machine);
+        let store = location
+            .get("store")
+            .and_then(Value::as_str)
+            .unwrap_or("local-files");
+        session["location"] = location.clone();
+        if session.get("store").and_then(Value::as_str).is_none() {
+            session["store"] = json!(store);
+        }
+
+        let tape_file = session
+            .get("physical_identity")
+            .and_then(|identity| identity.get("file"))
+            .filter(|file| !file.is_null())
+            .cloned()
+            .or_else(|| {
+                (machine == self_machine)
+                    .then(|| resolve_tape_path(context, &tape_id))
+                    .flatten()
+                    .map(|path| {
+                        json!({
+                            "machine": machine,
+                            "path": path,
+                            "kind": "tape",
+                        })
+                    })
+            });
+        if session
+            .get("physical_identity")
+            .is_none_or(|identity| !identity.is_object())
+        {
+            session["physical_identity"] = json!({
+                "machine": machine,
+                "store": store,
+                "tape_id": tape_id,
+                "file": tape_file,
+            });
+        } else if session["physical_identity"]
+            .get("file")
+            .is_none_or(Value::is_null)
+            && let Some(file) = tape_file.as_ref()
+        {
+            session["physical_identity"]["file"] = file.clone();
+        }
+
+        let window_start = session
+            .get("window_start")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let window_end = session
+            .get("window_end")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let total_lines = session
+            .get("total_lines")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let window_ready = window_start > 0
+            && window_end >= window_start
+            && window_end <= total_lines
+            && total_lines > 0;
+        let mut argv = vec![json!("engram"), json!("peek"), json!(tape_id)];
+        if machine != self_machine && store.contains('/') {
+            argv.push(json!("--store"));
+            argv.push(json!(store));
+        }
+        if window_ready {
+            argv.push(json!("--start"));
+            argv.push(json!(window_start.to_string()));
+            argv.push(json!("--lines"));
+            argv.push(json!(
+                window_end
+                    .saturating_sub(window_start)
+                    .saturating_add(1)
+                    .to_string()
+            ));
+        }
+
+        let timestamp = session
+            .get("timestamp")
+            .filter(|value| value.as_str().is_some_and(|value| !value.is_empty()))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let files_touched = session
+            .get("files_touched")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        let (evidence_label, evidence_basis) = explain_evidence_label(
+            cwd,
+            session,
+            target_file,
+            exact_edit_sessions,
+            &handoff_tape_ids,
+        );
+        session["evidence"] = json!({
+            "label": evidence_label,
+            "basis": evidence_basis,
+            "recorded_handoff": handoff_tape_ids.contains(&tape_id),
+            "rationale_status": "not_established_by_provenance_links",
+            "rationale_note": "A matching anchor, edit touch, or graph root does not establish the original decision or intent.",
+        });
+        session["next_lookup"] = json!({
+            "status": if window_ready { "ready" } else { "window_not_returned" },
+            "machine": machine,
+            "store": store,
+            "file": tape_file,
+            "files_touched": files_touched,
+            "time": timestamp,
+            "transcript_window": {
+                "start": window_start,
+                "end": window_end,
+                "total_lines": total_lines,
+            },
+            "argv": argv,
+            "reason": if window_ready { Value::Null } else { json!("The searched source did not return a bounded transcript window; peek will use its default anchor window.") },
+        });
+    }
 }
 
 fn peer_failure_status(code: &str) -> &'static str {
