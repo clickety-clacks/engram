@@ -54,8 +54,10 @@ impl FileIdentityResolver {
         target_path: &Path,
         evidence_path: &Path,
     ) -> FileIdentityRelation {
-        let target_path = normalize_absolute(target_path);
-        let evidence_path = normalize_absolute(evidence_path);
+        let target_path = canonicalize_absolute_with_missing_tail(target_path)
+            .unwrap_or_else(|| normalize_absolute(target_path));
+        let evidence_path = canonicalize_absolute_with_missing_tail(evidence_path)
+            .unwrap_or_else(|| normalize_absolute(evidence_path));
         if same_path(&target_path, &evidence_path) {
             return FileIdentityRelation::SamePhysicalPath;
         }
@@ -83,7 +85,8 @@ impl FileIdentityResolver {
     }
 
     fn identity_for(&mut self, path: &Path) -> Option<GitFileIdentity> {
-        let path = normalize_absolute(path);
+        let path = canonicalize_absolute_with_missing_tail(path)
+            .unwrap_or_else(|| normalize_absolute(path));
         if let Some(identity) = self.cache.get(&path) {
             return identity.clone();
         }
@@ -124,6 +127,28 @@ fn normalize_absolute(path: &Path) -> PathBuf {
         }
     }
     normalized
+}
+
+/// Resolve symlink aliases in the existing prefix while preserving a missing
+/// suffix. macOS commonly exposes temporary directories through both `/var`
+/// and `/private/var`; Git reports the physical root, so leaving the source
+/// path lexical makes a real file appear outside its own repository.
+fn canonicalize_absolute_with_missing_tail(path: &Path) -> Option<PathBuf> {
+    let normalized = normalize_absolute(path);
+    if !normalized.is_absolute() {
+        return None;
+    }
+    let mut existing = normalized.as_path();
+    let mut missing = Vec::new();
+    while !existing.exists() {
+        missing.push(existing.file_name()?.to_os_string());
+        existing = existing.parent()?;
+    }
+    let mut canonical = fs::canonicalize(existing).ok()?;
+    for component in missing.iter().rev() {
+        canonical.push(component);
+    }
+    Some(canonical)
 }
 
 fn path_components(path: &Path) -> Vec<String> {
@@ -365,6 +390,27 @@ mod tests {
                 &missing_checkout.join("scripts/verify_mix.sh")
             ),
             FileIdentityRelation::Unknown
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_paths_through_symlink_alias_share_physical_identity() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp_path(&temp, "repo");
+        let _head = init_repo(&repo, "line\n");
+        let alias = temp_path(&temp, "repo-alias");
+        symlink(&repo, &alias).expect("symlink repository alias");
+
+        let mut resolver = FileIdentityResolver::default();
+        assert_eq!(
+            resolver.relation_absolute(
+                &repo.join("scripts/verify_mix.sh"),
+                &alias.join("scripts/verify_mix.sh")
+            ),
+            FileIdentityRelation::SamePhysicalPath
         );
     }
 
