@@ -420,6 +420,21 @@ fn explain_file_range_prioritizes_exact_edits_before_default_page_locally_and_re
             .iter()
             .any(|session| session["session_id"] == remote_exact_id)
     );
+    let remote_exact_position = federated_result["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|session| session["session_id"] == remote_exact_id)
+        .expect("remote exact-shaped edit remains in ordinary results");
+    assert!(
+        remote_exact_position > 0,
+        "unknown remote path identity must not receive exact-span priority"
+    );
+    let remote_exact = &federated_result["sessions"][remote_exact_position];
+    assert_eq!(remote_exact["evidence"]["label"], "file_identity_unknown");
+    assert_eq!(remote_exact["evidence"]["file_identity"], "unknown");
+    assert_eq!(remote_exact["evidence"]["matched_kind"], "edit");
+    assert!(remote_exact["tape_facts"].get("span_edit_match").is_none());
     assert!(
         federated_result["sessions"][0]["tape_facts"]
             .get("span_edit_match")
@@ -466,7 +481,13 @@ fn explain_file_range_prioritizes_exact_edits_before_default_page_locally_and_re
         .iter()
         .find(|session| session["session_id"] == remote_exact_id)
         .expect("remote exact-shaped session");
+    assert_eq!(
+        remote_exact_session["evidence"]["label"],
+        "file_identity_unknown"
+    );
     assert_eq!(remote_exact_session["evidence"]["file_identity"], "unknown");
+    assert_eq!(remote_exact_session["evidence"]["matched_kind"], "edit");
+    assert!(remote_exact_session["tape_facts"]["span_edit_match"].is_null());
     assert_eq!(
         remote_exact_session["evidence"]["source_revision"],
         repo_head
