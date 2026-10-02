@@ -1,12 +1,14 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 use serde::Deserializer;
 use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
-use serde_json::value::RawValue;
+use serde_json::{Value, value::RawValue};
+
+use crate::query::format::{DateFilter, EventTimeDecision};
 
 const MAX_GREP_SCAN_WORKERS: usize = 4;
 const MAX_GREP_SCAN_UNCONSUMED: usize = 1_024;
@@ -19,6 +21,8 @@ pub(crate) struct GrepTapeSummary {
     pub(crate) match_count: usize,
     pub(crate) provenance_match_count: usize,
     pub(crate) provenance_event_count: usize,
+    pub(crate) unknown_time_evidence_count: usize,
+    pub(crate) unknown_time_match_count: usize,
     pub(crate) timestamp: String,
     pub(crate) total_lines: usize,
     pub(crate) anchor_line: usize,
@@ -795,10 +799,20 @@ fn read_grep_record<R: BufRead>(
 /// Scan one compressed JSONL tape without retaining the complete decompressed tape.
 /// A missing record limit is used only for the local path, whose existing
 /// contract has no configured per-record limit.
+#[cfg(test)]
 pub(crate) fn scan_grep_reader<R: Read>(
     compressed: R,
     record_limit: Option<u64>,
     pattern: &str,
+) -> Result<GrepTapeSummary, GrepScanError> {
+    scan_grep_reader_with_date(compressed, record_limit, pattern, None)
+}
+
+pub(crate) fn scan_grep_reader_with_date<R: Read>(
+    compressed: R,
+    record_limit: Option<u64>,
+    pattern: &str,
+    date_filter: Option<&DateFilter>,
 ) -> Result<GrepTapeSummary, GrepScanError> {
     let decoder = zstd::stream::read::Decoder::new(compressed)
         .map_err(|error| GrepScanError::new("decompress_error", error.to_string()))?;
@@ -809,6 +823,8 @@ pub(crate) fn scan_grep_reader<R: Read>(
     let mut match_count = 0usize;
     let mut provenance_match_count = 0usize;
     let mut provenance_event_count = 0usize;
+    let mut unknown_time_evidence_count = 0usize;
+    let mut unknown_time_match_count = 0usize;
     let mut first_match = None;
     let mut first_provenance_match = None;
     let mut timestamp = String::new();
@@ -845,10 +861,39 @@ pub(crate) fn scan_grep_reader<R: Read>(
 
         let event = parse_grep_event(&line[..content_end], pattern)
             .map_err(|error| GrepScanError::new("json_error", error.to_string()))?;
-        if let Some(row_timestamp) = event.timestamp.and_then(decoded_string)
-            && row_timestamp.as_ref() > timestamp.as_str()
+        let provenance = event.kind.is_some_and(|kind| {
+            decoded_string(kind).is_some_and(|kind| {
+                matches!(kind.as_ref(), "code.edit" | "code.read" | "span.link")
+            })
+        });
+        let evidence_bearing = event.kind.is_some_and(|kind| {
+            decoded_string(kind).is_some_and(|kind| kind.as_ref() != "meta")
+        });
+        let event_matches = event.matches(pattern);
+        let row_timestamp = event.timestamp.and_then(decoded_string);
+        let time_decision = date_filter.map_or(EventTimeDecision::Included, |filter| {
+            filter.event_time(row_timestamp.as_deref())
+        });
+        match time_decision {
+            EventTimeDecision::Included => {}
+            EventTimeDecision::Excluded => continue,
+            EventTimeDecision::Unknown => {
+                if evidence_bearing {
+                    unknown_time_evidence_count = unknown_time_evidence_count.saturating_add(1);
+                }
+                if event_matches {
+                    unknown_time_match_count = unknown_time_match_count.saturating_add(1);
+                }
+                continue;
+            }
+        }
+        if let Some(row_timestamp) = row_timestamp.as_deref()
+            && let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(row_timestamp)
+            && (timestamp.is_empty()
+                || chrono::DateTime::parse_from_rfc3339(&timestamp)
+                    .is_ok_and(|current| parsed > current))
         {
-            timestamp = row_timestamp.into_owned();
+            timestamp = row_timestamp.to_owned();
         }
         for file in [event.file, event.from_file, event.to_file]
             .into_iter()
@@ -857,16 +902,10 @@ pub(crate) fn scan_grep_reader<R: Read>(
         {
             files_touched.insert(file.into_owned());
         }
-
-        let provenance = event.kind.is_some_and(|kind| {
-            decoded_string(kind).is_some_and(|kind| {
-                matches!(kind.as_ref(), "code.edit" | "code.read" | "span.link")
-            })
-        });
         if provenance {
             provenance_event_count = provenance_event_count.saturating_add(1);
         }
-        if event.matches(pattern) {
+        if event_matches {
             match_count = match_count.saturating_add(1);
             first_match.get_or_insert(line_offset);
             if provenance {
@@ -887,6 +926,8 @@ pub(crate) fn scan_grep_reader<R: Read>(
         match_count,
         provenance_match_count,
         provenance_event_count,
+        unknown_time_evidence_count,
+        unknown_time_match_count,
         timestamp,
         total_lines,
         anchor_line: usize::try_from(anchor_offset)
@@ -894,6 +935,68 @@ pub(crate) fn scan_grep_reader<R: Read>(
             .saturating_add(1),
         files_touched,
     })
+}
+
+/// Read timestamps for a bounded set of original JSONL offsets without
+/// retaining the rest of a compressed tape. Missing or malformed target rows
+/// remain present with an unknown timestamp so callers cannot treat them as
+/// eligible evidence.
+pub(crate) fn read_tape_event_timestamps<R: Read>(
+    compressed: R,
+    target_offsets: &HashSet<u64>,
+    record_limit: Option<u64>,
+    decompressed_limit: Option<u64>,
+) -> Result<HashMap<u64, Option<String>>, GrepScanError> {
+    let mut timestamps = target_offsets
+        .iter()
+        .copied()
+        .map(|offset| (offset, None))
+        .collect::<HashMap<_, _>>();
+    let Some(last_offset) = target_offsets.iter().max().copied() else {
+        return Ok(timestamps);
+    };
+    let decoder = zstd::stream::read::Decoder::new(compressed)
+        .map_err(|error| GrepScanError::new("decompress_error", error.to_string()))?;
+    let mut reader = BufReader::new(decoder);
+    let mut line = Vec::new();
+    let mut bytes_read = 0u64;
+    let mut line_offset = 0u64;
+    loop {
+        line.clear();
+        let bytes = read_grep_record(
+            &mut reader,
+            &mut line,
+            record_limit,
+            usize::try_from(line_offset.saturating_add(1)).unwrap_or(usize::MAX),
+            bytes_read,
+        )?;
+        if bytes == 0 {
+            break;
+        }
+        bytes_read = bytes_read.saturating_add(bytes as u64);
+        if decompressed_limit.is_some_and(|limit| bytes_read > limit) {
+            return Err(GrepScanError::new(
+                "over_limit",
+                format!("decompressed tape exceeds {} byte limit", decompressed_limit.unwrap_or_default()),
+            ));
+        }
+        if target_offsets.contains(&line_offset) {
+            let content = line
+                .strip_suffix(b"\n")
+                .unwrap_or(&line)
+                .strip_suffix(b"\r")
+                .unwrap_or_else(|| line.strip_suffix(b"\n").unwrap_or(&line));
+            let timestamp = serde_json::from_slice::<Value>(content)
+                .ok()
+                .and_then(|row| row.get("t").and_then(Value::as_str).map(ToOwned::to_owned));
+            timestamps.insert(line_offset, timestamp);
+        }
+        if line_offset >= last_offset {
+            break;
+        }
+        line_offset = line_offset.saturating_add(1);
+    }
+    Ok(timestamps)
 }
 
 /// Run a bounded worker pool over sorted tasks, delivering results in input order.
@@ -1009,6 +1112,7 @@ fn grep_scan_worker_count(task_count: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query::format::DateFilter;
     use std::sync::Condvar;
 
     #[derive(Default)]
@@ -1102,6 +1206,39 @@ mod tests {
             zstd::stream::encode_all(&b"{bad json}\n"[..], 0).expect("compress bad tape");
         let error = scan_grep_reader(&malformed[..], Some(1024), "needle").unwrap_err();
         assert_eq!(error.code, "json_error");
+    }
+
+    #[test]
+    fn dated_scan_selects_each_event_and_reports_unknown_time_without_backdating_quotes() {
+        let content = concat!(
+            "{\"t\":\"2026-10-01T23:59:59.999999999Z\",\"k\":\"msg.in\",\"content\":\"needle before cutoff\"}\n",
+            "{\"t\":\"2026-10-02T00:00:00Z\",\"k\":\"msg.in\",\"content\":\"later quote old ruling needle\"}\n",
+            "{\"t\":\"2026-10-02T00:00:01Z\",\"k\":\"code.edit\",\"file\":\"after.rs\",\"after_text\":\"needle after cutoff\"}\n",
+            "{\"k\":\"msg.in\",\"content\":\"needle with unknown time\"}\n",
+            "{\"t\":\"2026-10-01T23:59:59Z\",\"k\":\"code.edit\",\"file\":\"before.rs\",\"after_text\":\"eligible evidence\"}\n",
+        );
+        let compressed = zstd::stream::encode_all(content.as_bytes(), 0).expect("compress tape");
+        let filter = DateFilter::parse(Some("2026-10-01T19:59:59-04:00"), Some("2026-10-01"))
+            .expect("parse bounds");
+        let summary = scan_grep_reader_with_date(&compressed[..], Some(2048), "needle", Some(&filter))
+            .expect("scan dated tape");
+
+        assert_eq!(summary.match_count, 1);
+        assert_eq!(summary.anchor_line, 1, "original tape offset is retained");
+        assert_eq!(summary.timestamp, "2026-10-01T23:59:59.999999999Z");
+        assert_eq!(summary.files_touched, ["before.rs"]);
+        assert_eq!(summary.provenance_event_count, 1);
+        assert_eq!(summary.unknown_time_evidence_count, 1);
+        assert_eq!(summary.unknown_time_match_count, 1);
+
+        let quoted = scan_grep_reader_with_date(
+            &compressed[..],
+            Some(2048),
+            "old ruling",
+            Some(&filter),
+        )
+        .expect("scan quoted later event");
+        assert_eq!(quoted.match_count, 0, "quoted dates do not change event time");
     }
 
     #[test]

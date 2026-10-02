@@ -12,14 +12,15 @@ use crate::index::lineage::{
 };
 use crate::index::{DispatchDirection, EdgeRow, ReaderMode, ReaderOpenError, SqliteIndex};
 use crate::query::explain::{
-    ExplainResult, ExplainTraversal, PrettyConfidenceTier, explain_across_indexes_by_anchor,
-    pretty_tier,
+    ExplainResult, ExplainTraversal, PrettyConfidenceTier, TemporalUnknownEvents,
+    explain_across_indexes_by_anchor, explain_across_indexes_by_anchor_at, pretty_tier,
 };
 use crate::query::file_identity::{FileIdentityRelation, FileIdentityResolver};
 pub use crate::store::tapes::{TapeRow, parse_jsonl_rows, print_json};
 use crate::store::tapes::{event_window, read_tape_content, resolve_tape_path, tape_id_from_path};
 use crate::tape::grep::{
-    grep_line_matches as decoded_grep_line_matches, scan_grep_reader, scan_parallel_in_order,
+    grep_line_matches as decoded_grep_line_matches, scan_grep_reader_with_date,
+    read_tape_event_timestamps, scan_parallel_in_order,
 };
 use crate::{CliError, RuntimeContext, path_string};
 
@@ -157,6 +158,42 @@ pub fn collect_anchor_scores(
     Ok(out)
 }
 
+pub fn collect_anchor_scores_with_date(
+    indexes: &[SqliteIndex],
+    anchors: &[String],
+    date_filter: &DateFilter,
+) -> Result<(HashMap<String, f32>, TemporalUnknownEvents), CliError> {
+    if anchors.is_empty() {
+        return Ok((HashMap::new(), HashSet::new()));
+    }
+    let mut by_tape = HashMap::<String, HashSet<String>>::new();
+    let mut unknown = TemporalUnknownEvents::new();
+    for (index_id, index) in indexes.iter().enumerate() {
+        for anchor in anchors {
+            for fragment in index.evidence_for_anchor(anchor)? {
+                match date_filter.event_time(Some(&fragment.timestamp)) {
+                    EventTimeDecision::Included => {
+                        by_tape
+                            .entry(fragment.tape_id)
+                            .or_default()
+                            .insert(anchor.clone());
+                    }
+                    EventTimeDecision::Excluded => {}
+                    EventTimeDecision::Unknown => {
+                        unknown.insert((index_id, fragment.tape_id, fragment.event_offset));
+                    }
+                }
+            }
+        }
+    }
+    let denominator = anchors.len() as f32;
+    let scores = by_tape
+        .into_iter()
+        .map(|(tape_id, hits)| (tape_id, hits.len() as f32 / denominator))
+        .collect();
+    Ok((scores, unknown))
+}
+
 pub fn collect_grep_matches(
     context: &RuntimeContext,
     indexes: &[SqliteIndex],
@@ -184,6 +221,8 @@ pub struct GrepScanOutput {
     pub ranks: HashMap<String, GrepRank>,
     pub workers: usize,
     pub scanned_tapes: usize,
+    pub unknown_time_evidence_events: usize,
+    pub unknown_time_matching_events: usize,
 }
 
 pub fn prepare_grep_scan(
@@ -243,14 +282,24 @@ pub fn prepare_grep_scan_with_tape_ids(
 }
 
 pub fn run_grep_scan(work: GrepScanWork, pattern: &str) -> Result<GrepScanOutput, CliError> {
+    run_grep_scan_with_date(work, pattern, None)
+}
+
+pub fn run_grep_scan_with_date(
+    work: GrepScanWork,
+    pattern: &str,
+    date_filter: Option<&DateFilter>,
+) -> Result<GrepScanOutput, CliError> {
     let scanned_tapes = work.tasks.len();
     let mut raw_sessions = Vec::new();
     let mut ranks = HashMap::new();
+    let mut unknown_time_evidence_events = 0usize;
+    let mut unknown_time_matching_events = 0usize;
     let workers = scan_parallel_in_order(
         &work.tasks,
         |task| {
             let file = File::open(&task.path).map_err(|error| CliError::io("read_error", error))?;
-            scan_grep_reader(file, None, pattern)
+            scan_grep_reader_with_date(file, None, pattern, date_filter)
                 .map_err(|error| CliError::new(error.code, error.message))
         },
         |result| match result {
@@ -262,6 +311,10 @@ pub fn run_grep_scan(work: GrepScanWork, pattern: &str) -> Result<GrepScanOutput
         },
         |task, result| -> Result<(), CliError> {
             let summary = result?;
+            unknown_time_evidence_events = unknown_time_evidence_events
+                .saturating_add(summary.unknown_time_evidence_count);
+            unknown_time_matching_events = unknown_time_matching_events
+                .saturating_add(summary.unknown_time_match_count);
             if summary.match_count == 0 {
                 return Ok(());
             }
@@ -278,6 +331,9 @@ pub fn run_grep_scan(work: GrepScanWork, pattern: &str) -> Result<GrepScanOutput
                 "grep_total_lines": summary.total_lines,
                 "grep_files_touched": summary.files_touched,
                 "grep_anchor_line": summary.anchor_line,
+                "grep_match_count": summary.match_count,
+                "grep_provenance_match_count": summary.provenance_match_count,
+                "grep_provenance_event_count": summary.provenance_event_count,
             }));
             ranks.insert(
                 task.tape_id.clone(),
@@ -295,6 +351,8 @@ pub fn run_grep_scan(work: GrepScanWork, pattern: &str) -> Result<GrepScanOutput
         ranks,
         workers,
         scanned_tapes,
+        unknown_time_evidence_events,
+        unknown_time_matching_events,
     })
 }
 
@@ -337,7 +395,7 @@ pub fn compare_grep_sessions(
                 .provenance_event_count
                 .cmp(&a_rank.provenance_event_count)
         })
-        .then_with(|| b_ts.cmp(a_ts))
+        .then_with(|| compare_timestamp_strings(b_ts, a_ts))
         .then_with(|| a_session_id.cmp(b_session_id))
 }
 
@@ -362,7 +420,7 @@ pub fn compare_explain_sessions(a: &Value, b: &Value) -> std::cmp::Ordering {
     b_score
         .total_cmp(&a_score)
         .then_with(|| b_touch_count.cmp(&a_touch_count))
-        .then_with(|| b_ts.cmp(a_ts))
+        .then_with(|| compare_timestamp_strings(b_ts, a_ts))
         .then_with(|| a_depth.cmp(&b_depth))
         .then_with(|| a_session_id.cmp(b_session_id))
 }
@@ -584,7 +642,10 @@ pub fn format_sessions_for_agent(
                 })
                 .unwrap_or_default()
         };
-        if files_touched.is_empty() && !grep_prepared {
+        if files_touched.is_empty()
+            && !grep_prepared
+            && raw.get("event_time_filtered").and_then(Value::as_bool) != Some(true)
+        {
             for file in collect_files_touched_from_rows(&rows) {
                 files_touched.insert(file);
             }
@@ -611,19 +672,35 @@ pub fn format_sessions_for_agent(
             });
         let touches = raw.get("touches").cloned().unwrap_or_else(|| json!([]));
 
-        out.push(json!({
+        let mut session = json!({
             "session_id": session_id,
             "timestamp": timestamp,
             "window_start": window_start,
             "window_end": window_end,
             "total_lines": total_lines,
+            "physical_total_lines": if grep_prepared { json!(total_lines) } else { Value::Null },
             "confidence": score_by_session.get(session_id).copied().unwrap_or(0.0),
             "refs_up": refs_up,
             "refs_down": refs_down,
             "repo_head": raw.get("repo_head").cloned().unwrap_or(Value::Null),
             "files_touched": files_touched,
             "touches": touches,
-        }));
+        });
+        if grep_prepared {
+            session["match_count"] = raw
+                .get("grep_match_count")
+                .cloned()
+                .unwrap_or_else(|| json!(0));
+            session["provenance_match_count"] = raw
+                .get("grep_provenance_match_count")
+                .cloned()
+                .unwrap_or_else(|| json!(0));
+            session["provenance_event_count"] = raw
+                .get("grep_provenance_event_count")
+                .cloned()
+                .unwrap_or_else(|| json!(0));
+        }
+        out.push(session);
     }
 
     Ok(out)
@@ -655,7 +732,7 @@ pub fn dispatch_ref_counts(
 pub fn extract_latest_timestamp_from_rows(rows: &[TapeRow]) -> String {
     rows.iter()
         .filter_map(|row| row.value.get("t").and_then(Value::as_str))
-        .max()
+        .max_by(|left, right| compare_timestamp_strings(left, right))
         .unwrap_or("")
         .to_string()
 }
@@ -699,7 +776,7 @@ pub fn apply_session_truncation(
         .filter(|timestamp| !timestamp.is_empty())
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
-    timestamps.sort();
+    timestamps.sort_by(|left, right| compare_timestamp_strings(left, right));
 
     let time_range = if timestamps.is_empty() {
         json!({"start": Value::Null, "end": Value::Null})
@@ -720,6 +797,18 @@ pub fn apply_session_truncation(
     (sessions, returned_count, total, time_range, truncated)
 }
 
+pub fn compare_timestamp_strings(left: &str, right: &str) -> std::cmp::Ordering {
+    match (
+        chrono::DateTime::parse_from_rfc3339(left),
+        chrono::DateTime::parse_from_rfc3339(right),
+    ) {
+        (Ok(left), Ok(right)) => left.cmp(&right),
+        (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
+        (Err(_), Ok(_)) => std::cmp::Ordering::Less,
+        (Err(_), Err(_)) => left.cmp(right),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DateFilter {
     since: Option<chrono::DateTime<Utc>>,
@@ -733,6 +822,45 @@ impl DateFilter {
             until: parse_date_bound(until, DateBound::Until)?,
         })
     }
+
+    pub fn is_bounded(&self) -> bool {
+        self.since.is_some() || self.until.is_some()
+    }
+
+    pub fn since_rfc3339(&self) -> Option<String> {
+        self.since.map(|value| value.to_rfc3339())
+    }
+
+    pub fn until_rfc3339(&self) -> Option<String> {
+        self.until.map(|value| value.to_rfc3339())
+    }
+
+    pub fn event_time(&self, raw: Option<&str>) -> EventTimeDecision {
+        if !self.is_bounded() {
+            return EventTimeDecision::Included;
+        }
+        let Some(raw) = raw.filter(|value| !value.is_empty()) else {
+            return EventTimeDecision::Unknown;
+        };
+        let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(raw) else {
+            return EventTimeDecision::Unknown;
+        };
+        let timestamp = parsed.with_timezone(&Utc);
+        if self.since.is_some_and(|since| timestamp < since)
+            || self.until.is_some_and(|until| timestamp > until)
+        {
+            EventTimeDecision::Excluded
+        } else {
+            EventTimeDecision::Included
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventTimeDecision {
+    Included,
+    Excluded,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -755,7 +883,7 @@ pub(crate) fn parse_date_bound(
     if let Ok(date) = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
         let dt = match bound {
             DateBound::Since => date.and_hms_opt(0, 0, 0),
-            DateBound::Until => date.and_hms_opt(23, 59, 59),
+            DateBound::Until => date.and_hms_nano_opt(23, 59, 59, 999_999_999),
         }
         .ok_or_else(|| CliError::new("invalid_date", raw.to_string()))?;
         return Ok(Some(chrono::DateTime::<Utc>::from_naive_utc_and_offset(
@@ -1161,6 +1289,46 @@ pub fn collect_touch_evidence(
     Ok(out)
 }
 
+pub fn collect_touch_evidence_with_date(
+    indexes: &[SqliteIndex],
+    direct: &[EvidenceFragmentRef],
+    touched_anchors: &[String],
+    date_filter: &DateFilter,
+) -> Result<(Vec<EvidenceFragmentRef>, TemporalUnknownEvents), CliError> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    let mut unknown = TemporalUnknownEvents::new();
+    for fragment in direct {
+        match date_filter.event_time(Some(&fragment.timestamp)) {
+            EventTimeDecision::Included => {
+                if seen.insert(touch_key(fragment)) {
+                    out.push(fragment.clone());
+                }
+            }
+            EventTimeDecision::Excluded => {}
+            EventTimeDecision::Unknown => {}
+        }
+    }
+    for (index_id, index) in indexes.iter().enumerate() {
+        for anchor in touched_anchors {
+            for fragment in index.evidence_for_anchor(anchor)? {
+                match date_filter.event_time(Some(&fragment.timestamp)) {
+                    EventTimeDecision::Included => {
+                        if seen.insert(touch_key(&fragment)) {
+                            out.push(fragment);
+                        }
+                    }
+                    EventTimeDecision::Excluded => {}
+                    EventTimeDecision::Unknown => {
+                        unknown.insert((index_id, fragment.tape_id, fragment.event_offset));
+                    }
+                }
+            }
+        }
+    }
+    Ok((out, unknown))
+}
+
 pub fn explain_across_indexes(
     indexes: &[SqliteIndex],
     anchors: &[String],
@@ -1213,6 +1381,60 @@ pub fn explain_across_indexes(
     })
 }
 
+pub fn explain_across_indexes_with_date(
+    context: &RuntimeContext,
+    indexes: &[SqliteIndex],
+    anchors: &[String],
+    traversal: ExplainTraversal,
+    include_forensics: bool,
+    date_filter: &DateFilter,
+) -> Result<(ExplainResult, TemporalUnknownEvents), CliError> {
+    explain_across_indexes_by_anchor_at(
+        indexes,
+        anchors,
+        traversal,
+        include_forensics,
+        date_filter,
+        |_, tape_id, offsets| load_local_event_timestamps(context, tape_id, offsets),
+    )
+}
+
+pub fn load_local_event_timestamps(
+    context: &RuntimeContext,
+    tape_id: &str,
+    offsets: &HashSet<u64>,
+) -> Result<HashMap<u64, Option<String>>, CliError> {
+    let Some(path) = resolve_tape_path(context, tape_id) else {
+        return Ok(offsets
+            .iter()
+            .copied()
+            .map(|offset| (offset, None))
+            .collect());
+    };
+    let file = crate::platform::open_read_nofollow(&path)
+        .map_err(|error| CliError::io("read_error", error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| CliError::io("read_error", error))?;
+    if !metadata.file_type().is_file() {
+        return Err(CliError::new("invalid_file", "tape path is not a regular file"));
+    }
+    let compressed_limit = crate::access::client::DEFAULT_READ_FILE_COMPRESSED_BYTES;
+    if metadata.len() > compressed_limit {
+        return Err(CliError::new(
+            "over_limit",
+            format!("compressed tape exceeds {compressed_limit} byte limit"),
+        ));
+    }
+    read_tape_event_timestamps(
+        file,
+        offsets,
+        Some(16 * 1024 * 1024),
+        Some(crate::access::client::DEFAULT_DECOMPRESSED_BYTES_PER_TAPE),
+    )
+    .map_err(|error| CliError::new(error.code, error.message))
+}
+
 pub(crate) fn touch_key(fragment: &EvidenceFragmentRef) -> String {
     format!(
         "{}:{}:{}:{}:{}",
@@ -1257,7 +1479,7 @@ pub fn build_session_windows(
         let latest_touch_timestamp = tape_touches
             .iter()
             .map(|touch| touch.timestamp.as_str())
-            .max()
+            .max_by(|left, right| compare_timestamp_strings(left, right))
             .unwrap_or("")
             .to_string();
 
@@ -1297,7 +1519,7 @@ pub fn build_session_windows(
             .unwrap_or("");
         b_touch_count
             .cmp(&a_touch_count)
-            .then_with(|| b_latest.cmp(a_latest))
+            .then_with(|| compare_timestamp_strings(b_latest, a_latest))
     });
 
     Ok(sessions)
@@ -1487,6 +1709,8 @@ pub fn compact_event(offset: u64, event: &Value) -> Value {
 
 pub fn edge_to_json(edge: &EdgeRow) -> Value {
     json!({
+        "source_tape_id": edge.source_tape_id,
+        "source_event_offset": edge.source_event_offset,
         "from_anchor": edge.from_anchor,
         "to_anchor": edge.to_anchor,
         "confidence": edge.confidence,

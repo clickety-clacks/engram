@@ -33,6 +33,8 @@ const FEATURE_WINDOW_ANCHORS_SQL: &str = "SELECT w.anchor
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EdgeRow {
+    pub source_tape_id: String,
+    pub source_event_offset: u64,
     pub from_anchor: String,
     pub to_anchor: String,
     pub confidence: f32,
@@ -656,6 +658,7 @@ impl SqliteIndex {
             from_anchor,
             min_confidence,
             include_forensics,
+            true,
         )
     }
 
@@ -665,7 +668,37 @@ impl SqliteIndex {
         min_confidence: f32,
         include_forensics: bool,
     ) -> rusqlite::Result<Vec<EdgeRow>> {
-        self.edges_for_anchor("to_anchor", to_anchor, min_confidence, include_forensics)
+        self.edges_for_anchor("to_anchor", to_anchor, min_confidence, include_forensics, true)
+    }
+
+    pub fn outbound_edges_with_sources(
+        &self,
+        from_anchor: &str,
+        min_confidence: f32,
+        include_forensics: bool,
+    ) -> rusqlite::Result<Vec<EdgeRow>> {
+        self.edges_for_anchor(
+            "from_anchor",
+            from_anchor,
+            min_confidence,
+            include_forensics,
+            false,
+        )
+    }
+
+    pub fn inbound_edges_with_sources(
+        &self,
+        to_anchor: &str,
+        min_confidence: f32,
+        include_forensics: bool,
+    ) -> rusqlite::Result<Vec<EdgeRow>> {
+        self.edges_for_anchor(
+            "to_anchor",
+            to_anchor,
+            min_confidence,
+            include_forensics,
+            false,
+        )
     }
 
     fn edges_for_anchor(
@@ -674,10 +707,11 @@ impl SqliteIndex {
         anchor: &str,
         min_confidence: f32,
         include_forensics: bool,
+        deduplicate_semantics: bool,
     ) -> rusqlite::Result<Vec<EdgeRow>> {
         let sql = format!(
-            "SELECT from_anchor, to_anchor, confidence, location_delta, cardinality,
-                    agent_link, note
+            "SELECT tape_id, event_offset, from_anchor, to_anchor, confidence,
+                    location_delta, cardinality, agent_link, note
              FROM edges
              WHERE {column} = ?1
              ORDER BY confidence DESC, edge_id ASC"
@@ -688,7 +722,7 @@ impl SqliteIndex {
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
             let edge = decode_edge_row(row)?;
-            if !seen.insert(semantic_edge_key(&edge)) {
+            if deduplicate_semantics && !seen.insert(semantic_edge_key(&edge)) {
                 continue;
             }
             if !include_forensics
@@ -1107,15 +1141,17 @@ pub(crate) fn semantic_edge_key(
 }
 
 fn decode_edge_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EdgeRow> {
-    let confidence = row.get(2)?;
-    let agent_link = row.get::<_, i64>(5)? != 0;
-    let note: String = row.get(6)?;
+    let confidence = row.get(4)?;
+    let agent_link = row.get::<_, i64>(7)? != 0;
+    let note: String = row.get(8)?;
     Ok(EdgeRow {
-        from_anchor: row.get(0)?,
-        to_anchor: row.get(1)?,
+        source_tape_id: row.get(0)?,
+        source_event_offset: row.get(1)?,
+        from_anchor: row.get(2)?,
+        to_anchor: row.get(3)?,
         confidence,
-        location_delta: decode_location_delta(&row.get::<_, String>(3)?),
-        cardinality: decode_cardinality(&row.get::<_, String>(4)?),
+        location_delta: decode_location_delta(&row.get::<_, String>(5)?),
+        cardinality: decode_cardinality(&row.get::<_, String>(6)?),
         agent_link,
         note: (!note.is_empty()).then_some(note),
         stored_class: derive_stored_class(agent_link, confidence),

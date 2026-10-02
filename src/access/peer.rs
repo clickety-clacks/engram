@@ -25,13 +25,15 @@ use crate::index::{
 };
 use crate::query::file_identity::{FileIdentityRelation, FileIdentityResolver};
 use crate::query::format::{
-    DateFilter, collect_files_touched_from_rows, edge_to_json, extract_latest_timestamp_from_rows,
-    session_matches_date_filter, structured_edit_overlaps_span,
+    DateFilter, EventTimeDecision, collect_files_touched_from_rows,
+    compare_timestamp_strings, edge_to_json, extract_latest_timestamp_from_rows,
+    structured_edit_overlaps_span,
 };
 use crate::store::tapes::{TapeRow, parse_jsonl_rows};
 use crate::tape::compress::decompress_jsonl_with_limit;
 use crate::tape::grep::{
-    GrepTapeSummary, grep_line_matches, scan_grep_reader, scan_parallel_in_order,
+    GrepTapeSummary, grep_line_matches, read_tape_event_timestamps,
+    scan_grep_reader_with_date, scan_parallel_in_order,
 };
 
 pub const PROTOCOL_VERSION: u64 = 1;
@@ -400,7 +402,10 @@ impl PeerSession {
             "protocol": PROTOCOL_VERSION,
             "schema": SCHEMA_VERSION,
             "query_semantics": QUERY_SEMANTICS_VERSION,
-            "features": [crate::access::QUERY_FEATURE_EXACT_SPAN_EDIT_RANKING],
+            "features": [
+                crate::access::QUERY_FEATURE_EXACT_SPAN_EDIT_RANKING,
+                crate::access::QUERY_FEATURE_EVENT_TIME_BOUNDS,
+            ],
             "limits": {
                 "request_timeout_ms": configured_limit(
                     &self.topology.limits,
@@ -536,8 +541,9 @@ impl PeerSession {
         id: &Value,
         output: &mut W,
     ) -> Result<Value, PeerError> {
-        reject_unknown_keys(args, &["anchors", "include_deleted"])?;
+        reject_unknown_keys(args, &["anchors", "include_deleted", "since", "until"])?;
         let anchors = anchor_batch_with_cap(args.get("anchors"), "args.anchors", self.batch_cap())?;
+        let date_filter = peer_date_filter(args)?;
         let include_deleted = match args.get("include_deleted") {
             None => false,
             Some(Value::Bool(value)) => *value,
@@ -556,11 +562,31 @@ impl PeerSession {
         .saturating_sub(1024);
         let mut response_bytes = 0u64;
         let mut records = 0usize;
+        let mut unknown_times = HashSet::<(String, u64)>::new();
         for store in stores {
             let export = self.require_open(store)?;
             let store_ref = format!("{}/{}", self.topology.self_label, store);
             for anchor in &anchors {
-                let matching = export.index.matching_window_anchors(anchor)?;
+                let mut matching = Vec::new();
+                for candidate in export.index.matching_window_anchors(anchor)? {
+                    let mut eligible = false;
+                    if date_filter.is_bounded() {
+                        for fragment in export.index.evidence_for_anchor(&candidate)? {
+                            match date_filter.event_time(Some(&fragment.timestamp)) {
+                                EventTimeDecision::Included => eligible = true,
+                                EventTimeDecision::Excluded => {}
+                                EventTimeDecision::Unknown => {
+                                    unknown_times.insert((fragment.tape_id, fragment.event_offset));
+                                }
+                            }
+                        }
+                    } else {
+                        eligible = true;
+                    }
+                    if eligible {
+                        matching.push(candidate);
+                    }
+                }
                 records += write_anchor_result_frames(
                     output,
                     id,
@@ -572,6 +598,17 @@ impl PeerSession {
                 )?;
 
                 for fragment in export.index.evidence_for_anchor(anchor)? {
+                    if date_filter.is_bounded() {
+                        match date_filter.event_time(Some(&fragment.timestamp)) {
+                            EventTimeDecision::Included => {}
+                            EventTimeDecision::Excluded => continue,
+                            EventTimeDecision::Unknown => {
+                                unknown_times
+                                    .insert((fragment.tape_id, fragment.event_offset));
+                                continue;
+                            }
+                        }
+                    }
                     let held = self.tape_path(&export.config, &fragment.tape_id).is_some();
                     write_data_limited(
                         output,
@@ -598,6 +635,17 @@ impl PeerSession {
 
                 if include_deleted {
                     for tombstone in export.index.tombstones_for_anchor(anchor)? {
+                        if date_filter.is_bounded() {
+                            match date_filter.event_time(Some(&tombstone.timestamp)) {
+                                EventTimeDecision::Included => {}
+                                EventTimeDecision::Excluded => continue,
+                                EventTimeDecision::Unknown => {
+                                    unknown_times
+                                        .insert((tombstone.tape_id, tombstone.event_offset));
+                                    continue;
+                                }
+                            }
+                        }
                         write_data_limited(
                             output,
                             id,
@@ -623,7 +671,11 @@ impl PeerSession {
                 }
             }
         }
-        Ok(json!({"records": records}))
+        Ok(json!({
+            "records": records,
+            "unknown_time_events": unknown_times.len(),
+            "temporal_completeness": if date_filter.is_bounded() && !unknown_times.is_empty() { "partial" } else { "complete" },
+        }))
     }
 
     fn lookup_edges<W: Write>(
@@ -633,8 +685,9 @@ impl PeerSession {
         id: &Value,
         output: &mut W,
     ) -> Result<Value, PeerError> {
-        reject_unknown_keys(args, &["nodes", "min_confidence", "include_forensics"])?;
+        reject_unknown_keys(args, &["nodes", "min_confidence", "include_forensics", "since", "until"])?;
         let nodes = anchor_batch_with_cap(args.get("nodes"), "args.nodes", self.batch_cap())?;
+        let date_filter = peer_date_filter(args)?;
         let min_confidence = match args.get("min_confidence") {
             None => 0.5,
             Some(value) => value.as_f64().ok_or_else(|| {
@@ -665,6 +718,7 @@ impl PeerSession {
         .saturating_sub(1024);
         let mut response_bytes = 0u64;
         let mut records = 0usize;
+        let mut unknown_times = HashSet::<(String, u64)>::new();
         for store in stores {
             let export = self.require_open(store)?;
             let store_ref = format!("{}/{}", self.topology.self_label, store);
@@ -678,15 +732,61 @@ impl PeerSession {
                 )?;
                 records += 1;
                 let mut seen = HashSet::new();
-                let mut edges =
-                    export
+                let edges = if date_filter.is_bounded() {
+                    let mut edges = export.index.inbound_edges_with_sources(
+                        node,
+                        min_confidence,
+                        include_forensics,
+                    )?;
+                    edges.extend(export.index.outbound_edges_with_sources(
+                        node,
+                        min_confidence,
+                        include_forensics,
+                    )?);
+                    let mut by_tape = HashMap::<String, HashSet<u64>>::new();
+                    for edge in &edges {
+                        by_tape
+                            .entry(edge.source_tape_id.clone())
+                            .or_default()
+                            .insert(edge.source_event_offset);
+                    }
+                    let mut timestamps = HashMap::<(String, u64), Option<String>>::new();
+                    for (tape_id, offsets) in by_tape {
+                        for (offset, timestamp) in
+                            self.tape_event_timestamps(&export.config, &tape_id, &offsets)?
+                        {
+                            timestamps.insert((tape_id.clone(), offset), timestamp);
+                        }
+                    }
+                    edges.retain(|edge| {
+                        match date_filter.event_time(
+                            timestamps
+                                .get(&(edge.source_tape_id.clone(), edge.source_event_offset))
+                                .and_then(Option::as_deref),
+                        ) {
+                            EventTimeDecision::Included => true,
+                            EventTimeDecision::Excluded => false,
+                            EventTimeDecision::Unknown => {
+                                unknown_times.insert((
+                                    edge.source_tape_id.clone(),
+                                    edge.source_event_offset,
+                                ));
+                                false
+                            }
+                        }
+                    });
+                    edges
+                } else {
+                    let mut edges = export
                         .index
                         .inbound_edges(node, min_confidence, include_forensics)?;
-                edges.extend(export.index.outbound_edges(
-                    node,
-                    min_confidence,
-                    include_forensics,
-                )?);
+                    edges.extend(export.index.outbound_edges(
+                        node,
+                        min_confidence,
+                        include_forensics,
+                    )?);
+                    edges
+                };
                 for edge in edges {
                     if !seen.insert(semantic_edge_key(&edge)) {
                         continue;
@@ -700,7 +800,11 @@ impl PeerSession {
                 }
             }
         }
-        Ok(json!({"records": records}))
+        Ok(json!({
+            "records": records,
+            "unknown_time_events": unknown_times.len(),
+            "temporal_completeness": if date_filter.is_bounded() && !unknown_times.is_empty() { "partial" } else { "complete" },
+        }))
     }
 
     fn tape_facts<W: Write>(
@@ -756,8 +860,11 @@ impl PeerSession {
                     "window_lines",
                     "include_digest",
                     "rank_span",
+                    "since",
+                    "until",
                 ],
             )?;
+            let date_filter = peer_date_filter(item)?;
             let tape_id = item.get("tape_id").and_then(Value::as_str).ok_or_else(|| {
                 PeerError::new("invalid_request", "tape_facts item needs a tape_id")
             })?;
@@ -851,6 +958,22 @@ impl PeerSession {
                     continue;
                 }
             };
+            let eligible_rows = rows
+                .iter()
+                .filter(|row| {
+                    matches!(
+                        date_filter.event_time(
+                            row.value.get("t").and_then(Value::as_str)
+                        ),
+                        EventTimeDecision::Included
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let eligible_offsets = eligible_rows
+                .iter()
+                .map(|row| row.offset)
+                .collect::<HashSet<_>>();
             let repo_head = unique_repo_head(&rows);
             let span_edit_match = rank_span.as_ref().is_some_and(|(file, start, end)| {
                 let Some(peer_cwd) = peer_cwd.as_deref() else {
@@ -978,6 +1101,14 @@ impl PeerSession {
                         .lines()
                         .skip(window_start.saturating_sub(1))
                         .take(window_end.saturating_sub(window_start).saturating_add(1))
+                        .enumerate()
+                        .filter(|(relative, _)| {
+                            let offset = window_start
+                                .saturating_sub(1)
+                                .saturating_add(*relative) as u64;
+                            eligible_offsets.contains(&offset)
+                        })
+                        .map(|(_, line)| line)
                         .try_fold(false, |matched, line| {
                             if matched {
                                 Ok(true)
@@ -996,8 +1127,8 @@ impl PeerSession {
                 "window_start": window_start,
                 "window_end": window_end,
                 "grep_filter_hits_window": grep_filter_hits_window,
-                "latest_timestamp": extract_latest_timestamp_from_rows(&rows),
-                "files_touched": collect_files_touched_from_rows(&rows),
+                "latest_timestamp": extract_latest_timestamp_from_rows(&eligible_rows),
+                "files_touched": collect_files_touched_from_rows(&eligible_rows),
             });
 
             let segment_turn_start = segment["message_turn_start"].as_i64().unwrap_or(0);
@@ -1295,6 +1426,8 @@ impl PeerSession {
         let mut total = 0usize;
         let mut time_min: Option<String> = None;
         let mut time_max: Option<String> = None;
+        let mut unknown_time_evidence_events = 0usize;
+        let mut unknown_time_matching_events = 0usize;
         let store_ref = format!("{}/{}", self.topology.self_label, stores[0]);
 
         let limits = self.topology.limits.clone();
@@ -1310,7 +1443,7 @@ impl PeerSession {
                         "indexed tape is not present in this export's tape directories",
                     ));
                 };
-                scan_tape_for_grep(path, *compressed_size, &limits, pattern)
+                scan_tape_for_grep(path, *compressed_size, &limits, pattern, &date_filter)
             },
             |result| match result {
                 Ok(summary) => summary.reorder_weight(),
@@ -1340,26 +1473,25 @@ impl PeerSession {
                         return Ok(());
                     }
                 };
-                if summary.match_count == 0
-                    || !session_matches_date_filter(
-                        &json!({"timestamp": summary.timestamp}),
-                        &date_filter,
-                    )
-                {
+                unknown_time_evidence_events = unknown_time_evidence_events
+                    .saturating_add(summary.unknown_time_evidence_count);
+                unknown_time_matching_events = unknown_time_matching_events
+                    .saturating_add(summary.unknown_time_match_count);
+                if summary.match_count == 0 {
                     return Ok(());
                 }
 
                 total = total.saturating_add(1);
                 if !summary.timestamp.is_empty() {
-                    if time_min
-                        .as_ref()
-                        .is_none_or(|current| summary.timestamp < *current)
+                    if time_min.as_ref().is_none_or(|current| {
+                        compare_event_timestamp(&summary.timestamp, current).is_lt()
+                    })
                     {
                         time_min = Some(summary.timestamp.clone());
                     }
-                    if time_max
-                        .as_ref()
-                        .is_none_or(|current| summary.timestamp > *current)
+                    if time_max.as_ref().is_none_or(|current| {
+                        compare_event_timestamp(&summary.timestamp, current).is_gt()
+                    })
                     {
                         time_max = Some(summary.timestamp.clone());
                     }
@@ -1375,6 +1507,7 @@ impl PeerSession {
                     "provenance_event_count": summary.provenance_event_count,
                     "timestamp": summary.timestamp,
                     "total_lines": summary.total_lines,
+                    "physical_total_lines": summary.total_lines,
                     "anchor_line": summary.anchor_line,
                     "files_touched": summary.files_touched,
                     "refs_up": refs_up,
@@ -1435,6 +1568,9 @@ impl PeerSession {
             "truncated": total > k,
             "failures": failure_count,
             "workers": scan_workers,
+            "unknown_time_evidence_events": unknown_time_evidence_events,
+            "unknown_time_matching_events": unknown_time_matching_events,
+            "temporal_completeness": if date_filter.is_bounded() && unknown_time_evidence_events > 0 { "partial" } else { "complete" },
         });
         let records = matches
             .into_iter()
@@ -1843,6 +1979,70 @@ impl PeerSession {
         })
     }
 
+    fn tape_event_timestamps(
+        &self,
+        export: &TopologyExport,
+        tape_id: &str,
+        offsets: &HashSet<u64>,
+    ) -> Result<HashMap<u64, Option<String>>, PeerError> {
+        let unknown = || {
+            offsets
+                .iter()
+                .copied()
+                .map(|offset| (offset, None))
+                .collect::<HashMap<_, _>>()
+        };
+        let Some((path, expected_size)) = self.tape_path(export, tape_id) else {
+            return Ok(unknown());
+        };
+        let compressed_limit = configured_limit(
+            &self.topology.limits,
+            "read_file_compressed_bytes",
+            MAX_READ_FILE_BYTES,
+        );
+        if expected_size > compressed_limit {
+            return Err(PeerError::new(
+                "budget_exceeded",
+                format!("compressed tape exceeds {compressed_limit} byte limit"),
+            ));
+        }
+        let file = crate::platform::open_read_nofollow(&path)
+            .map_err(|error| PeerError::new("tape_unavailable", error.to_string()))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| PeerError::new("tape_unavailable", error.to_string()))?;
+        if !metadata.file_type().is_file() || metadata.len() != expected_size {
+            return Err(PeerError::new(
+                "tape_changed",
+                "tape is not a stable regular file during timestamp lookup",
+            ));
+        }
+        let record_limit = configured_limit(
+            &self.topology.limits,
+            "grep_record_bytes",
+            16 * 1024 * 1024,
+        );
+        let decompressed_limit = configured_limit(
+            &self.topology.limits,
+            "decompressed_bytes_per_tape",
+            512 * 1024 * 1024,
+        );
+        read_tape_event_timestamps(
+            file,
+            offsets,
+            Some(record_limit),
+            Some(decompressed_limit),
+        )
+        .map_err(|error| {
+            let code = if error.code == "over_limit" {
+                "budget_exceeded"
+            } else {
+                error.code
+            };
+            PeerError::new(code, error.message)
+        })
+    }
+
     fn memoized_file_size(&self, path: &Path) -> Option<u64> {
         if let Some(size) = self.tape_file_sizes.borrow().get(path) {
             return *size;
@@ -1856,6 +2056,13 @@ impl PeerSession {
             .insert(path.to_path_buf(), size);
         size
     }
+}
+
+fn peer_date_filter(args: &serde_json::Map<String, Value>) -> Result<DateFilter, PeerError> {
+    let since = optional_string(args.get("since"), "since")?;
+    let until = optional_string(args.get("until"), "until")?;
+    DateFilter::parse(since.as_deref(), until.as_deref())
+        .map_err(|error| PeerError::new("invalid_request", error.message))
 }
 
 fn configured_limit(limits: &BTreeMap<String, u64>, key: &str, default: u64) -> u64 {
@@ -1938,7 +2145,7 @@ impl Ord for GrepCandidate {
                     .provenance_event_count
                     .cmp(&self.provenance_event_count)
             })
-            .then_with(|| other.timestamp.cmp(&self.timestamp))
+            .then_with(|| compare_timestamp_strings(&other.timestamp, &self.timestamp))
             .then_with(|| self.tape_id.cmp(&other.tape_id))
     }
 }
@@ -1948,6 +2155,7 @@ fn scan_tape_for_grep(
     expected_size: u64,
     limits: &BTreeMap<String, u64>,
     pattern: &str,
+    date_filter: &DateFilter,
 ) -> Result<GrepTapeSummary, PeerError> {
     let file = crate::platform::open_read_nofollow(path)
         .map_err(|error| PeerError::new("tape_unavailable", error.to_string()))?;
@@ -1968,14 +2176,28 @@ fn scan_tape_for_grep(
     }
 
     let record_limit = configured_limit(limits, "grep_record_bytes", 16 * 1024 * 1024);
-    scan_grep_reader(file, Some(record_limit), pattern).map_err(|error| {
-        let code = if error.code == "over_limit" {
-            "over_limit"
-        } else {
-            "invalid_tape"
-        };
-        PeerError::new(code, error.message)
-    })
+    scan_grep_reader_with_date(file, Some(record_limit), pattern, Some(date_filter)).map_err(
+        |error| {
+            let code = if error.code == "over_limit" {
+                "over_limit"
+            } else {
+                "invalid_tape"
+            };
+            PeerError::new(code, error.message)
+        },
+    )
+}
+
+fn compare_event_timestamp(left: &str, right: &str) -> Ordering {
+    match (
+        chrono::DateTime::parse_from_rfc3339(left),
+        chrono::DateTime::parse_from_rfc3339(right),
+    ) {
+        (Ok(left), Ok(right)) => left.cmp(&right),
+        (Ok(_), Err(_)) => Ordering::Greater,
+        (Err(_), Ok(_)) => Ordering::Less,
+        (Err(_), Err(_)) => left.cmp(right),
+    }
 }
 
 fn dispatch_ref_counts(index: &SqliteIndex, tape_id: &str) -> Result<(usize, usize), PeerError> {
