@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
-use engram::access::QUERY_FEATURE_EXACT_SPAN_EDIT_RANKING;
+use engram::access::{
+    QUERY_FEATURE_EVENT_TIME_BOUNDS, QUERY_FEATURE_EXACT_SPAN_EDIT_RANKING,
+};
 use engram::access::client::{
     DEFAULT_DECOMPRESSED_BYTES_PER_TAPE, DEFAULT_READ_FILE_COMPRESSED_BYTES, PeerFailure,
     PeerRequest, PeerResponse, RemoteOwner, decode_base64_chunk,
@@ -37,14 +39,16 @@ use engram::query::file_identity::{FileIdentityRelation, FileIdentityResolver};
 #[cfg(test)]
 use engram::query::format::MAX_QUERY_WINDOW_ANCHORS;
 use engram::query::format::{
-    DateFilter, ExplainTarget, GrepRank, annotate_chain_fields, apply_session_truncation,
-    build_chain_metadata, build_session_windows, classify_explain_target, collect_anchor_scores,
-    collect_touch_evidence, compact_event, compare_explain_sessions_with_span_priority,
+    DateFilter, EventTimeDecision, ExplainTarget, GrepRank, annotate_chain_fields, apply_session_truncation,
+    build_chain_metadata, build_session_windows, classify_explain_target,
+    collect_anchor_scores_with_date, collect_touch_evidence_with_date,
+    compact_event, compare_explain_sessions_with_span_priority, compare_timestamp_strings,
     compare_grep_sessions, default_peek_anchor_line, derive_anchor_candidates, dispatch_ref_counts,
     edge_to_json, emit_query_result, exact_span_edit_sessions, explain_across_indexes,
+    explain_across_indexes_with_date,
     extract_latest_timestamp_from_rows, format_sessions_for_agent, grep_line_matches,
-    open_query_indexes, prepare_grep_scan, prepare_grep_scan_with_tape_ids, print_pretty_explain,
-    read_file_span_variants, referenced_grep_tape_ids, run_grep_scan, session_matches_date_filter,
+    load_local_event_timestamps, open_query_indexes, prepare_grep_scan, prepare_grep_scan_with_tape_ids, print_pretty_explain,
+    read_file_span_variants, referenced_grep_tape_ids, run_grep_scan_with_date,
 };
 use engram::store::atomic::atomic_write;
 use engram::store::tapes::{
@@ -190,10 +194,12 @@ fn collect_local_federated_touches(
     local_stores: &[String],
     query_anchors: &[String],
     touched_anchors: &[FederatedExplainAnchor],
+    date_filter: &DateFilter,
+    temporal_unknown_events: &mut HashSet<(usize, String, u64)>,
 ) -> Result<Vec<engram::index::lineage::EvidenceFragmentRef>, CliError> {
     let mut seen = std::collections::HashSet::new();
     let mut touches = Vec::new();
-    for (index, store) in indexes.iter().zip(local_stores) {
+    for (index_id, (index, store)) in indexes.iter().zip(local_stores).enumerate() {
         let mut anchors = query_anchors.to_vec();
         anchors.extend(
             touched_anchors
@@ -205,6 +211,18 @@ fn collect_local_federated_touches(
         anchors.dedup();
         for anchor in anchors {
             for fragment in index.evidence_for_anchor(&anchor)? {
+                match date_filter.event_time(Some(&fragment.timestamp)) {
+                    EventTimeDecision::Included => {}
+                    EventTimeDecision::Excluded => continue,
+                    EventTimeDecision::Unknown => {
+                        temporal_unknown_events.insert((
+                            index_id,
+                            fragment.tape_id,
+                            fragment.event_offset,
+                        ));
+                        continue;
+                    }
+                }
                 let kind = match fragment.kind {
                     engram::index::lineage::EvidenceKind::Edit => "edit",
                     engram::index::lineage::EvidenceKind::Read => "read",
@@ -226,6 +244,40 @@ fn collect_local_federated_touches(
             .then_with(|| a.event_offset.cmp(&b.event_offset))
     });
     Ok(touches)
+}
+
+fn collect_local_federated_roots(
+    indexes: &[SqliteIndex],
+    local_stores: &[String],
+    query_anchors: &[String],
+    date_filter: &DateFilter,
+    temporal_unknown_events: &mut HashSet<(usize, String, u64)>,
+) -> Result<Vec<FederatedExplainAnchor>, CliError> {
+    let mut roots = std::collections::BTreeSet::new();
+    for (index_id, (index, store)) in indexes.iter().zip(local_stores).enumerate() {
+        for query_anchor in query_anchors {
+            for matched in index.matching_window_anchors(query_anchor)? {
+                let mut has_eligible_event = false;
+                for fragment in index.evidence_for_anchor(&matched)? {
+                    match date_filter.event_time(Some(&fragment.timestamp)) {
+                        EventTimeDecision::Included => has_eligible_event = true,
+                        EventTimeDecision::Excluded => {}
+                        EventTimeDecision::Unknown => {
+                            temporal_unknown_events.insert((
+                                index_id,
+                                fragment.tape_id,
+                                fragment.event_offset,
+                            ));
+                        }
+                    }
+                }
+                if has_eligible_event {
+                    roots.insert(federated_anchor(&matched, store));
+                }
+            }
+        }
+    }
+    Ok(roots.into_iter().collect())
 }
 
 fn federated_location_order(value: Option<&str>) -> u8 {
@@ -2226,6 +2278,7 @@ fn collect_federated_dispatch(
 }
 
 fn collect_federated_lineage(
+    context: &RuntimeContext,
     indexes: &[SqliteIndex],
     local_stores: &[String],
     roots: Vec<FederatedExplainAnchor>,
@@ -2233,6 +2286,9 @@ fn collect_federated_lineage(
     topology: &Topology,
     traversal: ExplainTraversal,
     include_forensics: bool,
+    date_filter: &DateFilter,
+    temporal_unknown_events: &mut HashSet<(usize, String, u64)>,
+    remote_temporal_unknown_events: &mut usize,
     deadline: Instant,
     cancelled: &Arc<AtomicBool>,
     sources: &mut [Value],
@@ -2249,21 +2305,69 @@ fn collect_federated_lineage(
         }
         let mut candidates_by_node =
             HashMap::<FederatedExplainAnchor, HashMap<String, FederatedExplainEdge>>::new();
-        for (index, store) in indexes.iter().zip(local_stores) {
+        for (index_id, (index, store)) in indexes.iter().zip(local_stores).enumerate() {
             for node in frontier
                 .iter()
                 .filter(|node| federated_anchor_applies(node, store))
             {
-                let mut edges = index.inbound_edges(
-                    &node.anchor,
-                    traversal.min_confidence,
-                    include_forensics,
-                )?;
-                edges.extend(index.outbound_edges(
-                    &node.anchor,
-                    traversal.min_confidence,
-                    include_forensics,
-                )?);
+                let edges = if date_filter.is_bounded() {
+                    let mut candidates = index.inbound_edges_with_sources(
+                        &node.anchor,
+                        traversal.min_confidence,
+                        include_forensics,
+                    )?;
+                    candidates.extend(index.outbound_edges_with_sources(
+                        &node.anchor,
+                        traversal.min_confidence,
+                        include_forensics,
+                    )?);
+                    let mut offsets_by_tape = HashMap::<String, HashSet<u64>>::new();
+                    for edge in &candidates {
+                        offsets_by_tape
+                            .entry(edge.source_tape_id.clone())
+                            .or_default()
+                            .insert(edge.source_event_offset);
+                    }
+                    let mut timestamps = HashMap::<(String, u64), Option<String>>::new();
+                    for (tape_id, offsets) in offsets_by_tape {
+                        for (offset, timestamp) in
+                            load_local_event_timestamps(context, &tape_id, &offsets)?
+                        {
+                            timestamps.insert((tape_id.clone(), offset), timestamp);
+                        }
+                    }
+                    candidates.retain(|edge| {
+                        match date_filter.event_time(
+                            timestamps
+                                .get(&(edge.source_tape_id.clone(), edge.source_event_offset))
+                                .and_then(Option::as_deref),
+                        ) {
+                            EventTimeDecision::Included => true,
+                            EventTimeDecision::Excluded => false,
+                            EventTimeDecision::Unknown => {
+                                temporal_unknown_events.insert((
+                                    index_id,
+                                    edge.source_tape_id.clone(),
+                                    edge.source_event_offset,
+                                ));
+                                false
+                            }
+                        }
+                    });
+                    candidates
+                } else {
+                    let mut edges = index.inbound_edges(
+                        &node.anchor,
+                        traversal.min_confidence,
+                        include_forensics,
+                    )?;
+                    edges.extend(index.outbound_edges(
+                        &node.anchor,
+                        traversal.min_confidence,
+                        include_forensics,
+                    )?);
+                    edges
+                };
                 let bucket = candidates_by_node.entry(node.clone()).or_default();
                 for edge in edges {
                     let Some(mut candidate) = federated_edge_candidate(store, edge_to_json(&edge))
@@ -2304,6 +2408,8 @@ fn collect_federated_lineage(
                     json!({
                         "min_confidence": traversal.min_confidence,
                         "include_forensics": include_forensics,
+                        "since": date_filter.since_rfc3339(),
+                        "until": date_filter.until_rfc3339(),
                     }),
                 );
                 if !batches.over_limit.is_empty() {
@@ -2358,6 +2464,35 @@ fn collect_federated_lineage(
                     );
                 }
                 Ok(response) => {
+                    let unknown_count = if date_filter.is_bounded() {
+                        match peer_event_time_unknown_count(&response) {
+                            Ok(count) => count,
+                            Err(message) => {
+                                *peer_failed = true;
+                                mark_source_phase(
+                                    sources,
+                                    &store,
+                                    "lookup_edges",
+                                    "protocol_error",
+                                    &message,
+                                );
+                                1
+                            }
+                        }
+                    } else {
+                        0
+                    };
+                    if unknown_count > 0 {
+                        *remote_temporal_unknown_events =
+                            remote_temporal_unknown_events.saturating_add(unknown_count);
+                        *peer_failed = true;
+                        mark_source_temporal_unknown(
+                            sources,
+                            &store,
+                            "lookup_edges",
+                            unknown_count,
+                        );
+                    }
                     for mut row in response.data {
                         if row.get("store").and_then(Value::as_str) != Some(store.as_str()) {
                             *peer_failed = true;
@@ -5098,6 +5233,34 @@ fn valid_tape_filename_segment(tape_id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
 }
 
+fn explain_for_date_filter(
+    context: &RuntimeContext,
+    indexes: &[SqliteIndex],
+    anchors: &[String],
+    traversal: ExplainTraversal,
+    include_forensics: bool,
+    date_filter: &DateFilter,
+) -> Result<(
+    engram::query::explain::ExplainResult,
+    std::collections::HashSet<(usize, String, u64)>,
+), CliError> {
+    if date_filter.is_bounded() {
+        explain_across_indexes_with_date(
+            context,
+            indexes,
+            anchors,
+            traversal,
+            include_forensics,
+            date_filter,
+        )
+    } else {
+        Ok((
+            explain_across_indexes(indexes, anchors, traversal, include_forensics)?,
+            std::collections::HashSet::new(),
+        ))
+    }
+}
+
 fn cmd_explain(
     cwd: &Path,
     _paths: &RepoPaths,
@@ -5136,6 +5299,7 @@ fn cmd_explain(
     #[cfg(feature = "t1772-proof")]
     let mut proof_direct_touches: Option<Value> = None;
     let date_filter = DateFilter::parse(args.since.as_deref(), args.until.as_deref())?;
+    let mut temporal_unknown_events = std::collections::HashSet::new();
 
     match target_kind {
         ExplainTarget::FileRange { file, start, end } => {
@@ -5147,11 +5311,23 @@ fn cmd_explain(
                 max_edges: args.max_edges,
                 max_depth: args.depth,
             };
-            let result =
-                explain_across_indexes(&indexes, &query_anchors, traversal, args.forensics)?;
+            let (result, unknown) = explain_for_date_filter(
+                context,
+                &indexes,
+                &query_anchors,
+                traversal,
+                args.forensics,
+                &date_filter,
+            )?;
+            temporal_unknown_events.extend(unknown);
             touched_anchors = result.touched_anchors.clone();
-            let touches =
-                collect_touch_evidence(&indexes, &result.direct, &result.touched_anchors)?;
+            let (touches, unknown) = collect_touch_evidence_with_date(
+                &indexes,
+                &result.direct,
+                &result.touched_anchors,
+                &date_filter,
+            )?;
+            temporal_unknown_events.extend(unknown);
             raw_sessions = build_session_windows(context, touches)?;
             exact_edit_sessions.extend(exact_span_edit_sessions(
                 &raw_sessions,
@@ -5160,14 +5336,20 @@ fn cmd_explain(
                 end,
                 cwd,
             ));
-            let (chain, dispatch_sessions, unresolved, ambiguous) =
-                collect_dispatch_upstream_sessions(context, &indexes, &raw_sessions)?;
+            let (chain, dispatch_sessions, unresolved, ambiguous) = if date_filter.is_bounded() {
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            } else {
+                collect_dispatch_upstream_sessions(context, &indexes, &raw_sessions)?
+            };
             dispatch_lineage = chain;
             dispatch_unresolved.extend(unresolved);
             dispatch_ambiguous.extend(ambiguous);
             raw_sessions.extend(dispatch_sessions);
             lineage = result.lineage.iter().map(edge_to_json).collect::<Vec<_>>();
-            score_by_session = collect_anchor_scores(&indexes, &query_anchors)?;
+            let (scores, unknown) =
+                collect_anchor_scores_with_date(&indexes, &query_anchors, &date_filter)?;
+            temporal_unknown_events.extend(unknown);
+            score_by_session = scores;
         }
         ExplainTarget::FileWhole { file } => {
             let full_text = fs::read_to_string(cwd.join(file))
@@ -5179,20 +5361,38 @@ fn cmd_explain(
                 max_edges: args.max_edges,
                 max_depth: args.depth,
             };
-            let result =
-                explain_across_indexes(&indexes, &query_anchors, traversal, args.forensics)?;
+            let (result, unknown) = explain_for_date_filter(
+                context,
+                &indexes,
+                &query_anchors,
+                traversal,
+                args.forensics,
+                &date_filter,
+            )?;
+            temporal_unknown_events.extend(unknown);
             touched_anchors = result.touched_anchors.clone();
-            let touches =
-                collect_touch_evidence(&indexes, &result.direct, &result.touched_anchors)?;
+            let (touches, unknown) = collect_touch_evidence_with_date(
+                &indexes,
+                &result.direct,
+                &result.touched_anchors,
+                &date_filter,
+            )?;
+            temporal_unknown_events.extend(unknown);
             raw_sessions = build_session_windows(context, touches)?;
-            let (chain, dispatch_sessions, unresolved, ambiguous) =
-                collect_dispatch_upstream_sessions(context, &indexes, &raw_sessions)?;
+            let (chain, dispatch_sessions, unresolved, ambiguous) = if date_filter.is_bounded() {
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            } else {
+                collect_dispatch_upstream_sessions(context, &indexes, &raw_sessions)?
+            };
             dispatch_lineage = chain;
             dispatch_unresolved.extend(unresolved);
             dispatch_ambiguous.extend(ambiguous);
             raw_sessions.extend(dispatch_sessions);
             lineage = result.lineage.iter().map(edge_to_json).collect::<Vec<_>>();
-            score_by_session = collect_anchor_scores(&indexes, &query_anchors)?;
+            let (scores, unknown) =
+                collect_anchor_scores_with_date(&indexes, &query_anchors, &date_filter)?;
+            temporal_unknown_events.extend(unknown);
+            score_by_session = scores;
         }
         ExplainTarget::Literal(text) => {
             query_anchors = if args.anchor {
@@ -5206,24 +5406,48 @@ fn cmd_explain(
                 max_edges: args.max_edges,
                 max_depth: args.depth,
             };
-            let result =
-                explain_across_indexes(&indexes, &query_anchors, traversal, args.forensics)?;
+            let (result, unknown) = explain_for_date_filter(
+                context,
+                &indexes,
+                &query_anchors,
+                traversal,
+                args.forensics,
+                &date_filter,
+            )?;
+            temporal_unknown_events.extend(unknown);
             #[cfg(feature = "t1772-proof")]
             if std::env::var("T1772_DIRECT_TOUCH_PROJECTION").as_deref() == Ok("1") {
                 proof_direct_touches = Some(direct_touch_projection(&result.direct));
             }
             touched_anchors = result.touched_anchors.clone();
-            let touches =
-                collect_touch_evidence(&indexes, &result.direct, &result.touched_anchors)?;
+            let (touches, unknown) = collect_touch_evidence_with_date(
+                &indexes,
+                &result.direct,
+                &result.touched_anchors,
+                &date_filter,
+            )?;
+            temporal_unknown_events.extend(unknown);
             raw_sessions = build_session_windows(context, touches)?;
-            let (chain, dispatch_sessions, unresolved, ambiguous) =
-                collect_dispatch_upstream_sessions(context, &indexes, &raw_sessions)?;
+            let (chain, dispatch_sessions, unresolved, ambiguous) = if date_filter.is_bounded() {
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            } else {
+                collect_dispatch_upstream_sessions(context, &indexes, &raw_sessions)?
+            };
             dispatch_lineage = chain;
             dispatch_unresolved.extend(unresolved);
             dispatch_ambiguous.extend(ambiguous);
             raw_sessions.extend(dispatch_sessions);
             lineage = result.lineage.iter().map(edge_to_json).collect::<Vec<_>>();
-            score_by_session = collect_anchor_scores(&indexes, &query_anchors)?;
+            let (scores, unknown) =
+                collect_anchor_scores_with_date(&indexes, &query_anchors, &date_filter)?;
+            temporal_unknown_events.extend(unknown);
+            score_by_session = scores;
+        }
+    }
+
+    if date_filter.is_bounded() {
+        for session in &mut raw_sessions {
+            session["event_time_filtered"] = Value::Bool(true);
         }
     }
 
@@ -5236,8 +5460,20 @@ fn cmd_explain(
         }
         let mut seen_tombstones = std::collections::HashSet::new();
         for anchor in &tombstone_anchors {
-            for index in &indexes {
+            for (index_id, index) in indexes.iter().enumerate() {
                 for tombstone in index.tombstones_for_anchor(anchor)? {
+                    match date_filter.event_time(Some(&tombstone.timestamp)) {
+                        EventTimeDecision::Included => {}
+                        EventTimeDecision::Excluded => continue,
+                        EventTimeDecision::Unknown => {
+                            temporal_unknown_events.insert((
+                                index_id,
+                                tombstone.tape_id.clone(),
+                                tombstone.event_offset,
+                            ));
+                            continue;
+                        }
+                    }
                     let key = (
                         tombstone.tape_id.clone(),
                         tombstone.event_offset,
@@ -5276,8 +5512,8 @@ fn cmd_explain(
         raw_sessions,
         &score_by_session,
         args.grep_filter.as_deref(),
+        &date_filter,
     )?;
-    sessions.retain(|session| session_matches_date_filter(session, &date_filter));
     annotate_chain_fields(&mut sessions, &dispatch_lineage);
     annotate_explain_inspection(
         context,
@@ -5292,6 +5528,16 @@ fn cmd_explain(
         .sort_by(|a, b| compare_explain_sessions_with_span_priority(a, b, &exact_edit_sessions));
     if sessions.is_empty() && tombstones.is_empty() && lineage.is_empty() {
         return Err(CliError::new("no_results", target));
+    }
+
+    if args.require_complete && date_filter.is_bounded() && !temporal_unknown_events.is_empty() {
+        return Err(CliError::new(
+            "incomplete_coverage",
+            format!(
+                "explain --require-complete rejected temporal uncertainty: {} evidence or link events have no trustworthy event timestamp",
+                temporal_unknown_events.len()
+            ),
+        ));
     }
 
     let (sessions, returned, total, time_range, truncated) = apply_session_truncation(
@@ -5332,6 +5578,8 @@ fn cmd_explain(
     "total": total,
     "time_range": time_range,
     "truncated": truncated,
+    "temporal_completeness": if date_filter.is_bounded() && !temporal_unknown_events.is_empty() { "partial" } else { "complete" },
+    "temporal_unknown_events": temporal_unknown_events.len(),
     });
     #[cfg(feature = "t1772-proof")]
     if let Some(touches) = proof_direct_touches {
@@ -5460,20 +5708,19 @@ fn cmd_explain_with_peers_inner(
         max_edges: args.max_edges,
         max_depth: args.depth,
     };
-    let mut roots = Vec::new();
-    for (index, store) in indexes.iter().zip(&local_stores) {
-        for anchor in &query_anchors {
-            roots.extend(
-                index
-                    .matching_window_anchors(anchor)?
-                    .into_iter()
-                    .map(|matched| federated_anchor(&matched, store)),
-            );
-        }
-    }
-    let local_scores = collect_anchor_scores(&indexes, &query_anchors)?;
-
     let date_filter = DateFilter::parse(args.since.as_deref(), args.until.as_deref())?;
+    let mut temporal_unknown_events = HashSet::<(usize, String, u64)>::new();
+    let mut roots = collect_local_federated_roots(
+        &indexes,
+        &local_stores,
+        &query_anchors,
+        &date_filter,
+        &mut temporal_unknown_events,
+    )?;
+    let (local_scores, unknown_scores) =
+        collect_anchor_scores_with_date(&indexes, &query_anchors, &date_filter)?;
+    temporal_unknown_events.extend(unknown_scores);
+    let mut remote_temporal_unknown_events = 0usize;
     let mut sources = local_grep_source_rows(context, &topology.self_label);
     for (machine, peer) in &topology.peers {
         if selected_machines.iter().any(|selected| selected == machine) {
@@ -5561,6 +5808,21 @@ fn cmd_explain_with_peers_inner(
                         }
                     }
                 }
+                if date_filter.is_bounded()
+                    && !owner.features.contains(QUERY_FEATURE_EVENT_TIME_BOUNDS)
+                {
+                    any_peer_failure = true;
+                    for export in &active_exports {
+                        mark_source_phase(
+                            &mut sources,
+                            &format!("{machine}/{export}"),
+                            "lookup_anchors",
+                            "incompatible_semantics",
+                            "peer does not advertise event-time date-bound semantics; refusing to mix session-level and event-level explain results",
+                        );
+                    }
+                    continue;
+                }
                 let mut requests = Vec::new();
                 let mut request_exports = Vec::new();
                 for export in &active_exports {
@@ -5571,7 +5833,11 @@ fn cmd_explain_with_peers_inner(
                         "anchors",
                         export,
                         &query_anchors,
-                        json!({"include_deleted": args.include_deleted}),
+                        json!({
+                            "include_deleted": args.include_deleted,
+                            "since": date_filter.since_rfc3339(),
+                            "until": date_filter.until_rfc3339(),
+                        }),
                     );
                     if !batches.over_limit.is_empty() {
                         any_peer_failure = true;
@@ -5634,6 +5900,35 @@ fn cmd_explain_with_peers_inner(
                     );
                 }
                 Ok(response) => {
+                    let unknown_count = if date_filter.is_bounded() {
+                        match peer_event_time_unknown_count(&response) {
+                            Ok(count) => count,
+                            Err(message) => {
+                                any_peer_failure = true;
+                                mark_source_phase(
+                                    &mut sources,
+                                    &store,
+                                    "lookup_anchors",
+                                    "protocol_error",
+                                    &message,
+                                );
+                                1
+                            }
+                        }
+                    } else {
+                        0
+                    };
+                    if unknown_count > 0 {
+                        remote_temporal_unknown_events =
+                            remote_temporal_unknown_events.saturating_add(unknown_count);
+                        any_peer_failure = true;
+                        mark_source_temporal_unknown(
+                            &mut sources,
+                            &store,
+                            "lookup_anchors",
+                            unknown_count,
+                        );
+                    }
                     for row in response.data {
                         if row.get("store").and_then(Value::as_str) != Some(store.as_str()) {
                             any_peer_failure = true;
@@ -5785,6 +6080,7 @@ fn cmd_explain_with_peers_inner(
 
     roots.extend(remote_roots);
     let (lineage, visited_anchors) = collect_federated_lineage(
+        context,
         &indexes,
         &local_stores,
         roots,
@@ -5792,17 +6088,14 @@ fn cmd_explain_with_peers_inner(
         &topology,
         traversal,
         args.forensics,
+        &date_filter,
+        &mut temporal_unknown_events,
+        &mut remote_temporal_unknown_events,
         query_deadline,
         cancelled,
         &mut sources,
         &mut any_peer_failure,
     )?;
-    let lineage_coverage = if any_peer_failure {
-        "partial"
-    } else {
-        "complete"
-    };
-
     let mut touch_requests =
         std::collections::BTreeMap::<String, Vec<(String, PeerRequest)>>::new();
     let mut touch_anchors_by_store = HashMap::<String, std::collections::HashSet<String>>::new();
@@ -5831,7 +6124,11 @@ fn cmd_explain_with_peers_inner(
                 "anchors",
                 export,
                 &anchors,
-                json!({"include_deleted": args.include_deleted}),
+                json!({
+                    "include_deleted": args.include_deleted,
+                    "since": date_filter.since_rfc3339(),
+                    "until": date_filter.until_rfc3339(),
+                }),
             );
             if !batches.over_limit.is_empty() {
                 any_peer_failure = true;
@@ -5870,6 +6167,35 @@ fn cmd_explain_with_peers_inner(
                 );
             }
             Ok(response) => {
+                let unknown_count = if date_filter.is_bounded() {
+                    match peer_event_time_unknown_count(&response) {
+                        Ok(count) => count,
+                        Err(message) => {
+                            any_peer_failure = true;
+                            mark_source_phase(
+                                &mut sources,
+                                &store,
+                                "lookup_anchors",
+                                "protocol_error",
+                                &message,
+                            );
+                            1
+                        }
+                    }
+                } else {
+                    0
+                };
+                if unknown_count > 0 {
+                    remote_temporal_unknown_events =
+                        remote_temporal_unknown_events.saturating_add(unknown_count);
+                    any_peer_failure = true;
+                    mark_source_temporal_unknown(
+                        &mut sources,
+                        &store,
+                        "lookup_anchors",
+                        unknown_count,
+                    );
+                }
                 for row in response.data {
                     if row.get("store").and_then(Value::as_str) != Some(store.as_str()) {
                         any_peer_failure = true;
@@ -5974,9 +6300,37 @@ fn cmd_explain_with_peers_inner(
         }
     }
 
-    let local_touches =
-        collect_local_federated_touches(&indexes, &local_stores, &query_anchors, &visited_anchors)?;
+    let local_touches = collect_local_federated_touches(
+        &indexes,
+        &local_stores,
+        &query_anchors,
+        &visited_anchors,
+        &date_filter,
+        &mut temporal_unknown_events,
+    )?;
+    if !temporal_unknown_events.is_empty() {
+        any_peer_failure = true;
+        let mut counts_by_index = HashMap::<usize, usize>::new();
+        for (index_id, _, _) in &temporal_unknown_events {
+            *counts_by_index.entry(*index_id).or_default() += 1;
+        }
+        for (index_id, count) in counts_by_index {
+            if let Some(store) = local_stores.get(index_id) {
+                mark_source_temporal_unknown(
+                    &mut sources,
+                    store,
+                    "event_time",
+                    count,
+                );
+            }
+        }
+    }
     let mut local_raw_sessions = build_session_windows(context, local_touches)?;
+    if date_filter.is_bounded() {
+        for session in &mut local_raw_sessions {
+            session["event_time_filtered"] = Value::Bool(true);
+        }
+    }
     if let Some((file, start, end)) = exact_span_target.as_ref() {
         exact_edit_sessions.extend(exact_span_edit_sessions(
             &local_raw_sessions,
@@ -6039,6 +6393,8 @@ fn cmd_explain_with_peers_inner(
                     "grep_filter": args.grep_filter,
                     "window_lines": context.peek_default_lines.max(1),
                     "include_digest": false,
+                    "since": date_filter.since_rfc3339(),
+                    "until": date_filter.until_rfc3339(),
                 });
                 if owner
                     .features
@@ -6236,6 +6592,25 @@ fn cmd_explain_with_peers_inner(
                 })
             })
             .collect::<Vec<_>>();
+        let (session_timestamp, session_files_touched) = if date_filter.is_bounded() {
+            let timestamp = fragments
+                .iter()
+                .filter_map(|fragment| fragment.get("timestamp").and_then(Value::as_str))
+                .max_by(|left, right| compare_timestamp_strings(left, right))
+                .unwrap_or("")
+                .to_string();
+            let mut files = fragments
+                .iter()
+                .filter_map(|fragment| fragment.get("file_path").and_then(Value::as_str))
+                .map(ToOwned::to_owned)
+                .collect::<std::collections::BTreeSet<_>>();
+            (json!(timestamp), json!(std::mem::take(&mut files)))
+        } else {
+            (
+                summary.get("latest_timestamp").cloned().unwrap_or_else(|| json!("")),
+                summary.get("files_touched").cloned().unwrap_or_else(|| json!([])),
+            )
+        };
         let (machine, export) = store
             .split_once('/')
             .unwrap_or((&topology.self_label, "local"));
@@ -6249,7 +6624,7 @@ fn cmd_explain_with_peers_inner(
             })
             .and_then(|source| source.get("db"))
             .cloned();
-        remote_sessions.push(json!({
+        let mut remote_session = json!({
             "session_id": tape_id,
             "tape_id": tape_id,
             "store": store,
@@ -6261,34 +6636,49 @@ fn cmd_explain_with_peers_inner(
                 "db": owner_db,
                 "file": remote_locations.get(&(store.clone(), tape_id.clone())),
             },
-            "timestamp": summary.get("latest_timestamp").cloned().unwrap_or_else(|| json!("")),
+            "timestamp": session_timestamp,
             "window_start": summary.get("window_start").cloned().unwrap_or_else(|| json!(0)),
             "window_end": summary.get("window_end").cloned().unwrap_or_else(|| json!(0)),
             "total_lines": summary.get("total_lines").cloned().unwrap_or_else(|| json!(0)),
+            "physical_total_lines": Value::Null,
             "confidence": score,
             "repo_head": fact.and_then(|row| row.get("repo_head")).cloned().unwrap_or(Value::Null),
             "refs_up": 0,
             "refs_down": 0,
-            "files_touched": summary.get("files_touched").cloned().unwrap_or_else(|| json!([])),
+            "files_touched": session_files_touched,
             "touches": touches,
             "tape_facts": fact.cloned().unwrap_or(Value::Null),
-        }));
+        });
+        if date_filter.is_bounded() {
+            remote_session["event_time_filtered"] = Value::Bool(true);
+        }
+        remote_sessions.push(remote_session);
     }
     let mut dispatch_inputs = local_dispatch_inputs;
     dispatch_inputs.extend(remote_sessions.iter().cloned());
-    let dispatch = collect_federated_dispatch(
-        context,
-        &indexes,
-        &local_stores,
-        &topology,
-        &dispatch_inputs,
-        &mut remote_facts,
-        &mut owners,
-        &mut sources,
-        query_deadline,
-        cancelled,
-        &mut any_peer_failure,
-    )?;
+    let dispatch = if date_filter.is_bounded() {
+        FederatedDispatchResult {
+            lineage: Vec::new(),
+            local_parent_sessions: Vec::new(),
+            remote_parent_sessions: Vec::new(),
+            unresolved: Vec::new(),
+            ambiguous: Vec::new(),
+        }
+    } else {
+        collect_federated_dispatch(
+            context,
+            &indexes,
+            &local_stores,
+            &topology,
+            &dispatch_inputs,
+            &mut remote_facts,
+            &mut owners,
+            &mut sources,
+            query_deadline,
+            cancelled,
+            &mut any_peer_failure,
+        )?
+    };
     local_raw_sessions.extend(dispatch.local_parent_sessions);
     let mut sessions = format_sessions_for_agent(
         context,
@@ -6296,6 +6686,7 @@ fn cmd_explain_with_peers_inner(
         local_raw_sessions,
         &local_scores,
         args.grep_filter.as_deref(),
+        &date_filter,
     )?;
     for session in &mut sessions {
         if let Some(tape_id) = session
@@ -6323,7 +6714,6 @@ fn cmd_explain_with_peers_inner(
     let dispatch_ambiguous = dispatch.ambiguous;
     sessions.extend(remote_sessions);
     sessions.extend(dispatch.remote_parent_sessions);
-    sessions.retain(|session| session_matches_date_filter(session, &date_filter));
     annotate_chain_fields(&mut sessions, &dispatch_lineage);
     annotate_explain_inspection(
         context,
@@ -6373,7 +6763,16 @@ fn cmd_explain_with_peers_inner(
         args.offset,
         context.explain_default_limit,
     );
-    if any_peer_failure && args.require_complete {
+    let temporal_unknown_count = temporal_unknown_events
+        .len()
+        .saturating_add(remote_temporal_unknown_events);
+    let temporal_incomplete = date_filter.is_bounded() && temporal_unknown_count > 0;
+    let lineage_coverage = if any_peer_failure {
+        "partial"
+    } else {
+        "complete"
+    };
+    if (any_peer_failure || temporal_incomplete) && args.require_complete {
         return Err(explain_require_complete_error(&sources));
     }
     let no_results = sessions.is_empty() && tombstones.is_empty() && lineage.is_empty();
@@ -6410,6 +6809,8 @@ fn cmd_explain_with_peers_inner(
         "total": total,
         "time_range": time_range,
         "truncated": truncated,
+        "temporal_completeness": if temporal_incomplete { "partial" } else { "complete" },
+        "temporal_unknown_events": temporal_unknown_count,
         "federation": {
             "coverage": if complete { "complete" } else { "partial" },
             "lineage_coverage": lineage_coverage,
@@ -6473,7 +6874,7 @@ fn cmd_grep(_paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Res
     }
 
     let work = prepare_grep_scan(context, &indexes)?;
-    let local_scan = run_grep_scan(work, &args.pattern)?;
+    let local_scan = run_grep_scan_with_date(work, &args.pattern, Some(&date_filter))?;
     let score_by_session = local_scan
         .ranks
         .iter()
@@ -6485,9 +6886,23 @@ fn cmd_grep(_paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Res
         local_scan.raw_sessions,
         &score_by_session,
         None,
+        &date_filter,
     )?;
-    sessions.retain(|session| session_matches_date_filter(session, &date_filter));
     sessions.sort_by(|a, b| compare_grep_sessions(a, b, &local_scan.ranks));
+    if args.require_complete
+        && date_filter.is_bounded()
+        && (local_scan.unknown_time_evidence_events > 0
+            || local_scan.unknown_time_matching_events > 0)
+    {
+        return Err(CliError::new(
+            "incomplete_coverage",
+            format!(
+                "grep --require-complete rejected temporal uncertainty: {} evidence events and {} matching events have no trustworthy event timestamp",
+                local_scan.unknown_time_evidence_events,
+                local_scan.unknown_time_matching_events
+            ),
+        ));
+    }
     if sessions.is_empty() {
         return Err(CliError::new("no_results", args.pattern));
     }
@@ -6538,7 +6953,10 @@ fn cmd_grep(_paths: &RepoPaths, context: &RuntimeContext, args: GrepArgs) -> Res
         "scan_stats": {
             "local_tapes": local_scan.scanned_tapes,
             "local_workers": local_scan.workers,
+            "unknown_time_evidence_events": local_scan.unknown_time_evidence_events,
+            "unknown_time_matching_events": local_scan.unknown_time_matching_events,
         },
+        "temporal_completeness": if date_filter.is_bounded() && (local_scan.unknown_time_evidence_events > 0 || local_scan.unknown_time_matching_events > 0) { "partial" } else { "complete" },
         "returned": returned,
         "total": total,
         "time_range": time_range,
@@ -6575,9 +6993,10 @@ fn cmd_grep_with_peer(
     let local_tape_ids = referenced_grep_tape_ids(&indexes)?;
     let local_lookup_dirs = context.tape_lookup_dirs.clone();
     let local_pattern = args.pattern.clone();
+    let local_date_filter = date_filter.clone();
     let local_scan = std::thread::spawn(move || {
         let local_work = prepare_grep_scan_with_tape_ids(local_lookup_dirs, local_tape_ids)?;
-        run_grep_scan(local_work, &local_pattern)
+        run_grep_scan_with_date(local_work, &local_pattern, Some(&local_date_filter))
     });
 
     let page_limit = args.limit.unwrap_or(context.explain_default_limit).min(25);
@@ -6618,6 +7037,8 @@ fn cmd_grep_with_peer(
     // failure must not erase a terminal-success scan, but any missing or
     // incomplete grep_scan keeps the matching scope unknown.
     let mut grep_scan_incomplete = false;
+    let mut temporal_unknown_evidence_events = 0usize;
+    let mut temporal_unknown_matching_events = 0usize;
     let mut completed_scan_proves_truncated = false;
     let mut peer_store_count = 0usize;
     let mut scanned_peers = Vec::new();
@@ -6706,6 +7127,23 @@ fn cmd_grep_with_peer(
                         }));
                         }
                     }
+                }
+
+                if date_filter.is_bounded()
+                    && !owner.features.contains(QUERY_FEATURE_EVENT_TIME_BOUNDS)
+                {
+                    any_source_failure = true;
+                    grep_scan_incomplete = true;
+                    for export in &active_exports {
+                        mark_source_phase(
+                            &mut source_rows,
+                            &format!("{machine}/{export}"),
+                            "grep_scan",
+                            "incompatible_semantics",
+                            "peer does not advertise event-time date-bound semantics; refusing to mix session-level and event-level results",
+                        );
+                    }
+                    continue;
                 }
 
                 let grep_limit = owner.limits.get("grep_k").copied().unwrap_or(10_000);
@@ -6835,6 +7273,39 @@ fn cmd_grep_with_peer(
                 );
                 continue;
             };
+            let peer_unknown_time_evidence_events = response
+                .stats
+                .get("unknown_time_evidence_events")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok());
+            let peer_unknown_time_matching_events = response
+                .stats
+                .get("unknown_time_matching_events")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok());
+            if date_filter.is_bounded()
+                && (peer_unknown_time_evidence_events.is_none()
+                    || peer_unknown_time_matching_events.is_none())
+            {
+                any_source_failure = true;
+                grep_scan_incomplete = true;
+                mark_source_phase(
+                    &mut source_rows,
+                    &store_name,
+                    "grep_scan",
+                    "protocol_error",
+                    "event-time peer omitted temporal completeness counters",
+                );
+                continue;
+            }
+            let peer_unknown_time_evidence_events =
+                peer_unknown_time_evidence_events.unwrap_or_default();
+            let peer_unknown_time_matching_events =
+                peer_unknown_time_matching_events.unwrap_or_default();
+            temporal_unknown_evidence_events = temporal_unknown_evidence_events
+                .saturating_add(peer_unknown_time_evidence_events);
+            temporal_unknown_matching_events = temporal_unknown_matching_events
+                .saturating_add(peer_unknown_time_matching_events);
             let mut store_failures = Vec::new();
             let mut valid_response = true;
             let mut store_records = Vec::<(Value, GrepRank)>::new();
@@ -6875,7 +7346,17 @@ fn cmd_grep_with_peer(
                     "time_range": store_time_range,
                     "truncated": store_truncated,
                     "workers": response.stats.get("workers").cloned().unwrap_or(Value::Null),
+                    "unknown_time_evidence_events": peer_unknown_time_evidence_events,
+                    "unknown_time_matching_events": peer_unknown_time_matching_events,
+                    "temporal_completeness": if date_filter.is_bounded() && (peer_unknown_time_evidence_events > 0 || peer_unknown_time_matching_events > 0) { "partial" } else { "complete" },
                 });
+            }
+            if date_filter.is_bounded()
+                && (peer_unknown_time_evidence_events > 0
+                    || peer_unknown_time_matching_events > 0)
+            {
+                source_count_known = false;
+                grep_scan_incomplete = true;
             }
             if !store_failures.is_empty() {
                 mark_source_failures(&mut source_rows, &store_name, "grep_scan", &store_failures);
@@ -6900,6 +7381,17 @@ fn cmd_grep_with_peer(
     let local_scan = local_scan
         .join()
         .map_err(|_| CliError::new("grep_worker_panicked", "local grep scan worker panicked"))??;
+    temporal_unknown_evidence_events = temporal_unknown_evidence_events
+        .saturating_add(local_scan.unknown_time_evidence_events);
+    temporal_unknown_matching_events = temporal_unknown_matching_events
+        .saturating_add(local_scan.unknown_time_matching_events);
+    if date_filter.is_bounded()
+        && (local_scan.unknown_time_evidence_events > 0
+            || local_scan.unknown_time_matching_events > 0)
+    {
+        source_count_known = false;
+        grep_scan_incomplete = true;
+    }
     let local_score_by_session = local_scan
         .ranks
         .iter()
@@ -6911,8 +7403,8 @@ fn cmd_grep_with_peer(
         local_scan.raw_sessions,
         &local_score_by_session,
         None,
+        &date_filter,
     )?;
-    local_sessions.retain(|session| session_matches_date_filter(session, &date_filter));
     for session in &mut local_sessions {
         let session_id = session
             .get("session_id")
@@ -7245,7 +7737,11 @@ fn cmd_grep_with_peer(
         }
     }
 
-    let any_selected_failure = any_source_failure || source_rows.iter().any(source_is_incomplete);
+    let temporal_incomplete = date_filter.is_bounded()
+        && (temporal_unknown_evidence_events > 0 || temporal_unknown_matching_events > 0);
+    let any_selected_failure = any_source_failure
+        || temporal_incomplete
+        || source_rows.iter().any(source_is_incomplete);
     let coverage = if any_selected_failure {
         "partial"
     } else {
@@ -7322,7 +7818,12 @@ fn cmd_grep_with_peer(
         "dispatch_lineage": [],
         "tombstones": [],
         "stores_queried": indexes.len() + peer_store_count,
-        "scan_stats": {"local": local_scan_stats},
+        "scan_stats": {
+            "local": local_scan_stats,
+            "unknown_time_evidence_events": temporal_unknown_evidence_events,
+            "unknown_time_matching_events": temporal_unknown_matching_events,
+        },
+        "temporal_completeness": if temporal_incomplete { "partial" } else { "complete" },
         "returned": returned,
         "total": exact_total,
         "time_range": time_range,
@@ -7369,11 +7870,19 @@ fn cmd_grep_with_peer(
             .iter()
             .filter_map(format_source_failure)
             .collect::<Vec<_>>();
-        let detail = if failures.is_empty() {
+        let mut detail = if failures.is_empty() {
             "one or more selected sources did not complete".to_string()
         } else {
             failures.join("; ")
         };
+        if temporal_incomplete {
+            if !detail.is_empty() {
+                detail.push_str("; ");
+            }
+            detail.push_str(&format!(
+                "{temporal_unknown_evidence_events} evidence events have no trustworthy event timestamp"
+            ));
+        }
         return Err(CliError::new(
             "incomplete_coverage",
             format!("grep --require-complete rejected incomplete coverage: {detail}"),
@@ -8272,13 +8781,55 @@ fn mark_source_phase(sources: &mut [Value], store: &str, phase: &str, code: &str
         .iter_mut()
         .find(|source| source.get("store").and_then(Value::as_str) == Some(store))
     {
-        source["status"] = json!(if phase == "open" {
+        source["status"] = json!(if phase == "open" || code == "incompatible_semantics" {
             peer_failure_status(code)
         } else {
             "failed"
         });
         source["phase"] = json!(phase);
         source["error"] = json!({"code": code, "message": message});
+    }
+}
+
+fn mark_source_temporal_unknown(
+    sources: &mut [Value],
+    store: &str,
+    phase: &str,
+    unknown_events: usize,
+) {
+    if let Some(source) = sources
+        .iter_mut()
+        .find(|source| source.get("store").and_then(Value::as_str) == Some(store))
+    {
+        let prior_status = source.get("status").and_then(Value::as_str).unwrap_or("");
+        if prior_status == "ok" || prior_status == "partial" {
+            source["status"] = json!("partial");
+            source["phase"] = json!("event_time");
+            source["error"] = json!({
+                "code": "unknown_event_time",
+                "message": format!("{unknown_events} evidence or lineage event(s) had no trustworthy event timestamp under the requested bounds (observed during {phase})"),
+            });
+        }
+    }
+}
+
+fn peer_event_time_unknown_count(response: &PeerResponse) -> Result<usize, String> {
+    let count = response
+        .stats
+        .get("unknown_time_events")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "peer event-time response omitted unknown_time_events".to_string())?
+        as usize;
+    let completeness = response
+        .stats
+        .get("temporal_completeness")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "peer event-time response omitted temporal_completeness".to_string())?;
+    match (completeness, count) {
+        ("complete", 0) | ("partial", 1..) => Ok(count),
+        ("complete", _) => Err("peer marked unknown event times complete".into()),
+        ("partial", 0) => Err("peer marked temporal results partial without unknown events".into()),
+        _ => Err("peer returned an invalid temporal_completeness value".into()),
     }
 }
 
@@ -8381,6 +8932,10 @@ fn format_peer_grep_session(
             "window_start": window_start,
             "window_end": window_end,
             "total_lines": total_lines,
+            "physical_total_lines": record.get("physical_total_lines").cloned().unwrap_or_else(|| json!(total_lines)),
+            "match_count": match_count,
+            "provenance_match_count": provenance_match_count,
+            "provenance_event_count": provenance_event_count,
             "confidence": match_count as f32,
             "refs_up": refs_up,
             "refs_down": refs_down,
@@ -8476,7 +9031,7 @@ fn valid_peer_time_range(stats: &Value) -> Option<Value> {
 
 fn merge_grep_time_ranges(ranges: &[Vec<String>]) -> Value {
     let mut timestamps = ranges.iter().flatten().cloned().collect::<Vec<_>>();
-    timestamps.sort();
+    timestamps.sort_by(|left, right| compare_timestamp_strings(left, right));
     timestamps.dedup();
     if timestamps.is_empty() {
         json!({"start": Value::Null, "end": Value::Null})

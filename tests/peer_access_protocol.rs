@@ -5272,8 +5272,10 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
         &mut available,
     );
     let available_identity_complete = temp.path().join("available-show-responses.identity.ready");
-    // Let the offline peer open normally, then disconnect its identity query
-    // only after the healthy peer has completed the same discovery round.
+    // Let the offline peer open normally, then fail its identity queries only
+    // after the healthy peer has completed the same discovery round. Returning
+    // terminal errors keeps this coverage test independent of shell SIGPIPE
+    // timing; other protocol tests exercise abrupt disconnects.
     let offline_script_path = temp.path().join("offline-after-available-discovery.sh");
     let offline_script = [
         "#!/bin/sh",
@@ -5292,7 +5294,7 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
         "      attempts=$((attempts + 1))",
         "      sleep 0.05",
         "    done",
-        "    exit 1",
+        r#"    printf '{"id":%s,"end":true,"ok":false,"error":{"code":"unavailable","message":"fixture owner unavailable"}}\n' "$id""#,
         "  fi",
         "done",
     ]
@@ -6253,6 +6255,586 @@ fn grep_merges_multiple_explicit_peers_and_keeps_unselected_peers_idle() {
         bounded_count_result["time_range"],
         bounded_result["time_range"]
     );
+}
+
+#[test]
+fn bounded_federated_grep_filters_event_time_before_owner_top_k_and_merge() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let tape = concat!(
+        "{\"t\":\"2026-10-01T23:59:59.999999999Z\",\"k\":\"msg.in\",\"content\":\"event-window-needle before\"}\n",
+        "{\"t\":\"2026-10-02T00:00:00Z\",\"k\":\"msg.in\",\"content\":\"event-window-needle after\"}\n",
+    );
+    let remote = write_grep_owner(temp.path(), "event-peer", binary, &[("remote-window", tape)]);
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "local-window",
+        tape,
+    );
+    set_peer_topology(&caller_home, json!({"event-peer": remote}));
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "grep",
+            "event-window-needle",
+            "--peers",
+            "event-peer",
+            "--since",
+            "2026-10-01T19:59:59-04:00",
+            "--until",
+            "2026-10-01",
+            "--limit",
+            "1",
+        ])
+        .output()
+        .expect("run event-time federated grep");
+    assert!(
+        output.status.success(),
+        "event-time federated grep failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("grep JSON");
+    assert_eq!(result["total"], 2);
+    assert_eq!(result["returned"], 1);
+    assert_eq!(result["temporal_completeness"], "complete");
+    assert!(result["sessions"].as_array().unwrap().iter().all(|session| {
+        session["timestamp"] == "2026-10-01T23:59:59.999999999Z"
+            && session["match_count"] == 1
+    }));
+    let sources = result["federation"]["sources"].as_array().unwrap();
+    let peer_source = sources
+        .iter()
+        .find(|source| source["store"] == "event-peer/default")
+        .expect("selected peer source");
+    assert_eq!(peer_source["grep_scan"]["total"], 1);
+    assert_eq!(peer_source["grep_scan"]["unknown_time_matching_events"], 0);
+}
+
+#[test]
+fn bounded_grep_rejects_a_peer_without_event_time_semantics_before_querying_it() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let owner = write_grep_owner(
+        temp.path(),
+        "legacy-peer",
+        binary,
+        &[("legacy-tape", "{\"t\":\"2026-10-01T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"legacy bounded needle\"}\n")],
+    );
+    let owner_home = temp.path().join("legacy-peer-home");
+    let script = temp.path().join("legacy-peer-wrapper.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n/usr/bin/env HOME={} {} peer-serve --stdio | while IFS= read -r line; do printf '%s\\n' \"$line\" | /usr/bin/sed 's/,\\\"event-time-bounds-v1\\\"//g'; done\n",
+            owner_home.display(),
+            binary,
+        ),
+    )
+    .expect("write legacy peer wrapper");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("make wrapper executable");
+    let mut legacy = owner;
+    legacy["command"] = json!(["/bin/sh", script.to_string_lossy()]);
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "bounded-local-empty",
+        "{\"t\":\"2026-10-01T12:00:00Z\",\"k\":\"msg.in\",\"content\":\"quiet\"}\n",
+    );
+    set_peer_topology(&caller_home, json!({"legacy-peer": legacy}));
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "grep",
+            "legacy bounded needle",
+            "--peers",
+            "legacy-peer",
+            "--until",
+            "2026-10-01",
+        ])
+        .output()
+        .expect("run bounded grep against legacy peer");
+    assert!(!output.status.success());
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("partial incompatible result is emitted before no_results");
+    let source = payload["federation"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["store"] == "legacy-peer/default")
+        .expect("legacy peer source");
+    assert_eq!(source["status"], "incompatible", "source={source:#}");
+    assert_eq!(source["error"]["code"], "incompatible_semantics");
+    assert!(source["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("event-time"));
+    assert!(source.get("grep_scan").is_none(), "legacy scan was not mixed in");
+}
+
+#[test]
+fn bounded_federated_explain_uses_event_time_for_remote_touches_and_lineage() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let source = "fn event_time_explain_target() { stable(); }\n".repeat(12);
+    let before = source.replace("stable", "older");
+    let tape_id = "event-time-explain-tape";
+    let tape = [
+        json!({
+            "t":"2026-09-30T12:00:00Z",
+            "k":"meta",
+            "model":"event-time-test",
+        }),
+        json!({
+            "t":"2026-10-01T23:59:59.999999999Z",
+            "k":"code.read",
+            "file":"src/event.rs",
+            "range":[1,12],
+            "text":source.clone(),
+        }),
+        json!({
+            "t":"2026-10-02T00:00:00Z",
+            "k":"code.edit",
+            "file":"src/event.rs",
+            "before_range":[1,12],
+            "after_range":[1,12],
+            "before_text":before.clone(),
+            "after_text":source.clone(),
+        }),
+    ]
+    .iter()
+    .map(serde_json::Value::to_string)
+    .collect::<Vec<_>>()
+    .join("\n")
+        + "\n";
+    let remote = write_grep_owner(
+        temp.path(),
+        "event-explain-peer",
+        binary,
+        &[(tape_id, &tape)],
+    );
+    let owner_home = temp.path().join("event-explain-peer-home");
+    let owner_db = owner_home.join(".engram/index.sqlite");
+    let index = SqliteIndex::open_writer(owner_db.to_str().expect("owner DB path"))
+        .expect("open owner index");
+    let parsed = engram::tape::event::parse_jsonl_events(&tape).expect("parse owner tape");
+    index
+        .ingest_tape_events(
+            tape_id,
+            &parsed,
+            engram::index::lineage::LINK_THRESHOLD_DEFAULT,
+        )
+        .expect("index read and later edit");
+    let query_anchors = engram::query::format::derive_anchor_candidates(std::slice::from_ref(&source));
+    let root_anchor = query_anchors
+        .iter()
+        .flat_map(|anchor| index.matching_window_anchors(anchor).expect("match anchor"))
+        .next()
+        .expect("indexed root anchor");
+    let later_target = engram::query::format::derive_anchor_candidates(std::slice::from_ref(&before))
+        .into_iter()
+        .next()
+        .expect("later edge target anchor");
+    index
+        .insert_edge(
+            &engram::index::EdgeSource {
+                source_kind: engram::index::EdgeSourceKind::SpanLink,
+                tape_id: tape_id.into(),
+                event_offset: 2,
+                pair_ordinal: 91,
+                from_window_ordinal: 91,
+                to_window_ordinal: 92,
+            },
+            &engram::index::lineage::SpanEdge {
+                from_anchor: root_anchor,
+                to_anchor: later_target,
+                confidence: 0.99,
+                location_delta: engram::index::lineage::LocationDelta::Adjacent,
+                cardinality: engram::index::lineage::Cardinality::OneToOne,
+                agent_link: false,
+                note: Some("bounded later edge fixture".into()),
+            },
+        )
+        .expect("insert later edge");
+    drop(index);
+
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "event-explain-caller",
+        "{\"t\":\"2026-09-30T12:00:00Z\",\"k\":\"note\",\"content\":\"empty\"}\n",
+    );
+    std::fs::create_dir_all(repo.join("src")).expect("source directory");
+    std::fs::write(repo.join("src/event.rs"), &source).expect("write query source");
+    let local_tape_id = "event-time-local-explain-tape";
+    let local_tape_path = repo
+        .join(".engram/tapes")
+        .join(format!("{local_tape_id}.jsonl.zst"));
+    let local_compressed = zstd::stream::encode_all(tape.as_bytes(), 0).expect("compress local tape");
+    std::fs::write(&local_tape_path, local_compressed).expect("write local event tape");
+    let local_db = repo.join(".engram/index.sqlite");
+    let local_index = SqliteIndex::open_writer(local_db.to_str().expect("local DB path"))
+        .expect("open local index");
+    local_index
+        .ingest_tape_events(
+            local_tape_id,
+            &parsed,
+            engram::index::lineage::LINK_THRESHOLD_DEFAULT,
+        )
+        .expect("index local read and later edit");
+    drop(local_index);
+    set_peer_topology(&caller_home, json!({"event-explain-peer": remote}));
+
+    let bounded = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "explain",
+            "src/event.rs",
+            "--peers",
+            "event-explain-peer",
+            "--since",
+            "2026-10-01T19:59:59-04:00",
+            "--until",
+            "2026-10-01",
+        ])
+        .output()
+        .expect("run bounded event-time peer explain");
+    assert!(
+        bounded.status.success(),
+        "bounded peer explain failed: {}",
+        String::from_utf8_lossy(&bounded.stderr)
+    );
+    let bounded_value: serde_json::Value =
+        serde_json::from_slice(&bounded.stdout).expect("bounded explain JSON");
+    let bounded_session = bounded_value["sessions"]
+        .as_array()
+        .expect("bounded sessions")
+        .iter()
+        .find(|session| session["session_id"] == tape_id)
+        .expect("eligible remote read");
+    assert_eq!(bounded_value["temporal_completeness"], "complete");
+    let bounded_local_session = bounded_value["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["session_id"] == local_tape_id)
+        .expect("eligible local read");
+    assert_eq!(bounded_local_session["timestamp"], "2026-10-01T23:59:59.999999999Z");
+    assert_eq!(bounded_local_session["touches"].as_array().unwrap().len(), 1);
+    assert_eq!(bounded_local_session["touches"][0]["event_offset"], 1);
+    assert_eq!(bounded_session["timestamp"], "2026-10-01T23:59:59.999999999Z");
+    assert_eq!(bounded_session["touches"].as_array().unwrap().len(), 1);
+    assert_eq!(bounded_session["touches"][0]["event_offset"], 1);
+    assert_eq!(
+        bounded_session["tape_facts"]["summary"]["latest_timestamp"],
+        "2026-10-01T23:59:59.999999999Z",
+        "bounded={bounded_value:#}"
+    );
+    assert_eq!(
+        bounded_session["files_touched"],
+        json!(["src/event.rs"])
+    );
+    assert!(bounded_value["lineage"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|edge| edge["note"] != "bounded later edge fixture"));
+
+    let unbounded = run_peer_explain(binary, &caller_home, &repo, "src/event.rs", "event-explain-peer");
+    assert!(
+        unbounded.status.success(),
+        "unbounded peer explain failed: {}",
+        String::from_utf8_lossy(&unbounded.stderr)
+    );
+    let unbounded_value: serde_json::Value =
+        serde_json::from_slice(&unbounded.stdout).expect("unbounded explain JSON");
+    let unbounded_session = unbounded_value["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["session_id"] == tape_id)
+        .expect("unbounded remote session");
+    let unbounded_local_session = unbounded_value["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["session_id"] == local_tape_id)
+        .expect("unbounded local session");
+    assert_eq!(unbounded_session["touches"].as_array().unwrap().len(), 2);
+    assert_eq!(unbounded_local_session["touches"].as_array().unwrap().len(), 2);
+    assert_eq!(unbounded_session["timestamp"], "2026-10-02T00:00:00Z");
+    assert!(unbounded_value["lineage"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|edge| edge["note"] == "bounded later edge fixture"));
+}
+
+#[test]
+fn bounded_federated_explain_grep_filter_uses_only_date_eligible_window_lines() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let source = "fn bounded_peer_context_target() { inspect(); }\n".repeat(12);
+    let tape_id = "bounded-peer-context-tape";
+    let tape = [
+        json!({
+            "t":"2026-09-30T12:00:00Z",
+            "k":"meta",
+            "model":"event-time-test",
+        }),
+        json!({
+            "t":"2026-10-01T12:00:00Z",
+            "k":"code.read",
+            "file":"src/context.rs",
+            "range":[1,12],
+            "text":source,
+        }),
+        json!({
+            "t":"2026-10-01T23:00:00Z",
+            "k":"msg.in",
+            "content":"eligible-window-token",
+        }),
+        json!({
+            "t":"2026-10-02T00:00:00Z",
+            "k":"msg.out",
+            "content":"post-bound-only-token",
+        }),
+    ]
+    .iter()
+    .map(serde_json::Value::to_string)
+    .collect::<Vec<_>>()
+    .join("\n")
+        + "\n";
+    let remote = write_grep_owner(
+        temp.path(),
+        "bounded-context-peer",
+        binary,
+        &[(tape_id, &tape)],
+    );
+    let owner_home = temp.path().join("bounded-context-peer-home");
+    let owner_db = owner_home.join(".engram/index.sqlite");
+    let index = SqliteIndex::open_writer(owner_db.to_str().expect("owner DB path"))
+        .expect("open owner index");
+    let parsed = engram::tape::event::parse_jsonl_events(&tape).expect("parse owner tape");
+    index
+        .ingest_tape_events(
+            tape_id,
+            &parsed,
+            engram::index::lineage::LINK_THRESHOLD_DEFAULT,
+        )
+        .expect("index peer read and in-window messages");
+    drop(index);
+
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "bounded-context-caller",
+        "{\"t\":\"2026-09-30T12:00:00Z\",\"k\":\"note\",\"content\":\"quiet local tape\"}\n",
+    );
+    std::fs::create_dir_all(repo.join("src")).expect("source directory");
+    std::fs::write(repo.join("src/context.rs"), &source).expect("write query source");
+    set_peer_topology(&caller_home, json!({"bounded-context-peer": remote}));
+
+    let post_bound_only = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "explain",
+            "src/context.rs:1-12",
+            "--peers",
+            "bounded-context-peer",
+            "--until",
+            "2026-10-01",
+            "--grep-filter",
+            "post-bound-only-token",
+        ])
+        .output()
+        .expect("run bounded peer explain with post-bound-only context");
+    assert!(!post_bound_only.status.success());
+    assert!(
+        String::from_utf8_lossy(&post_bound_only.stderr).contains("no_results"),
+        "post-bound-only peer context unexpectedly matched: {}",
+        String::from_utf8_lossy(&post_bound_only.stderr)
+    );
+    assert!(
+        post_bound_only.stdout.is_empty(),
+        "post-bound-only query emitted sessions: {}",
+        String::from_utf8_lossy(&post_bound_only.stdout)
+    );
+
+    let eligible = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "explain",
+            "src/context.rs:1-12",
+            "--peers",
+            "bounded-context-peer",
+            "--until",
+            "2026-10-01",
+            "--grep-filter",
+            "eligible-window-token",
+        ])
+        .output()
+        .expect("run bounded peer explain with eligible context");
+    assert!(
+        eligible.status.success(),
+        "eligible peer context was dropped: {}",
+        String::from_utf8_lossy(&eligible.stderr)
+    );
+    let eligible_result: serde_json::Value =
+        serde_json::from_slice(&eligible.stdout).expect("eligible explain JSON");
+    let sessions = eligible_result["sessions"].as_array().expect("sessions");
+    assert_eq!(sessions.len(), 1, "eligible={eligible_result:#}");
+    assert_eq!(sessions[0]["session_id"], tape_id);
+    assert_eq!(sessions[0]["window_start"], 1);
+    assert_eq!(sessions[0]["window_end"], 4);
+    assert_eq!(
+        sessions[0]["tape_facts"]["summary"]["grep_filter_hits_window"],
+        true
+    );
+}
+
+#[test]
+fn bounded_explain_rejects_peer_without_event_time_semantics() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let owner = write_grep_owner(temp.path(), "legacy-explain-peer", binary, &[]);
+    let owner_home = temp.path().join("legacy-explain-peer-home");
+    let script = temp.path().join("legacy-explain-peer-wrapper.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n/usr/bin/env HOME={} {} peer-serve --stdio | while IFS= read -r line; do printf '%s\\n' \"$line\" | /usr/bin/sed 's/,\\\"event-time-bounds-v1\\\"//g'; done\n",
+            owner_home.display(),
+            binary,
+        ),
+    )
+    .expect("write legacy explain peer wrapper");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("make legacy wrapper executable");
+    let mut legacy = owner;
+    legacy["command"] = json!(["/bin/sh", script.to_string_lossy()]);
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "legacy-explain-caller",
+        "{\"t\":\"2026-10-01T12:00:00Z\",\"k\":\"note\",\"content\":\"empty\"}\n",
+    );
+    std::fs::write(repo.join("legacy.rs"), "fn legacy_query() {}\n").expect("query file");
+    set_peer_topology(&caller_home, json!({"legacy-explain-peer": legacy}));
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "explain",
+            "legacy.rs",
+            "--peers",
+            "legacy-explain-peer",
+            "--until",
+            "2026-10-01",
+        ])
+        .output()
+        .expect("run bounded explain against legacy peer");
+    assert!(!output.status.success());
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("partial compatibility response");
+    let source = payload["federation"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["store"] == "legacy-explain-peer/default")
+        .expect("legacy peer diagnostic");
+    assert_eq!(source["status"], "incompatible");
+    assert_eq!(source["phase"], "lookup_anchors");
+    assert_eq!(source["error"]["code"], "incompatible_semantics");
+    assert!(source["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("event-time"));
+}
+
+#[test]
+fn bounded_peer_explain_reports_unknown_event_time_to_require_complete() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let source = "fn unknown_event_time_peer_target() { inspect(); }\n".repeat(8);
+    let tape_id = "unknown-event-time-peer-tape";
+    let tape = [
+        json!({"t":"2026-09-30T12:00:00Z","k":"meta","model":"test"}),
+        json!({
+            "t":"2026-10-01T12:00:00Z",
+            "k":"code.read",
+            "file":"unknown.rs",
+            "range":[1,8],
+            "text":source.clone(),
+        }),
+    ]
+    .iter()
+    .map(serde_json::Value::to_string)
+    .collect::<Vec<_>>()
+    .join("\n")
+        + "\n";
+    let remote = write_grep_owner(
+        temp.path(),
+        "unknown-time-peer",
+        binary,
+        &[(tape_id, &tape)],
+    );
+    let owner_db = temp
+        .path()
+        .join("unknown-time-peer-home/.engram/index.sqlite");
+    let index = SqliteIndex::open_writer(owner_db.to_str().expect("owner DB path"))
+        .expect("open owner index");
+    let parsed = engram::tape::event::parse_jsonl_events(&tape).expect("parse owner tape");
+    index
+        .ingest_tape_events(
+            tape_id,
+            &parsed,
+            engram::index::lineage::LINK_THRESHOLD_DEFAULT,
+        )
+        .expect("index owner read");
+    drop(index);
+    let connection = rusqlite::Connection::open(&owner_db).expect("open fixture index");
+    connection
+        .execute(
+            "UPDATE evidence_windows SET timestamp = '' WHERE tape_id = ?1 AND event_offset = 1",
+            rusqlite::params![tape_id],
+        )
+        .expect("make indexed event time unknown");
+    drop(connection);
+
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "unknown-time-caller",
+        "{\"t\":\"2026-09-30T12:00:00Z\",\"k\":\"note\",\"content\":\"empty\"}\n",
+    );
+    std::fs::write(repo.join("unknown.rs"), &source).expect("write query file");
+    set_peer_topology(&caller_home, json!({"unknown-time-peer": remote}));
+
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "explain",
+            "unknown.rs",
+            "--peers",
+            "unknown-time-peer",
+            "--until",
+            "2026-10-01",
+            "--require-complete",
+        ])
+        .output()
+        .expect("run bounded require-complete explain");
+    assert!(!output.status.success());
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    assert!(diagnostic.contains("incomplete_results"), "{diagnostic}");
+    assert!(diagnostic.contains("unknown_event_time"), "{diagnostic}");
+    assert!(diagnostic.contains("event_time"), "{diagnostic}");
 }
 
 #[test]

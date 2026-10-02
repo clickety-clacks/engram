@@ -1,8 +1,12 @@
 use std::cmp::Ordering;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::index::lineage::EvidenceFragmentRef;
 use crate::index::{EdgeRow, SqliteIndex};
+use crate::query::format::{DateFilter, EventTimeDecision};
+use crate::CliError;
+
+pub type TemporalUnknownEvents = HashSet<(usize, String, u64)>;
 
 pub const MIN_CONFIDENCE_DEFAULT: f32 = 0.50;
 pub const MAX_FANOUT_DEFAULT: usize = 50;
@@ -314,6 +318,192 @@ pub fn explain_across_indexes_by_anchor(
     })
 }
 
+/// Date-bounded explain traversal. Evidence anchors and graph edges are
+/// admitted only when their own source-event time falls within the requested
+/// interval. The timestamp loader receives one tape and the offsets needed at
+/// the current bounded traversal step.
+pub fn explain_across_indexes_by_anchor_at<F>(
+    indexes: &[SqliteIndex],
+    anchors: &[String],
+    traversal: ExplainTraversal,
+    include_forensics: bool,
+    date_filter: &DateFilter,
+    mut load_event_times: F,
+) -> Result<(ExplainResult, TemporalUnknownEvents), CliError>
+where
+    F: FnMut(usize, &str, &HashSet<u64>) -> Result<HashMap<u64, Option<String>>, CliError>,
+{
+    let mut direct = Vec::new();
+    let mut seen_direct = HashSet::new();
+    let mut temporal_unknown = TemporalUnknownEvents::new();
+    let mut roots = BTreeSet::new();
+
+    for (index_id, index) in indexes.iter().enumerate() {
+        for fragment in retrieve_direct(index, anchors)? {
+            match date_filter.event_time(Some(&fragment.timestamp)) {
+                EventTimeDecision::Included => {
+                    let key = (
+                        fragment.tape_id.clone(),
+                        fragment.event_offset,
+                        fragment.kind as u8,
+                        fragment.file_path.clone(),
+                        fragment.timestamp.clone(),
+                    );
+                    if seen_direct.insert(key) {
+                        direct.push(fragment);
+                    }
+                }
+                EventTimeDecision::Excluded => {}
+                EventTimeDecision::Unknown => {
+                    temporal_unknown.insert((
+                        index_id,
+                        fragment.tape_id,
+                        fragment.event_offset,
+                    ));
+                }
+            }
+        }
+        for anchor in anchors {
+            for matched in index.matching_window_anchors(anchor)? {
+                let fragments = index.evidence_for_anchor(&matched)?;
+                let mut has_eligible_event = false;
+                for fragment in fragments {
+                    match date_filter.event_time(Some(&fragment.timestamp)) {
+                        EventTimeDecision::Included => has_eligible_event = true,
+                        EventTimeDecision::Excluded => {}
+                        EventTimeDecision::Unknown => {
+                            temporal_unknown.insert((
+                                index_id,
+                                fragment.tape_id,
+                                fragment.event_offset,
+                            ));
+                        }
+                    }
+                }
+                if has_eligible_event {
+                    roots.insert(matched);
+                }
+            }
+        }
+    }
+
+    let mut queue: VecDeque<(String, usize)> =
+        roots.iter().cloned().map(|anchor| (anchor, 0)).collect();
+    let mut visited = HashSet::new();
+    let mut seen_edges = HashSet::new();
+    let mut lineage = Vec::new();
+    while let Some((anchor, depth)) = queue.pop_front() {
+        if !visited.insert(anchor.clone()) || depth >= traversal.max_depth {
+            continue;
+        }
+        if lineage.len() >= traversal.max_edges {
+            break;
+        }
+        let mut candidates = Vec::<(usize, EdgeRow)>::new();
+        for (index_id, index) in indexes.iter().enumerate() {
+            candidates.extend(
+                index
+                    .inbound_edges_with_sources(
+                        &anchor,
+                        traversal.min_confidence,
+                        include_forensics,
+                    )?
+                    .into_iter()
+                    .map(|edge| (index_id, edge)),
+            );
+            candidates.extend(
+                index
+                    .outbound_edges_with_sources(
+                        &anchor,
+                        traversal.min_confidence,
+                        include_forensics,
+                    )?
+                    .into_iter()
+                    .map(|edge| (index_id, edge)),
+            );
+        }
+
+        let mut offsets_by_tape = HashMap::<(usize, String), HashSet<u64>>::new();
+        for (index_id, edge) in &candidates {
+            offsets_by_tape
+                .entry((*index_id, edge.source_tape_id.clone()))
+                .or_default()
+                .insert(edge.source_event_offset);
+        }
+        let mut timestamps = HashMap::<(usize, String, u64), Option<String>>::new();
+        for ((index_id, tape_id), offsets) in offsets_by_tape {
+            for (offset, timestamp) in load_event_times(index_id, &tape_id, &offsets)? {
+                timestamps.insert((index_id, tape_id.clone(), offset), timestamp);
+            }
+        }
+
+        let mut eligible = Vec::<EdgeRow>::new();
+        let mut candidate_edges = HashSet::new();
+        for (index_id, edge) in candidates {
+            let timestamp = timestamps
+                .get(&(index_id, edge.source_tape_id.clone(), edge.source_event_offset))
+                .and_then(Option::as_deref);
+            match date_filter.event_time(timestamp) {
+                EventTimeDecision::Included => {
+                    let key = edge_key(&edge);
+                    if !seen_edges.contains(&key) && candidate_edges.insert(key) {
+                        eligible.push(edge);
+                    }
+                }
+                EventTimeDecision::Excluded => {}
+                EventTimeDecision::Unknown => {
+                    temporal_unknown.insert((
+                        index_id,
+                        edge.source_tape_id,
+                        edge.source_event_offset,
+                    ));
+                }
+            }
+        }
+        eligible.sort_by(compare_edge_candidates);
+        for edge in eligible.into_iter().take(traversal.max_fanout) {
+            if lineage.len() >= traversal.max_edges {
+                break;
+            }
+            seen_edges.insert(edge_key(&edge));
+            let next = if edge.from_anchor == anchor {
+                &edge.to_anchor
+            } else {
+                &edge.from_anchor
+            };
+            if !visited.contains(next) {
+                queue.push_back((next.clone(), depth + 1));
+            }
+            lineage.push(edge);
+        }
+    }
+
+    let mut touched_anchors = roots.into_iter().collect::<Vec<_>>();
+    let mut seen_anchors = touched_anchors.iter().cloned().collect::<HashSet<_>>();
+    for edge in &lineage {
+        if seen_anchors.insert(edge.from_anchor.clone()) {
+            touched_anchors.push(edge.from_anchor.clone());
+        }
+        if seen_anchors.insert(edge.to_anchor.clone()) {
+            touched_anchors.push(edge.to_anchor.clone());
+        }
+    }
+    direct.sort_by(|a, b| {
+        a.timestamp
+            .cmp(&b.timestamp)
+            .then_with(|| a.tape_id.cmp(&b.tape_id))
+            .then_with(|| a.event_offset.cmp(&b.event_offset))
+    });
+    Ok((
+        ExplainResult {
+            direct,
+            lineage,
+            touched_anchors,
+        },
+        temporal_unknown,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +528,8 @@ mod tests {
         note: Option<&str>,
     ) -> EdgeRow {
         EdgeRow {
+            source_tape_id: "test-tape".into(),
+            source_event_offset: 0,
             from_anchor: from_anchor.into(),
             to_anchor: to_anchor.into(),
             confidence,

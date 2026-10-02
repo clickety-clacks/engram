@@ -1072,6 +1072,295 @@ fn explain_since_until_filters_sessions_by_timestamp() {
 }
 
 #[test]
+fn grep_date_bounds_select_event_times_with_inclusive_day_edges_and_unknown_diagnostics() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = home.join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    let _ = run_json(&repo, &["init"], None, &home);
+
+    let transcript = concat!(
+        "{\"t\":\"2026-10-01T22:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle exactly at lower bound\"}\n",
+        "{\"t\":\"2026-10-01T23:59:59.999999999Z\",\"k\":\"code.edit\",\"file\":\"src/before.rs\",\"before_range\":[1,1],\"after_range\":[1,1],\"before_text\":\"old\",\"after_text\":\"eligible touch\"}\n",
+        "{\"t\":\"2026-10-02T00:00:00Z\",\"k\":\"msg.out\",\"content\":\"needle later quote of older ruling\"}\n",
+        "{\"t\":\"2026-10-02T00:00:01Z\",\"k\":\"code.edit\",\"file\":\"src/after.rs\",\"before_range\":[1,1],\"after_range\":[1,1],\"before_text\":\"old\",\"after_text\":\"needle after cutoff\"}\n",
+    );
+    let _ = run_json(&repo, &["record", "--stdin"], Some(transcript), &home);
+    let unknown_time_tape = repo.join(".engram/tapes/unknown-time.jsonl.zst");
+    let unknown_time = "{\"k\":\"msg.in\",\"content\":\"needle with unknown event time\"}\n";
+    fs::write(
+        unknown_time_tape,
+        zstd::stream::encode_all(unknown_time.as_bytes(), 0).expect("compress unknown-time tape"),
+    )
+    .expect("write unknown-time fixture");
+
+    let bounded = run_json(
+        &repo,
+        &[
+            "grep",
+            "needle",
+            "--since",
+            "2026-10-01T18:00:00-04:00",
+            "--until",
+            "2026-10-01",
+        ],
+        None,
+        &home,
+    );
+    assert_eq!(bounded["total"], Value::from(1));
+    assert_eq!(bounded["returned"], Value::from(1));
+    assert_eq!(bounded["sessions"][0]["match_count"], Value::from(1));
+    assert_eq!(bounded["sessions"][0]["physical_total_lines"], Value::from(4));
+    assert_eq!(
+        bounded["sessions"][0]["timestamp"],
+        Value::String("2026-10-01T23:59:59.999999999Z".to_string())
+    );
+    assert_eq!(
+        bounded["sessions"][0]["files_touched"],
+        json!(["src/before.rs"])
+    );
+    assert_eq!(bounded["scan_stats"]["unknown_time_matching_events"], 1);
+    assert_eq!(bounded["temporal_completeness"], "partial");
+
+    let quoted_only = run_cli(
+        &repo,
+        &[
+            "grep",
+            "older ruling",
+            "--until",
+            "2026-10-01",
+        ],
+        None,
+        &home,
+    );
+    assert!(!quoted_only.status.success());
+    assert!(String::from_utf8_lossy(&quoted_only.stderr).contains("no_results"));
+
+    let require_complete = run_cli(
+        &repo,
+        &[
+            "grep",
+            "needle",
+            "--until",
+            "2026-10-01",
+            "--require-complete",
+        ],
+        None,
+        &home,
+    );
+    assert!(!require_complete.status.success());
+    let error = String::from_utf8_lossy(&require_complete.stderr);
+    assert!(error.contains("incomplete_coverage"), "{error}");
+    assert!(error.contains("event timestamp"), "{error}");
+}
+
+#[test]
+fn explain_date_bounds_filter_mixed_reads_edits_before_scoring_and_diagnose_unknown_time() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = home.join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    let first_line = "fn event_time_target() { live(); }\n";
+    let second_line = "fn second_time_anchor() { value(); }\n";
+    let full_text = format!("{first_line}{second_line}");
+    write_repo_file(&repo, "src/lib.rs", &full_text);
+    let _ = run_json(&repo, &["init"], None, &home);
+
+    let transcript = [
+        json!({
+            "t": "2026-10-01T22:00:00Z", "k": "code.read", "file": "src/lib.rs",
+            "range": [1, 1], "text": first_line,
+        }),
+        json!({
+            "t": "2026-10-01T23:59:59.999999999Z", "k": "code.edit", "file": "src/lib.rs",
+            "before_range": [1, 1], "after_range": [1, 1], "before_text": "fn event_time_target() { old(); }\n",
+            "after_text": first_line, "similarity": 0.9,
+        }),
+        json!({
+            "t": "2026-10-02T00:00:01Z", "k": "code.edit", "file": "src/lib.rs",
+            "before_range": [1, 1], "after_range": [1, 2], "before_text": first_line,
+            "after_text": full_text, "similarity": 0.99,
+        }),
+        json!({
+            "t": "2026-10-02T00:00:02Z", "k": "msg.out", "role": "assistant",
+            "content": "later discussion quotes the 2026-10-01 ruling",
+        }),
+    ]
+    .into_iter()
+    .map(|row| row.to_string())
+    .collect::<Vec<_>>()
+    .join("\n")
+        + "\n";
+    let recorded = run_json(&repo, &["record", "--stdin"], Some(&transcript), &home);
+    let tape_id = recorded["tape_id"].as_str().expect("recorded tape id");
+
+    let bounded = run_json(
+        &repo,
+        &[
+            "explain",
+            "src/lib.rs:1-2",
+            "--since",
+            "2026-10-01T18:00:00-04:00",
+            "--until",
+            "2026-10-01",
+        ],
+        None,
+        &home,
+    );
+    assert_eq!(bounded["total"], 1);
+    let session = &bounded["sessions"][0];
+    assert_eq!(session["timestamp"], "2026-10-01T23:59:59.999999999Z");
+    assert_eq!(session["touches"].as_array().unwrap().len(), 2);
+    assert!(session["confidence"].as_f64().unwrap() < 1.0);
+    assert_eq!(session["files_touched"], json!(["src/lib.rs"]));
+    assert_eq!(bounded["temporal_completeness"], "complete");
+    let unbounded = run_json(&repo, &["explain", "src/lib.rs:1-2"], None, &home);
+    assert!(
+        unbounded["sessions"][0]["confidence"].as_f64().unwrap()
+            > session["confidence"].as_f64().unwrap(),
+        "later edit must not boost the pre-cutoff score: bounded={bounded} unbounded={unbounded}"
+    );
+    let tape_path = repo
+        .join(".engram/tapes")
+        .join(format!("{tape_id}.jsonl.zst"));
+    let compressed = fs::read(&tape_path).expect("read isolated tape");
+    let decoded = zstd::stream::decode_all(&compressed[..]).expect("decode isolated tape");
+    let mut unknown_offset = None;
+    let rewritten = String::from_utf8(decoded)
+        .expect("tape UTF-8")
+        .lines()
+        .enumerate()
+        .map(|(offset, line)| {
+            let mut row: Value = serde_json::from_str(line).expect("tape event JSON");
+            if row["k"] == "code.edit" && row["t"] == "2026-10-02T00:00:01Z" {
+                row.as_object_mut().unwrap().remove("t");
+                unknown_offset = Some(offset as u64);
+            }
+            row.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let offset = unknown_offset.expect("late edit offset");
+    fs::write(
+        &tape_path,
+        zstd::stream::encode_all(rewritten.as_bytes(), 0).expect("recompress isolated tape"),
+    )
+    .expect("write isolated tape fixture");
+    let connection = Connection::open(repo.join(".engram/index.sqlite")).expect("open fixture index");
+    connection
+        .execute(
+            "UPDATE evidence_windows SET timestamp = '' WHERE tape_id = ?1 AND event_offset = ?2",
+            rusqlite::params![tape_id, offset],
+        )
+        .expect("make indexed event time unknown");
+    drop(connection);
+
+    let unknown = run_json(
+        &repo,
+        &[
+            "explain",
+            "src/lib.rs:1-2",
+            "--until",
+            "2026-10-01",
+        ],
+        None,
+        &home,
+    );
+    assert_eq!(unknown["temporal_completeness"], "partial");
+    assert!(unknown["temporal_unknown_events"].as_u64().unwrap() > 0);
+    let required = run_cli(
+        &repo,
+        &[
+            "explain",
+            "src/lib.rs:1-2",
+            "--until",
+            "2026-10-01",
+            "--require-complete",
+        ],
+        None,
+        &home,
+    );
+    assert!(!required.status.success());
+    let error = String::from_utf8_lossy(&required.stderr);
+    assert!(error.contains("incomplete_coverage"), "{error}");
+    assert!(error.contains("event timestamp"), "{error}");
+}
+
+#[test]
+fn explain_grep_filter_uses_only_date_eligible_lines_inside_the_context_window() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = home.join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    let source = "fn bounded_context_target() { inspect(); }\n".repeat(12);
+    write_repo_file(&repo, "src/context.rs", &source);
+    let _ = run_json(&repo, &["init"], None, &home);
+
+    let transcript = [
+        json!({
+            "t": "2026-09-30T12:00:00Z", "k": "meta", "model": "context-test",
+        }),
+        json!({
+            "t": "2026-10-01T12:00:00Z", "k": "code.read", "file": "src/context.rs",
+            "range": [1, 12], "text": source,
+        }),
+        json!({
+            "t": "2026-10-01T23:00:00Z", "k": "msg.in", "content": "eligible-window-token",
+        }),
+        json!({
+            "t": "2026-10-02T00:00:00Z", "k": "msg.out", "content": "post-bound-only-token",
+        }),
+    ]
+    .into_iter()
+    .map(|row| row.to_string())
+    .collect::<Vec<_>>()
+    .join("\n")
+        + "\n";
+    let recorded = run_json(&repo, &["record", "--stdin"], Some(&transcript), &home);
+    let tape_id = recorded["tape_id"].as_str().expect("recorded tape id");
+
+    let post_bound_only = run_cli(
+        &repo,
+        &[
+            "explain",
+            "src/context.rs:1-12",
+            "--until",
+            "2026-10-01",
+            "--grep-filter",
+            "post-bound-only-token",
+        ],
+        None,
+        &home,
+    );
+    assert!(!post_bound_only.status.success());
+    assert!(
+        String::from_utf8_lossy(&post_bound_only.stderr).contains("no_results"),
+        "post-bound-only context unexpectedly matched: {}",
+        String::from_utf8_lossy(&post_bound_only.stderr)
+    );
+
+    let eligible = run_json(
+        &repo,
+        &[
+            "explain",
+            "src/context.rs:1-12",
+            "--until",
+            "2026-10-01",
+            "--grep-filter",
+            "eligible-window-token",
+        ],
+        None,
+        &home,
+    );
+    let sessions = eligible["sessions"].as_array().expect("sessions");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["session_id"], tape_id);
+    assert_eq!(sessions[0]["window_start"], 1);
+    assert_eq!(sessions[0]["window_end"], 4);
+}
+
+#[test]
 fn explain_direct_string_query_returns_fingerprint_matches() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
