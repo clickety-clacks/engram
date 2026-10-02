@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use engram::anchor::{expand_winnow_anchor, fingerprint_text};
+use engram::index::SqliteIndex;
+use engram::tape::event::parse_jsonl_events;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -269,6 +271,419 @@ fn ingest_is_local_scoped_incremental_and_idempotent() {
     let third = run_json(&repo, &["ingest"], None, &home);
     assert_eq!(third["status"], "ok");
     assert_eq!(third["imported_tapes"], 1);
+}
+
+#[test]
+fn explicit_source_replay_recovers_historical_native_edit_idempotently_and_keeps_appends() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = home.join("workspace/repo");
+    let workspace_store = repo.join(".engram");
+    fs::create_dir_all(workspace_store.join("tapes")).expect("store dirs");
+    fs::create_dir_all(home.join(".engram")).expect("home store");
+    fs::write(
+        workspace_store.join("config.yml"),
+        "db: .engram/index.sqlite\ntapes_dir: .engram/tapes\n",
+    )
+    .expect("workspace config");
+
+    let source = repo.join("rollout.codex.jsonl");
+    let target = repo.join("scripts/verify_mix.sh");
+    fs::create_dir_all(target.parent().unwrap()).expect("script dir");
+    let script = (1..=25)
+        .map(|line| format!("gateway_mix_check_{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(&target, &script).expect("target source");
+    let target_text = target.to_string_lossy().to_string();
+    let patch = format!(
+        "*** Begin Patch\n*** Add File: {target_text}\n{}*** End Patch",
+        script
+            .lines()
+            .map(|line| format!("+{line}\n"))
+            .collect::<String>()
+    );
+    let patch_binding = format!(
+        "const patch = {};\nconst result = await tools.apply_patch(patch);\ntext(result);\n",
+        serde_json::to_string(&patch).expect("encode patch")
+    );
+    let raw_rows = [
+        serde_json::json!({
+            "timestamp":"2026-08-09T02:28:21.374Z",
+            "type":"session_meta",
+            "payload":{"id":"019fe459-8a61-7351-a3f1-d00e3c9aa080","cwd":repo}
+        }),
+        serde_json::json!({
+            "timestamp":"2026-08-09T02:39:00.000Z",
+            "type":"event_msg",
+            "payload":{"type":"turn_context","turn_id":"turn_verify_mix","cwd":repo}
+        }),
+        serde_json::json!({
+            "timestamp":"2026-08-09T02:39:30.000Z",
+            "type":"response_item",
+            "payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Keep the gateway-driving Mix tests isolated so the test run does not contend for the shared gateway."}]}
+        }),
+        serde_json::json!({
+            "timestamp":"2026-08-09T02:40:31.210Z",
+            "type":"response_item",
+            "payload":{
+                "type":"custom_tool_call",
+                "call_id":"call_verify_mix_outer",
+                "name":"exec",
+                "input":patch_binding,
+                "internal_chat_message_metadata_passthrough":{"turn_id":"turn_verify_mix"}
+            }
+        }),
+        serde_json::json!({
+            "timestamp":"2026-08-09T02:40:31.249Z",
+            "type":"event_msg",
+            "payload":{
+                "type":"patch_apply_end",
+                "call_id":"exec-verify-mix-patch",
+                "turn_id":"turn_verify_mix",
+                "stdout":format!("Success. Updated the following files:\\nA {target_text}\\n"),
+                "stderr":"",
+                "success":true,
+                "status":"completed",
+                "changes":{(target_text.clone()):{"type":"add","content":script}}
+            }
+        }),
+        serde_json::json!({
+            "timestamp":"2026-08-09T02:40:31.300Z",
+            "type":"response_item",
+            "payload":{"type":"custom_tool_call_output","call_id":"call_verify_mix_outer","output":"Script completed\\n"}
+        }),
+    ];
+    let raw = raw_rows
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("encode raw source")
+        .join("\n")
+        + "\n";
+    fs::write(&source, &raw).expect("historical raw source");
+
+    let initial = run_json(&repo, &["ingest", "rollout.codex.jsonl"], None, &home);
+    assert_eq!(initial["status"], "ok", "{initial}");
+    assert_eq!(initial["imported_tapes"], 1, "{initial}");
+    let cursor_path = cursor_state_path(&repo, &source);
+    let mut cursor: Value =
+        serde_json::from_slice(&fs::read(&cursor_path).expect("initial cursor"))
+            .expect("cursor JSON");
+    let current_tape = cursor["tape_id"].as_str().unwrap().to_string();
+    let tapes_dir = workspace_store.join("tapes");
+    let current_tape_path = tapes_dir.join(format!("{current_tape}.jsonl.zst"));
+    let current_bytes = fs::read(&current_tape_path).expect("initial normalized tape");
+    let current_text = String::from_utf8(
+        zstd::stream::decode_all(current_bytes.as_slice()).expect("decompress initial tape"),
+    )
+    .expect("normalized UTF-8");
+    let mut legacy_rows = current_text
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("normalized JSONL");
+    assert!(legacy_rows.iter().any(|row| row["k"] == "code.edit"));
+    legacy_rows.retain(|row| row["k"] != "code.edit");
+    let legacy_meta = legacy_rows
+        .iter_mut()
+        .find(|row| row["k"] == "meta")
+        .expect("legacy meta");
+    if !legacy_meta["coverage"].is_object() {
+        legacy_meta["coverage"] = serde_json::json!({});
+    }
+    legacy_meta["coverage"]["edit"] = serde_json::json!("partial");
+    let legacy_text = legacy_rows
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("legacy rows JSON")
+        .join("\n")
+        + "\n";
+    let legacy_id = write_tape(&tapes_dir, &legacy_text);
+
+    let mut context_rows = Vec::new();
+    for (offset, mut row) in legacy_rows.into_iter().enumerate() {
+        if !matches!(
+            row["k"].as_str(),
+            Some("meta" | "msg.in" | "msg.out" | "tool.call")
+        ) {
+            continue;
+        }
+        row["context_source_normalized_offset"] = serde_json::json!(offset);
+        if row["k"] == "meta" {
+            row["ingest_context_only"] = serde_json::json!(true);
+            row["native_recovery_v1"] = serde_json::json!([{"tape_id":legacy_id,"points":[]}]);
+        }
+        context_rows.push(row);
+    }
+    let context_text = context_rows
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("context rows JSON")
+        .join("\n")
+        + "\n";
+    let context_id = write_tape(&tapes_dir, &context_text);
+    assert_ne!(legacy_id, context_id);
+    assert_ne!(legacy_id, current_tape);
+    assert_ne!(context_id, current_tape);
+
+    let db_path = workspace_store.join("index.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open isolated index");
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .expect("foreign keys");
+        conn.execute(
+            "DELETE FROM evidence_windows WHERE tape_id = ?1",
+            [&current_tape],
+        )
+        .expect("remove fresh edit rows for stale-store simulation");
+        conn.execute("DELETE FROM edges WHERE tape_id = ?1", [&current_tape])
+            .expect("remove fresh edges for stale-store simulation");
+        conn.execute("DELETE FROM tombstones WHERE tape_id = ?1", [&current_tape])
+            .expect("remove fresh tombstones for stale-store simulation");
+        conn.execute(
+            "DELETE FROM dispatch_links WHERE tape_id = ?1",
+            [&current_tape],
+        )
+        .expect("remove fresh dispatch rows for stale-store simulation");
+        conn.execute("DELETE FROM tapes WHERE tape_id = ?1", [&current_tape])
+            .expect("remove fresh tape index row for stale-store simulation");
+    }
+    fs::remove_file(&current_tape_path)
+        .expect("remove only fresh tape from isolated stale fixture");
+    {
+        let index = SqliteIndex::open_owner_writer(db_path.to_str().unwrap())
+            .expect("owner writer for isolated stale fixture");
+        for (id, text) in [(&legacy_id, &legacy_text), (&context_id, &context_text)] {
+            let events = parse_jsonl_events(text).expect("legacy tape events");
+            index
+                .ingest_tape_events_with_dispatch(id, &events, &[], 0.5)
+                .expect("index legacy physical tape");
+        }
+    }
+    cursor["tape_id"] = serde_json::json!(legacy_id);
+    cursor["continuity"]["tape_id"] = serde_json::json!(context_id);
+    fs::write(
+        &cursor_path,
+        serde_json::to_vec_pretty(&cursor).expect("legacy cursor JSON"),
+    )
+    .expect("install unchanged legacy cursor");
+    let legacy_bytes =
+        fs::read(tapes_dir.join(format!("{legacy_id}.jsonl.zst"))).expect("legacy tape bytes");
+    let context_bytes =
+        fs::read(tapes_dir.join(format!("{context_id}.jsonl.zst"))).expect("context tape bytes");
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open stale index read-only");
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM evidence_windows WHERE tape_id IN (?1, ?2)",
+                rusqlite::params![legacy_id, context_id],
+                |row| row.get(0),
+            )
+            .expect("legacy evidence count");
+        assert_eq!(
+            rows, 0,
+            "the stale full/context tapes have no edit evidence"
+        );
+    }
+    let before = run_cli(
+        &repo,
+        &[
+            "explain",
+            "scripts/verify_mix.sh:19-25",
+            "--until",
+            "2026-08-12",
+        ],
+        None,
+        &home,
+    );
+    assert!(!before.status.success(), "stale tape unexpectedly matched");
+    assert_eq!(stderr_json_line(&before.stderr)["error"], "no_results");
+
+    let recovered = run_json(
+        &repo,
+        &["ingest", "--reprocess-source", "rollout.codex.jsonl"],
+        None,
+        &home,
+    );
+    assert_eq!(recovered["status"], "ok", "{recovered}");
+    assert_eq!(recovered["imported_tapes"], 1, "{recovered}");
+    assert_eq!(recovered["failure_count"], 0, "{recovered}");
+    let replacement = recovered["source_replay"]["replacement_tape_id"]
+        .as_str()
+        .expect("replacement tape ID")
+        .to_string();
+    assert_ne!(replacement, legacy_id);
+    assert_ne!(replacement, context_id);
+    assert_eq!(
+        recovered["source_replay"]["prior_tape_ids"],
+        serde_json::json!([legacy_id, context_id])
+    );
+    let replacement_path = tapes_dir.join(format!("{replacement}.jsonl.zst"));
+    let replacement_bytes = fs::read(&replacement_path).expect("replacement tape");
+    let replacement_text = String::from_utf8(
+        zstd::stream::decode_all(replacement_bytes.as_slice()).expect("decompress replacement"),
+    )
+    .expect("replacement UTF-8");
+    let replacement_rows = replacement_text
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("replacement JSONL");
+    let replacement_meta = replacement_rows
+        .iter()
+        .find(|row| row["k"] == "meta")
+        .expect("replacement meta");
+    assert_eq!(
+        replacement_meta["ingest_source_replay_v1"]["source_sha256"],
+        sha256_hex(&raw)
+    );
+    assert_eq!(
+        replacement_meta["ingest_source_replay_v1"]["source_bytes"],
+        raw.len() as u64
+    );
+    assert_eq!(
+        replacement_meta["ingest_source_replay_v1"]["prior_tape_ids"],
+        serde_json::json!([legacy_id, context_id])
+    );
+    assert!(replacement_rows.iter().any(|row| {
+        row["k"] == "code.edit" && row["file"] == target_text && row["after_text"] == script
+    }));
+    assert_eq!(
+        legacy_bytes,
+        fs::read(tapes_dir.join(format!("{legacy_id}.jsonl.zst"))).expect("retained legacy tape")
+    );
+    assert_eq!(
+        context_bytes,
+        fs::read(tapes_dir.join(format!("{context_id}.jsonl.zst"))).expect("retained context tape")
+    );
+
+    let explain = run_json(
+        &repo,
+        &[
+            "explain",
+            "scripts/verify_mix.sh:19-25",
+            "--until",
+            "2026-08-12",
+        ],
+        None,
+        &home,
+    );
+    assert!(
+        explain["sessions"]
+            .as_array()
+            .expect("explain sessions")
+            .iter()
+            .any(|session| session["session_id"] == replacement),
+        "recovered tape missing from public span result: {explain}"
+    );
+
+    let after_first = ordered_index_snapshot(&db_path);
+    let tape_names_after_first = {
+        let mut names = fs::read_dir(&tapes_dir)
+            .expect("tape dir")
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let repeated = run_json(
+        &repo,
+        &["ingest", "--reprocess-source", "rollout.codex.jsonl"],
+        None,
+        &home,
+    );
+    assert_eq!(repeated["status"], "ok", "{repeated}");
+    assert_eq!(repeated["imported_tapes"], 0, "{repeated}");
+    assert_eq!(
+        repeated["source_replay"]["replacement_tape_id"],
+        replacement
+    );
+    assert_eq!(ordered_index_snapshot(&db_path), after_first);
+    let tape_names_after_repeat = {
+        let mut names = fs::read_dir(&tapes_dir)
+            .expect("tape dir")
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    assert_eq!(tape_names_after_repeat, tape_names_after_first);
+
+    let edit_count = |tape_id: &str| {
+        rusqlite::Connection::open(&db_path)
+            .expect("query index")
+            .query_row(
+                "SELECT COUNT(*) FROM evidence_windows WHERE tape_id = ?1 AND kind = 'edit'",
+                [tape_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("edit evidence count")
+    };
+    let recovered_edit_count = edit_count(&replacement);
+    assert!(recovered_edit_count > 0);
+
+    let appended = serde_json::json!({
+        "timestamp":"2026-08-09T03:28:00.000Z",
+        "type":"response_item",
+        "payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"The isolated test wrapper is ready."}]}
+    });
+    let mut append_line = serde_json::to_string(&appended).expect("append row");
+    append_line.push('\n');
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&source)
+        .expect("source append open")
+        .write_all(append_line.as_bytes())
+        .expect("append later conversation row");
+    let append_result = run_json(&repo, &["ingest", "rollout.codex.jsonl"], None, &home);
+    assert_eq!(append_result["status"], "ok", "{append_result}");
+    assert_eq!(append_result["imported_tapes"], 1, "{append_result}");
+    let appended_cursor: Value =
+        serde_json::from_slice(&fs::read(&cursor_path).expect("appended cursor"))
+            .expect("appended cursor JSON");
+    let appended_tape = appended_cursor["tape_id"].as_str().unwrap();
+    let appended_bytes =
+        fs::read(tapes_dir.join(format!("{appended_tape}.jsonl.zst"))).expect("continuation tape");
+    let appended_text = String::from_utf8(
+        zstd::stream::decode_all(appended_bytes.as_slice()).expect("decompress continuation"),
+    )
+    .expect("continuation UTF-8");
+    let appended_meta: Value = appended_text
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("continuation JSONL")
+        .into_iter()
+        .find(|row| row["k"] == "meta")
+        .expect("continuation meta");
+    assert_eq!(
+        appended_meta["ingest_continuation"]["previous_tape_id"],
+        replacement
+    );
+    assert_eq!(edit_count(&replacement), recovered_edit_count);
+    let after_append_explain = run_json(
+        &repo,
+        &[
+            "explain",
+            "scripts/verify_mix.sh:19-25",
+            "--until",
+            "2026-08-12",
+        ],
+        None,
+        &home,
+    );
+    assert!(
+        after_append_explain["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|session| session["session_id"] == replacement),
+        "append lost recovered edit: {after_append_explain}"
+    );
 }
 
 #[test]

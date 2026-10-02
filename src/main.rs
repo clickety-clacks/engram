@@ -2607,6 +2607,13 @@ struct PeerServeArgs {
 struct IngestArgs {
     #[arg(value_name = "PATH")]
     paths: Vec<PathBuf>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with = "paths",
+        help = "Re-normalize one already-ingested transcript (maximum 16 MiB), preserving its old tapes"
+    )]
+    reprocess_source: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Default)]
@@ -3131,7 +3138,11 @@ fn cmd_ingest(
 ) -> Result<(), CliError> {
     ensure_local_store(paths)?;
     print_context_conspicuity(context);
-    run_ingest(cwd, paths, context, &args.paths)
+    if let Some(source) = args.reprocess_source {
+        engram::ingest::run_ingest_source_replay(cwd, paths, context, &source)
+    } else {
+        run_ingest(cwd, paths, context, &args.paths)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3427,6 +3438,7 @@ fn run_watch_ingest(
                 &context,
                 IngestArgs {
                     paths: vec![changed],
+                    reprocess_source: None,
                 },
             )
         });

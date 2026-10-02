@@ -27,6 +27,7 @@ use crate::tape::event::{TapeEventAt, TapeEventData, parse_jsonl_events};
 use crate::{CliError, RepoPaths, RuntimeContext, ensure_db_parent, home_dir, path_string};
 
 const CURSOR_GUARD_WINDOW: usize = 512;
+const MAX_EXPLICIT_SOURCE_REPLAY_BYTES: u64 = 16 * 1024 * 1024;
 
 #[cfg(test)]
 thread_local! {
@@ -39,8 +40,54 @@ pub fn run_ingest(
     context: &RuntimeContext,
     raw_paths: &[PathBuf],
 ) -> Result<(), CliError> {
+    run_ingest_mode(cwd, paths, context, raw_paths, false)
+}
+
+/// Re-normalize one explicitly selected, previously ingested transcript using
+/// the current adapter. Original tapes remain immutable; the replacement tape
+/// carries a hash-bound source-replay record and the prior physical tape IDs.
+pub fn run_ingest_source_replay(
+    cwd: &Path,
+    paths: &RepoPaths,
+    context: &RuntimeContext,
+    raw_path: &Path,
+) -> Result<(), CliError> {
+    run_ingest_mode(cwd, paths, context, &[raw_path.to_path_buf()], true)
+}
+
+fn run_ingest_mode(
+    cwd: &Path,
+    paths: &RepoPaths,
+    context: &RuntimeContext,
+    raw_paths: &[PathBuf],
+    explicit_source_replay: bool,
+) -> Result<(), CliError> {
     fs::create_dir_all(&context.tapes_dir).map_err(|err| CliError::io("mkdir_error", err))?;
     let (mut candidates, mut failures) = discover_ingest_candidates(cwd, raw_paths)?;
+    if explicit_source_replay {
+        if raw_paths.len() != 1 || !failures.is_empty() || candidates.len() != 1 {
+            return Err(CliError::new(
+                "source_replay_scope",
+                "--reprocess-source requires exactly one in-scope regular transcript file",
+            ));
+        }
+        let selected_path = if raw_paths[0].is_absolute() {
+            raw_paths[0].clone()
+        } else {
+            cwd.join(&raw_paths[0])
+        };
+        let selected = fs::canonicalize(selected_path)
+            .map_err(|err| CliError::io("source_replay_scope", err))?;
+        if !fs::metadata(&selected)
+            .map_err(|err| CliError::io("source_replay_scope", err))?
+            .is_file()
+        {
+            return Err(CliError::new(
+                "source_replay_scope",
+                "--reprocess-source accepts one regular transcript file, not a directory",
+            ));
+        }
+    }
     let home = home_dir()?;
     if raw_paths.is_empty() {
         for descriptor in adapter_registry() {
@@ -62,6 +109,7 @@ pub fn run_ingest(
     let mut skipped_non_transcript = 0usize;
     let mut recovered_sources = 0usize;
     let mut recovered_tapes = 0usize;
+    let mut source_replay_result = None::<Value>;
 
     for path in candidates {
         scanned += 1;
@@ -99,7 +147,48 @@ pub fn run_ingest(
 
         let mut should_run_full = prior_state.is_none();
         let mut full_reason = None::<&str>;
-        if let Some(prev) = prior_state.as_ref() {
+        if explicit_source_replay {
+            let Some(prev) = prior_state.as_ref() else {
+                failures.push(json!({
+                    "path": path_string(&abs_path),
+                    "error": "--reprocess-source requires an existing ingest cursor",
+                }));
+                continue;
+            };
+            if metadata.len() > MAX_EXPLICIT_SOURCE_REPLAY_BYTES {
+                failures.push(json!({
+                    "path": path_string(&abs_path),
+                    "error": format!("--reprocess-source is limited to {MAX_EXPLICIT_SOURCE_REPLAY_BYTES} bytes"),
+                }));
+                continue;
+            }
+            if metadata.len() < prev.byte_cursor {
+                failures.push(json!({
+                    "path": path_string(&abs_path),
+                    "error": "source is shorter than its existing ingest cursor",
+                }));
+                continue;
+            }
+            match ingest_cursor_guard_matches(&abs_path, &prev.cursor_guard, metadata.len()) {
+                Ok(true) => {}
+                Ok(false) => {
+                    failures.push(json!({
+                        "path": path_string(&abs_path),
+                        "error": "source no longer matches its existing ingest cursor guard",
+                    }));
+                    continue;
+                }
+                Err(err) => {
+                    failures.push(json!({
+                        "path": path_string(&abs_path),
+                        "error": err.message,
+                    }));
+                    continue;
+                }
+            }
+            should_run_full = true;
+            full_reason = Some("explicit_source_replay_v1");
+        } else if let Some(prev) = prior_state.as_ref() {
             let prior_tape_path = tape_path_for_tapes_dir(&context.tapes_dir, &prev.tape_id);
             let prior_tape_missing = !prior_tape_path.exists()
                 || prev.continuity.as_ref().is_some_and(|state| {
@@ -235,12 +324,17 @@ pub fn run_ingest(
         }
 
         if should_run_full {
-            let all_bytes = match fs::read(&abs_path) {
+            let all_bytes_result = if explicit_source_replay {
+                read_explicit_source_replay(&abs_path)
+            } else {
+                fs::read(&abs_path).map_err(|err| CliError::io("read_error", err))
+            };
+            let all_bytes = match all_bytes_result {
                 Ok(value) => value,
                 Err(err) => {
                     failures.push(json!({
                         "path": path_string(&abs_path),
-                        "error": err.to_string(),
+                        "error": err.message,
                     }));
                     continue;
                 }
@@ -266,6 +360,29 @@ pub fn run_ingest(
                 }));
                 continue;
             }
+        };
+
+        let source_replay = if explicit_source_replay {
+            let previous = prior_state
+                .as_ref()
+                .expect("explicit source replay validated an existing cursor");
+            let source_path_sha256 = sha256_hex(&path_string(&abs_path));
+            let source_sha256 = sha256_hex_bytes(ingest_input.as_bytes());
+            let source_bytes = ingest_input.len() as u64;
+            let existing = previous.source_replay.as_ref().filter(|previous| {
+                previous.source_path_sha256 == source_path_sha256
+                    && previous.source_sha256 == source_sha256
+                    && previous.source_bytes == source_bytes
+            });
+            Some(existing.cloned().unwrap_or_else(|| SourceReplayProvenance {
+                version: 1,
+                source_path_sha256,
+                source_sha256,
+                source_bytes,
+                prior_tape_ids: prior_tape_ids(previous),
+            }))
+        } else {
+            None
         };
 
         // A guarded native cursor already identifies its format. Metadata-only
@@ -364,6 +481,11 @@ pub fn run_ingest(
         } else {
             (normalized, 0)
         };
+        let normalized = if let Some(provenance) = source_replay.as_ref() {
+            attach_source_replay_provenance(&normalized, provenance)?
+        } else {
+            normalized
+        };
         let events = match parse_jsonl_events(&normalized) {
             Ok(events) => events,
             Err(err) => {
@@ -445,6 +567,7 @@ pub fn run_ingest(
                     .or_else(|| previous.and_then(|state| state.last_message_timestamp.clone())),
             }),
             tape_id,
+            source_replay: source_replay.clone(),
         };
         if let Err(err) = save_ingest_state_for_path(paths, &abs_path, &state) {
             failures.push(json!({
@@ -452,6 +575,16 @@ pub fn run_ingest(
                 "error": err.message,
             }));
             continue;
+        }
+        if let Some(provenance) = source_replay {
+            source_replay_result = Some(json!({
+                "mode": "explicit_source_replay_v1",
+                "source_path_sha256": provenance.source_path_sha256,
+                "source_sha256": provenance.source_sha256,
+                "source_bytes": provenance.source_bytes,
+                "prior_tape_ids": provenance.prior_tape_ids,
+                "replacement_tape_id": state.tape_id,
+            }));
         }
     }
 
@@ -468,7 +601,95 @@ pub fn run_ingest(
     if recovered_sources > 0 {
         result["native_recovery"] = json!({"mode":"one_time_legacy_context_v1", "sources":recovered_sources, "tapes":recovered_tapes});
     }
+    if let Some(source_replay) = source_replay_result {
+        result["source_replay"] = source_replay;
+    }
     print_json(&result)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct SourceReplayProvenance {
+    version: u8,
+    source_path_sha256: String,
+    source_sha256: String,
+    source_bytes: u64,
+    prior_tape_ids: Vec<String>,
+}
+
+fn prior_tape_ids(previous: &IngestFileState) -> Vec<String> {
+    let mut ids = vec![previous.tape_id.clone()];
+    if let Some(continuity) = previous.continuity.as_ref() {
+        ids.push(continuity.tape_id.clone());
+    }
+    ids.dedup();
+    ids
+}
+
+fn attach_source_replay_provenance(
+    normalized: &str,
+    provenance: &SourceReplayProvenance,
+) -> Result<String, CliError> {
+    let mut rows = normalized
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let meta = rows
+        .iter_mut()
+        .find(|row| row["k"] == "meta")
+        .ok_or_else(|| {
+            CliError::new(
+                "source_replay_error",
+                "normalized transcript has no meta row",
+            )
+        })?;
+    meta["ingest_source_replay_v1"] = serde_json::to_value(provenance)?;
+    let encoded = rows
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()?
+        .join("\n");
+    Ok(encoded + "\n")
+}
+
+fn read_explicit_source_replay(path: &Path) -> Result<Vec<u8>, CliError> {
+    let file = File::open(path).map_err(|err| CliError::io("read_error", err))?;
+    let before = file
+        .metadata()
+        .map_err(|err| CliError::io("read_error", err))?;
+    if !before.is_file() {
+        return Err(CliError::new(
+            "source_replay_scope",
+            "--reprocess-source accepts one regular transcript file",
+        ));
+    }
+    if before.len() > MAX_EXPLICIT_SOURCE_REPLAY_BYTES {
+        return Err(CliError::new(
+            "source_replay_limit",
+            format!("--reprocess-source is limited to {MAX_EXPLICIT_SOURCE_REPLAY_BYTES} bytes"),
+        ));
+    }
+    let mut limited = file.take(MAX_EXPLICIT_SOURCE_REPLAY_BYTES + 1);
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    limited
+        .read_to_end(&mut bytes)
+        .map_err(|err| CliError::io("read_error", err))?;
+    if bytes.len() as u64 > MAX_EXPLICIT_SOURCE_REPLAY_BYTES {
+        return Err(CliError::new(
+            "source_replay_limit",
+            format!("--reprocess-source is limited to {MAX_EXPLICIT_SOURCE_REPLAY_BYTES} bytes"),
+        ));
+    }
+    let after = limited
+        .get_ref()
+        .metadata()
+        .map_err(|err| CliError::io("read_error", err))?;
+    if after.len() != before.len() || bytes.len() as u64 != before.len() {
+        return Err(CliError::new(
+            "source_replay_changed",
+            "source size changed while it was being reprocessed",
+        ));
+    }
+    Ok(bytes)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -486,6 +707,8 @@ pub(crate) struct IngestFileState {
     pub tape_id: String,
     #[serde(default)]
     continuity: Option<Continuity>,
+    #[serde(default)]
+    source_replay: Option<SourceReplayProvenance>,
 }
 
 fn store_normalized(context: &RuntimeContext, id: &str, normalized: &str) -> Result<(), CliError> {
