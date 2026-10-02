@@ -867,16 +867,9 @@ impl PeerSession {
                             };
                             let relation =
                                 identity_resolver.relation(peer_cwd, file, evidence_file);
-                            let same_file_and_revision = match relation {
-                                FileIdentityRelation::SamePhysicalPath => match (
-                                    repo_head.as_deref(),
-                                    target_identity
-                                        .as_ref()
-                                        .and_then(|identity| identity.head()),
-                                ) {
-                                    (Some(source), Some(target)) => source == target,
-                                    _ => true,
-                                },
+                            let same_file_identity = match relation {
+                                // The physical file remains the same when its checkout advances.
+                                FileIdentityRelation::SamePhysicalPath => true,
                                 FileIdentityRelation::SameRepositoryFile => matches!(
                                     (
                                         repo_head.as_deref(),
@@ -888,7 +881,7 @@ impl PeerSession {
                                 ),
                                 _ => false,
                             };
-                            same_file_and_revision
+                            same_file_identity
                                 && structured_edit_overlaps_span(
                                     &row.value,
                                     evidence_file,

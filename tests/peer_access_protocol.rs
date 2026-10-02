@@ -7867,6 +7867,140 @@ fn peer_tape_facts_returns_segment_history_turn_maps_and_bounded_summaries() {
 }
 
 #[test]
+fn peer_tape_facts_keeps_same_physical_edit_exact_after_later_commit() {
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("git is available for peer span tests");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("git stdout is UTF-8")
+            .trim()
+            .to_string()
+    }
+
+    fn commit(root: &Path, message: &str, date: &str) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["-c", "commit.gpgsign=false", "commit", "-m", message])
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .output()
+            .expect("git is available for peer span tests");
+        assert!(
+            output.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let repo = temp.path().join("same-path-repository");
+    let source = repo.join("src/lib.rs");
+    std::fs::create_dir_all(source.parent().expect("source parent"))
+        .expect("create source directory");
+    std::fs::write(&source, "pub fn example() {\n    before();\n}\n").expect("write source file");
+    let output = Command::new("git")
+        .arg("init")
+        .arg("--quiet")
+        .arg(&repo)
+        .output()
+        .expect("git is available for peer span tests");
+    assert!(output.status.success(), "git init failed");
+    let _ = git(&repo, &["config", "user.name", "Peer Span Test"]);
+    let _ = git(
+        &repo,
+        &["config", "user.email", "peer-span@example.invalid"],
+    );
+    let _ = git(&repo, &["add", "src/lib.rs"]);
+    commit(&repo, "session-start revision", "2026-01-01T00:00:00Z");
+    let session_head = git(&repo, &["rev-parse", "HEAD"]);
+
+    let source_path = source.to_string_lossy().to_string();
+    let content = format!(
+        "{}\n{}\n",
+        json!({"k":"meta", "repo_head":session_head}),
+        json!({
+            "t":"2026-01-01T00:30:00Z",
+            "k":"code.edit",
+            "file":source_path,
+            "after_range":[19,25],
+            "after_text":"after edit",
+        })
+    );
+    let tape_id = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
+    let remote = write_grep_owner(
+        temp.path(),
+        "same-path-owner",
+        binary,
+        &[(&tape_id, &content)],
+    );
+
+    std::fs::write(repo.join("README.md"), "a later commit after the edit\n")
+        .expect("write unrelated later-commit file");
+    let _ = git(&repo, &["add", "README.md"]);
+    commit(
+        &repo,
+        "commit after authoring session",
+        "2026-01-02T00:00:00Z",
+    );
+    let current_head = git(&repo, &["rev-parse", "HEAD"]);
+    assert_ne!(session_head, current_head);
+
+    let peer = TopologyPeer {
+        ssh: None,
+        command: Some(
+            remote["command"]
+                .as_array()
+                .expect("command array")
+                .iter()
+                .map(|arg| arg.as_str().expect("command string").to_string())
+                .collect(),
+        ),
+        engram: binary.to_string(),
+        exports: vec!["default".into()],
+    };
+    let mut owner =
+        RemoteOwner::connect("same-path-owner", "caller", &peer, Duration::from_secs(5))
+            .expect("connect owner");
+    let response = owner
+        .round(
+            &[PeerRequest::new(
+                "tape_facts",
+                vec!["default".into()],
+                json!({
+                    "items": [{
+                        "tape_id": tape_id,
+                        "edit_offsets": [1],
+                        "rank_span": {
+                            "file": source_path,
+                            "start": 19,
+                            "end": 25,
+                        },
+                    }],
+                }),
+            )],
+            Duration::from_secs(5),
+        )
+        .into_iter()
+        .next()
+        .expect("peer tape-facts response")
+        .expect("peer tape-facts succeeds");
+    let facts = &response.data[0];
+    assert_eq!(facts["repo_head"], session_head);
+    assert_eq!(facts["span_edit_match"], true);
+}
+
+#[test]
 fn peer_tape_facts_uses_smallest_resolvable_anchor_offset() {
     let temp = tempfile::tempdir().expect("tempdir");
     let binary = env!("CARGO_BIN_EXE_engram");

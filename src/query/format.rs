@@ -428,15 +428,8 @@ pub fn exact_span_edit_sessions(
                     let event_offset = touch.get("event_offset")?.as_u64()?;
                     let relation = identity_resolver.relation(cwd, file, evidence_file);
                     let same_path = match relation {
-                        FileIdentityRelation::SamePhysicalPath => match (
-                            source_repo_head,
-                            target_identity
-                                .as_ref()
-                                .and_then(|identity| identity.head()),
-                        ) {
-                            (Some(source), Some(target)) => source == target,
-                            _ => true,
-                        },
+                        // A session-start HEAD may lag the current checkout for this same file.
+                        FileIdentityRelation::SamePhysicalPath => true,
                         FileIdentityRelation::SameRepositoryFile => matches!(
                             (
                                 source_repo_head,
@@ -1883,6 +1876,45 @@ mod file_identity_span_tests {
                 &root,
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn same_physical_path_edit_remains_exact_after_later_commit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("repository");
+        let session_head = init_repo(&root);
+        let target = root.join("scripts/verify_mix.sh");
+        let session = edit_session("same-path-after-commit", &session_head, &target, 1, 1);
+
+        fs::write(root.join("README.md"), "a later commit after the edit\n")
+            .expect("write unrelated later-commit file");
+        let _ = git(&root, &["add", "README.md"]);
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["-c", "commit.gpgsign=false", "commit", "-m", "later commit"])
+            .env("GIT_AUTHOR_DATE", "2026-01-02T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2026-01-02T00:00:00Z")
+            .output()
+            .expect("git is available for same-path span tests");
+        assert!(
+            output.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let current_head = git(&root, &["rev-parse", "HEAD"]);
+        assert_ne!(session_head, current_head);
+
+        assert_eq!(
+            exact_span_edit_sessions(
+                std::slice::from_ref(&session),
+                &target.to_string_lossy(),
+                1,
+                1,
+                &root,
+            ),
+            ["same-path-after-commit".to_string()].into()
         );
     }
 }

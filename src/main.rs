@@ -7827,7 +7827,7 @@ fn explain_evidence_label(
     if exact_edit_sessions.contains(tape_id) {
         (
             "exact_span_edit",
-            "the indexed edit path and range match; recorded revisions agree when both are available",
+            "the indexed edit path and range match; revision equality is required only for cross-worktree identity",
             file_identity,
             "edit",
         )
@@ -9196,6 +9196,84 @@ mod tests {
         assert_eq!(
             unknown["touches"][0]["file_path"],
             unknown_path.to_string_lossy().as_ref()
+        );
+    }
+
+    #[test]
+    fn same_physical_exact_span_survives_checkout_head_advance() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repository = temp.path().join("repository");
+        let session_head = init_identity_test_repo(&repository, "line one\nline two\n");
+        let source_file = repository.join("scripts/verify_mix.sh");
+        let source_path = source_file.to_string_lossy().to_string();
+        let session = json!({
+            "session_id": "same-physical-path-after-commit",
+            "tape_id": "same-physical-path-after-commit",
+            "repo_head": session_head,
+            "touches": [{
+                "kind": "edit",
+                "file_path": source_path.clone(),
+                "event_offset": 7,
+            }],
+            "windows": [{
+                "events": [{
+                    "offset": 7,
+                    "event": {
+                        "k": "code.edit",
+                        "file": source_path,
+                        "after_range": [1, 1],
+                    }
+                }]
+            }]
+        });
+
+        fs::write(
+            repository.join("README.md"),
+            "a later commit after the edit\n",
+        )
+        .expect("write later-commit file");
+        let _ = git_identity_test(&repository, &["add", "README.md"]);
+        let output = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(["-c", "commit.gpgsign=false", "commit", "-m", "later commit"])
+            .env("GIT_AUTHOR_DATE", "2026-01-02T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2026-01-02T00:00:00Z")
+            .output()
+            .expect("git is available for exact-span label tests");
+        assert!(
+            output.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let current_head = git_identity_test(&repository, &["rev-parse", "HEAD"]);
+        assert_ne!(session_head, current_head);
+
+        let exact_sessions = exact_span_edit_sessions(
+            std::slice::from_ref(&session),
+            "scripts/verify_mix.sh",
+            1,
+            1,
+            &repository,
+        );
+        assert!(exact_sessions.contains("same-physical-path-after-commit"));
+
+        let mut resolver = FileIdentityResolver::default();
+        let label = explain_evidence_label(
+            &repository,
+            "local",
+            &session,
+            Some("scripts/verify_mix.sh"),
+            &exact_sessions,
+            &HashSet::new(),
+            &mut resolver,
+        );
+        assert_eq!(label.0, "exact_span_edit");
+        assert_eq!(label.2, "same_physical_path");
+        assert!(
+            label
+                .1
+                .contains("revision equality is required only for cross-worktree identity")
         );
     }
 
