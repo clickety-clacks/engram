@@ -358,15 +358,11 @@ pub fn compare_explain_sessions(a: &Value, b: &Value) -> std::cmp::Ordering {
     let a_session_id = a.get("session_id").and_then(Value::as_str).unwrap_or("");
     let b_session_id = b.get("session_id").and_then(Value::as_str).unwrap_or("");
 
-    b_touch_count
-        .cmp(&a_touch_count)
+    b_score
+        .total_cmp(&a_score)
+        .then_with(|| b_touch_count.cmp(&a_touch_count))
         .then_with(|| b_ts.cmp(a_ts))
         .then_with(|| a_depth.cmp(&b_depth))
-        .then_with(|| {
-            b_score
-                .partial_cmp(&a_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
         .then_with(|| a_session_id.cmp(b_session_id))
 }
 
