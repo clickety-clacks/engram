@@ -1608,6 +1608,84 @@ pub fn print_pretty_explain(
                 "  task ancestry status={}",
                 ancestry["status"].as_str().unwrap_or("unknown")
             );
+            if let Some(selection) = ancestry.get("selection") {
+                let label = if selection["kind"] == "direct_edit_task_association" {
+                    "Directly evidenced task"
+                } else {
+                    "Suggested task context"
+                };
+                println!(
+                    "    {label} assignment={}",
+                    selection["assignment_id"].as_str().unwrap_or("unknown")
+                );
+                if let Some(basis) = selection["visible_basis"].as_str() {
+                    println!("      {basis}");
+                }
+                if let Some(receipt) = ancestry.get("selected_receipt") {
+                    print_task_citation("selected receipt", receipt);
+                }
+            }
+            if let Some(unresolved) = ancestry.get("unresolved_receipt_context") {
+                println!(
+                    "    Unresolved receipt context assignment={} (not an ancestry hop)",
+                    unresolved["assignment_id"].as_str().unwrap_or("unknown")
+                );
+                if let Some(reason) = unresolved["reason"].as_str() {
+                    println!("      {reason}");
+                }
+            }
+            if ancestry["file_context_identity_status"] == "unknown_edit_path_identity" {
+                println!(
+                    "    File-specific context was not matched because the edited path has no usable absolute identity."
+                );
+            }
+            if ancestry["task_text_unavailable_receipts"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0
+            {
+                println!(
+                    "    File-specific task text was unavailable for {} receipts; no match was inferred.",
+                    ancestry["task_text_unavailable_receipts"]
+                        .as_u64()
+                        .unwrap_or_default()
+                );
+            }
+            for candidate in ancestry["file_specific_context_candidates"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                println!(
+                    "    File-specific context candidate assignment={} (edit relationship unverified)",
+                    candidate["assignment_id"].as_str().unwrap_or("unknown")
+                );
+                print_task_citation("candidate receipt", &candidate["receipt"]);
+            }
+            if ancestry["file_specific_context_candidates_omitted"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0
+            {
+                println!(
+                    "    {} additional file-specific receipt candidates were omitted by the display limit",
+                    ancestry["file_specific_context_candidates_omitted"]
+                        .as_u64()
+                        .unwrap_or_default()
+                );
+            }
+            if ancestry["other_receipts"]["other_assignment_count"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0
+            {
+                println!(
+                    "    {}",
+                    ancestry["other_receipts"]["message"]
+                        .as_str()
+                        .unwrap_or("Other receipt relationships are unknown.")
+                );
+            }
             if ancestry["alternatives_truncated"] == true {
                 println!(
                     "    alternatives truncated: {}",
@@ -1650,8 +1728,81 @@ pub fn print_pretty_explain(
                     step["assignment_id"].as_str().unwrap_or(""),
                     step["work_item_id"].as_str().unwrap_or("")
                 );
+                if let Some(relationship) = step["relationship_to_edit"].as_str() {
+                    println!("      {relationship}");
+                }
+                if let Some(selection) = step.get("parent_task_selection") {
+                    println!(
+                        "      Suggested upstream task context; its relation to the edit remains unverified."
+                    );
+                    if let Some(basis) = selection["visible_basis"].as_str() {
+                        println!("        {basis}");
+                    }
+                }
+                if let Some(unresolved) = step.get("unresolved_parent_receipt") {
+                    println!(
+                        "      Unresolved parent receipt assignment={} (not an ancestry hop)",
+                        unresolved["assignment_id"].as_str().unwrap_or("unknown")
+                    );
+                    if let Some(reason) = unresolved["reason"].as_str() {
+                        println!("        {reason}");
+                    }
+                    print_task_citation("unresolved parent receipt", &unresolved["receipt"]);
+                }
+                if step["parent_file_context_identity_status"] == "unknown_edit_path_identity" {
+                    println!(
+                        "      Parent file-specific context was not matched because the edited path has no usable absolute identity."
+                    );
+                }
+                if step["parent_task_text_unavailable_receipts"]
+                    .as_u64()
+                    .unwrap_or_default()
+                    > 0
+                {
+                    println!(
+                        "      Parent task text was unavailable for {} receipts; no match was inferred.",
+                        step["parent_task_text_unavailable_receipts"]
+                            .as_u64()
+                            .unwrap_or_default()
+                    );
+                }
                 print_task_edge_evidence(step);
                 print_task_context_passages(step);
+                for candidate in step["parent_file_specific_context_candidates"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                {
+                    println!(
+                        "      Parent file-specific context candidate assignment={} (relationship unverified)",
+                        candidate["assignment_id"].as_str().unwrap_or("unknown")
+                    );
+                    print_task_citation("parent candidate receipt", &candidate["receipt"]);
+                }
+                if step["parent_file_specific_context_candidates_omitted"]
+                    .as_u64()
+                    .unwrap_or_default()
+                    > 0
+                {
+                    println!(
+                        "      {} additional parent file-specific receipt candidates were omitted by the display limit",
+                        step["parent_file_specific_context_candidates_omitted"]
+                            .as_u64()
+                            .unwrap_or_default()
+                    );
+                }
+                if step["parent_other_receipts"]["other_assignment_count"]
+                    .as_u64()
+                    .unwrap_or_default()
+                    > 0
+                {
+                    println!(
+                        "      {}",
+                        step["parent_other_receipts"]["message"]
+                            .as_str()
+                            .unwrap_or("Other receipt relationships are unknown.")
+                    );
+                }
             }
         }
         if let Some(truncation) = session.get("task_ancestry_truncated") {

@@ -3,14 +3,15 @@
 //! pairs them with their recorded successful result; it never evaluates shell
 //! or JavaScript and never treats prose mentions as relationships.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
 use crate::index::{SqliteIndex, TaskContextEvent, TaskContextKind, TaskIdKind};
+use crate::query::file_identity::{FileIdentityRelation, FileIdentityResolver};
 use crate::query::format::{DateFilter, EventTimeDecision};
 use crate::store::tapes::resolve_tape_path;
 use crate::tape::adapters::codex::literal_exec_command_arguments;
@@ -530,6 +531,10 @@ pub fn attach_explain_task_ancestry(
                 &tape_id,
                 edit_offset,
                 timestamp,
+                touch["file_path"].as_str(),
+                touch["assignment_id"]
+                    .as_str()
+                    .or_else(|| touch["task_id"].as_str()),
                 date_filter,
                 depth_limit,
             )?;
@@ -635,6 +640,409 @@ fn task_receipts_before(
     Ok(out)
 }
 
+struct ReceiptSelection {
+    primary: Option<StoredTaskEvent>,
+    file_specific: Vec<StoredTaskEvent>,
+    other: Vec<StoredTaskEvent>,
+    observed_receipt_events: usize,
+    duplicate_receipt_events: usize,
+    file_specific_observed: usize,
+    task_text_unavailable: usize,
+    file_identity_unavailable: bool,
+    preferred_receipt_missing: bool,
+}
+
+/// Pick one primary receipt without treating temporal proximity as proof.
+/// Older receipts can be shown as additional context only when the delivered
+/// task text names this file through a known absolute or Git-identified path.
+fn select_receipt_context(
+    context: &RuntimeContext,
+    stores: &[PathBuf],
+    mut receipts: Vec<StoredTaskEvent>,
+    edited_file: Option<&str>,
+    directly_bound_assignment_id: Option<&str>,
+) -> ReceiptSelection {
+    let observed_receipt_events = receipts.len();
+    let mut seen_assignment_ids = HashSet::new();
+    receipts.retain(|receipt| seen_assignment_ids.insert(receipt.event.task_id.clone()));
+    let duplicate_receipt_events = observed_receipt_events.saturating_sub(receipts.len());
+
+    let preferred_index = directly_bound_assignment_id.and_then(|assignment_id| {
+        receipts
+            .iter()
+            .position(|receipt| receipt.event.task_id == assignment_id)
+    });
+    let preferred_receipt_missing =
+        directly_bound_assignment_id.is_some() && preferred_index.is_none();
+    let primary = if let Some(index) = preferred_index {
+        Some(receipts.remove(index))
+    } else if directly_bound_assignment_id.is_none() {
+        (!receipts.is_empty()).then(|| receipts.remove(0))
+    } else {
+        None
+    };
+
+    let Some(file_path) = edited_file.map(Path::new).filter(|path| path.is_absolute()) else {
+        return ReceiptSelection {
+            primary,
+            file_specific: Vec::new(),
+            other: receipts,
+            observed_receipt_events,
+            duplicate_receipt_events,
+            file_specific_observed: 0,
+            task_text_unavailable: 0,
+            file_identity_unavailable: true,
+            preferred_receipt_missing,
+        };
+    };
+
+    let task_texts = read_receipt_task_bodies(context, stores, &receipts);
+    let mut identity_resolver = FileIdentityResolver::default();
+    let mut file_specific = Vec::new();
+    let mut other = Vec::new();
+    let mut task_text_unavailable = 0usize;
+    for receipt in receipts {
+        let key = (receipt.tape_id.clone(), receipt.event.event_offset);
+        match task_texts.get(&key).and_then(Option::as_deref) {
+            Some(task_text)
+                if task_text_mentions_file(task_text, file_path, &mut identity_resolver) =>
+            {
+                file_specific.push(receipt);
+            }
+            Some(_) => other.push(receipt),
+            None => {
+                task_text_unavailable += 1;
+                other.push(receipt);
+            }
+        }
+    }
+    let file_specific_observed = file_specific.len();
+    let displayed_candidate_count = MAX_TASK_ANCESTRY_BRANCHES.saturating_sub(1);
+    let mut displayed_file_specific = file_specific
+        .drain(..file_specific.len().min(displayed_candidate_count))
+        .collect::<Vec<_>>();
+    other.extend(file_specific);
+    other.sort_by(|left, right| {
+        right
+            .event
+            .event_offset
+            .cmp(&left.event.event_offset)
+            .then_with(|| left.event.event_identity.cmp(&right.event.event_identity))
+    });
+    displayed_file_specific.sort_by(|left, right| {
+        right
+            .event
+            .event_offset
+            .cmp(&left.event.event_offset)
+            .then_with(|| left.event.event_identity.cmp(&right.event.event_identity))
+    });
+
+    ReceiptSelection {
+        primary,
+        file_specific: displayed_file_specific,
+        other,
+        observed_receipt_events,
+        duplicate_receipt_events,
+        file_specific_observed,
+        task_text_unavailable,
+        file_identity_unavailable: false,
+        preferred_receipt_missing,
+    }
+}
+
+fn read_receipt_task_bodies(
+    context: &RuntimeContext,
+    stores: &[PathBuf],
+    receipts: &[StoredTaskEvent],
+) -> HashMap<(String, u64), Option<String>> {
+    let mut by_tape: HashMap<(usize, String), Vec<u64>> = HashMap::new();
+    for receipt in receipts {
+        by_tape
+            .entry((receipt.store_index, receipt.tape_id.clone()))
+            .or_default()
+            .push(receipt.event.event_offset);
+    }
+    let mut output = HashMap::new();
+    for ((store_index, tape_id), mut offsets) in by_tape {
+        offsets.sort_unstable();
+        offsets.dedup();
+        let Some(path) = resolve_tape_path_for_store(context, stores, store_index, &tape_id) else {
+            output.extend(
+                offsets
+                    .into_iter()
+                    .map(|offset| ((tape_id.clone(), offset), None)),
+            );
+            continue;
+        };
+        let Ok(file) = File::open(path) else {
+            output.extend(
+                offsets
+                    .into_iter()
+                    .map(|offset| ((tape_id.clone(), offset), None)),
+            );
+            continue;
+        };
+        let Ok(decoder) = zstd::stream::read::Decoder::new(file) else {
+            output.extend(
+                offsets
+                    .into_iter()
+                    .map(|offset| ((tape_id.clone(), offset), None)),
+            );
+            continue;
+        };
+        let mut reader = BufReader::new(decoder);
+        let mut wanted = offsets.into_iter().peekable();
+        let Some(last_offset) = wanted.clone().last() else {
+            continue;
+        };
+        for offset in 0..=last_offset {
+            let row = match read_bounded_jsonl_line(&mut reader, TASK_CONTEXT_MAX_EVENT_BYTES) {
+                Ok(Some((line, false))) => serde_json::from_slice::<Value>(&line).ok(),
+                Ok(Some((_line, true))) => None,
+                Ok(None) | Err(_) => None,
+            };
+            while wanted.peek().copied() == Some(offset) {
+                wanted.next();
+                let task_text = row
+                    .as_ref()
+                    .and_then(assignment_task_body)
+                    .map(ToOwned::to_owned);
+                output.insert((tape_id.clone(), offset), task_text);
+            }
+            if wanted.peek().is_none() {
+                break;
+            }
+        }
+        for offset in wanted {
+            output.insert((tape_id.clone(), offset), None);
+        }
+    }
+    output
+}
+
+fn assignment_task_body(row: &Value) -> Option<&str> {
+    if row["k"].as_str()? != "msg.in" {
+        return None;
+    }
+    let content = row["content"].as_str()?;
+    let mut lines = content.split_inclusive('\n');
+    let sender_line = lines.next()?;
+    let sender = sender_line.trim();
+    if !sender.starts_with("[from ") || !sender.ends_with(']') {
+        return None;
+    }
+    let mut offset = sender_line.len();
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || (trimmed.starts_with('[') && trimmed.ends_with(']')) {
+            offset += line.len();
+            continue;
+        }
+        // The first non-header line begins the delivered task body.
+        return Some(&content[offset..]);
+    }
+    None
+}
+
+fn task_text_mentions_file(
+    task_text: &str,
+    edited_file: &Path,
+    identity_resolver: &mut FileIdentityResolver,
+) -> bool {
+    if !edited_file.is_absolute() {
+        return false;
+    }
+    let mut fenced = false;
+    for line in task_text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced || trimmed.starts_with('>') {
+            continue;
+        }
+        for mentioned_path in absolute_path_mentions(line) {
+            match identity_resolver.relation_absolute(edited_file, &mentioned_path) {
+                FileIdentityRelation::SamePhysicalPath
+                | FileIdentityRelation::SameRepositoryFile => {
+                    return true;
+                }
+                _ if identity_resolver
+                    .is_specific_same_repository_directory_prefix(edited_file, &mentioned_path) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+fn absolute_path_mentions(line: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let bytes = line.as_bytes();
+    for start in 0..bytes.len() {
+        let is_unix_root = bytes[start] == b'/';
+        let is_windows_drive = bytes[start].is_ascii_alphabetic()
+            && bytes.get(start + 1) == Some(&b':')
+            && matches!(bytes.get(start + 2), Some(b'\\' | b'/'));
+        let is_windows_unc = bytes[start] == b'\\' && bytes.get(start + 1) == Some(&b'\\');
+        if !(is_unix_root || is_windows_drive || is_windows_unc) {
+            continue;
+        }
+        let previous = line[..start].chars().next_back();
+        if previous.is_some_and(|previous| {
+            !(previous.is_whitespace()
+                || matches!(previous, '`' | '"' | '\'' | '(' | '[' | '{' | ':' | '='))
+        }) {
+            continue;
+        }
+        let remainder = &line[start..];
+        let end = remainder
+            .char_indices()
+            .find(|(_, character)| {
+                character.is_whitespace() || matches!(character, '`' | ')' | ']' | '}' | '"' | '\'')
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(remainder.len());
+        let token = remainder[..end].trim_end_matches([',', '.', ';', ':', '!', '?']);
+        if token.len() > 1 {
+            let candidate = Path::new(token);
+            if candidate.is_absolute() {
+                paths.push(candidate.to_path_buf());
+            }
+        }
+    }
+    paths
+}
+
+fn receipt_selection_metadata(
+    receipt: &StoredTaskEvent,
+    anchor: &str,
+    directly_bound: bool,
+) -> Value {
+    let (kind, basis, visible_basis, relationship) = if directly_bound {
+        (
+            "direct_edit_task_association",
+            "exact_assignment_id_on_edit_evidence",
+            "The edit evidence names this exact assignment ID.",
+            "directly_bound",
+        )
+    } else if anchor == "edit" {
+        (
+            "suggested_task_context",
+            "most_recent_receipt_before_edit",
+            "Most recent receipt before this edit; edit-to-task association unverified.",
+            "unverified",
+        )
+    } else if anchor == "work_item_creation" {
+        (
+            "suggested_parent_task_context",
+            "most_recent_receipt_before_work_item_creation",
+            "Most recent receipt before this work-item creation; upstream task association unverified.",
+            "unverified",
+        )
+    } else {
+        (
+            "suggested_parent_task_context",
+            "most_recent_receipt_before_dispatch",
+            "Most recent receipt before this dispatch; upstream task association unverified.",
+            "unverified",
+        )
+    };
+    json!({
+        "kind":kind,
+        "assignment_id":receipt.event.task_id,
+        "basis":basis,
+        "visible_basis":visible_basis,
+        "relationship_to_anchor":relationship,
+    })
+}
+
+fn annotate_operation_selection(
+    step: &mut Value,
+    edit_selection: &Value,
+    receipt_selection: &Value,
+) {
+    step["edit_task_selection"] = edit_selection.clone();
+    step["receipt_selection"] = receipt_selection.clone();
+    step["link_scope"] = json!("operation_to_receipt_only");
+    step["relationship_to_edit"] = if edit_selection["relationship_to_anchor"] == "directly_bound"
+        && receipt_selection["relationship_to_anchor"] == "directly_bound"
+    {
+        json!(
+            "The edit names this assignment ID; this operation is joined to the delivered receipt by exact assignment ID."
+        )
+    } else {
+        json!(
+            "Exact assignment ID joins this operation to the selected receipt; this does not establish the edit-to-task or upstream task relationship."
+        )
+    };
+}
+
+fn file_specific_receipt_candidates(
+    context: &RuntimeContext,
+    stores: &[PathBuf],
+    machine_label: &str,
+    receipts: &[StoredTaskEvent],
+) -> Value {
+    Value::Array(
+        receipts
+            .iter()
+            .map(|receipt| {
+                json!({
+                    "assignment_id":receipt.event.task_id,
+                    "basis":"The delivered task text names the edited file or a specific containing directory; its relationship to the edit remains unverified.",
+                    "receipt":task_event_citation(
+                        context,
+                        stores,
+                        machine_label,
+                        receipt,
+                        receipt.event.event_offset,
+                        "delivered_assignment_envelope",
+                    ),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn other_receipt_summary(receipts: &[StoredTaskEvent], anchor: &str) -> Value {
+    let mut assignment_ids = receipts
+        .iter()
+        .map(|receipt| receipt.event.task_id.clone())
+        .collect::<Vec<_>>();
+    assignment_ids.sort();
+    assignment_ids.dedup();
+    let count = assignment_ids.len();
+    let human_anchor = if anchor == "edit" {
+        "this edit"
+    } else {
+        "this dispatch"
+    };
+    let refs = receipts
+        .iter()
+        .map(|receipt| {
+            json!({
+                "assignment_id":receipt.event.task_id,
+                "event_identity":receipt.event.event_identity,
+                "tape_id":receipt.tape_id,
+                "event_offset":receipt.event.event_offset,
+                "timestamp":receipt.event.timestamp,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "message":format!("{count} other assignments were received before {human_anchor}; their relationship to {human_anchor} is unknown."),
+        "other_assignment_count":count,
+        "other_receipt_event_count":refs.len(),
+        "assignment_ids":assignment_ids,
+        "receipt_event_refs":refs,
+    })
+}
+
 fn build_edit_task_ancestry(
     context: &RuntimeContext,
     indexes: &[SqliteIndex],
@@ -643,6 +1051,8 @@ fn build_edit_task_ancestry(
     edit_tape: &str,
     edit_offset: u64,
     edit_timestamp: &str,
+    edited_file: Option<&str>,
+    directly_bound_assignment_id: Option<&str>,
     date_filter: &DateFilter,
     depth_limit: usize,
 ) -> Result<Value, CliError> {
@@ -668,7 +1078,7 @@ fn build_edit_task_ancestry(
         "status": "no_assignment_receipt",
         "guidance": ["No delivered assignment envelope was found before this edit. The available history may be incomplete."],
     });
-    let mut receipts = task_receipts_before(indexes, edit_tape, edit_offset)?
+    let receipts = task_receipts_before(indexes, edit_tape, edit_offset)?
         .into_iter()
         .filter(|receipt| receipt.event.task_id_kind == TaskIdKind::Assignment)
         .filter(|receipt| {
@@ -676,84 +1086,74 @@ fn build_edit_task_ancestry(
         })
         .collect::<Vec<_>>();
     if receipts.is_empty() {
-        return Ok(result);
-    }
-    if receipts.len() > 1 {
-        let observed_receipt_count = receipts.len();
-        let receipt_query_limit_reached = observed_receipt_count == MAX_TASK_CONTEXT_EVENTS;
-        let alternatives_truncated =
-            observed_receipt_count > MAX_TASK_ANCESTRY_BRANCHES || receipt_query_limit_reached;
-        receipts.truncate(MAX_TASK_ANCESTRY_BRANCHES);
-        result["status"] = json!("multiple_assignment_receipts");
-        result["alternatives_truncated"] = json!(alternatives_truncated);
-        result["alternatives_observed"] = json!(observed_receipt_count);
-        if alternatives_truncated {
-            result["truncation_reason"] = json!(if receipt_query_limit_reached {
-                "receipt_query_limit_reached; additional alternatives may be omitted"
-            } else {
-                "receipt_branch_display_limit"
+        if let Some(assignment_id) = directly_bound_assignment_id {
+            result["status"] = json!("direct_assignment_receipt_not_indexed");
+            result["selection"] = json!({
+                "kind":"direct_edit_task_association",
+                "assignment_id":assignment_id,
+                "basis":"exact_assignment_id_on_edit_evidence",
+                "visible_basis":"The edit evidence names this exact assignment ID, but its delivered receipt is not indexed before the edit.",
+                "relationship_to_anchor":"directly_bound",
+                "receipt_status":"not_indexed_before_edit",
             });
         }
-        let mut alternatives = Vec::new();
-        for receipt in &receipts {
-            let mut alternative = json!({
-                "assignment_id": receipt.event.task_id,
-                "receipt": task_event_citation(
-                    context,
-                    stores,
-                    machine_label,
-                    receipt,
-                    receipt.event.event_offset,
-                    "delivered_assignment_envelope",
-                ),
-            });
-            let operations = preceding_assignment_operations(indexes, receipt, date_filter)?;
-            match operations.as_slice() {
-                [operation] => {
-                    alternative["operation_link"] = assignment_operation_step(
-                        context,
-                        stores,
-                        machine_label,
-                        operation,
-                        receipt,
-                        date_filter,
-                    )?;
-                }
-                [] => {
-                    alternative["operation_link_status"] =
-                        json!("no_preceding_operation_for_exact_assignment_id");
-                }
-                _ => {
-                    alternative["operation_link_status"] =
-                        json!("multiple_preceding_operations_for_exact_assignment_id");
-                    alternative["operation_link_alternatives"] = Value::Array(
-                        operations
-                            .iter()
-                            .take(MAX_TASK_ANCESTRY_BRANCHES)
-                            .map(|operation| {
-                                assignment_operation_step(
-                                    context,
-                                    stores,
-                                    machine_label,
-                                    operation,
-                                    receipt,
-                                    date_filter,
-                                )
-                            })
-                            .collect::<Result<Vec<_>, _>>()?,
-                    );
-                }
-            }
-            alternatives.push(alternative);
-        }
-        result["receipt_alternatives"] = Value::Array(alternatives);
-        result["guidance"] = json!([
-            "More than one delivered assignment envelope precedes this edit. Exact assignment IDs are joined to their recorded operation results where available, but the edit's task remains ambiguous; inspect each cited handoff."
-        ]);
         return Ok(result);
     }
-
-    let mut current_receipt = receipts.remove(0);
+    let selection = select_receipt_context(
+        context,
+        stores,
+        receipts,
+        edited_file,
+        directly_bound_assignment_id,
+    );
+    result["receipt_events_observed"] = json!(selection.observed_receipt_events);
+    result["duplicate_receipt_events_collapsed"] = json!(selection.duplicate_receipt_events);
+    result["file_specific_context_candidates_observed"] = json!(selection.file_specific_observed);
+    result["file_specific_context_candidates_displayed"] = json!(selection.file_specific.len());
+    result["file_specific_context_candidates_omitted"] = json!(
+        selection
+            .file_specific_observed
+            .saturating_sub(selection.file_specific.len())
+    );
+    result["task_text_unavailable_receipts"] = json!(selection.task_text_unavailable);
+    result["file_context_identity_status"] = json!(if selection.file_identity_unavailable {
+        "unknown_edit_path_identity"
+    } else {
+        "available"
+    });
+    result["file_specific_context_candidates"] =
+        file_specific_receipt_candidates(context, stores, machine_label, &selection.file_specific);
+    result["other_receipts"] = other_receipt_summary(&selection.other, "edit");
+    if selection.preferred_receipt_missing {
+        let assignment_id = directly_bound_assignment_id.unwrap_or_default();
+        result["status"] = json!("direct_assignment_receipt_not_indexed");
+        result["selection"] = json!({
+            "kind":"direct_edit_task_association",
+            "assignment_id":assignment_id,
+            "basis":"exact_assignment_id_on_edit_evidence",
+            "visible_basis":"The edit evidence names this exact assignment ID, but its delivered receipt is not indexed before the edit.",
+            "relationship_to_anchor":"directly_bound",
+            "receipt_status":"not_indexed_before_edit",
+        });
+        return Ok(result);
+    }
+    let Some(mut current_receipt) = selection.primary else {
+        return Ok(result);
+    };
+    let directly_bound = directly_bound_assignment_id
+        .is_some_and(|assignment_id| current_receipt.event.task_id == assignment_id);
+    let mut current_selection =
+        receipt_selection_metadata(&current_receipt, "edit", directly_bound);
+    result["selection"] = current_selection.clone();
+    result["selected_receipt"] = task_event_citation(
+        context,
+        stores,
+        machine_label,
+        &current_receipt,
+        current_receipt.event.event_offset,
+        "delivered_assignment_envelope",
+    );
+    let edit_selection = current_selection.clone();
     let mut seen_assignments = HashSet::new();
     let mut steps = Vec::new();
     let mut status = "earliest_observed_handoff";
@@ -770,6 +1170,7 @@ fn build_edit_task_ancestry(
             "delivered_assignment_envelope",
         );
         result["guidance"] = json!([
+            current_selection["visible_basis"],
             "The task chain is available, but the requested traversal depth is zero. Earlier or missing context may remain."
         ]);
         return Ok(result);
@@ -779,7 +1180,7 @@ fn build_edit_task_ancestry(
         let assignment_id = current_receipt.event.task_id.clone();
         if !seen_assignments.insert(assignment_id.clone()) {
             status = "cycle_detected";
-            steps.push(json!({
+            let mut step = json!({
                 "relationship": "cycle_guard",
                 "assignment_id": assignment_id,
                 "receipt": task_event_citation(
@@ -790,7 +1191,9 @@ fn build_edit_task_ancestry(
                     current_receipt.event.event_offset,
                     "delivered_assignment_envelope",
                 ),
-            }));
+            });
+            annotate_operation_selection(&mut step, &edit_selection, &current_selection);
+            steps.push(step);
             break;
         }
 
@@ -799,19 +1202,34 @@ fn build_edit_task_ancestry(
 
         if operations.is_empty() {
             status = "no_recorded_assignment_operation";
-            steps.push(json!({
-                "relationship": "assignment_receipt",
-                "assignment_id": assignment_id,
-                "receipt": task_event_citation(
-                    context,
-                    stores,
-                    machine_label,
-                    &current_receipt,
-                    current_receipt.event.event_offset,
-                    "delivered_assignment_envelope",
-                ),
-                "reason": "No preceding successful assign or dispatch result for this exact assignment ID is indexed in the selected stores.",
-            }));
+            let reason = "No preceding successful assign or dispatch result for this exact assignment ID is indexed in the selected stores.";
+            let receipt = task_event_citation(
+                context,
+                stores,
+                machine_label,
+                &current_receipt,
+                current_receipt.event.event_offset,
+                "delivered_assignment_envelope",
+            );
+            if let Some(last) = steps.last_mut() {
+                if let Some(object) = last.as_object_mut() {
+                    object.remove("parent_task_selection");
+                }
+                last["unresolved_parent_receipt"] = json!({
+                    "assignment_id": assignment_id,
+                    "relationship": "receipt_context_only",
+                    "reason": reason,
+                    "receipt": receipt,
+                });
+            } else {
+                // The root receipt is already cited as the suggested task context. Keep the
+                // missing operation explicit without manufacturing an ancestry hop.
+                result["unresolved_receipt_context"] = json!({
+                    "assignment_id": assignment_id,
+                    "relationship": "receipt_context_only",
+                    "reason": reason,
+                });
+            }
             break;
         }
         if operations.len() > 1 {
@@ -821,7 +1239,23 @@ fn build_edit_task_ancestry(
                 || operation_query_limit_reached;
             operations.truncate(MAX_TASK_ANCESTRY_BRANCHES);
             status = "multiple_assignment_operations";
-            steps.push(json!({
+            let mut alternatives = operations
+                .iter()
+                .map(|candidate| {
+                    assignment_operation_step(
+                        context,
+                        stores,
+                        machine_label,
+                        candidate,
+                        &current_receipt,
+                        date_filter,
+                    )
+                })
+                .collect::<Result<Vec<_>, CliError>>()?;
+            for alternative in &mut alternatives {
+                annotate_operation_selection(alternative, &edit_selection, &current_selection);
+            }
+            let mut step = json!({
                 "relationship": "assignment_operation_alternatives",
                 "assignment_id": assignment_id,
                 "receipt": task_event_citation(
@@ -832,14 +1266,7 @@ fn build_edit_task_ancestry(
                     current_receipt.event.event_offset,
                     "delivered_assignment_envelope",
                 ),
-                "alternatives": operations.iter().map(|candidate| assignment_operation_step(
-                    context,
-                    stores,
-                    machine_label,
-                    candidate,
-                    &current_receipt,
-                    date_filter,
-                )).collect::<Result<Vec<_>, CliError>>()?,
+                "alternatives": alternatives,
                 "alternatives_observed": observed_operation_count,
                 "alternatives_truncated": alternatives_truncated,
                 "truncation_reason": if alternatives_truncated {
@@ -851,19 +1278,23 @@ fn build_edit_task_ancestry(
                 } else {
                     None
                 },
-            }));
+            });
+            annotate_operation_selection(&mut step, &edit_selection, &current_selection);
+            steps.push(step);
             break;
         }
 
         let operation = operations.remove(0);
-        steps.push(assignment_operation_step(
+        let mut operation_step = assignment_operation_step(
             context,
             stores,
             machine_label,
             &operation,
             &current_receipt,
             date_filter,
-        )?);
+        )?;
+        annotate_operation_selection(&mut operation_step, &edit_selection, &current_selection);
+        steps.push(operation_step);
         if steps.len() >= depth_limit {
             status = "depth_limit";
             break;
@@ -877,43 +1308,44 @@ fn build_edit_task_ancestry(
                         == EventTimeDecision::Included
                 })
                 .collect::<Vec<_>>();
-        if preceding.len() == 1 {
-            current_receipt = preceding.into_iter().next().expect("one receipt");
+        let parent_selection =
+            select_receipt_context(context, stores, preceding, edited_file, None);
+        if let Some(parent_receipt) = parent_selection.primary {
+            let selection_metadata = receipt_selection_metadata(&parent_receipt, "dispatch", false);
+            if let Some(last) = steps.last_mut() {
+                last["parent_task_selection"] = selection_metadata.clone();
+                last["parent_file_specific_context_candidates"] = file_specific_receipt_candidates(
+                    context,
+                    stores,
+                    machine_label,
+                    &parent_selection.file_specific,
+                );
+                last["parent_file_specific_context_candidates_observed"] =
+                    json!(parent_selection.file_specific_observed);
+                last["parent_file_specific_context_candidates_displayed"] =
+                    json!(parent_selection.file_specific.len());
+                last["parent_file_specific_context_candidates_omitted"] = json!(
+                    parent_selection
+                        .file_specific_observed
+                        .saturating_sub(parent_selection.file_specific.len())
+                );
+                last["parent_file_context_identity_status"] =
+                    json!(if parent_selection.file_identity_unavailable {
+                        "unknown_edit_path_identity"
+                    } else {
+                        "available"
+                    });
+                last["parent_task_text_unavailable_receipts"] =
+                    json!(parent_selection.task_text_unavailable);
+                last["parent_other_receipts"] =
+                    other_receipt_summary(&parent_selection.other, "dispatch");
+            }
+            current_selection = selection_metadata;
+            current_receipt = parent_receipt;
             continue;
         }
-        if preceding.len() > 1 {
-            let observed_parent_count = preceding.len();
-            let parent_query_limit_reached = observed_parent_count == MAX_TASK_CONTEXT_EVENTS;
-            let alternatives_truncated =
-                observed_parent_count > MAX_TASK_ANCESTRY_BRANCHES || parent_query_limit_reached;
-            status = "multiple_parent_assignments";
-            let candidates = preceding
-                .into_iter()
-                .take(MAX_TASK_ANCESTRY_BRANCHES)
-                .map(|receipt| {
-                    task_event_citation(
-                        context,
-                        stores,
-                        machine_label,
-                        &receipt,
-                        receipt.event.event_offset,
-                        "delivered_assignment_envelope",
-                    )
-                })
-                .collect::<Vec<_>>();
-            if let Some(last) = steps.last_mut() {
-                last["parent_assignment_alternatives"] = json!(candidates);
-                last["parent_assignment_alternatives_observed"] = json!(observed_parent_count);
-                last["parent_assignment_alternatives_truncated"] = json!(alternatives_truncated);
-                if alternatives_truncated {
-                    last["parent_assignment_truncation_reason"] =
-                        json!(if parent_query_limit_reached {
-                            "receipt_query_limit_reached; additional alternatives may be omitted"
-                        } else {
-                            "parent_branch_display_limit"
-                        });
-                }
-            }
+        if parent_selection.preferred_receipt_missing {
+            status = "direct_parent_receipt_not_indexed";
             break;
         }
 
@@ -942,7 +1374,7 @@ fn build_edit_task_ancestry(
                     || creation_query_limit_reached;
                 status = "multiple_work_item_creations";
                 creations.truncate(MAX_TASK_ANCESTRY_BRANCHES);
-                steps.push(json!({
+                let mut step = json!({
                     "relationship": "work_item_creation_alternatives",
                     "work_item_id": work_item_id,
                     "alternatives_observed": observed_creation_count,
@@ -964,18 +1396,26 @@ fn build_edit_task_ancestry(
                         creation.event.event_offset,
                         "work_item_creation_result",
                     )).collect::<Vec<_>>(),
-                }));
+                });
+                annotate_operation_selection(&mut step, &edit_selection, &current_selection);
+                steps.push(step);
                 break;
             }
             if let Some(creation) = creations.pop() {
-                steps.push(work_item_creation_step(
+                let mut creation_step = work_item_creation_step(
                     context,
                     stores,
                     machine_label,
                     &creation,
                     work_item_id,
                     date_filter,
-                )?);
+                )?;
+                annotate_operation_selection(
+                    &mut creation_step,
+                    &edit_selection,
+                    &current_selection,
+                );
+                steps.push(creation_step);
                 let creation_receipts =
                     task_receipts_before(indexes, &creation.tape_id, creation.event.event_offset)?
                         .into_iter()
@@ -984,29 +1424,43 @@ fn build_edit_task_ancestry(
                                 == EventTimeDecision::Included
                         })
                         .collect::<Vec<_>>();
-                if creation_receipts.len() == 1 {
-                    current_receipt = creation_receipts.into_iter().next().expect("one receipt");
-                    continue;
-                }
-                if creation_receipts.len() > 1 {
-                    status = "multiple_parent_assignments";
+                let parent_selection =
+                    select_receipt_context(context, stores, creation_receipts, edited_file, None);
+                if let Some(parent_receipt) = parent_selection.primary {
+                    let selection_metadata =
+                        receipt_selection_metadata(&parent_receipt, "work_item_creation", false);
                     if let Some(last) = steps.last_mut() {
-                        last["parent_assignment_alternatives"] = json!(
-                            creation_receipts
-                                .into_iter()
-                                .take(MAX_TASK_ANCESTRY_BRANCHES)
-                                .map(|receipt| task_event_citation(
-                                    context,
-                                    stores,
-                                    machine_label,
-                                    &receipt,
-                                    receipt.event.event_offset,
-                                    "delivered_assignment_envelope",
-                                ))
-                                .collect::<Vec<_>>()
+                        last["parent_task_selection"] = selection_metadata.clone();
+                        last["parent_file_specific_context_candidates"] =
+                            file_specific_receipt_candidates(
+                                context,
+                                stores,
+                                machine_label,
+                                &parent_selection.file_specific,
+                            );
+                        last["parent_file_specific_context_candidates_observed"] =
+                            json!(parent_selection.file_specific_observed);
+                        last["parent_file_specific_context_candidates_displayed"] =
+                            json!(parent_selection.file_specific.len());
+                        last["parent_file_specific_context_candidates_omitted"] = json!(
+                            parent_selection
+                                .file_specific_observed
+                                .saturating_sub(parent_selection.file_specific.len())
                         );
+                        last["parent_file_context_identity_status"] =
+                            json!(if parent_selection.file_identity_unavailable {
+                                "unknown_edit_path_identity"
+                            } else {
+                                "available"
+                            });
+                        last["parent_task_text_unavailable_receipts"] =
+                            json!(parent_selection.task_text_unavailable);
+                        last["parent_other_receipts"] =
+                            other_receipt_summary(&parent_selection.other, "dispatch");
                     }
-                    break;
+                    current_selection = selection_metadata;
+                    current_receipt = parent_receipt;
+                    continue;
                 }
             }
         }
@@ -1019,20 +1473,26 @@ fn build_edit_task_ancestry(
     }
     result["steps"] = Value::Array(steps);
     result["status"] = json!(status);
-    result["guidance"] = json!([match status {
-        "earliest_observed_handoff" =>
-            "This is the earliest handoff found in the available history. The reason may be in the human discussion above it; earlier or missing history may remain.",
-        "depth_limit" =>
-            "This chain stops at the requested traversal limit. Earlier or missing context may remain; the passages are context, not an established reason.",
-        "cycle_detected" =>
-            "A repeated assignment ID stopped this chain. Inspect the cited events; no intent or reason is inferred.",
+    let status_guidance = match status {
+        "earliest_observed_handoff" => {
+            "This is the earliest handoff found in the available history. The reason may be in the human discussion above it; earlier or missing history may remain."
+        }
+        "depth_limit" => {
+            "This chain stops at the requested traversal limit. Earlier or missing context may remain; the passages are context, not an established reason."
+        }
+        "cycle_detected" => {
+            "A repeated assignment ID stopped this chain. Inspect the cited events; no intent or reason is inferred."
+        }
         "multiple_assignment_operations"
         | "multiple_parent_assignments"
-        | "multiple_work_item_creations" =>
-            "More than one supported parent is recorded. The alternatives are shown separately; no single cause or ruling is selected.",
-        _ =>
-            "The linked task has no preceding supported operation in the selected history. The available context may be incomplete.",
-    }]);
+        | "multiple_work_item_creations" => {
+            "More than one supported parent is recorded. The alternatives are shown separately; no single cause or ruling is selected."
+        }
+        _ => {
+            "The selected assignment receipt has no preceding supported operation in the selected history, so it remains unresolved rather than an upstream conversation link. The available context may be incomplete."
+        }
+    };
+    result["guidance"] = json!([current_selection["visible_basis"], status_guidance,]);
     Ok(result)
 }
 
@@ -1510,7 +1970,10 @@ mod tests {
 
         let (following, oversized) = read_bounded_jsonl_line(&mut reader, 64).unwrap().unwrap();
         assert!(!oversized);
-        assert_eq!(serde_json::from_slice::<Value>(&following).unwrap()["k"], "msg.in");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&following).unwrap()["k"],
+            "msg.in"
+        );
         assert!(read_bounded_jsonl_line(&mut reader, 64).unwrap().is_none());
     }
 
@@ -1959,6 +2422,7 @@ mod tests {
             ReaderMode::Live,
         )
         .unwrap();
+        let indexes = [index];
         let mut sessions = vec![json!({
             "tape_id":receiver_tape,
             "touches":[{
@@ -1969,7 +2433,7 @@ mod tests {
         })];
         attach_explain_task_ancestry(
             &context,
-            &[index],
+            &indexes,
             &mut sessions,
             &DateFilter::parse(None, None).unwrap(),
             4,
@@ -2055,10 +2519,12 @@ mod tests {
                 .contains("child dispatch")
         );
         assert!(
-            ancestry["guidance"][0]
-                .as_str()
+            ancestry["guidance"]
+                .as_array()
                 .unwrap()
-                .contains("reason may be")
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|guidance| guidance.contains("reason may be"))
         );
         assert_eq!(
             ancestry["steps"][1]["relationship"],
@@ -2091,13 +2557,15 @@ mod tests {
     }
 
     #[test]
-    fn multiple_exact_receipts_keep_distinct_dispatch_edges_without_crosswalking_sessions() {
+    fn multiple_receipts_select_recent_and_collapse_others_without_crosswalking_sessions() {
         let temp = tempfile::tempdir().unwrap();
         let context = runtime_context(temp.path());
         let first_tape = "dispatch-first";
         let second_tape = "dispatch-second";
         let receiver_tape = "dispatch-recipient";
         let recipient_key = "agent:coder:engram s_recipient01";
+        let edited_file = temp.path().join("repo/src/lib.rs");
+        let edited_file_text = edited_file.to_string_lossy().to_string();
 
         let mut first_call = wrapped_call(
             &format!(
@@ -2142,7 +2610,14 @@ mod tests {
         );
         second_result["t"] = json!("2026-10-03T12:00:03Z");
         let first_raw = jsonl([first_call, first_result]);
-        let second_raw = jsonl([second_call, second_result]);
+        let unlinked_parent_id = "asg_12345678-1234-1234-1234-1234567890c1";
+        let unlinked_parent_receipt = json!({
+            "t":"2026-10-03T12:00:01.500Z",
+            "k":"msg.in",
+            "source":{"session_id":"native-second-dispatch-session"},
+            "content":format!("[from agent:main]\n[assignment: {unlinked_parent_id}]\nEarlier context without a recorded dispatch.")
+        });
+        let second_raw = jsonl([unlinked_parent_receipt, second_call, second_result]);
         let control_assignment_ids = [
             "asg_12345678-1234-1234-1234-1234567890b1",
             "asg_12345678-1234-1234-1234-1234567890b2",
@@ -2165,7 +2640,7 @@ mod tests {
                 "t":"2026-10-03T12:00:04Z",
                 "k":"msg.in",
                 "source":{"session_id":"native-recipient-session"},
-                "content":format!("[from agent:main]\n[assignment: {ASSIGNMENT}]\nFirst delivery.")
+                "content":format!("[from agent:main]\n[assignment: {ASSIGNMENT}]\nFirst delivery for {edited_file_text}.")
             }),
             json!({
                 "t":"2026-10-03T12:00:05Z",
@@ -2176,7 +2651,7 @@ mod tests {
             json!({
                 "t":"2026-10-03T12:00:06Z",
                 "k":"code.edit",
-                "file":"src/lib.rs",
+                "file":edited_file_text,
                 "before_range":[4,4],
                 "after_range":[4,5],
                 "before_text":"old",
@@ -2217,13 +2692,24 @@ mod tests {
             ReaderMode::Live,
         )
         .unwrap();
-        let mut sessions = vec![json!({
-            "tape_id":receiver_tape,
-            "touches":[{"kind":"edit","event_offset":5,"timestamp":"2026-10-03T12:00:06Z"}]
-        })];
+        let indexes = [index];
+        let mut sessions = vec![
+            json!({
+                "tape_id":receiver_tape,
+                "touches":[{"kind":"edit","event_offset":5,"timestamp":"2026-10-03T12:00:06Z","file_path":edited_file_text}]
+            }),
+            json!({
+                "tape_id":receiver_tape,
+                "touches":[{"kind":"edit","event_offset":5,"timestamp":"2026-10-03T12:00:06Z","file_path":edited_file_text,"assignment_id":ASSIGNMENT}]
+            }),
+            json!({
+                "tape_id":receiver_tape,
+                "touches":[{"kind":"edit","event_offset":5,"timestamp":"2026-10-03T12:00:06Z","file_path":edited_file_text,"assignment_id":control_assignment_ids[0]}]
+            }),
+        ];
         attach_explain_task_ancestry(
             &context,
-            &[index],
+            &indexes,
             &mut sessions,
             &DateFilter::parse(None, None).unwrap(),
             3,
@@ -2232,42 +2718,194 @@ mod tests {
         .unwrap();
 
         let ancestry = &sessions[0]["task_ancestry"][0];
-        assert_eq!(ancestry["status"], "multiple_assignment_receipts");
-        assert_eq!(ancestry["alternatives_observed"], 5);
-        assert_eq!(ancestry["alternatives_truncated"], true);
+        assert_eq!(ancestry["status"], "no_recorded_assignment_operation");
+        assert_eq!(ancestry["receipt_events_observed"], 5);
+        assert_eq!(ancestry["other_receipts"]["other_assignment_count"], 3);
+        assert_eq!(ancestry["selection"]["kind"], "suggested_task_context");
         assert_eq!(
-            ancestry["truncation_reason"],
-            "receipt_branch_display_limit"
+            ancestry["selection"]["visible_basis"],
+            "Most recent receipt before this edit; edit-to-task association unverified."
         );
-        let alternatives = ancestry["receipt_alternatives"].as_array().unwrap();
-        assert_eq!(alternatives.len(), 4);
-        assert_eq!(alternatives[0]["assignment_id"], SIBLING_ASSIGNMENT);
-        assert_eq!(alternatives[1]["assignment_id"], ASSIGNMENT);
-        let mut linked_count = 0;
-        for alternative in alternatives {
-            let Some(operation) = alternative.get("operation_link") else {
-                assert_eq!(
-                    alternative["operation_link_status"],
-                    "no_preceding_operation_for_exact_assignment_id"
-                );
-                continue;
-            };
-            linked_count += 1;
-            assert_eq!(operation["relationship"], "dispatched_assignment");
-            assert_eq!(
-                operation["binding_basis"],
-                "The exact assignment ID joins the successful operation result to the delivered envelope. The operation's Tightbeam holder key and the envelope's native transcript session ID are different identifier domains; equality is not asserted."
-            );
-            assert_eq!(
-                operation["edge_evidence"]["recipient_envelope"]["observed_recipient_session"]["identity_domain"],
-                "native_transcript_session_id"
-            );
-            assert_ne!(
-                operation["recipient_session"],
-                operation["edge_evidence"]["recipient_envelope"]["observed_recipient_session"]["id"]
-            );
-        }
-        assert_eq!(linked_count, 2);
+        assert_eq!(
+            ancestry["selected_receipt"]["event_identity"],
+            "assignment-envelope:4"
+        );
+        assert_eq!(ancestry["selected_receipt"]["source"]["event_offset"], 4);
+        let file_context = ancestry["file_specific_context_candidates"]
+            .as_array()
+            .unwrap();
+        assert_eq!(file_context.len(), 1);
+        assert_eq!(file_context[0]["assignment_id"], ASSIGNMENT);
+        assert_eq!(
+            file_context[0]["receipt"]["event_identity"],
+            "assignment-envelope:3"
+        );
+        assert!(
+            file_context[0]["basis"]
+                .as_str()
+                .unwrap()
+                .contains("remains unverified")
+        );
+        assert_eq!(
+            ancestry["other_receipts"]["assignment_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            ancestry["other_receipts"]["message"],
+            "3 other assignments were received before this edit; their relationship to this edit is unknown."
+        );
+        let steps = ancestry["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0]["assignment_id"], SIBLING_ASSIGNMENT);
+        assert_eq!(steps[0]["relationship"], "dispatched_assignment");
+        assert!(steps[0].get("parent_task_selection").is_none());
+        assert_eq!(
+            steps[0]["unresolved_parent_receipt"]["assignment_id"],
+            unlinked_parent_id
+        );
+        assert_eq!(
+            steps[0]["unresolved_parent_receipt"]["relationship"],
+            "receipt_context_only"
+        );
+        assert_eq!(
+            steps[0]["unresolved_parent_receipt"]["receipt"]["source"]["tape_id"],
+            second_tape
+        );
+        assert_eq!(
+            steps[0]["unresolved_parent_receipt"]["receipt"]["source"]["event_offset"],
+            0
+        );
+        assert_eq!(
+            steps[0]["edit_task_selection"]["kind"],
+            "suggested_task_context"
+        );
+        assert_eq!(
+            steps[0]["edit_task_selection"]["relationship_to_anchor"],
+            "unverified"
+        );
+        assert!(
+            steps[0]["relationship_to_edit"]
+                .as_str()
+                .unwrap()
+                .contains("does not establish")
+        );
+        let step = &steps[0];
+        let operation = step;
+        assert_eq!(operation["relationship"], "dispatched_assignment");
+        assert_eq!(
+            operation["binding_basis"],
+            "The exact assignment ID joins the successful operation result to the delivered envelope. The operation's Tightbeam holder key and the envelope's native transcript session ID are different identifier domains; equality is not asserted."
+        );
+        assert_eq!(
+            operation["edge_evidence"]["recipient_envelope"]["observed_recipient_session"]["identity_domain"],
+            "native_transcript_session_id"
+        );
+        assert_ne!(
+            operation["recipient_session"],
+            operation["edge_evidence"]["recipient_envelope"]["observed_recipient_session"]["id"]
+        );
+
+        let directly_bound = &sessions[1]["task_ancestry"][0];
+        assert_eq!(
+            directly_bound["selection"]["kind"],
+            "direct_edit_task_association"
+        );
+        assert_eq!(directly_bound["selection"]["assignment_id"], ASSIGNMENT);
+        assert_eq!(
+            directly_bound["selected_receipt"]["source"]["event_offset"],
+            3
+        );
+        assert_eq!(directly_bound["steps"][0]["assignment_id"], ASSIGNMENT);
+        assert_eq!(
+            directly_bound["other_receipts"]["other_assignment_count"],
+            4
+        );
+
+        let direct_without_operation = &sessions[2]["task_ancestry"][0];
+        assert_eq!(
+            direct_without_operation["selection"]["kind"],
+            "direct_edit_task_association"
+        );
+        assert_eq!(
+            direct_without_operation["selection"]["assignment_id"],
+            control_assignment_ids[0]
+        );
+        assert_eq!(
+            direct_without_operation["status"],
+            "no_recorded_assignment_operation"
+        );
+        assert!(
+            direct_without_operation["steps"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            direct_without_operation["unresolved_receipt_context"]["assignment_id"],
+            control_assignment_ids[0]
+        );
+        assert_eq!(
+            direct_without_operation["unresolved_receipt_context"]["relationship"],
+            "receipt_context_only"
+        );
+
+        let bounded_filter = DateFilter::parse(Some("2026-10-03T12:00:04.500Z"), None).unwrap();
+        let mut cutoff_sessions = vec![json!({
+            "tape_id":receiver_tape,
+            "touches":[{"kind":"edit","event_offset":5,"timestamp":"2026-10-03T12:00:06Z","file_path":edited_file_text}]
+        })];
+        attach_explain_task_ancestry(
+            &context,
+            &indexes,
+            &mut cutoff_sessions,
+            &bounded_filter,
+            3,
+            "gibson",
+        )
+        .unwrap();
+        let bounded = &cutoff_sessions[0]["task_ancestry"][0];
+        assert_eq!(bounded["selected_receipt"]["source"]["event_offset"], 4);
+        assert_eq!(
+            bounded["selection"]["basis"],
+            "most_recent_receipt_before_edit"
+        );
+        assert_eq!(bounded["receipt_events_observed"], 1);
+    }
+
+    #[test]
+    fn file_context_ignores_quoted_and_generic_path_mentions() {
+        let temp = tempfile::tempdir().unwrap();
+        let edited_file = temp.path().join("repo/src/lib.rs");
+        let edited_file_text = edited_file.to_string_lossy();
+        let mut resolver = FileIdentityResolver::default();
+
+        assert!(task_text_mentions_file(
+            &format!("Please edit `{edited_file_text}` before testing."),
+            &edited_file,
+            &mut resolver,
+        ));
+        assert!(!task_text_mentions_file(
+            &format!("> Prior report mentions `{edited_file_text}`."),
+            &edited_file,
+            &mut resolver,
+        ));
+        assert!(!task_text_mentions_file(
+            &format!("```text\n{edited_file_text}\n```"),
+            &edited_file,
+            &mut resolver,
+        ));
+        assert!(!task_text_mentions_file(
+            &format!("Work under {}.", temp.path().display()),
+            &edited_file,
+            &mut resolver,
+        ));
+        assert_eq!(
+            absolute_path_mentions("Update `/workspace/project/src/lib.rs`."),
+            vec![PathBuf::from("/workspace/project/src/lib.rs")]
+        );
     }
 
     #[test]
