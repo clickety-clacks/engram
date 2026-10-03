@@ -19,8 +19,8 @@ use crate::query::file_identity::{FileIdentityRelation, FileIdentityResolver};
 pub use crate::store::tapes::{TapeRow, parse_jsonl_rows, print_json};
 use crate::store::tapes::{event_window, read_tape_content, resolve_tape_path, tape_id_from_path};
 use crate::tape::grep::{
-    grep_line_matches as decoded_grep_line_matches, scan_grep_reader_with_date,
-    read_tape_event_timestamps, scan_parallel_in_order,
+    grep_line_matches as decoded_grep_line_matches, read_tape_event_timestamps,
+    scan_grep_reader_with_date, scan_parallel_in_order,
 };
 use crate::{CliError, RuntimeContext, path_string};
 
@@ -311,10 +311,10 @@ pub fn run_grep_scan_with_date(
         },
         |task, result| -> Result<(), CliError> {
             let summary = result?;
-            unknown_time_evidence_events = unknown_time_evidence_events
-                .saturating_add(summary.unknown_time_evidence_count);
-            unknown_time_matching_events = unknown_time_matching_events
-                .saturating_add(summary.unknown_time_match_count);
+            unknown_time_evidence_events =
+                unknown_time_evidence_events.saturating_add(summary.unknown_time_evidence_count);
+            unknown_time_matching_events =
+                unknown_time_matching_events.saturating_add(summary.unknown_time_match_count);
             if summary.match_count == 0 {
                 return Ok(());
             }
@@ -720,6 +720,13 @@ pub fn format_sessions_for_agent(
             "files_touched": files_touched,
             "touches": touches,
         });
+        if let Some(task_ancestry) = raw
+            .get("task_ancestry")
+            .and_then(Value::as_array)
+            .filter(|ancestry| !ancestry.is_empty())
+        {
+            session["task_ancestry"] = json!(task_ancestry);
+        }
         if grep_prepared {
             session["match_count"] = raw
                 .get("grep_match_count")
@@ -1451,7 +1458,10 @@ pub fn load_local_event_timestamps(
         .metadata()
         .map_err(|error| CliError::io("read_error", error))?;
     if !metadata.file_type().is_file() {
-        return Err(CliError::new("invalid_file", "tape path is not a regular file"));
+        return Err(CliError::new(
+            "invalid_file",
+            "tape path is not a regular file",
+        ));
     }
     let compressed_limit = crate::access::client::DEFAULT_READ_FILE_COMPRESSED_BYTES;
     if metadata.len() > compressed_limit {
@@ -1593,6 +1603,67 @@ pub fn print_pretty_explain(
             .and_then(Value::as_u64)
             .unwrap_or(0);
         println!("- tape={} touches={}", tape_id, touch_count);
+        for ancestry in session["task_ancestry"].as_array().into_iter().flatten() {
+            println!(
+                "  task ancestry status={}",
+                ancestry["status"].as_str().unwrap_or("unknown")
+            );
+            if ancestry["alternatives_truncated"] == true {
+                println!(
+                    "    alternatives truncated: {}",
+                    ancestry["truncation_reason"]
+                        .as_str()
+                        .unwrap_or("bounded display limit")
+                );
+            }
+            for guidance in ancestry["guidance"].as_array().into_iter().flatten() {
+                if let Some(guidance) = guidance.as_str() {
+                    println!("    {guidance}");
+                }
+            }
+            for alternative in ancestry["receipt_alternatives"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                println!(
+                    "    receipt alternative assignment={}",
+                    alternative["assignment_id"].as_str().unwrap_or("unknown")
+                );
+                print_task_citation("receipt", &alternative["receipt"]);
+                if let Some(link) = alternative.get("operation_link") {
+                    println!(
+                        "      exact-id operation={} work_item={}",
+                        link["relationship"].as_str().unwrap_or("unknown"),
+                        link["work_item_id"].as_str().unwrap_or("unknown")
+                    );
+                    print_task_edge_evidence(link);
+                    print_task_context_passages(link);
+                } else if let Some(status) = alternative["operation_link_status"].as_str() {
+                    println!("      operation link: {status}");
+                }
+            }
+            for step in ancestry["steps"].as_array().into_iter().flatten() {
+                println!(
+                    "    hop={} assignment={} work_item={}",
+                    step["relationship"].as_str().unwrap_or("unknown"),
+                    step["assignment_id"].as_str().unwrap_or(""),
+                    step["work_item_id"].as_str().unwrap_or("")
+                );
+                print_task_edge_evidence(step);
+                print_task_context_passages(step);
+            }
+        }
+        if let Some(truncation) = session.get("task_ancestry_truncated") {
+            println!(
+                "  task ancestry truncated: {} eligible edits observed, {} displayed ({})",
+                truncation["eligible_edit_count_observed"]
+                    .as_u64()
+                    .unwrap_or_default(),
+                truncation["displayed"].as_u64().unwrap_or_default(),
+                truncation["reason"].as_str().unwrap_or("unknown limit")
+            );
+        }
     }
 
     println!("lineage:");
@@ -1617,6 +1688,39 @@ pub fn print_pretty_explain(
         for tombstone in tombstones {
             println!("- {tombstone}");
         }
+    }
+}
+
+fn print_task_citation(label: &str, citation: &Value) {
+    let source = &citation["source"];
+    println!(
+        "      cite {} {}:{}@{} {}",
+        label,
+        source["machine"].as_str().unwrap_or("unknown-machine"),
+        source["tape_id"].as_str().unwrap_or("unknown-tape"),
+        source["event_offset"].as_u64().unwrap_or_default(),
+        source["timestamp"].as_str().unwrap_or("unknown-time")
+    );
+}
+
+fn print_task_edge_evidence(step: &Value) {
+    if let Some(evidence) = step["edge_evidence"].as_object() {
+        for (label, citation) in evidence {
+            print_task_citation(label, citation);
+        }
+    }
+}
+
+fn print_task_context_passages(step: &Value) {
+    for passage in step["context"]["passages"].as_array().into_iter().flatten() {
+        println!(
+            "      {} [{}] {}",
+            passage["speaker"].as_str().unwrap_or("unknown-speaker"),
+            passage["source"]["event_offset"]
+                .as_u64()
+                .unwrap_or_default(),
+            passage["text"].as_str().unwrap_or("")
+        );
     }
 }
 
@@ -1821,7 +1925,10 @@ mod chain_graph_tests {
 
         assert_eq!(error.code, "reader_unavailable");
         assert!(error.message.contains("schema version 3"));
-        assert!(error.message.contains("requires version 4"));
+        assert!(error.message.contains(&format!(
+            "requires version {}",
+            crate::index::SCHEMA_VERSION
+        )));
         assert!(error.message.contains("does not migrate"));
         assert!(!error.message.contains("Query is not read-only"));
         assert!(!error.message.contains("grant SQLite write access"));

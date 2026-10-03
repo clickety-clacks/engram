@@ -1298,6 +1298,25 @@ pub(crate) fn assigned_exec_command_arguments(code: &str) -> Option<String> {
         .then_some(arguments)
 }
 
+/// Project one literal `tools.exec_command` request from the two wrapper forms
+/// emitted by the supported Codex runner. It never evaluates JavaScript and
+/// rejects batches, computed arguments, or trailing statements.
+pub(crate) fn literal_exec_command_arguments(code: &str) -> Option<String> {
+    if let Some(arguments) = assigned_exec_command_arguments(code) {
+        return Some(arguments);
+    }
+    let mut rest = code.trim();
+    if rest.starts_with("// @exec:") {
+        rest = rest.split_once('\n')?.1.trim_start();
+    }
+    let call_arguments = rest.strip_prefix("text(await tools.exec_command(")?;
+    let (arguments, consumed) = literal_command_arguments(call_arguments)?;
+    let tail = call_arguments[consumed..]
+        .trim_start()
+        .strip_prefix("));")?;
+    tail.trim().is_empty().then_some(arguments)
+}
+
 fn nested_results(output: &Value, calls: &[CodexCall]) -> Option<Vec<Value>> {
     let blocks = output.as_array()?;
     if blocks.len() != calls.len() + 1 || !blocks.iter().all(|b| b["type"] == "input_text") {
@@ -1400,7 +1419,8 @@ mod tests {
 
     use super::{
         CodexState, assigned_exec_command_arguments, codex_jsonl_incremental,
-        codex_jsonl_to_tape_jsonl, native_file_changes, nested_calls,
+        codex_jsonl_to_tape_jsonl, literal_exec_command_arguments, native_file_changes,
+        nested_calls,
     };
 
     #[test]
@@ -1755,6 +1775,23 @@ mod tests {
             )
             .is_none()
         );
+
+        let no_binding = r#"text(await tools.exec_command({cmd:"tightbeam assign --work-item wi_00000000-0000-0000-0000-000000000000"}));"#;
+        let arguments = literal_exec_command_arguments(no_binding)
+            .expect("literal unassigned exec wrapper");
+        let arguments: Value = serde_json::from_str(&arguments).expect("normalized arguments");
+        assert_eq!(
+            arguments["cmd"],
+            "tightbeam assign --work-item wi_00000000-0000-0000-0000-000000000000"
+        );
+        assert!(literal_exec_command_arguments(
+            r#"text(await tools.exec_command({cmd:command}));"#
+        )
+        .is_none());
+        assert!(literal_exec_command_arguments(
+            r#"text(await tools.exec_command({cmd:"echo marker"})); text("trailing");"#
+        )
+        .is_none());
     }
 
     #[test]

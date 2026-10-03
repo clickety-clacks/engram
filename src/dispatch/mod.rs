@@ -11,6 +11,7 @@ use crate::store::tapes::{
 use crate::{CliError, RuntimeContext};
 
 pub mod federated;
+pub mod task_context;
 
 const TRANSCRIPT_WINDOW_RADIUS: usize = 2;
 

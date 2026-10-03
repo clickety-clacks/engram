@@ -31,6 +31,7 @@ use engram::dispatch::{
     build_dispatch_session_for_link, collect_dispatch_upstream_sessions,
     extract_dispatch_links_from_transcript,
 };
+use engram::dispatch::task_context::attach_explain_task_ancestry;
 use engram::index::lineage::LINK_THRESHOLD_DEFAULT;
 use engram::index::{DispatchDirection, ReaderMode, SqliteIndex};
 use engram::ingest::{extract_meta, git_head, now_iso8601, record_transcript, run_ingest};
@@ -5444,6 +5445,15 @@ fn cmd_explain(
             score_by_session = scores;
         }
     }
+
+    attach_explain_task_ancestry(
+        context,
+        &indexes,
+        &mut raw_sessions,
+        &date_filter,
+        args.depth,
+        &self_machine,
+    )?;
 
     if date_filter.is_bounded() {
         for session in &mut raw_sessions {

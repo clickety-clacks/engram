@@ -1529,7 +1529,7 @@ mod tests {
             command: Some(vec![
                 "/bin/sh".into(),
                 "-c".into(),
-                "while IFS= read -r request; do id=$(printf '%s\\n' \"$request\" | sed -n 's/.*\\\"id\\\":\\([0-9][0-9]*\\).*/\\1/p'); printf '{\"id\":%s,\"data\":{\"store\":\"eezo/default\",\"status\":\"ok\",\"db\":\"/owner/index.sqlite\",\"tape_dirs\":[\"/owner/tapes\"],\"reader_mode\":\"live\",\"snapshot_at\":\"2026-09-23T00:00:00Z\"}}\\n{\"id\":%s,\"end\":true,\"ok\":true,\"stats\":{\"self\":\"eezo\",\"build\":\"0.2.1\",\"protocol\":1,\"schema\":4,\"query_semantics\":1,\"limits\":{\"read_file_compressed_bytes\":268435456,\"decompressed_bytes_per_tape\":536870912}}}\\n' \"$id\" \"$id\"; done".into(),
+                "while IFS= read -r request; do id=$(printf '%s\\n' \"$request\" | sed -n 's/.*\\\"id\\\":\\([0-9][0-9]*\\).*/\\1/p'); printf '{\"id\":%s,\"data\":{\"store\":\"eezo/default\",\"status\":\"ok\",\"db\":\"/owner/index.sqlite\",\"tape_dirs\":[\"/owner/tapes\"],\"reader_mode\":\"live\",\"snapshot_at\":\"2026-09-23T00:00:00Z\"}}\\n{\"id\":%s,\"end\":true,\"ok\":true,\"stats\":{\"self\":\"eezo\",\"build\":\"0.2.1\",\"protocol\":1,\"schema\":5,\"query_semantics\":1,\"limits\":{\"read_file_compressed_bytes\":268435456,\"decompressed_bytes_per_tape\":536870912}}}\\n' \"$id\" \"$id\"; done".into(),
             ]),
             engram: "/unused".into(),
             exports: vec!["default".into()],

@@ -15,7 +15,7 @@ use crate::index::lineage::{
 };
 use crate::tape::event::{FileRange, TapeEventAt, TapeEventData};
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 pub const QUERY_SEMANTICS_VERSION: u32 = 1;
 const EXACT_EVIDENCE_SQL: &str =
     "SELECT evidence_id, anchor, tape_id, event_offset, kind, file_path, timestamp
@@ -82,10 +82,40 @@ pub struct DispatchLinkRow {
     pub direction: DispatchDirection,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskIdKind {
+    Assignment,
+    WorkItem,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskContextKind {
+    WorkItemCreate,
+    AssignmentCreate,
+    AssignmentDispatch,
+    AssignmentReceipt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskContextEvent {
+    pub event_identity: String,
+    pub event_offset: u64,
+    pub result_offset: Option<u64>,
+    pub kind: TaskContextKind,
+    pub task_id_kind: TaskIdKind,
+    pub task_id: String,
+    pub work_item_id: Option<String>,
+    pub actor_session: Option<String>,
+    pub recipient_session: Option<String>,
+    pub timestamp: String,
+    pub event_timestamp: String,
+}
+
 pub struct SqliteIndex {
     conn: Connection,
     access_kind: AccessKind,
     reader_mode: Option<ReaderMode>,
+    schema_version: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,19 +217,23 @@ impl SqliteIndex {
     fn open_writer_with_wal_policy(path: &str, preserve_wal: bool) -> rusqlite::Result<Self> {
         let existed = Path::new(path).exists();
         let conn = Connection::open(path)?;
-        let index = Self {
+        let mut index = Self {
             conn,
             access_kind: AccessKind::Writer,
             reader_mode: None,
+            schema_version: 0,
         };
         let version = index.user_version()?;
-        if existed && version != SCHEMA_VERSION {
+        if existed && !matches!(version, 4 | SCHEMA_VERSION) {
             return Err(rusqlite::Error::InvalidQuery);
         }
         index.configure_writer(preserve_wal)?;
         if !existed {
-            index.create_schema_v4()?;
+            index.create_schema_v5()?;
+        } else if version == 4 {
+            index.migrate_v4_to_v5()?;
         }
+        index.schema_version = SCHEMA_VERSION;
         Ok(index)
     }
 
@@ -234,15 +268,20 @@ impl SqliteIndex {
             conn,
             access_kind: AccessKind::Reader,
             reader_mode: Some(mode),
+            schema_version: 0,
         };
         index.conn.execute_batch("PRAGMA query_only = ON")?;
         let actual_version = index.user_version()?;
-        if actual_version != SCHEMA_VERSION {
+        if !matches!(actual_version, 4 | SCHEMA_VERSION) {
             return Err(ReaderOpenError::SchemaVersion {
                 expected: SCHEMA_VERSION,
                 actual: actual_version,
             });
         }
+        // Version 4 remains queryable without task ancestry. New context is
+        // optional evidence, so legacy stores keep their existing read path.
+        let mut index = index;
+        index.schema_version = actual_version;
         Ok(index)
     }
 
@@ -252,9 +291,10 @@ impl SqliteIndex {
             conn,
             access_kind: AccessKind::Writer,
             reader_mode: None,
+            schema_version: SCHEMA_VERSION,
         };
         index.configure_writer(false)?;
-        index.create_schema_v4()?;
+        index.create_schema_v5()?;
         Ok(index)
     }
 
@@ -314,9 +354,11 @@ impl SqliteIndex {
 
     fn configure_writer(&self, preserve_wal: bool) -> rusqlite::Result<()> {
         self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-        let journal_mode = self.conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
-            row.get::<_, String>(0)
-        })?;
+        let journal_mode = self
+            .conn
+            .query_row("PRAGMA journal_mode = WAL", [], |row| {
+                row.get::<_, String>(0)
+            })?;
         self.conn.execute_batch("PRAGMA synchronous = FULL;")?;
         if preserve_wal {
             if !journal_mode.eq_ignore_ascii_case("wal") {
@@ -337,7 +379,7 @@ impl SqliteIndex {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
     }
 
-    fn create_schema_v4(&self) -> rusqlite::Result<()> {
+    fn create_schema_v5(&self) -> rusqlite::Result<()> {
         self.conn.execute_batch(
             "
             CREATE TABLE evidence_windows (
@@ -412,9 +454,61 @@ impl SqliteIndex {
             CREATE INDEX idx_dispatch_links_received
               ON dispatch_links(tape_id, direction, first_turn_index);
 
-            PRAGMA user_version = 4;
+            CREATE TABLE task_context_events (
+              tape_id TEXT NOT NULL,
+              event_offset INTEGER NOT NULL,
+              result_offset INTEGER,
+              kind TEXT NOT NULL CHECK(kind IN ('work_item_create','assignment_create','assignment_dispatch','assignment_receipt')),
+              task_id_kind TEXT NOT NULL CHECK(task_id_kind IN ('assignment','work_item')),
+              task_id TEXT NOT NULL,
+              work_item_id TEXT,
+              event_identity TEXT NOT NULL,
+              actor_session TEXT,
+              recipient_session TEXT,
+              timestamp TEXT NOT NULL,
+              event_timestamp TEXT NOT NULL,
+              PRIMARY KEY(tape_id, event_offset, kind, event_identity)
+            );
+            CREATE INDEX idx_task_context_task_id
+              ON task_context_events(task_id_kind, task_id);
+            CREATE INDEX idx_task_context_work_item
+              ON task_context_events(work_item_id, kind);
+            CREATE INDEX idx_task_context_tape_offset
+              ON task_context_events(tape_id, event_offset);
+
+            PRAGMA user_version = 5;
             ",
         )
+    }
+
+    fn migrate_v4_to_v5(&self) -> rusqlite::Result<()> {
+        self.conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE task_context_events (
+               tape_id TEXT NOT NULL,
+               event_offset INTEGER NOT NULL,
+               result_offset INTEGER,
+               kind TEXT NOT NULL CHECK(kind IN ('work_item_create','assignment_create','assignment_dispatch','assignment_receipt')),
+               task_id_kind TEXT NOT NULL CHECK(task_id_kind IN ('assignment','work_item')),
+               task_id TEXT NOT NULL,
+               work_item_id TEXT,
+               event_identity TEXT NOT NULL,
+               actor_session TEXT,
+               recipient_session TEXT,
+               timestamp TEXT NOT NULL,
+               event_timestamp TEXT NOT NULL,
+               PRIMARY KEY(tape_id, event_offset, kind, event_identity)
+             );
+             CREATE INDEX idx_task_context_task_id
+               ON task_context_events(task_id_kind, task_id);
+             CREATE INDEX idx_task_context_work_item
+               ON task_context_events(work_item_id, kind);
+             CREATE INDEX idx_task_context_tape_offset
+               ON task_context_events(tape_id, event_offset);
+             PRAGMA user_version = 5;
+             COMMIT;",
+        )?;
+        Ok(())
     }
 
     fn insert_evidence_window_on(
@@ -554,6 +648,34 @@ impl SqliteIndex {
         Ok(())
     }
 
+    fn insert_task_context_event_on(
+        conn: &Connection,
+        tape_id: &str,
+        event: &TaskContextEvent,
+    ) -> rusqlite::Result<()> {
+        conn.execute(
+            "INSERT OR IGNORE INTO task_context_events
+             (tape_id, event_offset, result_offset, kind, task_id_kind, task_id,
+              work_item_id, event_identity, actor_session, recipient_session, timestamp, event_timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                tape_id,
+                event.event_offset as i64,
+                event.result_offset.map(|offset| offset as i64),
+                encode_task_context_kind(event.kind),
+                encode_task_id_kind(event.task_id_kind),
+                event.task_id,
+                event.work_item_id,
+                event.event_identity,
+                event.actor_session,
+                event.recipient_session,
+                event.timestamp,
+                event.event_timestamp,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn evidence_for_anchor(&self, anchor: &str) -> rusqlite::Result<Vec<EvidenceFragmentRef>> {
         let mut matches = self.evidence_window_matches(anchor)?;
         sort_evidence_window_matches(&mut matches);
@@ -668,7 +790,13 @@ impl SqliteIndex {
         min_confidence: f32,
         include_forensics: bool,
     ) -> rusqlite::Result<Vec<EdgeRow>> {
-        self.edges_for_anchor("to_anchor", to_anchor, min_confidence, include_forensics, true)
+        self.edges_for_anchor(
+            "to_anchor",
+            to_anchor,
+            min_confidence,
+            include_forensics,
+            true,
+        )
     }
 
     pub fn outbound_edges_with_sources(
@@ -853,6 +981,17 @@ impl SqliteIndex {
         tape_id: &str,
         events: &[TapeEventAt],
         dispatch_links: &[DispatchLink],
+        link_threshold: f32,
+    ) -> rusqlite::Result<()> {
+        self.ingest_tape_events_with_context(tape_id, events, dispatch_links, &[], link_threshold)
+    }
+
+    pub fn ingest_tape_events_with_context(
+        &self,
+        tape_id: &str,
+        events: &[TapeEventAt],
+        dispatch_links: &[DispatchLink],
+        task_context_events: &[TaskContextEvent],
         _link_threshold: f32,
     ) -> rusqlite::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
@@ -974,11 +1113,118 @@ impl SqliteIndex {
         for link in dispatch_links {
             Self::insert_dispatch_link_on(tx.deref(), tape_id, link)?;
         }
+        for event in task_context_events {
+            Self::insert_task_context_event_on(tx.deref(), tape_id, event)?;
+        }
         tx.execute(
             "INSERT OR IGNORE INTO tapes (tape_id) VALUES (?1)",
             params![tape_id],
         )?;
         tx.commit()
+    }
+
+    pub fn task_context_events_for_id(
+        &self,
+        kind: TaskIdKind,
+        id: &str,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<(String, TaskContextEvent)>> {
+        if self.schema_version < 5 || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT tape_id, event_offset, result_offset, kind, task_id_kind, task_id,
+                    work_item_id, event_identity, actor_session, recipient_session, timestamp, event_timestamp
+             FROM task_context_events
+             WHERE task_id_kind = ?1 AND task_id = ?2
+             ORDER BY timestamp ASC, tape_id ASC, event_offset ASC
+             LIMIT ?3",
+        )?;
+        stmt.query_map(
+            params![encode_task_id_kind(kind), id, limit.min(64) as i64],
+            decode_task_context_event,
+        )?
+        .collect()
+    }
+
+    pub fn task_context_events_by_work_item(
+        &self,
+        work_item_id: &str,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<(String, TaskContextEvent)>> {
+        if self.schema_version < 5 || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT tape_id, event_offset, result_offset, kind, task_id_kind, task_id,
+                    work_item_id, event_identity, actor_session, recipient_session, timestamp, event_timestamp
+             FROM task_context_events
+             WHERE (task_id_kind = 'work_item' AND task_id = ?1)
+                OR work_item_id = ?1
+             ORDER BY timestamp ASC, tape_id ASC, event_offset ASC
+             LIMIT ?2",
+        )?;
+        stmt.query_map(
+            params![work_item_id, limit.min(64) as i64],
+            decode_task_context_event,
+        )?
+        .collect()
+    }
+
+    pub fn task_context_events_for_tape_before(
+        &self,
+        tape_id: &str,
+        event_offset: u64,
+        kind: TaskContextKind,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<TaskContextEvent>> {
+        if self.schema_version < 5 || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT tape_id, event_offset, result_offset, kind, task_id_kind, task_id,
+                    work_item_id, event_identity, actor_session, recipient_session, timestamp, event_timestamp
+             FROM task_context_events
+             WHERE tape_id = ?1 AND event_offset < ?2 AND kind = ?3
+             ORDER BY event_offset DESC
+             LIMIT ?4",
+        )?;
+        stmt.query_map(
+            params![
+                tape_id,
+                event_offset as i64,
+                encode_task_context_kind(kind),
+                limit.min(64) as i64
+            ],
+            decode_task_context_event,
+        )?
+        .map(|row| row.map(|(_, event)| event))
+        .collect()
+    }
+
+    pub fn assignment_receipts_before(
+        &self,
+        tape_id: &str,
+        event_offset: u64,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<TaskContextEvent>> {
+        if self.schema_version < 5 || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT tape_id, event_offset, result_offset, kind, task_id_kind, task_id,
+                    work_item_id, event_identity, actor_session, recipient_session, timestamp, event_timestamp
+             FROM task_context_events
+             WHERE tape_id = ?1 AND kind = 'assignment_receipt' AND event_offset < ?2
+             ORDER BY event_offset DESC
+             LIMIT ?3",
+        )?;
+        stmt.query_map(
+            params![tape_id, event_offset as i64, limit.min(64) as i64],
+            decode_task_context_event,
+        )?
+        .map(|row| row.map(|(_, event)| event))
+        .collect()
     }
 
     pub fn dispatch_links_for_tape(&self, tape_id: &str) -> rusqlite::Result<Vec<DispatchLink>> {
@@ -1167,6 +1413,61 @@ fn decode_dispatch_link_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Dispatc
     })
 }
 
+fn encode_task_id_kind(kind: TaskIdKind) -> &'static str {
+    match kind {
+        TaskIdKind::Assignment => "assignment",
+        TaskIdKind::WorkItem => "work_item",
+    }
+}
+
+fn encode_task_context_kind(kind: TaskContextKind) -> &'static str {
+    match kind {
+        TaskContextKind::WorkItemCreate => "work_item_create",
+        TaskContextKind::AssignmentCreate => "assignment_create",
+        TaskContextKind::AssignmentDispatch => "assignment_dispatch",
+        TaskContextKind::AssignmentReceipt => "assignment_receipt",
+    }
+}
+
+fn decode_task_context_event(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(String, TaskContextEvent)> {
+    let tape_id = row.get::<_, String>(0)?;
+    let event_offset = row.get::<_, i64>(1)?;
+    let result_offset = row.get::<_, Option<i64>>(2)?;
+    let kind = match row.get::<_, String>(3)?.as_str() {
+        "work_item_create" => TaskContextKind::WorkItemCreate,
+        "assignment_create" => TaskContextKind::AssignmentCreate,
+        "assignment_dispatch" => TaskContextKind::AssignmentDispatch,
+        "assignment_receipt" => TaskContextKind::AssignmentReceipt,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    let task_id_kind = match row.get::<_, String>(4)?.as_str() {
+        "assignment" => TaskIdKind::Assignment,
+        "work_item" => TaskIdKind::WorkItem,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    if event_offset < 0 || result_offset.is_some_and(|offset| offset < 0) {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok((
+        tape_id,
+        TaskContextEvent {
+            event_offset: event_offset as u64,
+            result_offset: result_offset.map(|offset| offset as u64),
+            kind,
+            task_id_kind,
+            task_id: row.get(5)?,
+            work_item_id: row.get(6)?,
+            event_identity: row.get(7)?,
+            actor_session: row.get(8)?,
+            recipient_session: row.get(9)?,
+            timestamp: row.get(10)?,
+            event_timestamp: row.get(11)?,
+        },
+    ))
+}
+
 fn encode_evidence_kind(kind: EvidenceKind) -> &'static str {
     match kind {
         EvidenceKind::Edit => "edit",
@@ -1288,15 +1589,118 @@ mod tests {
     }
 
     #[test]
-    fn schema_v4_uses_wide_windows_and_narrow_postings_only() {
+    fn schema_v5_adds_bounded_task_context_without_result_caches() {
         let index = SqliteIndex::open_in_memory().unwrap();
-        assert_eq!(index.scalar_i64("PRAGMA user_version"), 4);
+        assert_eq!(index.scalar_i64("PRAGMA user_version"), 5);
+        assert_eq!(
+            index.scalar_i64(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'task_context_events'"
+            ),
+            1
+        );
         assert_eq!(
             index.scalar_i64(
                 "SELECT COUNT(*) FROM sqlite_master
                  WHERE type = 'table' AND name IN ('query_results','result_feedback','evidence')"
             ),
             0
+        );
+    }
+
+    #[test]
+    fn task_context_events_round_trip_and_query_limits_are_bounded() {
+        let index = SqliteIndex::open_in_memory().unwrap();
+        let work_item = "wi_abcdef01-2345-6789-abcd-ef0123456789";
+        let assignment = "asg_12345678-1234-1234-1234-1234567890ab";
+        let events = [
+            TaskContextEvent {
+                event_identity: "call-create".into(),
+                event_offset: 2,
+                result_offset: Some(3),
+                kind: TaskContextKind::WorkItemCreate,
+                task_id_kind: TaskIdKind::WorkItem,
+                task_id: work_item.into(),
+                work_item_id: Some(work_item.into()),
+                actor_session: Some("agent:main s_sender".into()),
+                recipient_session: None,
+                timestamp: "2026-10-03T12:00:00Z".into(),
+                event_timestamp: "2026-10-03T11:59:59Z".into(),
+            },
+            TaskContextEvent {
+                event_identity: "call-dispatch".into(),
+                event_offset: 9,
+                result_offset: Some(10),
+                kind: TaskContextKind::AssignmentDispatch,
+                task_id_kind: TaskIdKind::Assignment,
+                task_id: assignment.into(),
+                work_item_id: Some(work_item.into()),
+                actor_session: Some("agent:main s_sender".into()),
+                recipient_session: Some("agent:coder s_receiver".into()),
+                timestamp: "2026-10-03T12:01:00Z".into(),
+                event_timestamp: "2026-10-03T12:00:59Z".into(),
+            },
+            TaskContextEvent {
+                event_identity: "assignment-envelope:4".into(),
+                event_offset: 4,
+                result_offset: None,
+                kind: TaskContextKind::AssignmentReceipt,
+                task_id_kind: TaskIdKind::Assignment,
+                task_id: assignment.into(),
+                work_item_id: None,
+                actor_session: None,
+                recipient_session: Some("agent:coder s_receiver".into()),
+                timestamp: "2026-10-03T12:02:00Z".into(),
+                event_timestamp: "2026-10-03T12:02:00Z".into(),
+            },
+        ];
+        index
+            .ingest_tape_events_with_context(
+                "source-tape",
+                &[],
+                &[],
+                &events,
+                LINK_THRESHOLD_DEFAULT,
+            )
+            .unwrap();
+
+        let assignment_rows = index
+            .task_context_events_for_id(TaskIdKind::Assignment, assignment, 2)
+            .unwrap();
+        assert_eq!(assignment_rows.len(), 2);
+        assert!(assignment_rows.iter().any(|(tape, event)| {
+            tape == "source-tape"
+                && event.kind == TaskContextKind::AssignmentDispatch
+                && event.result_offset == Some(10)
+                && event.event_timestamp == "2026-10-03T12:00:59Z"
+        }));
+        let item_rows = index
+            .task_context_events_by_work_item(work_item, 1)
+            .unwrap();
+        assert_eq!(item_rows.len(), 1);
+        assert_eq!(item_rows[0].1.kind, TaskContextKind::WorkItemCreate);
+        let receipts = index
+            .task_context_events_for_tape_before(
+                "source-tape",
+                9,
+                TaskContextKind::AssignmentReceipt,
+                4,
+            )
+            .unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].event_offset, 4);
+        assert_eq!(
+            index
+                .task_context_events_for_tape_before(
+                    "source-tape",
+                    4,
+                    TaskContextKind::AssignmentReceipt,
+                    4,
+                )
+                .unwrap()
+                .len(),
+            0,
+            "the event at the query offset is not a preceding receipt"
         );
     }
 
@@ -1506,12 +1910,12 @@ mod tests {
     // D1/T1: this intentionally exercises Frozen mode. The previous test name
     // implied arbitrary readers could use immutable mode when sidecars were
     // absent; Live readers must instead remain mode=ro.
-    fn frozen_reader_opens_schema_v4_without_wal_shm_or_file_mutation() {
+    fn frozen_reader_opens_schema_v5_without_wal_shm_or_file_mutation() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("index.sqlite");
         {
             let writer = SqliteIndex::open_writer(path.to_str().unwrap()).unwrap();
-            assert_eq!(writer.user_version().unwrap(), 4);
+            assert_eq!(writer.user_version().unwrap(), 5);
         }
         let before = std::fs::read(&path).unwrap();
         {
