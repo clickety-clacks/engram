@@ -909,9 +909,13 @@ fn absolute_path_mentions(line: &str) -> Vec<PathBuf> {
             .unwrap_or(remainder.len());
         let token = remainder[..end].trim_end_matches([',', '.', ';', ':', '!', '?']);
         if token.len() > 1 {
-            let candidate = Path::new(token);
-            if candidate.is_absolute() {
-                paths.push(candidate.to_path_buf());
+            // These mentions can describe files on a different host. Their
+            // path syntax must be recognized lexically instead of asking the
+            // current platform whether the token is absolute.
+            let uri_authority =
+                is_unix_root && token.starts_with("//") && line[..start].ends_with(':');
+            if !uri_authority {
+                paths.push(PathBuf::from(token));
             }
         }
     }
@@ -2906,6 +2910,11 @@ mod tests {
             absolute_path_mentions("Update `/workspace/project/src/lib.rs`."),
             vec![PathBuf::from("/workspace/project/src/lib.rs")]
         );
+        assert_eq!(
+            absolute_path_mentions(r"Edit C:\workspace\project\src\lib.rs."),
+            vec![PathBuf::from(r"C:\workspace\project\src\lib.rs")]
+        );
+        assert!(absolute_path_mentions("See https://example.invalid/src/lib.rs").is_empty());
     }
 
     #[test]
