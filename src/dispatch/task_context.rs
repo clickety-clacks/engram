@@ -4,13 +4,15 @@
 //! or JavaScript and never treats prose mentions as relationships.
 
 use std::collections::HashSet;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader};
 use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
 use crate::index::{SqliteIndex, TaskContextEvent, TaskContextKind, TaskIdKind};
 use crate::query::format::{DateFilter, EventTimeDecision};
-use crate::store::tapes::{parse_jsonl_rows, read_tape_content, resolve_tape_path};
+use crate::store::tapes::resolve_tape_path;
 use crate::tape::adapters::codex::literal_exec_command_arguments;
 use crate::{CliError, RuntimeContext};
 
@@ -19,6 +21,7 @@ const MAX_TASK_ANCESTRY_DEPTH: usize = 4;
 const MAX_TASK_ANCESTRY_BRANCHES: usize = 4;
 const TASK_CONTEXT_MESSAGE_COUNT: usize = 2;
 const TASK_CONTEXT_MESSAGE_CHARS: usize = 480;
+const TASK_CONTEXT_MAX_EVENT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Operation {
@@ -1280,15 +1283,32 @@ fn preceding_context(
             json!({"status":"unavailable","reason":"source_tape_unavailable","passages":[]}),
         );
     };
-    let raw = read_tape_content(&path)?;
-    let rows = parse_jsonl_rows(&raw)?;
+    let file = File::open(&path).map_err(|error| CliError::io("read_error", error))?;
+    let decoder = zstd::stream::read::Decoder::new(file)
+        .map_err(|error| CliError::io("decompress_error", error))?;
+    let mut reader = BufReader::new(decoder);
     let mut selected = Vec::new();
     let mut unknown_time = false;
-    for row in rows.iter().filter(|row| row.offset < before_offset).rev() {
-        if !matches!(row.value["k"].as_str(), Some("msg.in" | "msg.out")) {
+    let mut oversized_events_skipped = 0usize;
+    for offset in 0..before_offset {
+        let Some((line, oversized)) =
+            read_bounded_jsonl_line(&mut reader, TASK_CONTEXT_MAX_EVENT_BYTES)
+                .map_err(|error| CliError::io("read_error", error))?
+        else {
+            break;
+        };
+        if oversized {
+            oversized_events_skipped += 1;
             continue;
         }
-        match date_filter.event_time(row.value["t"].as_str()) {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let row: Value = serde_json::from_slice(&line)?;
+        if !matches!(row["k"].as_str(), Some("msg.in" | "msg.out")) {
+            continue;
+        }
+        match date_filter.event_time(row["t"].as_str()) {
             EventTimeDecision::Included => {}
             EventTimeDecision::Excluded => continue,
             EventTimeDecision::Unknown => {
@@ -1302,24 +1322,65 @@ fn preceding_context(
             machine_label,
             store_index,
             tape_id,
-            row.offset,
-            &row.value,
+            offset,
+            &row,
         ));
-        if selected.len() >= TASK_CONTEXT_MESSAGE_COUNT {
-            break;
+        if selected.len() > TASK_CONTEXT_MESSAGE_COUNT {
+            selected.remove(0);
         }
     }
-    selected.reverse();
-    let status = if selected.is_empty() {
+    let status = if !selected.is_empty() && oversized_events_skipped > 0 {
+        "available_with_oversized_events_skipped"
+    } else if selected.is_empty() {
         if unknown_time && date_filter.is_bounded() {
             "preceding_context_has_unknown_time"
+        } else if oversized_events_skipped > 0 {
+            "no_bounded_preceding_message_found"
         } else {
             "no_preceding_message_found"
         }
     } else {
         "available"
     };
-    Ok(json!({"status":status,"passages":selected}))
+    Ok(json!({
+        "status":status,
+        "passages":selected,
+        "oversized_events_skipped":oversized_events_skipped,
+        "event_byte_limit":TASK_CONTEXT_MAX_EVENT_BYTES,
+    }))
+}
+
+/// Read one physical JSONL row without retaining an arbitrarily large event.
+/// Oversized rows are drained through their newline and reported to the caller.
+fn read_bounded_jsonl_line<R: BufRead>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> io::Result<Option<(Vec<u8>, bool)>> {
+    let mut line = Vec::with_capacity(max_bytes.min(8 * 1024));
+    let mut oversized = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return if line.is_empty() && !oversized {
+                Ok(None)
+            } else {
+                Ok(Some((line, oversized)))
+            };
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let content_len = newline.unwrap_or(available.len());
+        if !oversized {
+            let remaining = max_bytes.saturating_sub(line.len());
+            let retained = content_len.min(remaining);
+            line.extend_from_slice(&available[..retained]);
+            oversized = retained < content_len;
+        }
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(Some((line, oversized)));
+        }
+    }
 }
 
 fn resolve_tape_path_for_store(
@@ -1429,6 +1490,7 @@ mod tests {
     use crate::{RuntimeContext, config::EffectiveWatchConfig};
     use serde_json::json;
     use std::fs;
+    use std::io::Cursor;
 
     const ASSIGNMENT: &str = "asg_12345678-1234-1234-1234-1234567890ab";
     const PARENT_ASSIGNMENT: &str = "asg_12345678-1234-1234-1234-1234567890ac";
@@ -1436,6 +1498,21 @@ mod tests {
     const WORK_ITEM: &str = "wi_abcdef01-2345-6789-abcd-ef0123456789";
     const SENDER: &str = "agent:main:clawline:mike:main s_sender01";
     const RECIPIENT: &str = "agent:coder:engram s_recipient01";
+
+    #[test]
+    fn bounded_context_reader_drains_large_rows_without_growing_the_buffer() {
+        let input = format!("{}\n{{\"k\":\"msg.in\"}}\n", "x".repeat(4096));
+        let mut reader = Cursor::new(input.as_bytes());
+        let (oversized_line, oversized) =
+            read_bounded_jsonl_line(&mut reader, 64).unwrap().unwrap();
+        assert!(oversized);
+        assert_eq!(oversized_line.len(), 64);
+
+        let (following, oversized) = read_bounded_jsonl_line(&mut reader, 64).unwrap().unwrap();
+        assert!(!oversized);
+        assert_eq!(serde_json::from_slice::<Value>(&following).unwrap()["k"], "msg.in");
+        assert!(read_bounded_jsonl_line(&mut reader, 64).unwrap().is_none());
+    }
 
     fn wrapped_call(command: &str, call_id: &str, timestamp: &str) -> Value {
         json!({
