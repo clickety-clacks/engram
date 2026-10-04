@@ -515,6 +515,10 @@ pub fn attach_explain_task_ancestry(
                 })
             })
             .collect::<Vec<_>>();
+        if !eligible_edits.is_empty() {
+            session["task_context_coverage"] =
+                task_context_coverage_for_tape(context, indexes, &stores, machine_label, &tape_id)?;
+        }
         for touch in eligible_edits.iter().take(8) {
             let Some(edit_offset) = touch["event_offset"].as_u64() else {
                 continue;
@@ -569,6 +573,81 @@ fn selected_store_paths(context: &RuntimeContext) -> Vec<PathBuf> {
             .cloned(),
     );
     stores
+}
+
+fn task_context_coverage_for_tape(
+    context: &RuntimeContext,
+    indexes: &[SqliteIndex],
+    stores: &[PathBuf],
+    machine_label: &str,
+    tape_id: &str,
+) -> Result<Value, CliError> {
+    let mut sources = Vec::new();
+    for (store_index, index) in indexes.iter().enumerate() {
+        if !index.has_tape(tape_id)? {
+            continue;
+        }
+        let coverage = index.task_context_coverage_for_tape(tape_id)?;
+        let path = stores.get(store_index);
+        sources.push(json!({
+            "machine": if path == Some(&context.db_path) {
+                machine_label
+            } else {
+                "machine_identity_unavailable_for_selected_store"
+            },
+            "store": path.map(|value| value.display().to_string()),
+            "tape_id": tape_id,
+            "status": coverage.status,
+            "supported_event_count": coverage.supported_event_count,
+        }));
+    }
+    let statuses = sources
+        .iter()
+        .filter_map(|source| source["status"].as_str())
+        .collect::<Vec<_>>();
+    let status = if statuses.is_empty() {
+        "source_store_unavailable"
+    } else if statuses.iter().all(|status| *status == "indexed") {
+        "indexed"
+    } else if statuses.iter().any(|status| *status == "indexed") {
+        "partially_indexed"
+    } else if statuses
+        .iter()
+        .any(|status| *status == "tape_rebuild_required")
+    {
+        "tape_rebuild_required"
+    } else {
+        "store_rebuild_required"
+    };
+    let message = match status {
+        "indexed" => {
+            "Task-context extraction ran for this tape. No displayed ancestry means no supported handoff was found under the current query bounds; it does not prove no handoff occurred."
+        }
+        "partially_indexed" => {
+            "Only some selected stores have task-context coverage for this tape. Missing stores or copies may contain additional handoff history."
+        }
+        "tape_rebuild_required" => {
+            "This tape has no task-context coverage marker. Rebuild a separate index from its retained original transcript to add ancestry coverage; existing rows are not backfilled in place."
+        }
+        "store_rebuild_required" => {
+            "This store predates task-context indexing. Rebuild a separate index from retained original transcripts to add ancestry coverage; this store was not migrated or changed."
+        }
+        _ => {
+            "The selected source store for this edit could not be identified, so task-context coverage is unknown."
+        }
+    };
+    Ok(json!({
+        "status": status,
+        "reason": message,
+        "required_action": if matches!(status, "store_rebuild_required" | "tape_rebuild_required") {
+            "rebuild_from_retained_transcripts_into_a_new_store"
+        } else if status == "source_store_unavailable" {
+            "verify_selected_store"
+        } else {
+            "none"
+        },
+        "sources": sources,
+    }))
 }
 
 fn task_events_for_id(
@@ -2040,6 +2119,37 @@ mod tests {
         fs::write(path, compress_jsonl(normalized).unwrap()).unwrap();
     }
 
+    fn ingest_context_fixture(
+        context: &RuntimeContext,
+        writer: &SqliteIndex,
+        tape_id: &str,
+        raw: &str,
+        task_events: &[TaskContextEvent],
+    ) {
+        write_fixture_tape(context, tape_id, raw);
+        writer
+            .ingest_tape_events_with_context(
+                tape_id,
+                &parse_jsonl_events(raw).unwrap(),
+                &[],
+                task_events,
+                crate::index::lineage::LINK_THRESHOLD_DEFAULT,
+            )
+            .unwrap();
+    }
+
+    fn explain_edit_session(tape_id: &str, edit_offset: u64, timestamp: &str) -> Value {
+        json!({
+            "tape_id":tape_id,
+            "touches":[{
+                "kind":"edit",
+                "event_offset":edit_offset,
+                "timestamp":timestamp,
+                "file_path":"scripts/verify_mix.sh"
+            }]
+        })
+    }
+
     #[test]
     fn pairs_literal_dispatch_with_successful_returned_assignment_and_receiver() {
         let call_id = "call_dispatch_01";
@@ -2918,6 +3028,437 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_assignment_operations_are_returned_as_cited_alternatives() {
+        let temp = tempfile::tempdir().unwrap();
+        let context = runtime_context(temp.path());
+        let operation_tape = "operation-alternatives";
+        let edit_tape = "operation-alternatives-edit";
+        let assignment_result = json!({
+            "id":ASSIGNMENT,
+            "workItemId":WORK_ITEM,
+            "openedBySession":SENDER,
+            "holderKey":RECIPIENT,
+            "state":"open"
+        })
+        .to_string();
+        let mut first_result = wrapped_result("same-assignment-first", &assignment_result, 0);
+        first_result["t"] = json!("2026-10-03T12:00:02Z");
+        let mut second_result = wrapped_result("same-assignment-second", &assignment_result, 0);
+        second_result["t"] = json!("2026-10-03T12:00:04Z");
+        let operations = jsonl([
+            json!({"t":"2026-10-03T12:00:00Z","k":"msg.in","content":"Two dispatch records were retained."}),
+            wrapped_call(
+                &format!(
+                    "tightbeam dispatch --to '{RECIPIENT}' --work-item {WORK_ITEM} --subject 'first operation' --brief 'First evidence.'"
+                ),
+                "same-assignment-first",
+                "2026-10-03T12:00:01Z",
+            ),
+            first_result,
+            wrapped_call(
+                &format!(
+                    "tightbeam dispatch --to '{RECIPIENT}' --work-item {WORK_ITEM} --subject 'second operation' --brief 'Second evidence.'"
+                ),
+                "same-assignment-second",
+                "2026-10-03T12:00:03Z",
+            ),
+            second_result,
+        ]);
+        let edit = jsonl([
+            json!({
+                "t":"2026-10-03T12:00:05Z",
+                "k":"msg.in",
+                "source":{"session_id":"native-recipient-session"},
+                "content":format!("[from agent:main]\n[assignment: {ASSIGNMENT}]\nRetained edit task.")
+            }),
+            json!({
+                "t":"2026-10-03T12:00:06Z",
+                "k":"code.edit",
+                "file":"scripts/verify_mix.sh",
+                "before_range":[19,25],
+                "after_range":[19,25],
+                "before_text":"old verification",
+                "after_text":"updated verification"
+            }),
+        ]);
+        let writer = SqliteIndex::open_owner_writer(context.db_path.to_str().unwrap()).unwrap();
+        ingest_context_fixture(
+            &context,
+            &writer,
+            operation_tape,
+            &operations,
+            &extract_task_context_events(&operations),
+        );
+        ingest_context_fixture(
+            &context,
+            &writer,
+            edit_tape,
+            &edit,
+            &extract_task_context_events(&edit),
+        );
+        drop(writer);
+        let index =
+            SqliteIndex::open_reader_mode(context.db_path.to_str().unwrap(), ReaderMode::Live)
+                .unwrap();
+        let mut sessions = vec![explain_edit_session(edit_tape, 1, "2026-10-03T12:00:06Z")];
+        attach_explain_task_ancestry(
+            &context,
+            &[index],
+            &mut sessions,
+            &DateFilter::parse(None, None).unwrap(),
+            4,
+            "gibson",
+        )
+        .unwrap();
+        let ancestry = &sessions[0]["task_ancestry"][0];
+        assert_eq!(ancestry["status"], "multiple_assignment_operations");
+        assert_eq!(
+            ancestry["steps"][0]["relationship"],
+            "assignment_operation_alternatives"
+        );
+        let alternatives = ancestry["steps"][0]["alternatives"].as_array().unwrap();
+        assert_eq!(alternatives.len(), 2);
+        assert_eq!(
+            alternatives
+                .iter()
+                .map(|alternative| alternative["event_identity"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["same-assignment-first", "same-assignment-second"]
+        );
+    }
+
+    #[test]
+    fn repeated_work_item_creation_is_returned_as_alternatives() {
+        let temp = tempfile::tempdir().unwrap();
+        let context = runtime_context(temp.path());
+        let tape_id = "creation-alternatives";
+        let item_result = json!({"workItem":{"id":WORK_ITEM,"state":"open"}}).to_string();
+        let assignment_result = json!({
+            "id":ASSIGNMENT,
+            "workItemId":WORK_ITEM,
+            "openedBySession":SENDER,
+            "holderKey":RECIPIENT,
+            "state":"open"
+        })
+        .to_string();
+        let mut first_item_result = wrapped_result("create-first", &item_result, 0);
+        first_item_result["t"] = json!("2026-10-03T12:00:02Z");
+        let mut second_item_result = wrapped_result("create-second", &item_result, 0);
+        second_item_result["t"] = json!("2026-10-03T12:00:04Z");
+        let mut dispatch_result = wrapped_result("create-dispatch", &assignment_result, 0);
+        dispatch_result["t"] = json!("2026-10-03T12:00:07Z");
+        let raw = jsonl([
+            json!({"t":"2026-10-03T12:00:00Z","k":"msg.in","content":"Retained work-item creation context."}),
+            wrapped_call(
+                "tightbeam work-item-create --title 'First creation'",
+                "create-first",
+                "2026-10-03T12:00:01Z",
+            ),
+            first_item_result,
+            wrapped_call(
+                "tightbeam work-item-create --title 'Second creation'",
+                "create-second",
+                "2026-10-03T12:00:03Z",
+            ),
+            second_item_result,
+            wrapped_call(
+                &format!(
+                    "tightbeam dispatch --to '{RECIPIENT}' --work-item {WORK_ITEM} --subject 'Child task' --brief 'Retain both creation candidates.'"
+                ),
+                "create-dispatch",
+                "2026-10-03T12:00:06Z",
+            ),
+            dispatch_result,
+            json!({
+                "t":"2026-10-03T12:00:08Z",
+                "k":"msg.in",
+                "source":{"session_id":"native-recipient-session"},
+                "content":format!("[from agent:main]\n[assignment: {ASSIGNMENT}]\nRetained child task.")
+            }),
+            json!({
+                "t":"2026-10-03T12:00:09Z",
+                "k":"code.edit",
+                "file":"scripts/verify_mix.sh",
+                "before_range":[19,25],
+                "after_range":[19,25],
+                "before_text":"old verification",
+                "after_text":"updated verification"
+            }),
+        ]);
+        let task_events = extract_task_context_events(&raw);
+        assert_eq!(
+            task_events
+                .iter()
+                .filter(|event| event.kind == TaskContextKind::WorkItemCreate)
+                .count(),
+            2
+        );
+        let writer = SqliteIndex::open_owner_writer(context.db_path.to_str().unwrap()).unwrap();
+        ingest_context_fixture(&context, &writer, tape_id, &raw, &task_events);
+        drop(writer);
+        let index =
+            SqliteIndex::open_reader_mode(context.db_path.to_str().unwrap(), ReaderMode::Live)
+                .unwrap();
+        let mut sessions = vec![explain_edit_session(tape_id, 8, "2026-10-03T12:00:09Z")];
+        attach_explain_task_ancestry(
+            &context,
+            &[index],
+            &mut sessions,
+            &DateFilter::parse(None, None).unwrap(),
+            4,
+            "gibson",
+        )
+        .unwrap();
+        let ancestry = &sessions[0]["task_ancestry"][0];
+        assert_eq!(ancestry["status"], "multiple_work_item_creations");
+        let creation_step = ancestry["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["relationship"] == "work_item_creation_alternatives")
+            .expect("ambiguous creation step");
+        assert_eq!(creation_step["alternatives"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn cyclic_assignment_receipts_stop_and_report_duplicate_receipts_collapsed() {
+        let temp = tempfile::tempdir().unwrap();
+        let context = runtime_context(temp.path());
+        let tape_id = "cyclic-assignment-history";
+        let assignment_b = "asg_12345678-1234-1234-1234-1234567890bc";
+        let dispatch_a = json!({
+            "id":ASSIGNMENT,
+            "workItemId":WORK_ITEM,
+            "openedBySession":SENDER,
+            "holderKey":RECIPIENT,
+            "state":"open"
+        })
+        .to_string();
+        let dispatch_b = json!({
+            "id":assignment_b,
+            "workItemId":WORK_ITEM,
+            "openedBySession":SENDER,
+            "holderKey":RECIPIENT,
+            "state":"open"
+        })
+        .to_string();
+        let mut result_b = wrapped_result("cycle-b", &dispatch_b, 0);
+        result_b["t"] = json!("2026-10-03T12:00:02Z");
+        let mut result_a = wrapped_result("cycle-a", &dispatch_a, 0);
+        result_a["t"] = json!("2026-10-03T12:00:05Z");
+        let raw = jsonl([
+            json!({
+                "t":"2026-10-03T12:00:00Z",
+                "k":"msg.in",
+                "source":{"session_id":"native-recipient-session"},
+                "content":format!("[from agent:main]\n[assignment: {ASSIGNMENT}]\nFirst A receipt.")
+            }),
+            wrapped_call(
+                &format!(
+                    "tightbeam dispatch --to '{RECIPIENT}' --work-item {WORK_ITEM} --subject 'B in cycle' --brief 'Cycle fixture.'"
+                ),
+                "cycle-b",
+                "2026-10-03T12:00:01Z",
+            ),
+            result_b,
+            json!({
+                "t":"2026-10-03T12:00:03Z",
+                "k":"msg.in",
+                "source":{"session_id":"native-recipient-session"},
+                "content":format!("[from agent:main]\n[assignment: {assignment_b}]\nB receipt.")
+            }),
+            wrapped_call(
+                &format!(
+                    "tightbeam dispatch --to '{RECIPIENT}' --work-item {WORK_ITEM} --subject 'A in cycle' --brief 'Cycle fixture.'"
+                ),
+                "cycle-a",
+                "2026-10-03T12:00:04Z",
+            ),
+            result_a,
+            json!({
+                "t":"2026-10-03T12:00:06Z",
+                "k":"msg.in",
+                "source":{"session_id":"native-recipient-session"},
+                "content":format!("[from agent:main]\n[assignment: {ASSIGNMENT}]\nDuplicate A receipt.")
+            }),
+            json!({
+                "t":"2026-10-03T12:00:07Z",
+                "k":"code.edit",
+                "file":"scripts/verify_mix.sh",
+                "before_range":[19,25],
+                "after_range":[19,25],
+                "before_text":"old verification",
+                "after_text":"updated verification"
+            }),
+        ]);
+        let task_events = extract_task_context_events(&raw);
+        let writer = SqliteIndex::open_owner_writer(context.db_path.to_str().unwrap()).unwrap();
+        ingest_context_fixture(&context, &writer, tape_id, &raw, &task_events);
+        drop(writer);
+        let index =
+            SqliteIndex::open_reader_mode(context.db_path.to_str().unwrap(), ReaderMode::Live)
+                .unwrap();
+        let mut sessions = vec![explain_edit_session(tape_id, 7, "2026-10-03T12:00:07Z")];
+        attach_explain_task_ancestry(
+            &context,
+            &[index],
+            &mut sessions,
+            &DateFilter::parse(None, None).unwrap(),
+            4,
+            "gibson",
+        )
+        .unwrap();
+        let ancestry = &sessions[0]["task_ancestry"][0];
+        assert_eq!(ancestry["status"], "cycle_detected");
+        assert_eq!(ancestry["duplicate_receipt_events_collapsed"], 1);
+        assert_eq!(
+            ancestry["steps"].as_array().unwrap().last().unwrap()["relationship"],
+            "cycle_guard"
+        );
+    }
+
+    #[test]
+    fn date_bounds_filter_context_passages_not_only_link_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let context = runtime_context(temp.path());
+        let tape_id = "bounded-task-context";
+        let mut dispatch_result = wrapped_result(
+            "bounded-dispatch",
+            &json!({
+                "id":ASSIGNMENT,
+                "workItemId":WORK_ITEM,
+                "openedBySession":SENDER,
+                "holderKey":RECIPIENT,
+                "state":"open"
+            })
+            .to_string(),
+            0,
+        );
+        dispatch_result["t"] = json!("2026-10-03T12:00:06Z");
+        let raw = jsonl([
+            json!({"t":"2026-10-03T12:00:01Z","k":"msg.in","content":"before the requested window"}),
+            json!({"t":"2026-10-03T12:00:05Z","k":"msg.in","content":"inside the requested window"}),
+            json!({"t":"2026-10-03T12:00:08Z","k":"msg.in","content":"after the requested window"}),
+            wrapped_call(
+                &format!(
+                    "tightbeam dispatch --to '{RECIPIENT}' --work-item {WORK_ITEM} --subject 'Bounded task' --brief 'Link within window.'"
+                ),
+                "bounded-dispatch",
+                "2026-10-03T12:00:06Z",
+            ),
+            dispatch_result,
+            json!({
+                "t":"2026-10-03T12:00:06Z",
+                "k":"msg.in",
+                "source":{"session_id":"native-recipient-session"},
+                "content":format!("[from agent:main]\n[assignment: {ASSIGNMENT}]\nBounded receipt.")
+            }),
+            json!({
+                "t":"2026-10-03T12:00:06Z",
+                "k":"code.edit",
+                "file":"scripts/verify_mix.sh",
+                "before_range":[19,25],
+                "after_range":[19,25],
+                "before_text":"old verification",
+                "after_text":"updated verification"
+            }),
+        ]);
+        let task_events = extract_task_context_events(&raw);
+        let writer = SqliteIndex::open_owner_writer(context.db_path.to_str().unwrap()).unwrap();
+        ingest_context_fixture(&context, &writer, tape_id, &raw, &task_events);
+        drop(writer);
+        let index =
+            SqliteIndex::open_reader_mode(context.db_path.to_str().unwrap(), ReaderMode::Live)
+                .unwrap();
+        let filter =
+            DateFilter::parse(Some("2026-10-03T12:00:04Z"), Some("2026-10-03T12:00:07Z")).unwrap();
+        let mut sessions = vec![explain_edit_session(tape_id, 6, "2026-10-03T12:00:06Z")];
+        attach_explain_task_ancestry(&context, &[index], &mut sessions, &filter, 4, "gibson")
+            .unwrap();
+        let passages = sessions[0]["task_ancestry"][0]["steps"][0]["context"]["passages"]
+            .as_array()
+            .unwrap();
+        assert_eq!(passages.len(), 1);
+        assert_eq!(passages[0]["text"], "inside the requested window");
+        assert!(passages.iter().all(|passage| {
+            passage["text"] != "before the requested window"
+                && passage["text"] != "after the requested window"
+        }));
+    }
+
+    #[test]
+    fn legacy_v4_edit_output_calls_for_a_new_store_rebuild() {
+        let temp = tempfile::tempdir().unwrap();
+        let context = runtime_context(temp.path());
+        let tape_id = "legacy-v4-edit";
+        let raw = jsonl([
+            json!({"t":"2026-10-03T12:00:00Z","k":"meta","model":"coverage-test"}),
+            json!({
+                "t":"2026-10-03T12:00:01Z",
+                "k":"code.edit",
+                "file":"scripts/verify_mix.sh",
+                "before_range":[19,25],
+                "after_range":[19,25],
+                "before_text":"old verification",
+                "after_text":"updated verification"
+            }),
+        ]);
+        write_fixture_tape(&context, tape_id, &raw);
+        {
+            let writer = SqliteIndex::open_owner_writer(context.db_path.to_str().unwrap()).unwrap();
+            drop(writer);
+            let legacy = rusqlite::Connection::open(&context.db_path).unwrap();
+            legacy
+                .execute_batch(
+                    "DROP TABLE task_context_coverage;
+                     DROP TABLE task_context_events;
+                     PRAGMA user_version = 4;",
+                )
+                .unwrap();
+        }
+        {
+            let writer = SqliteIndex::open_owner_writer(context.db_path.to_str().unwrap()).unwrap();
+            writer
+                .ingest_tape_events_with_context(
+                    tape_id,
+                    &parse_jsonl_events(&raw).unwrap(),
+                    &[],
+                    &[],
+                    crate::index::lineage::LINK_THRESHOLD_DEFAULT,
+                )
+                .unwrap();
+        }
+        let index =
+            SqliteIndex::open_reader_mode(context.db_path.to_str().unwrap(), ReaderMode::Live)
+                .unwrap();
+        let mut sessions = vec![explain_edit_session(tape_id, 1, "2026-10-03T12:00:01Z")];
+        attach_explain_task_ancestry(
+            &context,
+            &[index],
+            &mut sessions,
+            &DateFilter::parse(None, None).unwrap(),
+            4,
+            "gibson",
+        )
+        .unwrap();
+        assert!(sessions[0].get("task_ancestry").is_none());
+        assert_eq!(
+            sessions[0]["task_context_coverage"]["status"],
+            "store_rebuild_required"
+        );
+        assert_eq!(
+            sessions[0]["task_context_coverage"]["required_action"],
+            "rebuild_from_retained_transcripts_into_a_new_store"
+        );
+        assert!(
+            sessions[0]["task_context_coverage"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("not migrated or changed")
+        );
+    }
+
+    #[test]
     fn an_id_mention_before_an_edit_does_not_create_task_ancestry() {
         let temp = tempfile::tempdir().unwrap();
         let context = runtime_context(temp.path());
@@ -2979,6 +3520,11 @@ mod tests {
         assert!(
             sessions[0].get("task_ancestry").is_none(),
             "mention-only identifiers do not add an empty ancestry result"
+        );
+        assert_eq!(sessions[0]["task_context_coverage"]["status"], "indexed");
+        assert_eq!(
+            sessions[0]["task_context_coverage"]["sources"][0]["supported_event_count"], 0,
+            "a covered tape with no supported handoff is distinct from an old unindexed tape"
         );
     }
 }

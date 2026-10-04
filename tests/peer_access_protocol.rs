@@ -1090,6 +1090,7 @@ fn explain_reference_projection(mut value: serde_json::Value) -> serde_json::Val
                 session.remove("tape_facts");
                 session.remove("tape_present_locally");
                 session.remove("next_lookup");
+                session.remove("task_context_coverage");
             }
         }
     }
@@ -1856,6 +1857,7 @@ fn explain_peers_matches_local_multi_store_reference() {
     let local_id = "local-parity-tape";
     let local_events = jsonl(&[
         json!({"t":"2026-09-25T11:00:00Z","k":"meta","model":"peer-test"}),
+        json!({"t":"2026-09-25T11:00:01Z","k":"msg.in","source":{"session_id":"native-local-session"},"content":"[from agent:main]\n[assignment: asg_12345678-1234-1234-1234-1234567890ab]\nThe local task receipt is retained."}),
         edit_event(file, &before, &source),
     ]);
     let (caller_home, repo) = write_local_grep_source(
@@ -1876,10 +1878,11 @@ fn explain_peers_matches_local_multi_store_reference() {
     let parsed =
         engram::tape::event::parse_jsonl_events(&local_events).expect("parse local events");
     index
-        .ingest_tape_events_with_dispatch(
+        .ingest_tape_events_with_context(
             local_id,
             &parsed,
             &[],
+            &engram::dispatch::task_context::extract_task_context_events(&local_events),
             engram::index::lineage::LINK_THRESHOLD_DEFAULT,
         )
         .expect("index local parity tape");
@@ -1911,6 +1914,17 @@ fn explain_peers_matches_local_multi_store_reference() {
     );
     let local: serde_json::Value =
         serde_json::from_slice(&local.stdout).expect("local explain JSON");
+    let local_session = local["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["session_id"] == local_id)
+        .expect("local edit result");
+    assert_eq!(local_session["task_context_coverage"]["status"], "indexed");
+    assert_eq!(
+        local_session["task_ancestry"][0]["status"],
+        "no_recorded_assignment_operation"
+    );
 
     std::fs::write(
         &local_config,
@@ -1929,6 +1943,32 @@ fn explain_peers_matches_local_multi_store_reference() {
     );
     let federated: serde_json::Value =
         serde_json::from_slice(&federated.stdout).expect("federated explain JSON");
+    let federated_local_session = federated["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["session_id"] == local_id)
+        .expect("local edit remains in selected-peer results");
+    assert_eq!(
+        federated_local_session["task_context_coverage"]["status"],
+        "indexed"
+    );
+    assert_eq!(
+        federated_local_session["task_ancestry"][0]["status"],
+        "no_recorded_assignment_operation",
+        "selecting peers must not drop local task ancestry"
+    );
+    let remote_session = federated["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["session_id"] == remote_id)
+        .expect("remote edit result");
+    assert_eq!(
+        remote_session["task_context_coverage"]["status"],
+        "peer_task_context_unavailable",
+        "remote ancestry absence is explicitly labeled"
+    );
     assert_eq!(
         federated["federation"]["coverage"], "complete",
         "federated parity result: {federated:#}"
@@ -5286,7 +5326,7 @@ fn show_with_selected_peers_keeps_tape_and_reports_partial_unavailability() {
         r#"  op=$(printf '%s\n' "$request" | sed -n 's/.*"op":"\([^"]*\)".*/\1/p')"#,
         "  if [ \"$op\" = open ]; then",
         r#"    printf '{"id":%s,"data":{"store":"offline/default","status":"ok","db":"/fixture/offline.sqlite","tape_dirs":[],"reader_mode":"live","snapshot_at":"2026-09-25T00:00:00Z"}}\n' "$id""#,
-        r#"    printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"offline","build":"fixture","protocol":1,"schema":5,"query_semantics":1,"limits":{"grep_k":10000}}}\n' "$id""#,
+        r#"    printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"offline","build":"fixture","protocol":1,"schema":4,"query_semantics":1,"limits":{"grep_k":10000}}}\n' "$id""#,
         "  else",
         "    attempts=0",
         "    while [ ! -f \"$marker\" ]; do",
@@ -6939,7 +6979,7 @@ fn grep_runs_selected_peer_scan_rounds_concurrently() {
         "  case \"$op\" in",
         "    open)",
         r#"      printf '{"id":%s,"data":{"store":"%s/default","status":"ok","db":"/fixture/%s.sqlite","tape_dirs":[],"reader_mode":"live","snapshot_at":"2026-09-25T00:00:00Z"}}\n' "$id" "$machine" "$machine""#,
-        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"%s","build":"0.2.1","protocol":1,"schema":5,"query_semantics":1,"limits":{"grep_k":10000}}}\n' "$id" "$machine""#,
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"%s","build":"0.2.1","protocol":1,"schema":4,"query_semantics":1,"limits":{"grep_k":10000}}}\n' "$id" "$machine""#,
         "      ;;",
         "    grep_scan)",
         "      touch \"$mine\"",
@@ -7047,7 +7087,7 @@ fn spawn_grep_waiting_for_peer(
         "  case \"$op\" in",
         "    open)",
         r#"      printf '{"id":%s,"data":{"store":"%s/default","status":"ok","db":"/fixture/%s.sqlite","tape_dirs":[],"reader_mode":"live","snapshot_at":"2026-09-25T00:00:00Z"}}\n' "$id" "$machine" "$machine""#,
-        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"%s","build":"0.2.1","protocol":1,"schema":5,"query_semantics":1,"limits":{"grep_k":10000}}}\n' "$id" "$machine""#,
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"%s","build":"0.2.1","protocol":1,"schema":4,"query_semantics":1,"limits":{"grep_k":10000}}}\n' "$id" "$machine""#,
         "      ;;",
         "    grep_scan)",
         "      if [ \"$blocked_operation\" = grep_scan ]; then",
@@ -9513,7 +9553,7 @@ fn grep_discards_incomplete_peer_scan_after_disconnect_and_keeps_concurrent_peer
         r#"  case "$op" in"#,
         "    open)",
         r#"      printf '{"id":%s,"data":{"store":"broken/default","status":"ok","db":"/fixture/broken.sqlite","tape_dirs":[],"reader_mode":"live","snapshot_at":"2026-09-25T00:00:00Z"}}\n' "$id""#,
-        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"broken","build":"fixture","protocol":1,"schema":5,"query_semantics":1,"limits":{"grep_k":10000}}}\n' "$id""#,
+        r#"      printf '{"id":%s,"end":true,"ok":true,"stats":{"self":"broken","build":"fixture","protocol":1,"schema":4,"query_semantics":1,"limits":{"grep_k":10000}}}\n' "$id""#,
         "      ;;",
         "    grep_scan)",
         "      attempts=0",

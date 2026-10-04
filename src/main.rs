@@ -6602,6 +6602,7 @@ fn cmd_explain_with_peers_inner(
                 })
             })
             .collect::<Vec<_>>();
+        let remote_has_edit = touches.iter().any(|touch| touch["kind"] == "edit");
         let (session_timestamp, session_files_touched) = if date_filter.is_bounded() {
             let timestamp = fragments
                 .iter()
@@ -6662,6 +6663,19 @@ fn cmd_explain_with_peers_inner(
         if date_filter.is_bounded() {
             remote_session["event_time_filtered"] = Value::Bool(true);
         }
+        if remote_has_edit {
+            remote_session["task_context_coverage"] = json!({
+                "status":"peer_task_context_unavailable",
+                "reason":"The selected peer returned this edit, but the current peer protocol does not expose task-context ancestry.",
+                "required_action":"not_supported_by_current_peer_protocol",
+                "sources":[{
+                    "machine":machine,
+                    "store":store,
+                    "tape_id":tape_id,
+                    "status":"peer_task_context_unavailable",
+                }],
+            });
+        }
         remote_sessions.push(remote_session);
     }
     let mut dispatch_inputs = local_dispatch_inputs;
@@ -6690,6 +6704,14 @@ fn cmd_explain_with_peers_inner(
         )?
     };
     local_raw_sessions.extend(dispatch.local_parent_sessions);
+    attach_explain_task_ancestry(
+        context,
+        &indexes,
+        &mut local_raw_sessions,
+        &date_filter,
+        args.depth,
+        &topology.self_label,
+    )?;
     let mut sessions = format_sessions_for_agent(
         context,
         &indexes,

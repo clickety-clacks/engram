@@ -15,7 +15,10 @@ use crate::index::lineage::{
 };
 use crate::tape::event::{FileRange, TapeEventAt, TapeEventData};
 
-pub const SCHEMA_VERSION: i64 = 5;
+// Task-context ancestry is an optional owner-local derived relation. It does
+// not change the SQLite or peer protocol schema contract.
+pub const SCHEMA_VERSION: i64 = 4;
+const LEGACY_TASK_CONTEXT_SCHEMA_VERSION: i64 = 5;
 pub const QUERY_SEMANTICS_VERSION: u32 = 1;
 const EXACT_EVIDENCE_SQL: &str =
     "SELECT evidence_id, anchor, tape_id, event_offset, kind, file_path, timestamp
@@ -111,11 +114,17 @@ pub struct TaskContextEvent {
     pub event_timestamp: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskContextCoverage {
+    pub status: &'static str,
+    pub supported_event_count: Option<usize>,
+}
+
 pub struct SqliteIndex {
     conn: Connection,
     access_kind: AccessKind,
     reader_mode: Option<ReaderMode>,
-    schema_version: i64,
+    task_context_available: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,19 +230,17 @@ impl SqliteIndex {
             conn,
             access_kind: AccessKind::Writer,
             reader_mode: None,
-            schema_version: 0,
+            task_context_available: false,
         };
         let version = index.user_version()?;
-        if existed && !matches!(version, 4 | SCHEMA_VERSION) {
+        if existed && !matches!(version, SCHEMA_VERSION | LEGACY_TASK_CONTEXT_SCHEMA_VERSION) {
             return Err(rusqlite::Error::InvalidQuery);
         }
         index.configure_writer(preserve_wal)?;
         if !existed {
-            index.create_schema_v5()?;
-        } else if version == 4 {
-            index.migrate_v4_to_v5()?;
+            index.create_schema_v4()?;
         }
-        index.schema_version = SCHEMA_VERSION;
+        index.task_context_available = index.has_task_context_tables()?;
         Ok(index)
     }
 
@@ -268,20 +275,23 @@ impl SqliteIndex {
             conn,
             access_kind: AccessKind::Reader,
             reader_mode: Some(mode),
-            schema_version: 0,
+            task_context_available: false,
         };
         index.conn.execute_batch("PRAGMA query_only = ON")?;
         let actual_version = index.user_version()?;
-        if !matches!(actual_version, 4 | SCHEMA_VERSION) {
+        if !matches!(
+            actual_version,
+            SCHEMA_VERSION | LEGACY_TASK_CONTEXT_SCHEMA_VERSION
+        ) {
             return Err(ReaderOpenError::SchemaVersion {
                 expected: SCHEMA_VERSION,
                 actual: actual_version,
             });
         }
-        // Version 4 remains queryable without task ancestry. New context is
-        // optional evidence, so legacy stores keep their existing read path.
+        // Task-context tables are inspected without creating them. Legacy
+        // stores keep their existing read path and report the coverage gap.
         let mut index = index;
-        index.schema_version = actual_version;
+        index.task_context_available = index.has_task_context_tables()?;
         Ok(index)
     }
 
@@ -291,10 +301,12 @@ impl SqliteIndex {
             conn,
             access_kind: AccessKind::Writer,
             reader_mode: None,
-            schema_version: SCHEMA_VERSION,
+            task_context_available: false,
         };
         index.configure_writer(false)?;
-        index.create_schema_v5()?;
+        index.create_schema_v4()?;
+        let mut index = index;
+        index.task_context_available = index.has_task_context_tables()?;
         Ok(index)
     }
 
@@ -379,7 +391,7 @@ impl SqliteIndex {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
     }
 
-    fn create_schema_v5(&self) -> rusqlite::Result<()> {
+    fn create_schema_v4(&self) -> rusqlite::Result<()> {
         self.conn.execute_batch(
             "
             CREATE TABLE evidence_windows (
@@ -476,39 +488,54 @@ impl SqliteIndex {
             CREATE INDEX idx_task_context_tape_offset
               ON task_context_events(tape_id, event_offset);
 
-            PRAGMA user_version = 5;
+            CREATE TABLE task_context_coverage (
+              tape_id TEXT PRIMARY KEY,
+              extraction_version INTEGER NOT NULL,
+              supported_event_count INTEGER NOT NULL CHECK(supported_event_count >= 0)
+            );
+
+            PRAGMA user_version = 4;
             ",
         )
     }
 
-    fn migrate_v4_to_v5(&self) -> rusqlite::Result<()> {
-        self.conn.execute_batch(
-            "BEGIN IMMEDIATE;
-             CREATE TABLE task_context_events (
-               tape_id TEXT NOT NULL,
-               event_offset INTEGER NOT NULL,
-               result_offset INTEGER,
-               kind TEXT NOT NULL CHECK(kind IN ('work_item_create','assignment_create','assignment_dispatch','assignment_receipt')),
-               task_id_kind TEXT NOT NULL CHECK(task_id_kind IN ('assignment','work_item')),
-               task_id TEXT NOT NULL,
-               work_item_id TEXT,
-               event_identity TEXT NOT NULL,
-               actor_session TEXT,
-               recipient_session TEXT,
-               timestamp TEXT NOT NULL,
-               event_timestamp TEXT NOT NULL,
-               PRIMARY KEY(tape_id, event_offset, kind, event_identity)
-             );
-             CREATE INDEX idx_task_context_task_id
-               ON task_context_events(task_id_kind, task_id);
-             CREATE INDEX idx_task_context_work_item
-               ON task_context_events(work_item_id, kind);
-             CREATE INDEX idx_task_context_tape_offset
-               ON task_context_events(tape_id, event_offset);
-             PRAGMA user_version = 5;
-             COMMIT;",
-        )?;
-        Ok(())
+    fn has_task_context_tables(&self) -> rusqlite::Result<bool> {
+        self.conn.query_row(
+            "SELECT COUNT(*) = 2 FROM sqlite_master
+             WHERE type = 'table' AND name IN ('task_context_events', 'task_context_coverage')",
+            [],
+            |row| row.get(0),
+        )
+    }
+
+    pub fn task_context_coverage_for_tape(
+        &self,
+        tape_id: &str,
+    ) -> rusqlite::Result<TaskContextCoverage> {
+        if !self.task_context_available {
+            return Ok(TaskContextCoverage {
+                status: "store_rebuild_required",
+                supported_event_count: None,
+            });
+        }
+        let count: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT supported_event_count FROM task_context_coverage WHERE tape_id = ?1",
+                params![tape_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(match count {
+            Some(count) => TaskContextCoverage {
+                status: "indexed",
+                supported_event_count: usize::try_from(count).ok(),
+            },
+            None => TaskContextCoverage {
+                status: "tape_rebuild_required",
+                supported_event_count: None,
+            },
+        })
     }
 
     fn insert_evidence_window_on(
@@ -973,7 +1000,7 @@ impl SqliteIndex {
         events: &[TapeEventAt],
         link_threshold: f32,
     ) -> rusqlite::Result<()> {
-        self.ingest_tape_events_with_dispatch(tape_id, events, &[], link_threshold)
+        self.ingest_tape_events_inner(tape_id, events, &[], &[], false, link_threshold)
     }
 
     pub fn ingest_tape_events_with_dispatch(
@@ -983,7 +1010,7 @@ impl SqliteIndex {
         dispatch_links: &[DispatchLink],
         link_threshold: f32,
     ) -> rusqlite::Result<()> {
-        self.ingest_tape_events_with_context(tape_id, events, dispatch_links, &[], link_threshold)
+        self.ingest_tape_events_inner(tape_id, events, dispatch_links, &[], false, link_threshold)
     }
 
     pub fn ingest_tape_events_with_context(
@@ -992,6 +1019,25 @@ impl SqliteIndex {
         events: &[TapeEventAt],
         dispatch_links: &[DispatchLink],
         task_context_events: &[TaskContextEvent],
+        link_threshold: f32,
+    ) -> rusqlite::Result<()> {
+        self.ingest_tape_events_inner(
+            tape_id,
+            events,
+            dispatch_links,
+            task_context_events,
+            true,
+            link_threshold,
+        )
+    }
+
+    fn ingest_tape_events_inner(
+        &self,
+        tape_id: &str,
+        events: &[TapeEventAt],
+        dispatch_links: &[DispatchLink],
+        task_context_events: &[TaskContextEvent],
+        task_context_was_extracted: bool,
         _link_threshold: f32,
     ) -> rusqlite::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
@@ -1113,13 +1159,21 @@ impl SqliteIndex {
         for link in dispatch_links {
             Self::insert_dispatch_link_on(tx.deref(), tape_id, link)?;
         }
-        for event in task_context_events {
-            Self::insert_task_context_event_on(tx.deref(), tape_id, event)?;
-        }
         tx.execute(
             "INSERT OR IGNORE INTO tapes (tape_id) VALUES (?1)",
             params![tape_id],
         )?;
+        if self.task_context_available && task_context_was_extracted {
+            for event in task_context_events {
+                Self::insert_task_context_event_on(tx.deref(), tape_id, event)?;
+            }
+            tx.execute(
+                "INSERT OR REPLACE INTO task_context_coverage
+                 (tape_id, extraction_version, supported_event_count)
+                 VALUES (?1, 1, ?2)",
+                params![tape_id, task_context_events.len() as i64],
+            )?;
+        }
         tx.commit()
     }
 
@@ -1129,7 +1183,7 @@ impl SqliteIndex {
         id: &str,
         limit: usize,
     ) -> rusqlite::Result<Vec<(String, TaskContextEvent)>> {
-        if self.schema_version < 5 || limit == 0 {
+        if !self.task_context_available || limit == 0 {
             return Ok(Vec::new());
         }
         let mut stmt = self.conn.prepare(
@@ -1152,7 +1206,7 @@ impl SqliteIndex {
         work_item_id: &str,
         limit: usize,
     ) -> rusqlite::Result<Vec<(String, TaskContextEvent)>> {
-        if self.schema_version < 5 || limit == 0 {
+        if !self.task_context_available || limit == 0 {
             return Ok(Vec::new());
         }
         let mut stmt = self.conn.prepare(
@@ -1178,7 +1232,7 @@ impl SqliteIndex {
         kind: TaskContextKind,
         limit: usize,
     ) -> rusqlite::Result<Vec<TaskContextEvent>> {
-        if self.schema_version < 5 || limit == 0 {
+        if !self.task_context_available || limit == 0 {
             return Ok(Vec::new());
         }
         let mut stmt = self.conn.prepare(
@@ -1208,7 +1262,7 @@ impl SqliteIndex {
         event_offset: u64,
         limit: usize,
     ) -> rusqlite::Result<Vec<TaskContextEvent>> {
-        if self.schema_version < 5 || limit == 0 {
+        if !self.task_context_available || limit == 0 {
             return Ok(Vec::new());
         }
         let mut stmt = self.conn.prepare(
@@ -1589,15 +1643,16 @@ mod tests {
     }
 
     #[test]
-    fn schema_v5_adds_bounded_task_context_without_result_caches() {
+    fn fresh_schema_keeps_v4_peer_compatibility_and_adds_optional_task_context() {
         let index = SqliteIndex::open_in_memory().unwrap();
-        assert_eq!(index.scalar_i64("PRAGMA user_version"), 5);
+        assert_eq!(index.scalar_i64("PRAGMA user_version"), 4);
+        assert_eq!(SCHEMA_VERSION, 4);
         assert_eq!(
             index.scalar_i64(
                 "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type = 'table' AND name = 'task_context_events'"
+                 WHERE type = 'table' AND name IN ('task_context_events','task_context_coverage')"
             ),
-            1
+            2
         );
         assert_eq!(
             index.scalar_i64(
@@ -1605,6 +1660,69 @@ mod tests {
                  WHERE type = 'table' AND name IN ('query_results','result_feedback','evidence')"
             ),
             0
+        );
+    }
+
+    #[test]
+    fn opening_existing_v4_writer_does_not_migrate_or_backfill_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("legacy-v4.sqlite");
+        {
+            let index = SqliteIndex::open_writer(path.to_str().unwrap()).unwrap();
+            index
+                .conn
+                .execute_batch(
+                    "DROP TABLE task_context_coverage;
+                     DROP TABLE task_context_events;
+                     PRAGMA user_version = 4;",
+                )
+                .unwrap();
+        }
+
+        let index = SqliteIndex::open_writer(path.to_str().unwrap()).unwrap();
+        assert_eq!(index.user_version().unwrap(), 4);
+        assert!(!index.task_context_available);
+        assert_eq!(
+            index.scalar_i64(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name IN ('task_context_events','task_context_coverage')"
+            ),
+            0
+        );
+        let event = TaskContextEvent {
+            event_identity: "legacy-context-event".into(),
+            event_offset: 0,
+            result_offset: None,
+            kind: TaskContextKind::AssignmentReceipt,
+            task_id_kind: TaskIdKind::Assignment,
+            task_id: "asg_12345678-1234-1234-1234-1234567890ab".into(),
+            work_item_id: None,
+            actor_session: None,
+            recipient_session: Some("agent:coder s_receiver".into()),
+            timestamp: "2026-10-03T12:00:00Z".into(),
+            event_timestamp: "2026-10-03T12:00:00Z".into(),
+        };
+        index
+            .ingest_tape_events_with_context("legacy-tape", &[], &[], &[event], 0.5)
+            .unwrap();
+        assert_eq!(index.user_version().unwrap(), 4);
+        assert_eq!(
+            index
+                .task_context_events_for_tape_before(
+                    "legacy-tape",
+                    1,
+                    TaskContextKind::AssignmentReceipt,
+                    4,
+                )
+                .unwrap(),
+            Vec::new()
+        );
+        assert_eq!(
+            index
+                .task_context_coverage_for_tape("legacy-tape")
+                .unwrap()
+                .status,
+            "store_rebuild_required"
         );
     }
 
@@ -1679,6 +1797,13 @@ mod tests {
             .unwrap();
         assert_eq!(item_rows.len(), 1);
         assert_eq!(item_rows[0].1.kind, TaskContextKind::WorkItemCreate);
+        assert_eq!(
+            index.task_context_coverage_for_tape("source-tape").unwrap(),
+            TaskContextCoverage {
+                status: "indexed",
+                supported_event_count: Some(3),
+            }
+        );
         let receipts = index
             .task_context_events_for_tape_before(
                 "source-tape",
@@ -1701,6 +1826,35 @@ mod tests {
                 .len(),
             0,
             "the event at the query offset is not a preceding receipt"
+        );
+    }
+
+    #[test]
+    fn task_context_coverage_distinguishes_unprocessed_tapes_from_empty_extraction() {
+        let index = SqliteIndex::open_in_memory().unwrap();
+        index
+            .ingest_tape_events_with_dispatch("pre-feature-tape", &[], &[], 0.5)
+            .unwrap();
+        assert_eq!(
+            index
+                .task_context_coverage_for_tape("pre-feature-tape")
+                .unwrap(),
+            TaskContextCoverage {
+                status: "tape_rebuild_required",
+                supported_event_count: None,
+            }
+        );
+        index
+            .ingest_tape_events_with_context("empty-extraction-tape", &[], &[], &[], 0.5)
+            .unwrap();
+        assert_eq!(
+            index
+                .task_context_coverage_for_tape("empty-extraction-tape")
+                .unwrap(),
+            TaskContextCoverage {
+                status: "indexed",
+                supported_event_count: Some(0),
+            }
         );
     }
 
@@ -1910,12 +2064,12 @@ mod tests {
     // D1/T1: this intentionally exercises Frozen mode. The previous test name
     // implied arbitrary readers could use immutable mode when sidecars were
     // absent; Live readers must instead remain mode=ro.
-    fn frozen_reader_opens_schema_v5_without_wal_shm_or_file_mutation() {
+    fn frozen_reader_opens_schema_v4_without_wal_shm_or_file_mutation() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("index.sqlite");
         {
             let writer = SqliteIndex::open_writer(path.to_str().unwrap()).unwrap();
-            assert_eq!(writer.user_version().unwrap(), 5);
+            assert_eq!(writer.user_version().unwrap(), 4);
         }
         let before = std::fs::read(&path).unwrap();
         {

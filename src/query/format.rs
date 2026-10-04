@@ -727,6 +727,9 @@ pub fn format_sessions_for_agent(
         {
             session["task_ancestry"] = json!(task_ancestry);
         }
+        if let Some(coverage) = raw.get("task_context_coverage") {
+            session["task_context_coverage"] = coverage.clone();
+        }
         if grep_prepared {
             session["match_count"] = raw
                 .get("grep_match_count")
@@ -1603,6 +1606,15 @@ pub fn print_pretty_explain(
             .and_then(Value::as_u64)
             .unwrap_or(0);
         println!("- tape={} touches={}", tape_id, touch_count);
+        if let Some(coverage) = session.get("task_context_coverage") {
+            println!(
+                "  task context coverage={}: {}",
+                coverage["status"].as_str().unwrap_or("unknown"),
+                coverage["reason"]
+                    .as_str()
+                    .unwrap_or("coverage is unavailable")
+            );
+        }
         for ancestry in session["task_ancestry"].as_array().into_iter().flatten() {
             println!(
                 "  task ancestry status={}",
