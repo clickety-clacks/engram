@@ -79,12 +79,13 @@ existing index alone. With `--peers`, local ancestry is still included, while a
 remote edit is labeled `peer_task_context_unavailable` because the current peer
 protocol does not export task-context relations.
 
-On the frozen PR38 corpus, the task-context relation added 3,076,096 bytes for
-4,484 extracted events while scanning 7,199 tapes. This is the observed index
-delta for that corpus, not a forecast for another store. Rebuilding also reads
-and parses retained transcript bytes; that I/O and elapsed time scale with the
-corpus. The recorded query timings for this sample were warm-cache only; cold
-cache latency has not been measured.
+On the frozen PR38 corpus, the task-context event relation, indexes, and
+per-tape coverage table added 4,222,976 bytes. Extraction found 4,484 supported
+events on 966 tapes and recorded coverage across the 7,199 tapes scanned. This
+is the observed isolated-index delta for that corpus, not a forecast for
+another store. Rebuilding also reads and parses retained transcript bytes; that
+I/O and elapsed time scale with the corpus. The recorded query timings for
+this sample were warm-cache only; cold-cache latency has not been measured.
 
 ## 3. How you configure it
 
