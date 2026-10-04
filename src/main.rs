@@ -51,6 +51,11 @@ use engram::query::format::{
     load_local_event_timestamps, open_query_indexes, prepare_grep_scan, prepare_grep_scan_with_tape_ids, print_pretty_explain,
     read_file_span_variants, referenced_grep_tape_ids, run_grep_scan_with_date,
 };
+use engram::query::format::print_pretty_later_discussion;
+use engram::query::later_discussion::{
+    collect as collect_later_discussion,
+    require_complete_error as later_discussion_require_complete_error,
+};
 use engram::store::atomic::atomic_write;
 use engram::store::tapes::{
     parse_jsonl_rows, print_json, read_tape_content, resolve_tape_path, tape_id_from_path,
@@ -5275,6 +5280,7 @@ fn cmd_explain(
         .clone()
         .ok_or_else(|| CliError::new("invalid_explain_target", "target is required"))?;
     let target_kind = classify_explain_target(cwd, context, &[], &target, args.anchor)?;
+    let query_source_texts = explain_query_source_texts(cwd, &target_kind)?;
     let target_file = match &target_kind {
         ExplainTarget::FileRange { file, .. } | ExplainTarget::FileWhole { file } => {
             Some(file.clone())
@@ -5302,10 +5308,9 @@ fn cmd_explain(
     let date_filter = DateFilter::parse(args.since.as_deref(), args.until.as_deref())?;
     let mut temporal_unknown_events = std::collections::HashSet::new();
 
-    match target_kind {
+    match target_kind.clone() {
         ExplainTarget::FileRange { file, start, end } => {
-            let span_texts = read_file_span_variants(&cwd.join(&file), start, end)?;
-            query_anchors = derive_anchor_candidates(&span_texts);
+            query_anchors = derive_anchor_candidates(&query_source_texts);
             let traversal = ExplainTraversal {
                 min_confidence: args.min_confidence,
                 max_fanout: args.max_fanout,
@@ -5352,10 +5357,8 @@ fn cmd_explain(
             temporal_unknown_events.extend(unknown);
             score_by_session = scores;
         }
-        ExplainTarget::FileWhole { file } => {
-            let full_text = fs::read_to_string(cwd.join(file))
-                .map_err(|err| CliError::io("read_span_error", err))?;
-            query_anchors = derive_anchor_candidates(&[full_text]);
+        ExplainTarget::FileWhole { .. } => {
+            query_anchors = derive_anchor_candidates(&query_source_texts);
             let traversal = ExplainTraversal {
                 min_confidence: args.min_confidence,
                 max_fanout: args.max_fanout,
@@ -5511,8 +5514,28 @@ fn cmd_explain(
         }
     }
 
+    let later_discussion = collect_later_discussion(
+        context,
+        &indexes,
+        &raw_sessions,
+        &target,
+        &target_kind,
+        &query_source_texts,
+        &self_machine,
+        &date_filter,
+        &[],
+        None,
+        None,
+    )?;
+    if args.require_complete
+        && let Some(error) = later_discussion_require_complete_error(&later_discussion)
+    {
+        return Err(error);
+    }
+
     if args.pretty {
         print_pretty_explain(&target, &[], &raw_sessions, &tombstones);
+        print_pretty_later_discussion(&later_discussion);
         return Ok(());
     }
 
@@ -5582,6 +5605,7 @@ fn cmd_explain(
     "chains": chain_metadata,
     "lineage": lineage,
     "dispatch_lineage": dispatch_lineage,
+    "later_discussion": later_discussion,
     "tombstones": tombstones,
     "stores_queried": indexes.len(),
     "returned": returned,
@@ -5602,6 +5626,22 @@ fn cmd_explain(
         payload["dispatch_ambiguous"] = json!(dispatch_ambiguous);
     }
     emit_query_result("explain", payload)
+}
+
+fn explain_query_source_texts(
+    cwd: &Path,
+    target_kind: &ExplainTarget,
+) -> Result<Vec<String>, CliError> {
+    match target_kind {
+        ExplainTarget::FileRange { file, start, end } => {
+            read_file_span_variants(&cwd.join(file), *start, *end)
+        }
+        ExplainTarget::FileWhole { file } => Ok(vec![
+            fs::read_to_string(cwd.join(file))
+                .map_err(|error| CliError::io("read_span_error", error))?,
+        ]),
+        ExplainTarget::Literal(text) => Ok(vec![text.clone()]),
+    }
 }
 
 #[cfg(feature = "t1772-proof")]
@@ -5687,14 +5727,10 @@ fn cmd_explain_with_peers_inner(
         selected_machines.join(",")
     );
 
-    let query_anchors = match target_kind {
-        ExplainTarget::FileRange { file, start, end } => {
-            derive_anchor_candidates(&read_file_span_variants(&cwd.join(file), start, end)?)
-        }
-        ExplainTarget::FileWhole { file } => {
-            let text = fs::read_to_string(cwd.join(file))
-                .map_err(|error| CliError::io("read_span_error", error))?;
-            derive_anchor_candidates(&[text])
+    let query_source_texts = explain_query_source_texts(cwd, &target_kind)?;
+    let query_anchors = match target_kind.clone() {
+        ExplainTarget::FileRange { .. } | ExplainTarget::FileWhole { .. } => {
+            derive_anchor_candidates(&query_source_texts)
         }
         ExplainTarget::Literal(text) => {
             if args.anchor {
@@ -6712,6 +6748,7 @@ fn cmd_explain_with_peers_inner(
         args.depth,
         &topology.self_label,
     )?;
+    let later_discussion_raw_sessions = local_raw_sessions.clone();
     let mut sessions = format_sessions_for_agent(
         context,
         &indexes,
@@ -6741,6 +6778,27 @@ fn cmd_explain_with_peers_inner(
             });
         }
     }
+    let later_peer_sources = sources
+        .iter()
+        .filter(|source| {
+            source.get("kind").and_then(Value::as_str) == Some("peer")
+                && source.get("status").and_then(Value::as_str) != Some("not_selected")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let later_discussion = collect_later_discussion(
+        context,
+        &indexes,
+        &later_discussion_raw_sessions,
+        &target,
+        &target_kind,
+        &query_source_texts,
+        &topology.self_label,
+        &date_filter,
+        &later_peer_sources,
+        Some(query_deadline),
+        Some(cancelled.as_ref()),
+    )?;
     let dispatch_lineage = dispatch.lineage;
     let dispatch_unresolved = dispatch.unresolved;
     let dispatch_ambiguous = dispatch.ambiguous;
@@ -6807,6 +6865,11 @@ fn cmd_explain_with_peers_inner(
     if (any_peer_failure || temporal_incomplete) && args.require_complete {
         return Err(explain_require_complete_error(&sources));
     }
+    if args.require_complete
+        && let Some(error) = later_discussion_require_complete_error(&later_discussion)
+    {
+        return Err(error);
+    }
     let no_results = sessions.is_empty() && tombstones.is_empty() && lineage.is_empty();
     let complete = !any_peer_failure;
     let chain_metadata = build_chain_metadata(&sessions);
@@ -6835,6 +6898,7 @@ fn cmd_explain_with_peers_inner(
         "dispatch_lineage": dispatch_lineage,
         "dispatch_unresolved": dispatch_unresolved,
         "dispatch_ambiguous": dispatch_ambiguous,
+        "later_discussion": later_discussion,
         "tombstones": tombstones,
         "stores_queried": indexes.len() + sources.iter().filter(|source| source.get("kind").and_then(Value::as_str) == Some("peer") && source.get("status").and_then(Value::as_str) == Some("ok")).count(),
         "returned": returned,

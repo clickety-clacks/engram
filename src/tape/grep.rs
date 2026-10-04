@@ -757,7 +757,7 @@ impl GrepScanError {
     }
 }
 
-fn read_grep_record<R: BufRead>(
+pub(crate) fn read_grep_record<R: BufRead>(
     reader: &mut R,
     record: &mut Vec<u8>,
     limit: Option<u64>,

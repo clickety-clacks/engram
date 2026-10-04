@@ -391,7 +391,6 @@ fn explain_file_range_prioritizes_exact_edits_before_default_page_locally_and_re
             "src/module.rs:1-12",
             "--peers",
             "alpha",
-            "--require-complete",
         ])
         .output()
         .expect("run federated exact-span explain");
@@ -403,6 +402,19 @@ fn explain_file_range_prioritizes_exact_edits_before_default_page_locally_and_re
     let federated_result: serde_json::Value =
         serde_json::from_slice(&federated_output.stdout).expect("federated explain JSON");
     assert_eq!(federated_result["federation"]["coverage"], "complete");
+    assert_eq!(
+        federated_result["later_discussion"]["status"],
+        "partial",
+        "relaxed explain keeps core peer coverage while disclosing the unsupported optional scan"
+    );
+    assert!(
+        federated_result["later_discussion"]["coverage"]["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|source| source["store"] == "alpha/default"
+                && source["status"] == "unsupported")
+    );
     assert_eq!(federated_result["total"], 18);
     assert_eq!(federated_result["returned"], 10);
     assert_eq!(federated_result["truncated"], true);
@@ -444,7 +456,7 @@ fn explain_file_range_prioritizes_exact_edits_before_default_page_locally_and_re
     assert_eq!(federated_result["dispatch_unresolved"], json!([]));
     assert_eq!(federated_result["dispatch_ambiguous"], json!([]));
 
-    let federated_all_output = Command::new(binary)
+    let strict_output = Command::new(binary)
         .current_dir(&repo)
         .env("HOME", &caller_home)
         .args([
@@ -453,6 +465,23 @@ fn explain_file_range_prioritizes_exact_edits_before_default_page_locally_and_re
             "--peers",
             "alpha",
             "--require-complete",
+        ])
+        .output()
+        .expect("run strict federated exact-span explain");
+    assert!(!strict_output.status.success());
+    let strict_error = String::from_utf8_lossy(&strict_output.stderr);
+    assert!(strict_error.contains("incomplete_coverage"), "{strict_error}");
+    assert!(strict_error.contains("alpha/default"), "{strict_error}");
+    assert!(strict_error.contains("later_discussion_content_scan"), "{strict_error}");
+
+    let federated_all_output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "explain",
+            "src/module.rs:1-12",
+            "--peers",
+            "alpha",
             "--limit",
             "25",
         ])

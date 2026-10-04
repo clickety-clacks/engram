@@ -1061,6 +1061,9 @@ fn owner_dispatch_rows(
 fn explain_reference_projection(mut value: serde_json::Value) -> serde_json::Value {
     let object = value.as_object_mut().expect("explain payload object");
     object.remove("federation");
+    // Later-discussion coverage is route-specific: local additional stores can
+    // be scanned directly, while selected peers lack the scan operation.
+    object.remove("later_discussion");
     for field in ["dispatch_ambiguous", "dispatch_unresolved"] {
         if object
             .get(field)
@@ -1972,6 +1975,18 @@ fn explain_peers_matches_local_multi_store_reference() {
     assert_eq!(
         federated["federation"]["coverage"], "complete",
         "federated parity result: {federated:#}"
+    );
+    assert_eq!(
+        federated["later_discussion"]["status"], "partial",
+        "the selected peer cannot run a later-discussion scan through the current protocol"
+    );
+    assert!(
+        federated["later_discussion"]["coverage"]["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|source| source["store"] == "remote-owner/default"
+                && source["status"] == "unsupported")
     );
     assert_eq!(operation_count(&remote_operations, "read_file"), 0);
     assert_eq!(
@@ -3000,6 +3015,8 @@ fn explain_require_complete_keeps_candidate_only_incomplete_history_best_effort(
     let strict: serde_json::Value =
         serde_json::from_slice(&required.stdout).expect("strict explain JSON");
     assert_eq!(strict["federation"]["coverage"], "complete");
+    assert_eq!(strict["later_discussion"]["status"], "not_applicable");
+    assert_eq!(strict["later_discussion"]["coverage"]["complete"], true);
     assert!(
         strict["dispatch_unresolved"]
             .as_array()

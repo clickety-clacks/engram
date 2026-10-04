@@ -1854,6 +1854,111 @@ pub fn print_pretty_explain(
     }
 }
 
+pub fn print_pretty_later_discussion(later_discussion: &Value) {
+    println!(
+        "later discussion ({}): {}",
+        later_discussion["relation"].as_str().unwrap_or("unknown"),
+        later_discussion["status"].as_str().unwrap_or("unknown")
+    );
+    if let Some(guidance) = later_discussion["guidance"].as_str() {
+        println!("  {guidance}");
+    }
+    let coverage = &later_discussion["coverage"];
+    println!(
+        "  coverage={} tapes={} decoded_bytes={} omitted={}",
+        coverage["status"].as_str().unwrap_or("unknown"),
+        coverage["scanned_tapes"].as_u64().unwrap_or_default(),
+        coverage["decompressed_bytes"].as_u64().unwrap_or_default(),
+        later_discussion["omitted"].as_u64().unwrap_or_default()
+    );
+    for reason in coverage["incomplete_reasons"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        if let Some(reason) = reason.as_str() {
+            println!("  incomplete: {reason}");
+        }
+    }
+    for result in later_discussion["results"].as_array().into_iter().flatten() {
+        let event = &result["event"];
+        println!(
+            "- {} {}:{}@{} {} {}",
+            event["machine"].as_str().unwrap_or("unknown-machine"),
+            event["store"].as_str().unwrap_or("unknown-store"),
+            event["tape_id"].as_str().unwrap_or("unknown-tape"),
+            event["event_offset"].as_u64().unwrap_or_default(),
+            event["timestamp"].as_str().unwrap_or("unknown-time"),
+            event["attribution"]
+                .as_str()
+                .unwrap_or("unknown-attribution")
+        );
+        println!(
+            "  edit {}:{}@{} {}",
+            result["edit_reference"]["store"]
+                .as_str()
+                .unwrap_or("unknown-store"),
+            result["edit_reference"]["tape_id"]
+                .as_str()
+                .unwrap_or("unknown-tape"),
+            result["edit_reference"]["event_offset"]
+                .as_u64()
+                .unwrap_or_default(),
+            result["edit_reference"]["timestamp"]
+                .as_str()
+                .unwrap_or("unknown-time")
+        );
+        println!(
+            "  seed={} quote={} {}",
+            event["matched_seed"].as_str().unwrap_or("unknown"),
+            event["quote_status"].as_str().unwrap_or("unknown"),
+            event["snippet"].as_str().unwrap_or("")
+        );
+        if let Some(argv) = result["next_lookup"]["argv"].as_array() {
+            let command = argv
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!("  next lookup: {command}");
+        }
+        if let Some(repeats) = result["repeat_occurrences"].as_array() {
+            for repeat in repeats {
+                println!(
+                    "  identical-text occurrence (identity not asserted): {} {}:{}@{} {} {}",
+                    repeat["machine"].as_str().unwrap_or("unknown-machine"),
+                    repeat["store"].as_str().unwrap_or("unknown-store"),
+                    repeat["tape_id"].as_str().unwrap_or("unknown-tape"),
+                    repeat["event_offset"].as_u64().unwrap_or_default(),
+                    repeat["timestamp"].as_str().unwrap_or("unknown-time"),
+                    repeat["attribution"]
+                        .as_str()
+                        .unwrap_or("unknown-attribution")
+                );
+                if let Some(argv) = repeat["next_lookup"]["argv"].as_array() {
+                    let command = argv
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    println!("    next lookup: {command}");
+                }
+            }
+        }
+        let repeat_omitted = result["repeat_occurrences_omitted"]
+            .as_u64()
+            .unwrap_or_default();
+        if repeat_omitted > 0 {
+            println!(
+                "  identical-text occurrence references omitted={repeat_omitted}: {}",
+                result["repeat_occurrences_omitted_reason"]
+                    .as_str()
+                    .unwrap_or("repeat-reference limit")
+            );
+        }
+    }
+}
+
 fn print_task_citation(label: &str, citation: &Value) {
     let source = &citation["source"];
     println!(
