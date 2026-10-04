@@ -84,6 +84,35 @@ impl FileIdentityResolver {
         self.identity_for(&path)
     }
 
+    /// Return true when `directory_path` names a non-root directory in the
+    /// same Git repository and its repository-relative path contains
+    /// `file_path`. This is used for file-specific context only; an unknown or
+    /// unavailable repository identity never becomes a match.
+    pub fn is_specific_same_repository_directory_prefix(
+        &mut self,
+        file_path: &Path,
+        directory_path: &Path,
+    ) -> bool {
+        let file_path = canonicalize_absolute_with_missing_tail(file_path)
+            .unwrap_or_else(|| normalize_absolute(file_path));
+        let directory_path = canonicalize_absolute_with_missing_tail(directory_path)
+            .unwrap_or_else(|| normalize_absolute(directory_path));
+        if !directory_path.is_dir() {
+            return false;
+        }
+        let Some(file_identity) = self.identity_for(&file_path) else {
+            return false;
+        };
+        let Some(directory_identity) = self.identity_for(&directory_path) else {
+            return false;
+        };
+        let prefix = &directory_identity.relative_path;
+        file_identity.common_dir == directory_identity.common_dir
+            && !prefix.is_empty()
+            && file_identity.relative_path.len() > prefix.len()
+            && file_identity.relative_path[..prefix.len()] == prefix[..]
+    }
+
     fn identity_for(&mut self, path: &Path) -> Option<GitFileIdentity> {
         let path = canonicalize_absolute_with_missing_tail(path)
             .unwrap_or_else(|| normalize_absolute(path));
@@ -405,6 +434,27 @@ mod tests {
                 &missing_checkout.join("scripts/verify_mix.sh")
             ),
             FileIdentityRelation::Unknown
+        );
+    }
+
+    #[test]
+    fn only_specific_same_repository_directories_match_as_file_context() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp_path(&temp, "repo");
+        let _head = init_repo(&repo, "line\n");
+        let file = repo.join("scripts/verify_mix.sh");
+        let mut resolver = FileIdentityResolver::default();
+
+        assert!(
+            resolver.is_specific_same_repository_directory_prefix(&file, &repo.join("scripts"))
+        );
+        assert!(
+            !resolver.is_specific_same_repository_directory_prefix(&file, &repo),
+            "the repository root is too broad to qualify as file context"
+        );
+        assert!(
+            !resolver.is_specific_same_repository_directory_prefix(&file, temp.path()),
+            "a filesystem ancestor outside the repository is not a task-file match"
         );
     }
 

@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::dispatch::extract_dispatch_links_from_transcript;
+use crate::dispatch::task_context::extract_task_context_events;
 use crate::index::SqliteIndex;
 use crate::index::lineage::LINK_THRESHOLD_DEFAULT;
 use crate::store::atomic::atomic_write;
@@ -399,6 +400,7 @@ pub fn run_ingest(
         } else {
             ingest_input
         });
+        let task_context_events = extract_task_context_events(&normalized);
 
         let tape_id = tape_id_for_contents(&normalized);
         let tape_path = tape_path_for_tapes_dir(&context.tapes_dir, &tape_id);
@@ -412,10 +414,11 @@ pub fn run_ingest(
 
         let already_indexed = index.has_tape(&tape_id)?;
         if !already_indexed {
-            index.ingest_tape_events_with_dispatch(
+            index.ingest_tape_events_with_context(
                 &tape_id,
                 &events,
                 &dispatch_links,
+                &task_context_events,
                 LINK_THRESHOLD_DEFAULT,
             )?;
             imported += 1;

@@ -1090,6 +1090,7 @@ fn explain_reference_projection(mut value: serde_json::Value) -> serde_json::Val
                 session.remove("tape_facts");
                 session.remove("tape_present_locally");
                 session.remove("next_lookup");
+                session.remove("task_context_coverage");
             }
         }
     }
@@ -1856,6 +1857,7 @@ fn explain_peers_matches_local_multi_store_reference() {
     let local_id = "local-parity-tape";
     let local_events = jsonl(&[
         json!({"t":"2026-09-25T11:00:00Z","k":"meta","model":"peer-test"}),
+        json!({"t":"2026-09-25T11:00:01Z","k":"msg.in","source":{"session_id":"native-local-session"},"content":"[from agent:main]\n[assignment: asg_12345678-1234-1234-1234-1234567890ab]\nThe local task receipt is retained."}),
         edit_event(file, &before, &source),
     ]);
     let (caller_home, repo) = write_local_grep_source(
@@ -1876,10 +1878,11 @@ fn explain_peers_matches_local_multi_store_reference() {
     let parsed =
         engram::tape::event::parse_jsonl_events(&local_events).expect("parse local events");
     index
-        .ingest_tape_events_with_dispatch(
+        .ingest_tape_events_with_context(
             local_id,
             &parsed,
             &[],
+            &engram::dispatch::task_context::extract_task_context_events(&local_events),
             engram::index::lineage::LINK_THRESHOLD_DEFAULT,
         )
         .expect("index local parity tape");
@@ -1911,6 +1914,17 @@ fn explain_peers_matches_local_multi_store_reference() {
     );
     let local: serde_json::Value =
         serde_json::from_slice(&local.stdout).expect("local explain JSON");
+    let local_session = local["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["session_id"] == local_id)
+        .expect("local edit result");
+    assert_eq!(local_session["task_context_coverage"]["status"], "indexed");
+    assert_eq!(
+        local_session["task_ancestry"][0]["status"],
+        "no_recorded_assignment_operation"
+    );
 
     std::fs::write(
         &local_config,
@@ -1929,6 +1943,32 @@ fn explain_peers_matches_local_multi_store_reference() {
     );
     let federated: serde_json::Value =
         serde_json::from_slice(&federated.stdout).expect("federated explain JSON");
+    let federated_local_session = federated["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["session_id"] == local_id)
+        .expect("local edit remains in selected-peer results");
+    assert_eq!(
+        federated_local_session["task_context_coverage"]["status"],
+        "indexed"
+    );
+    assert_eq!(
+        federated_local_session["task_ancestry"][0]["status"],
+        "no_recorded_assignment_operation",
+        "selecting peers must not drop local task ancestry"
+    );
+    let remote_session = federated["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["session_id"] == remote_id)
+        .expect("remote edit result");
+    assert_eq!(
+        remote_session["task_context_coverage"]["status"],
+        "peer_task_context_unavailable",
+        "remote ancestry absence is explicitly labeled"
+    );
     assert_eq!(
         federated["federation"]["coverage"], "complete",
         "federated parity result: {federated:#}"

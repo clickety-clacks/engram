@@ -66,6 +66,27 @@ Dispatch markers are traversed during normal explain:
 
 `explain` follows dispatch markers automatically. It has no separate `--dispatch` mode.
 
+Dispatch ancestry uses an optional derived relation built during a fresh index
+rebuild from retained original transcripts. Engram does not migrate or backfill
+an existing v4 store in place. Edit results include `task_context_coverage`:
+`indexed` means extraction ran for that tape, `tape_rebuild_required` means the
+store has the relation but that tape has no coverage marker, and
+`store_rebuild_required` means the store predates the relation. To cover old
+history, build and validate a separate staging index from the retained source
+transcripts using the [index lifecycle](docs/index-lifecycle.md); if a raw
+transcript is unavailable, its missing history cannot be reconstructed from the
+existing index alone. With `--peers`, local ancestry is still included, while a
+remote edit is labeled `peer_task_context_unavailable` because the current peer
+protocol does not export task-context relations.
+
+On the frozen PR38 corpus, the task-context event relation, indexes, and
+per-tape coverage table added 4,222,976 bytes. Extraction found 4,484 supported
+events on 966 tapes and recorded coverage across the 7,199 tapes scanned. This
+is the observed isolated-index delta for that corpus, not a forecast for
+another store. Rebuilding also reads and parses retained transcript bytes; that
+I/O and elapsed time scale with the corpus. The recorded query timings for
+this sample were warm-cache only; cold-cache latency has not been measured.
+
 ## 3. How you configure it
 
 ### Config resolution
