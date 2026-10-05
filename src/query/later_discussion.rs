@@ -22,10 +22,10 @@ const MAX_RESULTS: usize = 5;
 const MAX_PER_CONVERSATION: usize = 2;
 const MAX_REPEAT_OCCURRENCES: usize = 32;
 const MAX_EDIT_ANCHORS: usize = 128;
-const MAX_CANDIDATE_TAPES_PER_SOURCE: usize = 128;
+const MAX_CANDIDATE_TAPES_PER_SOURCE: usize = 16;
 const MAX_TASK_CONTEXT_ROWS_PER_LOOKUP: usize = 64;
-const MAX_COMPRESSED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-const MAX_DECOMPRESSED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_COMPRESSED_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_DECOMPRESSED_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_DECOMPRESSED_BYTES_PER_TAPE: u64 = 512 * 1024 * 1024;
 const MAX_RECORD_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SNIPPET_CHARS: usize = 260;
@@ -310,6 +310,15 @@ pub fn collect(
                 selector_counts: BTreeMap::new(),
                 reason: None,
             };
+            if deadline.is_some_and(|limit| Instant::now() >= limit) {
+                row.status = "budget_stop".to_owned();
+                append_coverage_reason(
+                    &mut row,
+                    "existing explain query deadline expired before later-discussion candidate selection",
+                );
+                coverage.push(row);
+                break;
+            }
             let selection = match select_candidate_tapes(index, &source.store, &edits) {
                 Ok(selection) => selection,
                 Err(error) => {
@@ -2525,6 +2534,175 @@ mod tests {
             .iter()
             .all(|candidate| candidate.tape_id != "unrelated-tape"));
         assert!(selected.incomplete_reasons.is_empty());
+    }
+
+    #[test]
+    fn candidate_tape_cap_preserves_direct_and_assignment_id_priority() {
+        let index = SqliteIndex::open_in_memory().unwrap();
+        let assignment_id = "asg_12345678-1234-1234-1234-1234567890ab";
+        let work_item_id = "wi_12345678-1234-1234-1234-1234567890ab";
+        let prior_receipt = crate::index::TaskContextEvent {
+            event_identity: "prior-receipt".to_owned(),
+            event_offset: 2,
+            result_offset: None,
+            kind: TaskContextKind::AssignmentReceipt,
+            task_id_kind: TaskIdKind::Assignment,
+            task_id: assignment_id.to_owned(),
+            work_item_id: Some(work_item_id.to_owned()),
+            actor_session: None,
+            recipient_session: Some("agent:coder s_receiver".to_owned()),
+            timestamp: "2026-10-01T00:00:02Z".to_owned(),
+            event_timestamp: "2026-10-01T00:00:02Z".to_owned(),
+        };
+        index
+            .ingest_tape_events_with_context("edit-tape", &[], &[], &[prior_receipt], 0.5)
+            .unwrap();
+
+        for ordinal in 0..20 {
+            let assignment_event = crate::index::TaskContextEvent {
+                event_identity: format!("assignment-event-{ordinal}"),
+                event_offset: ordinal + 1,
+                result_offset: None,
+                kind: TaskContextKind::AssignmentDispatch,
+                task_id_kind: TaskIdKind::Assignment,
+                task_id: assignment_id.to_owned(),
+                work_item_id: None,
+                actor_session: Some("agent:main s_sender".to_owned()),
+                recipient_session: Some("agent:coder s_receiver".to_owned()),
+                timestamp: "2026-10-01T00:00:03Z".to_owned(),
+                event_timestamp: "2026-10-01T00:00:03Z".to_owned(),
+            };
+            index
+                .ingest_tape_events_with_context(
+                    &format!("assignment-{ordinal:02}"),
+                    &[],
+                    &[],
+                    &[assignment_event],
+                    0.5,
+                )
+                .unwrap();
+
+            let work_item_event = crate::index::TaskContextEvent {
+                event_identity: format!("work-item-event-{ordinal}"),
+                event_offset: ordinal + 1,
+                result_offset: None,
+                kind: TaskContextKind::AssignmentCreate,
+                task_id_kind: TaskIdKind::Assignment,
+                task_id: format!("asg_87654321-0000-0000-0000-{ordinal:012}"),
+                work_item_id: Some(work_item_id.to_owned()),
+                actor_session: Some("agent:main s_sender".to_owned()),
+                recipient_session: Some("agent:coder s_receiver".to_owned()),
+                timestamp: "2026-10-01T00:00:03Z".to_owned(),
+                event_timestamp: "2026-10-01T00:00:03Z".to_owned(),
+            };
+            index
+                .ingest_tape_events_with_context(
+                    &format!("work-item-{ordinal:02}"),
+                    &[],
+                    &[],
+                    &[work_item_event],
+                    0.5,
+                )
+                .unwrap();
+        }
+
+        let edit = EditAnchor {
+            machine: "local".to_owned(),
+            store: "test-store".to_owned(),
+            tape_id: "edit-tape".to_owned(),
+            event_offset: 10,
+            file_path: "src/lib.rs".to_owned(),
+            timestamp: "2026-10-01T00:00:06Z".to_owned(),
+            selection_seed: seed("rank_span", SeedMode::Identifier),
+        };
+        let selected = select_candidate_tapes(&index, "test-store", &[edit]).unwrap();
+
+        assert!(selected.budget_stop);
+        assert_eq!(selected.tapes.len(), MAX_CANDIDATE_TAPES_PER_SOURCE);
+        assert!(
+            selected
+                .incomplete_reasons
+                .iter()
+                .any(|reason| reason.contains("per-source decode cap"))
+        );
+        assert_eq!(selected.tapes[0].tape_id, "edit-tape");
+        assert!(selected.tapes.iter().all(|candidate| {
+            candidate.tape_id == "edit-tape" || candidate.tape_id.starts_with("assignment-")
+        }));
+        assert!(selected.tapes.iter().any(|candidate| {
+            candidate.tape_id.starts_with("assignment-")
+                && candidate.selectors.iter().any(|selector| {
+                    selector.relation == "indexed_assignment_id_event"
+                        && selector.task_id.as_deref() == Some(assignment_id)
+                })
+        }));
+    }
+
+    #[test]
+    fn expired_explain_deadline_skips_later_discussion_selection() {
+        let root = std::env::temp_dir();
+        let context = RuntimeContext {
+            config_path: root.join("engram-test-config.yml"),
+            db_path: root.clone(),
+            tapes_dir: root.clone(),
+            frozen_stores: Vec::new(),
+            tape_lookup_dirs: vec![root.clone()],
+            additional_stores: Vec::new(),
+            explain_default_limit: 10,
+            peek_default_lines: 8,
+            peek_default_before: 2,
+            peek_default_after: 2,
+            peek_grep_context: 2,
+            metrics_enabled: false,
+            metrics_log: root.join("metrics.jsonl"),
+            watch: None,
+        };
+        let index = SqliteIndex::open_in_memory().unwrap();
+        index.ingest_tape_events("edit-tape", &[], 0.5).unwrap();
+        let raw_sessions = vec![json!({
+            "tape_id": "edit-tape",
+            "touches": [{
+                "kind": "edit",
+                "event_offset": 1,
+                "file_path": "src/lib.rs",
+                "timestamp": "2026-10-01T00:00:01Z"
+            }],
+            "windows": [{
+                "events": [{
+                    "offset": 1,
+                    "event": {
+                        "k": "code.edit",
+                        "file": "src/lib.rs",
+                        "after_text": "rank_span"
+                    }
+                }]
+            }]
+        })];
+        let result = collect(
+            &context,
+            &[index],
+            &raw_sessions,
+            "rank_span",
+            &ExplainTarget::Literal("rank_span".to_owned()),
+            &["rank_span".to_owned()],
+            "local",
+            &DateFilter::parse(None, None).unwrap(),
+            &[],
+            Some(Instant::now() - std::time::Duration::from_secs(1)),
+            None,
+        )
+        .unwrap();
+
+        let source = &result["coverage"]["sources"][0];
+        assert_eq!(source["status"], "budget_stop");
+        assert_eq!(source["candidate_tapes"], 0);
+        assert_eq!(source["tapes_scanned"], 0);
+        assert!(
+            source["reason"]
+                .as_str()
+                .unwrap()
+                .contains("deadline expired before later-discussion candidate selection")
+        );
     }
 
     #[test]

@@ -75,6 +75,7 @@ const MAX_CONCURRENT_PEERS: usize = 4;
 const PEER_CONNECT_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const PEER_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const PEER_QUERY_TIMEOUT: Duration = Duration::from_secs(120);
+const EXPLAIN_LATER_DISCUSSION_BUDGET: Duration = Duration::from_secs(30);
 const PEER_QUERY_TERMINAL_RUNNING: u8 = 0;
 const PEER_QUERY_TERMINAL_CANCELLED: u8 = 1;
 const PEER_QUERY_TERMINAL_COMMITTED: u8 = 2;
@@ -5274,6 +5275,7 @@ fn cmd_explain(
     args: ExplainArgs,
 ) -> Result<(), CliError> {
     print_context_conspicuity(context);
+    let later_discussion_deadline = Instant::now() + EXPLAIN_LATER_DISCUSSION_BUDGET;
 
     let target = args
         .target
@@ -5524,7 +5526,7 @@ fn cmd_explain(
         &self_machine,
         &date_filter,
         &[],
-        None,
+        Some(later_discussion_deadline),
         None,
     )?;
     if args.require_complete
