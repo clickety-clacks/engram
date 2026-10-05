@@ -438,6 +438,63 @@ pub fn compare_explain_sessions_with_span_priority(
         .then_with(|| compare_explain_sessions(a, b))
 }
 
+/// A file outside a Git checkout cannot have a same-repository edit. If no
+/// indexed edit names the same physical path, exact-span priority cannot
+/// change the index-derived ranking, so the page can be chosen before tapes
+/// are decoded. Keep the ordinary path whenever identity could affect rank.
+pub fn can_preselect_explain_file_page(
+    cwd: &Path,
+    file: &str,
+    touches: &[EvidenceFragmentRef],
+) -> bool {
+    let mut resolver = FileIdentityResolver::default();
+    if resolver.identity_for_query_path(cwd, file).is_some() {
+        return false;
+    }
+    !touches.iter().filter(|touch| touch.kind == EvidenceKind::Edit).any(|touch| {
+        resolver.relation(cwd, file, &touch.file_path) == FileIdentityRelation::SamePhysicalPath
+    })
+}
+
+/// Preserve the ordinary explain comparator and truncation metadata while
+/// carrying only indexed touch facts. The caller hydrates the selected tapes.
+pub fn preselect_explain_file_page(
+    touches: &[EvidenceFragmentRef],
+    score_by_session: &HashMap<String, f32>,
+    limit: Option<usize>,
+    offset: usize,
+    default_limit: usize,
+) -> (HashSet<String>, usize, Value, bool) {
+    let mut by_tape: HashMap<&str, Vec<&EvidenceFragmentRef>> = HashMap::new();
+    for touch in touches {
+        by_tape.entry(&touch.tape_id).or_default().push(touch);
+    }
+    let mut ranked = by_tape
+        .into_iter()
+        .map(|(tape_id, tape_touches)| {
+            let latest = tape_touches
+                .iter()
+                .map(|touch| touch.timestamp.as_str())
+                .max_by(|left, right| compare_timestamp_strings(left, right))
+                .unwrap_or("");
+            json!({
+                "session_id": tape_id,
+                "timestamp": latest,
+                "touches": vec![Value::Null; tape_touches.len()],
+                "confidence": score_by_session.get(tape_id).copied().unwrap_or(0.0),
+            })
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(compare_explain_sessions);
+    let (page, _, total, time_range, truncated) =
+        apply_session_truncation(ranked, limit, offset, default_limit);
+    let ids = page
+        .iter()
+        .filter_map(|session| session["session_id"].as_str().map(ToOwned::to_owned))
+        .collect();
+    (ids, total, time_range, truncated)
+}
+
 pub fn structured_edit_overlaps_span(event: &Value, file: &str, start: u32, end: u32) -> bool {
     if event.get("k").and_then(Value::as_str) != Some("code.edit")
         || event.get("file").and_then(Value::as_str) != Some(file)
@@ -2065,6 +2122,55 @@ pub(crate) fn pretty_tier_name(tier: PrettyConfidenceTier) -> &'static str {
         PrettyConfidenceTier::Related => "related",
         PrettyConfidenceTier::Hidden => "hidden",
         PrettyConfidenceTier::ForensicsOnly => "forensics_only",
+    }
+}
+
+#[cfg(test)]
+mod preselect_tests {
+    use super::*;
+
+    #[test]
+    fn unrelated_file_page_keeps_rank_and_full_result_metadata() {
+        let fixture = tempfile::tempdir().unwrap();
+        fs::write(fixture.path().join("target.rs"), "fn target() {}\n").unwrap();
+        let touch = |tape_id: &str, event_offset, kind, timestamp: &str, file_path: &str| {
+            EvidenceFragmentRef {
+                tape_id: tape_id.into(),
+                event_offset,
+                kind,
+                file_path: file_path.into(),
+                timestamp: timestamp.into(),
+            }
+        };
+        let touches = vec![
+            touch("a", 1, EvidenceKind::Read, "2026-09-01T00:00:00Z", "/other/a.rs"),
+            touch("a", 2, EvidenceKind::Read, "2026-09-03T00:00:00Z", "/other/a.rs"),
+            touch("b", 3, EvidenceKind::Edit, "2026-09-02T00:00:00Z", "/other/b.rs"),
+            touch("c", 4, EvidenceKind::Read, "2026-09-04T00:00:00Z", "/other/c.rs"),
+        ];
+        let scores = HashMap::from([("a".into(), 0.75), ("b".into(), 0.75), ("c".into(), 0.25)]);
+
+        assert!(can_preselect_explain_file_page(fixture.path(), "target.rs", &touches));
+        let (page, total, range, truncated) =
+            preselect_explain_file_page(&touches, &scores, Some(1), 1, 8);
+        assert_eq!(page, HashSet::from(["b".to_string()]));
+        assert_eq!(total, 3);
+        assert!(truncated);
+        assert_eq!(range["start"], "2026-09-02T00:00:00Z");
+        assert_eq!(range["end"], "2026-09-04T00:00:00Z");
+
+        let same_file_edit = touch(
+            "d",
+            5,
+            EvidenceKind::Edit,
+            "2026-09-05T00:00:00Z",
+            fixture.path().join("target.rs").to_str().unwrap(),
+        );
+        assert!(!can_preselect_explain_file_page(
+            fixture.path(),
+            "target.rs",
+            &[same_file_edit],
+        ));
     }
 }
 

@@ -41,6 +41,7 @@ use engram::query::file_identity::{FileIdentityRelation, FileIdentityResolver};
 use engram::query::format::MAX_QUERY_WINDOW_ANCHORS;
 use engram::query::format::{
     DateFilter, EventTimeDecision, ExplainTarget, GrepRank, annotate_chain_fields, apply_session_truncation,
+    can_preselect_explain_file_page, preselect_explain_file_page,
     build_chain_metadata, build_session_windows, classify_explain_target,
     collect_anchor_scores_with_date, collect_touch_evidence_with_date,
     compact_event, compare_explain_sessions_with_span_priority, compare_timestamp_strings,
@@ -5296,6 +5297,7 @@ fn cmd_explain(
     let mut tombstones = Vec::new();
     let touched_anchors;
     let score_by_session;
+    let mut preselected_page: Option<(usize, Value, bool)> = None;
     let mut exact_edit_sessions = HashSet::new();
     #[cfg(feature = "t1772-proof")]
     let mut proof_direct_touches: Option<Value> = None;
@@ -5329,14 +5331,42 @@ fn cmd_explain(
                 &date_filter,
             )?;
             temporal_unknown_events.extend(unknown);
-            raw_sessions = build_session_windows(context, touches)?;
-            exact_edit_sessions.extend(exact_span_edit_sessions(
-                &raw_sessions,
-                &file,
-                start,
-                end,
-                cwd,
-            ));
+            let (scores, unknown) =
+                collect_anchor_scores_with_date(&indexes, &query_anchors, &date_filter)?;
+            temporal_unknown_events.extend(unknown);
+            score_by_session = scores;
+            let preselect = date_filter.is_bounded()
+                && args.depth == 0
+                && args.grep_filter.is_none()
+                && !args.pretty
+                && !args.include_deleted
+                && can_preselect_explain_file_page(cwd, &file, &touches);
+            if preselect {
+                let (selected_ids, total, time_range, truncated) = preselect_explain_file_page(
+                    &touches,
+                    &score_by_session,
+                    args.limit,
+                    args.offset,
+                    context.explain_default_limit,
+                );
+                raw_sessions = build_session_windows(
+                    context,
+                    touches
+                        .into_iter()
+                        .filter(|touch| selected_ids.contains(&touch.tape_id))
+                        .collect(),
+                )?;
+                preselected_page = Some((total, time_range, truncated));
+            } else {
+                raw_sessions = build_session_windows(context, touches)?;
+                exact_edit_sessions.extend(exact_span_edit_sessions(
+                    &raw_sessions,
+                    &file,
+                    start,
+                    end,
+                    cwd,
+                ));
+            }
             let (chain, dispatch_sessions, unresolved, ambiguous) = if date_filter.is_bounded() {
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new())
             } else {
@@ -5347,10 +5377,6 @@ fn cmd_explain(
             dispatch_ambiguous.extend(ambiguous);
             raw_sessions.extend(dispatch_sessions);
             lineage = result.lineage.iter().map(edge_to_json).collect::<Vec<_>>();
-            let (scores, unknown) =
-                collect_anchor_scores_with_date(&indexes, &query_anchors, &date_filter)?;
-            temporal_unknown_events.extend(unknown);
-            score_by_session = scores;
         }
         ExplainTarget::FileWhole { file } => {
             let full_text = fs::read_to_string(cwd.join(file))
@@ -5550,12 +5576,18 @@ fn cmd_explain(
         ));
     }
 
-    let (sessions, returned, total, time_range, truncated) = apply_session_truncation(
-        sessions,
-        args.limit,
-        args.offset,
-        context.explain_default_limit,
-    );
+    let (sessions, returned, total, time_range, truncated) =
+        if let Some((total, time_range, truncated)) = preselected_page {
+            let returned = sessions.len();
+            (sessions, returned, total, time_range, truncated)
+        } else {
+            apply_session_truncation(
+                sessions,
+                args.limit,
+                args.offset,
+                context.explain_default_limit,
+            )
+        };
     if sessions.is_empty() && tombstones.is_empty() && lineage.is_empty() {
         return Err(CliError::new("no_results", target));
     }
