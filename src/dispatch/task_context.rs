@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -23,6 +23,10 @@ const MAX_TASK_ANCESTRY_BRANCHES: usize = 4;
 const TASK_CONTEXT_MESSAGE_COUNT: usize = 2;
 const TASK_CONTEXT_MESSAGE_CHARS: usize = 480;
 const TASK_CONTEXT_MAX_EVENT_BYTES: usize = 64 * 1024;
+const ASSIGNMENT_METADATA_LOOKAHEAD_EVENTS: u64 = 12;
+const ASSIGNMENT_METADATA_MAX_SCAN_EVENTS: u64 = 50_000;
+const ASSIGNMENT_METADATA_MAX_DECOMPRESSED_BYTES: u64 = 160 * 1024 * 1024;
+const ASSIGNMENT_METADATA_MAX_PENDING_CALLS: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Operation {
@@ -272,6 +276,110 @@ fn split_literal_shell_words(input: &str) -> Option<Vec<String>> {
     Some(words)
 }
 
+/// Read the literal command vector from the Codex batch wrapper used by the
+/// retained work-item-trace specimen. This recognizes a fixed JSON-string
+/// array and its output loop; it never evaluates JavaScript or shell text.
+fn literal_batched_exec_commands(code: &str) -> Option<Vec<String>> {
+    let mut rest = code.trim().strip_prefix("const cmds = [")?.trim_start();
+    let mut commands = Vec::new();
+    loop {
+        if let Some(tail) = rest.strip_prefix(']') {
+            rest = tail;
+            break;
+        }
+        if commands.len() >= 16 {
+            return None;
+        }
+        let mut values = serde_json::Deserializer::from_str(rest).into_iter::<String>();
+        let command = values.next()?.ok()?;
+        if command.is_empty() {
+            return None;
+        }
+        rest = rest[values.byte_offset()..].trim_start();
+        commands.push(command);
+        if let Some(tail) = rest.strip_prefix(',') {
+            rest = tail.trim_start();
+        } else if let Some(tail) = rest.strip_prefix(']') {
+            rest = tail;
+            break;
+        } else {
+            return None;
+        }
+    }
+    if commands.is_empty() {
+        return None;
+    }
+
+    rest = rest
+        .trim_start()
+        .strip_prefix(';')?
+        .trim_start()
+        .strip_prefix("const results = await Promise.all(cmds.map(cmd => tools.exec_command({")?;
+    rest = skip_literal_batch_exec_options(rest)?;
+    rest = rest.strip_prefix("})))")?.trim_start();
+    rest = rest.strip_prefix(';')?.trim_start();
+    let tail =
+        "for (let i = 0; i < results.length; i++) text(`--- ${i} ---\\n${results[i].output}`);";
+    rest.strip_prefix(tail)?
+        .trim()
+        .is_empty()
+        .then_some(commands)
+}
+
+/// Parse only literal exec options after the batch wrapper's `cmd,` field.
+fn skip_literal_batch_exec_options(input: &str) -> Option<&str> {
+    let mut rest = input.trim_start().strip_prefix("cmd,")?.trim_start();
+    let mut seen = HashSet::new();
+    loop {
+        if rest.starts_with('}') {
+            return Some(rest);
+        }
+        let (key, tail) = if rest.starts_with('"') {
+            let mut values = serde_json::Deserializer::from_str(rest).into_iter::<String>();
+            let key = values.next()?.ok()?;
+            (key, &rest[values.byte_offset()..])
+        } else {
+            let end = rest.find(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')?;
+            (rest[..end].to_owned(), &rest[end..])
+        };
+        if !matches!(
+            key.as_str(),
+            "workdir"
+                | "max_output_tokens"
+                | "yield_time_ms"
+                | "tty"
+                | "login"
+                | "sandbox_permissions"
+                | "justification"
+                | "prefix_rule"
+        ) || !seen.insert(key)
+        {
+            return None;
+        }
+        rest = tail.trim_start().strip_prefix(':')?.trim_start();
+        let mut values = serde_json::Deserializer::from_str(rest).into_iter::<Value>();
+        let _literal_value = values.next()?.ok()?;
+        rest = rest[values.byte_offset()..].trim_start();
+        if let Some(tail) = rest.strip_prefix(',') {
+            rest = tail.trim_start();
+        } else if !rest.starts_with('}') {
+            return None;
+        }
+    }
+}
+
+fn work_item_trace_query(command: &str) -> Option<String> {
+    let words = split_literal_shell_words(command)?;
+    let executable = words.first()?;
+    if executable != "tightbeam" && executable.rsplit('/').next() != Some("tightbeam") {
+        return None;
+    }
+    if words.len() != 3 || words[1] != "work-item-trace" || !valid_typed_id(&words[2], "wi_") {
+        return None;
+    }
+    Some(words[2].clone())
+}
+
 fn successful_command_stdout(
     call: &Value,
     result: &Value,
@@ -376,7 +484,10 @@ fn event_from_result(
             let work_item_id = returned_work_item
                 .or(operation.work_item_id.as_deref())
                 .map(str::to_owned);
-            let opened_by = nonempty_string(&assignment["openedBySession"]);
+            let opened_by = nonempty_string(&assignment["openedBySession"]).or_else(|| {
+                nonempty_string(&assignment["openerRef"])
+                    .map(|opener| opener.strip_prefix("session:").unwrap_or(opener))
+            });
             let actor_session = opened_by.map(str::to_owned).or(source_session);
             let recipient_session = nonempty_string(&assignment["holderKey"]).map(str::to_owned);
             if let (Some(expected), Some(actual)) = (
@@ -1284,8 +1395,32 @@ fn build_edit_task_ancestry(
             preceding_assignment_operations(indexes, &current_receipt, date_filter)?;
 
         if operations.is_empty() {
+            let root_scan = assignment_root_metadata_scan(
+                context,
+                stores,
+                &current_receipt,
+                &steps,
+                date_filter,
+            );
+            if root_scan.complete && !root_scan.snapshots.is_empty() {
+                result["observed_human_root"] = observed_human_root_from_metadata(
+                    context,
+                    stores,
+                    machine_label,
+                    &current_receipt,
+                    &root_scan,
+                );
+                result["root_metadata_scan"] = root_scan.summary();
+                status = "observed_human_root";
+                chain_finished = true;
+                break;
+            }
             status = "no_recorded_assignment_operation";
-            let reason = "No preceding successful assign or dispatch result for this exact assignment ID is indexed in the selected stores.";
+            let reason = if root_scan.complete {
+                "No preceding successful assign or dispatch result for this exact assignment ID is indexed, and the bounded same-tape window contains no explicit human-root assignment metadata."
+            } else {
+                "No preceding successful assign or dispatch result for this exact assignment ID is indexed; the bounded assignment-metadata scan was incomplete, so root identity remains unknown."
+            };
             let receipt = task_event_citation(
                 context,
                 stores,
@@ -1303,6 +1438,7 @@ fn build_edit_task_ancestry(
                     "relationship": "receipt_context_only",
                     "reason": reason,
                     "receipt": receipt,
+                    "assignment_metadata_scan": root_scan.summary(),
                 });
             } else {
                 // The root receipt is already cited as the suggested task context. Keep the
@@ -1311,6 +1447,7 @@ fn build_edit_task_ancestry(
                     "assignment_id": assignment_id,
                     "relationship": "receipt_context_only",
                     "reason": reason,
+                    "assignment_metadata_scan": root_scan.summary(),
                 });
             }
             break;
@@ -1377,6 +1514,19 @@ fn build_edit_task_ancestry(
             date_filter,
         )?;
         annotate_operation_selection(&mut operation_step, &edit_selection, &current_selection);
+        if let Some(human_root) = operation_step
+            .get("observed_human_root")
+            .filter(|root| {
+                root.get("classification").and_then(Value::as_str) == Some("observed_human_root")
+            })
+            .cloned()
+        {
+            steps.push(operation_step);
+            result["observed_human_root"] = human_root;
+            status = "observed_human_root";
+            chain_finished = true;
+            break;
+        }
         steps.push(operation_step);
         if steps.len() >= depth_limit {
             status = "depth_limit";
@@ -1571,6 +1721,9 @@ fn build_edit_task_ancestry(
         | "multiple_work_item_creations" => {
             "More than one supported parent is recorded. The alternatives are shown separately; no single cause or ruling is selected."
         }
+        "observed_human_root" => {
+            "The cited assignment operation or bounded metadata snapshot identifies an observed human root. The chain stops at that boundary; no earlier conversation or rationale is inferred."
+        }
         _ => {
             "The selected assignment receipt has no preceding supported operation in the selected history, so it remains unresolved rather than an upstream conversation link. The available context may be incomplete."
         }
@@ -1617,7 +1770,11 @@ fn assignment_operation_step(
         receipt.event.event_offset,
         "delivered_assignment_envelope",
     );
-    Ok(json!({
+    let observed_human_root = observed_human_root(&operation.event).map(|mut root| {
+        root["source"] = returned.clone();
+        root
+    });
+    let mut step = json!({
         "relationship": if operation.event.kind == TaskContextKind::AssignmentDispatch { "dispatched_assignment" } else { "created_assignment" },
         "assignment_id": operation.event.task_id,
         "work_item_id": operation.event.work_item_id,
@@ -1642,7 +1799,351 @@ fn assignment_operation_step(
             operation.event.event_offset,
             date_filter,
         )?,
-    }))
+    });
+    if let Some(root) = observed_human_root {
+        step["observed_human_root"] = root;
+    }
+    Ok(step)
+}
+
+fn observed_human_root(event: &TaskContextEvent) -> Option<Value> {
+    let mut observations = Vec::new();
+    if event.actor_session.as_deref() == Some("user:mike") {
+        observations.push(json!({
+            "basis":"assignment_actor_user_mike",
+            "identity":"user:mike",
+            "identity_domain":"user_identity_label",
+        }));
+    }
+    if let Some(holder) = event
+        .recipient_session
+        .as_deref()
+        .filter(|holder| is_mike_main_root_holder(holder))
+    {
+        observations.push(json!({
+            "basis":"assignment_holder_mike_main_root",
+            "identity":holder,
+            "identity_domain":"tightbeam_session_key",
+        }));
+    }
+    (!observations.is_empty()).then(|| {
+        json!({
+            "classification":"observed_human_root",
+            "assignment_id":event.task_id,
+            "observations":observations,
+        })
+    })
+}
+
+fn is_mike_main_root_holder(holder: &str) -> bool {
+    holder.trim() == "agent:main:clawline:mike:main"
+}
+
+#[derive(Debug, Clone)]
+struct AssignmentRootMetadataSnapshot {
+    assignment_id: String,
+    work_item_id: String,
+    opener: Option<String>,
+    holder: Option<String>,
+    call_offset: u64,
+    result_offset: u64,
+    timestamp: String,
+}
+
+#[derive(Debug, Default)]
+struct AssignmentRootMetadataScan {
+    snapshots: Vec<AssignmentRootMetadataSnapshot>,
+    complete: bool,
+    reason: Option<&'static str>,
+    scanned_events: u64,
+    window_start: u64,
+    window_end_exclusive: u64,
+}
+
+impl AssignmentRootMetadataScan {
+    fn summary(&self) -> Value {
+        json!({
+            "status": if self.complete { "complete" } else { "partial" },
+            "reason": self.reason,
+            "scanned_events": self.scanned_events,
+            "window_start_offset": self.window_start,
+            "window_end_offset_exclusive": self.window_end_exclusive,
+            "matching_root_snapshots": self.snapshots.len(),
+            "event_byte_limit": TASK_CONTEXT_MAX_EVENT_BYTES,
+            "decompressed_byte_limit": ASSIGNMENT_METADATA_MAX_DECOMPRESSED_BYTES,
+            "lookahead_event_limit": ASSIGNMENT_METADATA_LOOKAHEAD_EVENTS,
+        })
+    }
+}
+
+fn assignment_root_metadata_scan(
+    context: &RuntimeContext,
+    stores: &[PathBuf],
+    receipt: &StoredTaskEvent,
+    steps: &[Value],
+    date_filter: &DateFilter,
+) -> AssignmentRootMetadataScan {
+    let Some(path) =
+        resolve_tape_path_for_store(context, stores, receipt.store_index, &receipt.tape_id)
+    else {
+        return AssignmentRootMetadataScan {
+            reason: Some("source_tape_unavailable"),
+            window_start: receipt.event.event_offset.saturating_add(1),
+            ..AssignmentRootMetadataScan::default()
+        };
+    };
+    let window_start = receipt.event.event_offset.saturating_add(1);
+    let local_end = window_start.saturating_add(ASSIGNMENT_METADATA_LOOKAHEAD_EVENTS);
+    let operation_bound = steps.last().and_then(|step| {
+        let source = step
+            .get("edge_evidence")?
+            .get("operation_request")?
+            .get("source")?;
+        let source_tape = source.get("tape_id")?.as_str()?;
+        let source_store = source.get("store")?.as_str()?;
+        let receipt_store = stores.get(receipt.store_index)?.display().to_string();
+        let offset = source.get("event_offset")?.as_u64()?;
+        (source_tape == receipt.tape_id
+            && source_store == receipt_store
+            && offset > receipt.event.event_offset)
+            .then_some(offset)
+    });
+    let requested_end = operation_bound.map_or(local_end, |bound| local_end.min(bound));
+    let window_end_exclusive = requested_end.min(ASSIGNMENT_METADATA_MAX_SCAN_EVENTS);
+    let mut scan = AssignmentRootMetadataScan {
+        complete: window_end_exclusive == requested_end,
+        reason: (window_end_exclusive != requested_end).then_some("event_scan_limit"),
+        window_start,
+        window_end_exclusive,
+        ..AssignmentRootMetadataScan::default()
+    };
+    if window_end_exclusive <= window_start {
+        scan.complete = true;
+        scan.reason = None;
+        return scan;
+    }
+
+    let Ok(file) = File::open(path) else {
+        scan.complete = false;
+        scan.reason = Some("source_tape_read_error");
+        return scan;
+    };
+    let Ok(decoder) = zstd::stream::read::Decoder::new(file) else {
+        scan.complete = false;
+        scan.reason = Some("source_tape_decompress_error");
+        return scan;
+    };
+    let mut bounded_decoder = decoder.take(ASSIGNMENT_METADATA_MAX_DECOMPRESSED_BYTES);
+    let mut reader = BufReader::new(&mut bounded_decoder);
+    let mut pending = HashMap::<String, (u64, usize, Vec<(usize, String)>)>::new();
+    let mut oversized_in_window = false;
+    let mut reached_end = true;
+    for event_offset in 0..window_end_exclusive {
+        let row = match read_bounded_jsonl_line(&mut reader, TASK_CONTEXT_MAX_EVENT_BYTES) {
+            Ok(Some((line, oversized))) => {
+                if event_offset >= receipt.event.event_offset && oversized {
+                    oversized_in_window = true;
+                }
+                if oversized || line.iter().all(u8::is_ascii_whitespace) {
+                    None
+                } else {
+                    serde_json::from_slice::<Value>(&line).ok()
+                }
+            }
+            Ok(None) => {
+                reached_end = false;
+                break;
+            }
+            Err(_) => {
+                reached_end = false;
+                scan.reason = Some("source_tape_read_error");
+                break;
+            }
+        };
+        scan.scanned_events = event_offset.saturating_add(1);
+        if event_offset < receipt.event.event_offset {
+            continue;
+        }
+        let Some(row) = row else {
+            continue;
+        };
+        match row["k"].as_str() {
+            Some("tool.call") if row["tool"] == "exec" => {
+                let Some(call_id) = row["call_id"].as_str() else {
+                    continue;
+                };
+                let Some(commands) = row["args"].as_str().and_then(literal_batched_exec_commands)
+                else {
+                    continue;
+                };
+                let queries = commands
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, command)| {
+                        work_item_trace_query(command).map(|work_item_id| (index, work_item_id))
+                    })
+                    .collect::<Vec<_>>();
+                if !queries.is_empty() {
+                    if pending.len() >= ASSIGNMENT_METADATA_MAX_PENDING_CALLS {
+                        scan.complete = false;
+                        scan.reason = Some("pending_call_limit");
+                        reached_end = false;
+                        break;
+                    }
+                    pending.insert(call_id.to_owned(), (event_offset, commands.len(), queries));
+                }
+            }
+            Some("tool.result") => {
+                let Some(call_id) = row["call_id"].as_str() else {
+                    continue;
+                };
+                let Some((call_offset, command_count, queries)) = pending.remove(call_id) else {
+                    continue;
+                };
+                if date_filter.event_time(row["t"].as_str()) != EventTimeDecision::Included {
+                    continue;
+                }
+                let Some(blocks) = row["raw_output"].as_array() else {
+                    continue;
+                };
+                if blocks.len() != command_count.saturating_add(1)
+                    || blocks.iter().any(|block| block["type"] != "input_text")
+                {
+                    continue;
+                }
+                let Some(header) = blocks.first().and_then(|block| block["text"].as_str()) else {
+                    continue;
+                };
+                if !header.starts_with("Script completed\nWall time ")
+                    || !header.ends_with("\nOutput:\n")
+                {
+                    continue;
+                }
+                for (index, work_item_id) in queries {
+                    let Some(block) = blocks.get(index + 1) else {
+                        continue;
+                    };
+                    let Some(text) = block["text"].as_str() else {
+                        continue;
+                    };
+                    let marker = format!("--- {index} ---\n");
+                    let Some(output) = text.strip_prefix(&marker) else {
+                        continue;
+                    };
+                    let Ok(trace) = serde_json::from_str::<Value>(output.trim()) else {
+                        continue;
+                    };
+                    if trace["workItem"]["id"].as_str() != Some(work_item_id.as_str()) {
+                        continue;
+                    }
+                    for assignment in trace["assignments"].as_array().into_iter().flatten() {
+                        if assignment["id"].as_str() != Some(receipt.event.task_id.as_str()) {
+                            continue;
+                        }
+                        let opener = nonempty_string(&assignment["openerRef"])
+                            .or_else(|| nonempty_string(&assignment["openedBySession"]))
+                            .map(|value| value.strip_prefix("session:").unwrap_or(value).to_owned())
+                            .or_else(|| {
+                                (assignment["openedByUser"].as_str() == Some("mike"))
+                                    .then(|| "user:mike".to_owned())
+                            });
+                        let holder = nonempty_string(&assignment["holderKey"]).map(str::to_owned);
+                        let is_human_root = opener.as_deref() == Some("user:mike")
+                            || holder.as_deref().is_some_and(is_mike_main_root_holder);
+                        if is_human_root {
+                            scan.snapshots.push(AssignmentRootMetadataSnapshot {
+                                assignment_id: receipt.event.task_id.clone(),
+                                work_item_id: work_item_id.clone(),
+                                opener,
+                                holder,
+                                call_offset,
+                                result_offset: event_offset,
+                                timestamp: row["t"].as_str().unwrap_or_default().to_owned(),
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    drop(reader);
+    if !reached_end && scan.reason.is_none() {
+        scan.reason = if bounded_decoder.limit() == 0 {
+            Some("decompressed_byte_limit")
+        } else {
+            Some("source_tape_ended_before_window")
+        };
+    }
+    if oversized_in_window {
+        scan.complete = false;
+        scan.reason = Some("oversized_event_skipped_in_window");
+    }
+    scan.complete &= reached_end && !oversized_in_window;
+    scan
+}
+
+fn observed_human_root_from_metadata(
+    context: &RuntimeContext,
+    stores: &[PathBuf],
+    machine_label: &str,
+    receipt: &StoredTaskEvent,
+    scan: &AssignmentRootMetadataScan,
+) -> Value {
+    let mut observations = Vec::new();
+    let mut evidence = Vec::new();
+    let mut seen_observations = HashSet::new();
+    for snapshot in &scan.snapshots {
+        if snapshot.opener.as_deref() == Some("user:mike")
+            && seen_observations.insert(("assignment_opener_user_mike", "user:mike"))
+        {
+            observations.push(json!({
+                "basis":"assignment_opener_user_mike",
+                "identity":"user:mike",
+                "identity_domain":"user_identity_label",
+            }));
+        }
+        if let Some(holder) = snapshot
+            .holder
+            .as_deref()
+            .filter(|holder| is_mike_main_root_holder(holder))
+            && seen_observations.insert(("assignment_holder_mike_main_root", holder))
+        {
+            observations.push(json!({
+                "basis":"assignment_holder_mike_main_root",
+                "identity":holder,
+                "identity_domain":"tightbeam_session_key",
+            }));
+        }
+        let mut source = source_address(
+            context,
+            stores,
+            machine_label,
+            receipt.store_index,
+            &receipt.tape_id,
+            snapshot.result_offset,
+            &snapshot.timestamp,
+        );
+        source["timestamp_basis"] = json!("indexed_result_timestamp");
+        evidence.push(json!({
+            "type":"assignment_metadata_snapshot",
+            "assignment_id":snapshot.assignment_id,
+            "work_item_id":snapshot.work_item_id,
+            "source":source,
+            "request_event_offset":snapshot.call_offset,
+            "observed_opener":snapshot.opener,
+            "observed_holder":snapshot.holder,
+            "relationship":"metadata_only_not_an_assignment_operation",
+        }));
+    }
+    json!({
+        "classification":"observed_human_root",
+        "assignment_id":receipt.event.task_id,
+        "basis":"explicit_retained_assignment_metadata",
+        "observations":observations,
+        "evidence":evidence,
+        "relationship_scope":"root_identity_only",
+    })
 }
 
 fn preceding_assignment_operations(
@@ -2148,6 +2649,341 @@ mod tests {
                 "file_path":"scripts/verify_mix.sh"
             }]
         })
+    }
+
+    fn ancestry_for_assignment_root(
+        opened_by: Option<&str>,
+        opener_ref: Option<&str>,
+        holder: &str,
+    ) -> Value {
+        let temp = tempfile::tempdir().unwrap();
+        let context = runtime_context(temp.path());
+        let operation_tape = "observed-root-operation";
+        let receiver_tape = "observed-root-receiver";
+        let mut call = wrapped_call(
+            &format!(
+                "tightbeam dispatch --to '{holder}' --work-item {WORK_ITEM} --subject 'Root task' --brief 'Continue the human request.'"
+            ),
+            "call_observed_root",
+            "2026-10-03T12:00:00Z",
+        );
+        call["source"]["session_id"] = json!("native-dispatcher-session");
+        let mut assignment = json!({
+            "id":PARENT_ASSIGNMENT,
+            "workItemId":WORK_ITEM,
+            "holderKey":holder,
+            "state":"open"
+        });
+        if let Some(opened_by) = opened_by {
+            assignment["openedBySession"] = json!(opened_by);
+        }
+        if let Some(opener_ref) = opener_ref {
+            assignment["openerRef"] = json!(opener_ref);
+        }
+        let mut returned = wrapped_result(
+            "call_observed_root",
+            &json!({"assignment":assignment}).to_string(),
+            0,
+        );
+        returned["t"] = json!("2026-10-03T12:00:01Z");
+        let operation_raw = jsonl([call, returned]);
+        let receiver_raw = jsonl([
+            json!({
+                "t":"2026-10-03T12:00:02Z",
+                "k":"msg.in",
+                "source":{"session_id":"native-recipient-session"},
+                "content":format!("[from agent:main]\n[assignment: {PARENT_ASSIGNMENT}]\nContinue the verified task.")
+            }),
+            json!({
+                "t":"2026-10-03T12:00:03Z",
+                "k":"code.edit",
+                "file":"scripts/verify_mix.sh",
+                "before_range":[19,25],
+                "after_range":[19,25],
+                "before_text":"verify the mixed changes",
+                "after_text":"verify the mixed changes with retained context"
+            }),
+        ]);
+        write_fixture_tape(&context, operation_tape, &operation_raw);
+        write_fixture_tape(&context, receiver_tape, &receiver_raw);
+        let operation_rows = parse_jsonl_events(&operation_raw).unwrap();
+        let operation_context = extract_task_context_events(&operation_raw);
+        let receiver_rows = parse_jsonl_events(&receiver_raw).unwrap();
+        let receiver_context = extract_task_context_events(&receiver_raw);
+        {
+            let writer = SqliteIndex::open_owner_writer(
+                context.db_path.to_str().expect("fixture database path"),
+            )
+            .unwrap();
+            writer
+                .ingest_tape_events_with_context(
+                    operation_tape,
+                    &operation_rows,
+                    &[],
+                    &operation_context,
+                    crate::index::lineage::LINK_THRESHOLD_DEFAULT,
+                )
+                .unwrap();
+            writer
+                .ingest_tape_events_with_context(
+                    receiver_tape,
+                    &receiver_rows,
+                    &[],
+                    &receiver_context,
+                    crate::index::lineage::LINK_THRESHOLD_DEFAULT,
+                )
+                .unwrap();
+        }
+        let index = SqliteIndex::open_reader_mode(
+            context.db_path.to_str().expect("fixture database path"),
+            ReaderMode::Live,
+        )
+        .unwrap();
+        let indexes = [index];
+        let mut sessions = vec![explain_edit_session(
+            receiver_tape,
+            1,
+            "2026-10-03T12:00:03Z",
+        )];
+        attach_explain_task_ancestry(
+            &context,
+            &indexes,
+            &mut sessions,
+            &DateFilter::parse(None, None).unwrap(),
+            4,
+            "gibson",
+        )
+        .unwrap();
+        sessions[0]["task_ancestry"][0].clone()
+    }
+
+    #[test]
+    fn user_mike_opener_ref_is_reported_as_observed_human_root() {
+        let ancestry = ancestry_for_assignment_root(None, Some("user:mike"), RECIPIENT);
+        assert_eq!(ancestry["status"], "observed_human_root");
+        assert_eq!(ancestry["steps"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            ancestry["observed_human_root"]["observations"][0]["basis"],
+            "assignment_actor_user_mike"
+        );
+        assert_eq!(
+            ancestry["observed_human_root"]["source"]["type"],
+            "successful_assignment_result"
+        );
+        assert!(ancestry.get("unresolved_parent_receipt").is_none());
+    }
+
+    #[test]
+    fn mike_main_root_holder_without_opener_is_reported_as_human_root() {
+        let ancestry = ancestry_for_assignment_root(None, None, "agent:main:clawline:mike:main");
+        assert_eq!(ancestry["status"], "observed_human_root");
+        assert_eq!(
+            ancestry["observed_human_root"]["observations"][0]["basis"],
+            "assignment_holder_mike_main_root"
+        );
+        assert_eq!(
+            ancestry["observed_human_root"]["observations"][0]["identity_domain"],
+            "tightbeam_session_key"
+        );
+        assert!(ancestry.get("unresolved_parent_receipt").is_none());
+    }
+
+    #[test]
+    fn non_root_assignment_without_parent_is_not_inferred_as_human_root() {
+        let ancestry = ancestry_for_assignment_root(Some("agent:owner s_owner01"), None, RECIPIENT);
+        assert_eq!(ancestry["status"], "earliest_observed_handoff");
+        assert!(ancestry.get("observed_human_root").is_none());
+    }
+
+    #[test]
+    fn retained_trace_snapshot_closes_unoperated_parent_at_cited_human_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let context = runtime_context(temp.path());
+        let root_tape = "root-trace-snapshot";
+        let receiver_tape = "root-trace-receiver";
+        let command = format!("/usr/bin/tightbeam work-item-trace {WORK_ITEM}");
+        let batch_args = format!(
+            r#"const cmds = [
+  {}
+];
+const results = await Promise.all(cmds.map(cmd => tools.exec_command({{
+  cmd,
+  workdir: "/tmp"
+}})));
+for (let i = 0; i < results.length; i++) text(`--- ${{i}} ---\n${{results[i].output}}`);"#,
+            serde_json::to_string(&command).unwrap()
+        );
+        assert_eq!(
+            literal_batched_exec_commands(&batch_args),
+            Some(vec![command])
+        );
+        assert!(
+            literal_batched_exec_commands(&batch_args.replace("  cmd,", "  cmd: dynamic,"))
+                .is_none()
+        );
+
+        let trace = json!({
+            "workItem":{"id":WORK_ITEM},
+            "assignments":[{
+                "id":PARENT_ASSIGNMENT,
+                "openerRef":"user:mike",
+                "holderKey":"agent:main:clawline:mike:main",
+                "state":"open"
+            }]
+        });
+        let root_receipt = json!({
+            "t":"2026-10-03T12:00:00Z",
+            "k":"msg.in",
+            "source":{"session_id":"native-main-session"},
+            "content":format!("[from user:mike]\n[assignment: {PARENT_ASSIGNMENT}]\nRoot assignment.")
+        });
+        let trace_call = json!({
+            "t":"2026-10-03T12:00:01Z",
+            "k":"tool.call",
+            "tool":"exec",
+            "call_id":"call_root_trace",
+            "source":{"harness":"codex-cli","session_id":SENDER},
+            "args":batch_args
+        });
+        let trace_result = json!({
+            "t":"2026-10-03T12:00:02Z",
+            "k":"tool.result",
+            "tool":"exec",
+            "call_id":"call_root_trace",
+            "raw_output":[
+                {"type":"input_text","text":"Script completed\nWall time 0.1s\nOutput:\n"},
+                {"type":"input_text","text":format!("--- 0 ---\n{}\n",trace)}
+            ]
+        });
+        let mut child_call = wrapped_call(
+            &format!(
+                "tightbeam dispatch --to '{RECIPIENT}' --work-item {WORK_ITEM} --subject 'Child task' --brief 'Continue the retained request.'"
+            ),
+            "call_child_dispatch",
+            "2026-10-03T12:00:03Z",
+        );
+        child_call["source"]["session_id"] = json!(SENDER);
+        let mut child_result = wrapped_result(
+            "call_child_dispatch",
+            &json!({
+                "id":ASSIGNMENT,
+                "workItemId":WORK_ITEM,
+                "openedBySession":SENDER,
+                "holderKey":RECIPIENT,
+                "state":"open"
+            })
+            .to_string(),
+            0,
+        );
+        child_result["t"] = json!("2026-10-03T12:00:04Z");
+        let root_raw = jsonl([
+            root_receipt,
+            trace_call,
+            trace_result,
+            child_call,
+            child_result,
+        ]);
+        let receiver_raw = jsonl([
+            json!({
+                "t":"2026-10-03T12:00:05Z",
+                "k":"msg.in",
+                "source":{"session_id":"native-recipient-session"},
+                "content":format!("[from agent:main]\n[assignment: {ASSIGNMENT}]\nImplement the edit.")
+            }),
+            json!({
+                "t":"2026-10-03T12:00:06Z",
+                "k":"code.edit",
+                "file":"scripts/verify_mix.sh",
+                "before_range":[19,25],
+                "after_range":[19,25],
+                "before_text":"verify the mixed changes",
+                "after_text":"verify the mixed changes with retained context"
+            }),
+        ]);
+        write_fixture_tape(&context, root_tape, &root_raw);
+        write_fixture_tape(&context, receiver_tape, &receiver_raw);
+        let root_rows = parse_jsonl_events(&root_raw).unwrap();
+        let root_task_events = extract_task_context_events(&root_raw);
+        assert_eq!(
+            root_task_events
+                .iter()
+                .filter(|event| event.kind == TaskContextKind::AssignmentReceipt)
+                .count(),
+            1
+        );
+        let receiver_rows = parse_jsonl_events(&receiver_raw).unwrap();
+        let receiver_task_events = extract_task_context_events(&receiver_raw);
+        {
+            let writer = SqliteIndex::open_owner_writer(
+                context.db_path.to_str().expect("fixture database path"),
+            )
+            .unwrap();
+            writer
+                .ingest_tape_events_with_context(
+                    root_tape,
+                    &root_rows,
+                    &[],
+                    &root_task_events,
+                    crate::index::lineage::LINK_THRESHOLD_DEFAULT,
+                )
+                .unwrap();
+            writer
+                .ingest_tape_events_with_context(
+                    receiver_tape,
+                    &receiver_rows,
+                    &[],
+                    &receiver_task_events,
+                    crate::index::lineage::LINK_THRESHOLD_DEFAULT,
+                )
+                .unwrap();
+        }
+        let index = SqliteIndex::open_reader_mode(
+            context.db_path.to_str().expect("fixture database path"),
+            ReaderMode::Live,
+        )
+        .unwrap();
+        let indexes = [index];
+        let mut sessions = vec![explain_edit_session(
+            receiver_tape,
+            1,
+            "2026-10-03T12:00:06Z",
+        )];
+        attach_explain_task_ancestry(
+            &context,
+            &indexes,
+            &mut sessions,
+            &DateFilter::parse(None, None).unwrap(),
+            4,
+            "gibson",
+        )
+        .unwrap();
+
+        let ancestry = &sessions[0]["task_ancestry"][0];
+        assert_eq!(ancestry["status"], "observed_human_root");
+        assert_eq!(
+            ancestry["observed_human_root"]["assignment_id"],
+            PARENT_ASSIGNMENT
+        );
+        assert_eq!(
+            ancestry["observed_human_root"]["evidence"][0]["type"],
+            "assignment_metadata_snapshot"
+        );
+        assert_eq!(
+            ancestry["observed_human_root"]["evidence"][0]["source"]["event_offset"],
+            2
+        );
+        assert_eq!(
+            ancestry["observed_human_root"]["observations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            ancestry["steps"][0]
+                .get("unresolved_parent_receipt")
+                .is_none()
+        );
     }
 
     #[test]

@@ -1256,6 +1256,31 @@ impl SqliteIndex {
         .collect()
     }
 
+    pub fn task_context_events_for_tape_before_any(
+        &self,
+        tape_id: &str,
+        event_offset: u64,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<TaskContextEvent>> {
+        if !self.task_context_available || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT tape_id, event_offset, result_offset, kind, task_id_kind, task_id,
+                    work_item_id, event_identity, actor_session, recipient_session, timestamp, event_timestamp
+             FROM task_context_events
+             WHERE tape_id = ?1 AND event_offset < ?2
+             ORDER BY event_offset DESC
+             LIMIT ?3",
+        )?;
+        stmt.query_map(
+            params![tape_id, event_offset as i64, limit.min(64) as i64],
+            decode_task_context_event,
+        )?
+        .map(|row| row.map(|(_, event)| event))
+        .collect()
+    }
+
     pub fn assignment_receipts_before(
         &self,
         tape_id: &str,

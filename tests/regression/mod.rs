@@ -1152,6 +1152,10 @@ fn grep_date_bounds_select_event_times_with_inclusive_day_edges_and_unknown_diag
     let error = String::from_utf8_lossy(&require_complete.stderr);
     assert!(error.contains("incomplete_coverage"), "{error}");
     assert!(error.contains("event timestamp"), "{error}");
+    assert!(
+        !error.contains("task-context coverage is tape_rebuild_required"),
+        "a fresh record must index even empty task-context extraction: {error}"
+    );
 }
 
 #[test]

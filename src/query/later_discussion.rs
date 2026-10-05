@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -7,10 +8,10 @@ use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::index::SqliteIndex;
+use crate::index::{SqliteIndex, TaskContextKind, TaskIdKind};
 use crate::query::format::{DateFilter, EventTimeDecision, ExplainTarget};
 use crate::store::tapes::tape_path_for_tapes_dir;
 use crate::tape::grep::read_grep_record;
@@ -21,12 +22,13 @@ const MAX_RESULTS: usize = 5;
 const MAX_PER_CONVERSATION: usize = 2;
 const MAX_REPEAT_OCCURRENCES: usize = 32;
 const MAX_EDIT_ANCHORS: usize = 128;
-const MAX_TAPES_PER_SOURCE: usize = 10_000;
+const MAX_CANDIDATE_TAPES_PER_SOURCE: usize = 128;
+const MAX_TASK_CONTEXT_ROWS_PER_LOOKUP: usize = 64;
 const MAX_COMPRESSED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_DECOMPRESSED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_DECOMPRESSED_BYTES_PER_TAPE: u64 = 512 * 1024 * 1024;
 const MAX_RECORD_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_SNIPPET_CHARS: usize = 480;
+const MAX_SNIPPET_CHARS: usize = 260;
 const GUIDANCE: &str =
     "Later conversations discussed this code; check them for decisions made after it was written.";
 const RELATION: &str = "later_discussion";
@@ -43,6 +45,7 @@ struct ScanEventHeader<'a> {
 struct Seed {
     text: String,
     mode: SeedMode,
+    class: SeedClass,
     reason: &'static str,
     specificity: u16,
 }
@@ -51,6 +54,12 @@ struct Seed {
 enum SeedMode {
     Identifier,
     Phrase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeedClass {
+    Distinctive,
+    Supporting,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +102,7 @@ struct Hit {
     content_fingerprint: String,
     repeat_occurrences: Vec<Value>,
     repeat_occurrences_omitted: u64,
+    candidate_selectors: Vec<CandidateSelector>,
 }
 
 #[derive(Debug)]
@@ -119,7 +129,7 @@ struct SourceCoverage {
     db_path: String,
     status: String,
     operation: &'static str,
-    tapes_total: usize,
+    candidate_tapes: usize,
     tapes_scanned: usize,
     compressed_bytes_opened: u64,
     decompressed_bytes: u64,
@@ -127,7 +137,32 @@ struct SourceCoverage {
     candidate_messages: u64,
     matching_unknown_time: u64,
     skipped_content: u64,
+    selector_counts: BTreeMap<String, usize>,
     reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CandidateSelector {
+    relation: String,
+    task_id_kind: Option<String>,
+    task_id: Option<String>,
+    event_kind: Option<String>,
+    from_tape_id: Option<String>,
+    from_event_offset: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct CandidateTape {
+    tape_id: String,
+    priority: u8,
+    selectors: BTreeSet<CandidateSelector>,
+}
+
+#[derive(Debug, Default)]
+struct CandidateSelection {
+    tapes: Vec<CandidateTape>,
+    incomplete_reasons: Vec<String>,
+    budget_stop: bool,
 }
 
 /// Find a bounded set of deterministic seed strings from the requested span,
@@ -143,6 +178,7 @@ pub fn derive_seeds(
             json!({
                 "text": seed.text,
                 "match": match (seed.reason, seed.mode) { ("repo_relative_file_path", SeedMode::Phrase) => "path_token_sequence", (_, SeedMode::Identifier) => "identifier_boundary", (_, SeedMode::Phrase) => "literal_phrase" },
+                "class": seed.class.as_str(),
                 "derived_from": seed.reason,
             })
         })
@@ -198,8 +234,8 @@ pub fn collect(
                 store: db_path.display().to_string(),
                 db_path: db_path.display().to_string(),
                 status: "not_applicable".to_owned(),
-                operation: "decoded_message_content_scan",
-                tapes_total: 0,
+                operation: "indexed_candidate_tape_content_scan",
+                candidate_tapes: 0,
                 tapes_scanned: 0,
                 compressed_bytes_opened: 0,
                 decompressed_bytes: 0,
@@ -207,10 +243,14 @@ pub fn collect(
                 candidate_messages: 0,
                 matching_unknown_time: 0,
                 skipped_content: 0,
+                selector_counts: BTreeMap::new(),
                 reason: not_applicable_reason.clone(),
             });
         }
-    } else if seeds.is_empty() {
+    } else if !seeds
+        .iter()
+        .any(|seed| seed.class == SeedClass::Distinctive)
+    {
         global_issue = Some(
             "no distinctive query-derived seed was available; content scan was skipped".to_owned(),
         );
@@ -225,8 +265,8 @@ pub fn collect(
                 store: db_path.display().to_string(),
                 db_path: db_path.display().to_string(),
                 status: "incomplete".to_owned(),
-                operation: "decoded_message_content_scan",
-                tapes_total: 0,
+                operation: "indexed_candidate_tape_content_scan",
+                candidate_tapes: 0,
                 tapes_scanned: 0,
                 compressed_bytes_opened: 0,
                 decompressed_bytes: 0,
@@ -234,6 +274,7 @@ pub fn collect(
                 candidate_messages: 0,
                 matching_unknown_time: 0,
                 skipped_content: 0,
+                selector_counts: BTreeMap::new(),
                 reason: Some(
                     "there is no timestamped structured edit to order discussions against"
                         .to_owned(),
@@ -257,8 +298,8 @@ pub fn collect(
                 store: source.store.clone(),
                 db_path: source.db_path.display().to_string(),
                 status: "complete".to_owned(),
-                operation: "decoded_message_content_scan",
-                tapes_total: 0,
+                operation: "indexed_candidate_tape_content_scan",
+                candidate_tapes: 0,
                 tapes_scanned: 0,
                 compressed_bytes_opened: 0,
                 decompressed_bytes: 0,
@@ -266,80 +307,108 @@ pub fn collect(
                 candidate_messages: 0,
                 matching_unknown_time: 0,
                 skipped_content: 0,
+                selector_counts: BTreeMap::new(),
                 reason: None,
             };
-            let tape_ids = match index.tape_ids() {
-                Ok(tape_ids) => tape_ids,
+            let selection = match select_candidate_tapes(index, &source.store, &edits) {
+                Ok(selection) => selection,
                 Err(error) => {
                     row.status = "failed".to_owned();
-                    row.reason = Some(format!("could not enumerate indexed tapes: {error}"));
+                    row.reason = Some(format!("could not select indexed candidate tapes: {error}"));
                     coverage.push(row);
                     continue;
                 }
             };
-            row.tapes_total = tape_ids.len();
-            if tape_ids.len() > MAX_TAPES_PER_SOURCE {
+            row.candidate_tapes = selection.tapes.len();
+            for candidate in &selection.tapes {
+                for selector in &candidate.selectors {
+                    *row.selector_counts
+                        .entry(selector.relation.clone())
+                        .or_default() += 1;
+                }
+            }
+            if selection.budget_stop {
                 row.status = "budget_stop".to_owned();
-                row.reason = Some(format!(
-                    "source has {} indexed tapes; scan cap is {MAX_TAPES_PER_SOURCE}",
-                    tape_ids.len()
-                ));
-                coverage.push(row);
-                continue;
+            } else if !selection.incomplete_reasons.is_empty() {
+                row.status = "incomplete".to_owned();
+            }
+            if !selection.incomplete_reasons.is_empty() {
+                append_coverage_reason(
+                    &mut row,
+                    &format!(
+                        "indexed candidate selection: {}",
+                        selection.incomplete_reasons.join("; ")
+                    ),
+                );
             }
 
-            for tape_id in tape_ids {
+            for candidate in selection.tapes {
+                let tape_id = &candidate.tape_id;
                 if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
                     row.status = "cancelled".to_owned();
-                    row.reason =
-                        Some("query cancellation was observed before this tape".to_owned());
+                    append_coverage_reason(
+                        &mut row,
+                        "query cancellation was observed before this tape",
+                    );
                     break;
                 }
                 if deadline.is_some_and(|limit| Instant::now() >= limit) {
                     row.status = "budget_stop".to_owned();
-                    row.reason = Some(
-                        "existing explain query deadline expired during later-discussion scan"
-                            .to_owned(),
+                    append_coverage_reason(
+                        &mut row,
+                        "existing explain query deadline expired during later-discussion scan",
                     );
                     timed_out = true;
                     break;
                 }
                 if total_decompressed >= MAX_DECOMPRESSED_BYTES {
                     row.status = "budget_stop".to_owned();
-                    row.reason = Some(format!(
-                        "query decoded-byte budget reached {MAX_DECOMPRESSED_BYTES} bytes"
-                    ));
+                    append_coverage_reason(
+                        &mut row,
+                        &format!(
+                            "query decoded-byte budget reached {MAX_DECOMPRESSED_BYTES} bytes"
+                        ),
+                    );
                     break;
                 }
-                let path = tape_path_for_tapes_dir(&source.tapes_dir, &tape_id);
+                let path = tape_path_for_tapes_dir(&source.tapes_dir, tape_id);
                 if !path.is_file() {
                     row.status = "incomplete".to_owned();
-                    row.reason = Some(format!(
-                        "indexed tape {tape_id} is absent at {}",
-                        path.display()
-                    ));
+                    append_coverage_reason(
+                        &mut row,
+                        &format!("indexed tape {tape_id} is absent at {}", path.display()),
+                    );
                     continue;
                 }
                 let compressed_bytes = match fs::metadata(&path) {
                     Ok(metadata) => metadata.len(),
                     Err(error) => {
                         row.status = "incomplete".to_owned();
-                        row.reason = Some(format!("cannot stat tape {tape_id}: {error}"));
+                        append_coverage_reason(
+                            &mut row,
+                            &format!("cannot stat tape {tape_id}: {error}"),
+                        );
                         continue;
                     }
                 };
                 if total_compressed.saturating_add(compressed_bytes) > MAX_COMPRESSED_BYTES {
                     row.status = "budget_stop".to_owned();
-                    row.reason = Some(format!(
-                        "compressed-byte budget {MAX_COMPRESSED_BYTES} would be exceeded before tape {tape_id}"
-                    ));
+                    append_coverage_reason(
+                        &mut row,
+                        &format!(
+                            "compressed-byte budget {MAX_COMPRESSED_BYTES} would be exceeded before tape {tape_id}"
+                        ),
+                    );
                     break;
                 }
                 let file = match File::open(&path) {
                     Ok(file) => file,
                     Err(error) => {
                         row.status = "incomplete".to_owned();
-                        row.reason = Some(format!("cannot open tape {tape_id}: {error}"));
+                        append_coverage_reason(
+                            &mut row,
+                            &format!("cannot open tape {tape_id}: {error}"),
+                        );
                         continue;
                     }
                 };
@@ -352,7 +421,7 @@ pub fn collect(
                 match scan_one_tape(
                     file,
                     &source,
-                    &tape_id,
+                    tape_id,
                     &seeds,
                     &edits,
                     date_filter,
@@ -360,7 +429,7 @@ pub fn collect(
                     cancelled,
                     deadline,
                 ) {
-                    Ok(scan) => {
+                    Ok(mut scan) => {
                         row.tapes_scanned = row.tapes_scanned.saturating_add(1);
                         row.decompressed_bytes =
                             row.decompressed_bytes.saturating_add(scan.decoded_bytes);
@@ -374,10 +443,16 @@ pub fn collect(
                         row.skipped_content =
                             row.skipped_content.saturating_add(scan.skipped_content);
                         total_decompressed = total_decompressed.saturating_add(scan.decoded_bytes);
+                        for hit in &mut scan.hits {
+                            hit.candidate_selectors = candidate.selectors.iter().cloned().collect();
+                        }
                         all_hits.extend(scan.hits);
                         if let Some(issue) = scan.issue {
                             row.status = issue.status.to_owned();
-                            row.reason = Some(format!("tape {tape_id}: {}", issue.reason));
+                            append_coverage_reason(
+                                &mut row,
+                                &format!("tape {tape_id}: {}", issue.reason),
+                            );
                             if issue.status == "budget_stop" {
                                 break;
                             }
@@ -385,7 +460,10 @@ pub fn collect(
                     }
                     Err(issue) => {
                         row.status = issue.status.to_owned();
-                        row.reason = Some(format!("tape {tape_id}: {}", issue.reason));
+                        append_coverage_reason(
+                            &mut row,
+                            &format!("tape {tape_id}: {}", issue.reason),
+                        );
                         if issue.status == "budget_stop" {
                             break;
                         }
@@ -439,7 +517,7 @@ pub fn collect(
             db_path: String::new(),
             status: peer_status.to_owned(),
             operation: "later_discussion_content_scan",
-            tapes_total: 0,
+            candidate_tapes: 0,
             tapes_scanned: 0,
             compressed_bytes_opened: 0,
             decompressed_bytes: 0,
@@ -447,6 +525,7 @@ pub fn collect(
             candidate_messages: 0,
             matching_unknown_time: 0,
             skipped_content: 0,
+            selector_counts: BTreeMap::new(),
             reason: Some(reason),
         });
     }
@@ -525,6 +604,7 @@ pub fn collect(
             json!({
                 "text": seed.text,
                 "match": match (seed.reason, seed.mode) { ("repo_relative_file_path", SeedMode::Phrase) => "path_token_sequence", (_, SeedMode::Identifier) => "identifier_boundary", (_, SeedMode::Phrase) => "literal_phrase" },
+                "class": seed.class.as_str(),
                 "derived_from": seed.reason,
             })
         })
@@ -538,7 +618,7 @@ pub fn collect(
                 "index": if source.db_path.is_empty() { Value::Null } else { json!(source.db_path) },
                 "operation": source.operation,
                 "status": source.status,
-                "tapes_total": source.tapes_total,
+                "candidate_tapes": source.candidate_tapes,
                 "tapes_scanned": source.tapes_scanned,
                 "compressed_bytes_opened": source.compressed_bytes_opened,
                 "decompressed_bytes": source.decompressed_bytes,
@@ -546,6 +626,7 @@ pub fn collect(
                 "candidate_messages": source.candidate_messages,
                 "matching_unknown_time": source.matching_unknown_time,
                 "skipped_content": source.skipped_content,
+                "selector_counts": source.selector_counts,
                 "reason": source.reason,
             })
         })
@@ -604,9 +685,12 @@ pub fn collect(
             "status": if no_timestamped_edit_anchor { "not_applicable" } else if source_incomplete { "partial" } else { "complete" },
             "complete": !source_incomplete,
             "applicable": !no_timestamped_edit_anchor,
+            "search_scope": "bounded_index_selected_tapes",
+            "absence_claim": "no_matching_discussion_in_selected_tapes_only; unselected corpus tapes were not decoded",
             "not_applicable_reason": not_applicable_reason,
             "seeds": seeds_json,
             "sources": coverage_json,
+            "candidate_tapes": coverage.iter().map(|source| source.candidate_tapes).sum::<usize>(),
             "scanned_sources": coverage.iter().filter(|source| source.tapes_scanned > 0).count(),
             "scanned_tapes": coverage.iter().map(|source| source.tapes_scanned).sum::<usize>(),
             "candidate_messages": candidate_count,
@@ -621,7 +705,8 @@ pub fn collect(
                 "max_seeds": MAX_SEEDS,
                 "max_results": MAX_RESULTS,
                 "max_per_conversation": MAX_PER_CONVERSATION,
-                "max_tapes_per_source": MAX_TAPES_PER_SOURCE,
+                "max_candidate_tapes_per_source": MAX_CANDIDATE_TAPES_PER_SOURCE,
+                "max_task_context_rows_per_lookup": MAX_TASK_CONTEXT_ROWS_PER_LOOKUP,
                 "max_compressed_bytes": MAX_COMPRESSED_BYTES,
                 "max_decompressed_bytes": MAX_DECOMPRESSED_BYTES,
                 "max_decompressed_bytes_per_tape": MAX_DECOMPRESSED_BYTES_PER_TAPE,
@@ -670,6 +755,213 @@ fn query_store_paths(context: &RuntimeContext) -> Vec<(PathBuf, PathBuf)> {
         }
     }
     paths
+}
+
+fn append_coverage_reason(row: &mut SourceCoverage, reason: &str) {
+    match row.reason.as_mut() {
+        Some(existing) if !existing.is_empty() => {
+            existing.push_str("; ");
+            existing.push_str(reason);
+        }
+        Some(existing) => existing.push_str(reason),
+        None => row.reason = Some(reason.to_owned()),
+    }
+}
+
+fn task_context_kind_label(kind: TaskContextKind) -> &'static str {
+    match kind {
+        TaskContextKind::WorkItemCreate => "work_item_create",
+        TaskContextKind::AssignmentCreate => "assignment_create",
+        TaskContextKind::AssignmentDispatch => "assignment_dispatch",
+        TaskContextKind::AssignmentReceipt => "assignment_receipt",
+    }
+}
+
+fn task_id_kind_label(kind: TaskIdKind) -> &'static str {
+    match kind {
+        TaskIdKind::Assignment => "assignment",
+        TaskIdKind::WorkItem => "work_item",
+    }
+}
+
+fn add_candidate_tape(
+    candidates: &mut BTreeMap<String, CandidateTape>,
+    tape_id: &str,
+    priority: u8,
+    selector: CandidateSelector,
+) {
+    let candidate = candidates
+        .entry(tape_id.to_owned())
+        .or_insert_with(|| CandidateTape {
+            tape_id: tape_id.to_owned(),
+            priority,
+            selectors: BTreeSet::new(),
+        });
+    candidate.priority = candidate.priority.min(priority);
+    candidate.selectors.insert(selector);
+}
+
+fn select_candidate_tapes(
+    index: &SqliteIndex,
+    store: &str,
+    edits: &[EditAnchor],
+) -> Result<CandidateSelection, rusqlite::Error> {
+    let mut candidates = BTreeMap::<String, CandidateTape>::new();
+    let mut selection = CandidateSelection::default();
+
+    // Start only from selected structured edits. Read-only sessions that happen
+    // to share a lexical anchor are not later-discussion candidates by themselves.
+    for edit in edits.iter().filter(|edit| edit.store == store) {
+        add_candidate_tape(
+            &mut candidates,
+            &edit.tape_id,
+            0,
+            CandidateSelector {
+                relation: "selected_code_edit_anchor".to_owned(),
+                task_id_kind: None,
+                task_id: None,
+                event_kind: Some("code_edit".to_owned()),
+                from_tape_id: Some(edit.tape_id.clone()),
+                from_event_offset: Some(edit.event_offset),
+            },
+        );
+
+        let task_coverage = index.task_context_coverage_for_tape(&edit.tape_id)?;
+        if task_coverage.status != "indexed" {
+            selection.incomplete_reasons.push(format!(
+                "selected edit tape {} task-context coverage is {}",
+                edit.tape_id, task_coverage.status
+            ));
+            continue;
+        }
+
+        // Any exact task operation before the selected edit can carry an
+        // assignment or work-item key upstream. Receipts are one such event;
+        // a dispatch or creation on the edit tape is also a valid starting key.
+        let prior_events = index.task_context_events_for_tape_before_any(
+            &edit.tape_id,
+            edit.event_offset,
+            MAX_TASK_CONTEXT_ROWS_PER_LOOKUP,
+        )?;
+        if prior_events.len() >= MAX_TASK_CONTEXT_ROWS_PER_LOOKUP {
+            selection.budget_stop = true;
+            selection.incomplete_reasons.push(format!(
+                "pre-edit task-context events for tape {} reached the {}-row lookup cap",
+                edit.tape_id, MAX_TASK_CONTEXT_ROWS_PER_LOOKUP
+            ));
+        }
+
+        let mut assignment_ids = BTreeMap::<String, u64>::new();
+        let mut work_item_ids = BTreeMap::<String, u64>::new();
+        for event in prior_events {
+            if !event.task_id.is_empty() {
+                match event.task_id_kind {
+                    TaskIdKind::Assignment => {
+                        assignment_ids
+                            .entry(event.task_id.clone())
+                            .or_insert(event.event_offset);
+                    }
+                    TaskIdKind::WorkItem => {
+                        work_item_ids
+                            .entry(event.task_id.clone())
+                            .or_insert(event.event_offset);
+                    }
+                }
+            }
+            if let Some(work_item_id) = event.work_item_id.filter(|id| !id.is_empty()) {
+                work_item_ids
+                    .entry(work_item_id)
+                    .or_insert(event.event_offset);
+            }
+        }
+
+        for (assignment_id, parent_offset) in assignment_ids {
+            let operation_rows = index.task_context_events_for_id(
+                TaskIdKind::Assignment,
+                &assignment_id,
+                MAX_TASK_CONTEXT_ROWS_PER_LOOKUP,
+            )?;
+            if operation_rows.len() >= MAX_TASK_CONTEXT_ROWS_PER_LOOKUP {
+                selection.budget_stop = true;
+                selection.incomplete_reasons.push(format!(
+                    "assignment {assignment_id} event lookup reached the {}-row cap",
+                    MAX_TASK_CONTEXT_ROWS_PER_LOOKUP
+                ));
+            }
+            for (event_tape, event) in operation_rows {
+                if let Some(work_item_id) = event.work_item_id.as_deref() {
+                    work_item_ids
+                        .entry(work_item_id.to_owned())
+                        .or_insert(parent_offset);
+                }
+                add_candidate_tape(
+                    &mut candidates,
+                    &event_tape,
+                    1,
+                    CandidateSelector {
+                        relation: "indexed_assignment_id_event".to_owned(),
+                        task_id_kind: Some(task_id_kind_label(TaskIdKind::Assignment).to_owned()),
+                        task_id: Some(assignment_id.clone()),
+                        event_kind: Some(task_context_kind_label(event.kind).to_owned()),
+                        from_tape_id: Some(edit.tape_id.clone()),
+                        from_event_offset: Some(parent_offset),
+                    },
+                );
+            }
+        }
+
+        // A captured work-item ID is a second exact index key. Its bounded
+        // lookup can reach a create/dispatch conversation without decoding
+        // unrelated explain sessions or enumerating store tapes.
+        for (work_item_id, parent_offset) in work_item_ids {
+            let item_rows = index.task_context_events_by_work_item(
+                &work_item_id,
+                MAX_TASK_CONTEXT_ROWS_PER_LOOKUP,
+            )?;
+            if item_rows.len() >= MAX_TASK_CONTEXT_ROWS_PER_LOOKUP {
+                selection.budget_stop = true;
+                selection.incomplete_reasons.push(format!(
+                    "work item {work_item_id} event lookup reached the {}-row cap",
+                    MAX_TASK_CONTEXT_ROWS_PER_LOOKUP
+                ));
+            }
+            for (event_tape, event) in item_rows {
+                add_candidate_tape(
+                    &mut candidates,
+                    &event_tape,
+                    2,
+                    CandidateSelector {
+                        relation: "indexed_work_item_id_event".to_owned(),
+                        task_id_kind: Some(task_id_kind_label(TaskIdKind::WorkItem).to_owned()),
+                        task_id: Some(work_item_id.clone()),
+                        event_kind: Some(task_context_kind_label(event.kind).to_owned()),
+                        from_tape_id: Some(edit.tape_id.clone()),
+                        from_event_offset: Some(parent_offset),
+                    },
+                );
+            }
+        }
+    }
+
+    let mut candidates = candidates.into_values().collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| left.tape_id.cmp(&right.tape_id))
+    });
+    if candidates.len() > MAX_CANDIDATE_TAPES_PER_SOURCE {
+        selection.budget_stop = true;
+        selection.incomplete_reasons.push(format!(
+            "indexed candidate set has {} tapes; the per-source decode cap is {}",
+            candidates.len(),
+            MAX_CANDIDATE_TAPES_PER_SOURCE
+        ));
+        candidates.truncate(MAX_CANDIDATE_TAPES_PER_SOURCE);
+    }
+    selection.tapes = candidates;
+    selection.incomplete_reasons.sort();
+    selection.incomplete_reasons.dedup();
+    Ok(selection)
 }
 
 fn collect_edit_anchors(
@@ -1132,6 +1424,51 @@ fn meaningful_compound_identifier(value: &str) -> bool {
         >= 2
 }
 
+impl SeedClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Distinctive => "distinctive",
+            Self::Supporting => "supporting",
+        }
+    }
+}
+
+fn classify_seed(reason: &str, mode: SeedMode, text: &str) -> SeedClass {
+    match mode {
+        SeedMode::Identifier => {
+            let labeled_identifier = text.bytes().any(|byte| byte.is_ascii_alphabetic())
+                && text.bytes().any(|byte| byte.is_ascii_digit())
+                && text.bytes().take_while(u8::is_ascii_alphabetic).count() >= 2;
+            if meaningful_compound_identifier(text) || labeled_identifier {
+                SeedClass::Distinctive
+            } else {
+                SeedClass::Supporting
+            }
+        }
+        SeedMode::Phrase => {
+            let meaningful = text
+                .split_whitespace()
+                .filter(|word| word.len() >= 3 && !is_stop_word(word))
+                .count();
+            let distinctive = if reason == "repo_relative_file_path" {
+                meaningful >= 3
+            } else {
+                meaningful >= 4
+                    && text
+                        .split_whitespace()
+                        .filter(|word| word.len() >= 5 && !is_stop_word(word))
+                        .count()
+                        >= 2
+            };
+            if distinctive {
+                SeedClass::Distinctive
+            } else {
+                SeedClass::Supporting
+            }
+        }
+    }
+}
+
 fn push_seed(
     seeds: &mut Vec<Seed>,
     text: String,
@@ -1148,6 +1485,7 @@ fn push_seed(
         return;
     }
     seeds.push(Seed {
+        class: classify_seed(reason, mode, &text),
         text,
         mode,
         reason,
@@ -1213,11 +1551,20 @@ fn scan_one_tape<R: Read>(
         ) {
             Ok(bytes) => bytes,
             Err(error) if error.code == "over_limit" => {
+                let limit_detail = if record_limit < MAX_RECORD_BYTES {
+                    format!(
+                        "record exceeds remaining scan allowance of {record_limit} bytes; configured per-record maximum remains {MAX_RECORD_BYTES} bytes"
+                    )
+                } else {
+                    format!(
+                        "record exceeds configured per-record maximum of {MAX_RECORD_BYTES} bytes"
+                    )
+                };
                 issue = Some(ScanIssue {
                     status: "budget_stop",
                     reason: format!(
-                        "bounded JSONL read stopped at byte {}: {}",
-                        decoded_bytes, error.message
+                        "bounded JSONL read stopped at byte {} ({limit_detail}): {}",
+                        decoded_bytes, error.message,
                     ),
                 });
                 break;
@@ -1306,6 +1653,9 @@ fn scan_one_tape<R: Read>(
                 continue;
             }
             for seed in seeds {
+                if seed.class != SeedClass::Distinctive {
+                    continue;
+                }
                 let Some(match_at) = find_seed(segment, seed) else {
                     continue;
                 };
@@ -1388,6 +1738,7 @@ fn scan_one_tape<R: Read>(
             content_fingerprint: normalized_content_fingerprint(&matched_segment),
             repeat_occurrences: Vec::new(),
             repeat_occurrences_omitted: 0,
+            candidate_selectors: Vec::new(),
         };
         candidate_messages = candidate_messages.saturating_add(1);
         keep_best_per_tape(&mut hits, hit);
@@ -1406,6 +1757,7 @@ fn scan_one_tape<R: Read>(
 fn best_seed_for_edit_event(event: &Value, seeds: &[Seed]) -> Option<Seed> {
     seeds
         .iter()
+        .filter(|seed| seed.class == SeedClass::Distinctive)
         .filter(|seed| {
             ["file", "after_text", "before_text", "note"]
                 .iter()
@@ -1861,17 +2213,32 @@ fn snippet_around(text: &str, match_at: usize, match_len: usize, limit: usize) -
         .saturating_add(match_len)
         .saturating_add(limit * 2 / 3)
         .min(text.len());
-    let start = text
+    let raw_start = text
         .char_indices()
         .map(|(index, _)| index)
         .take_while(|index| *index < start_target)
         .last()
         .unwrap_or(0);
-    let end = text
+    let raw_end = text
         .char_indices()
         .map(|(index, _)| index)
         .find(|index| *index >= end_target)
         .unwrap_or(text.len());
+    let sentence_start = text
+        .char_indices()
+        .take_while(|(index, _)| *index < match_at)
+        .filter_map(|(index, character)| sentence_boundary_end(text, index, character))
+        .last();
+    let sentence_end = text
+        .char_indices()
+        .filter(|(index, _)| *index >= match_at.saturating_add(match_len))
+        .filter_map(|(index, character)| sentence_boundary_end(text, index, character))
+        .take_while(|end| *end <= end_target)
+        .last();
+    let (start, end) = match (sentence_start, sentence_end) {
+        (Some(start), Some(end)) if end.saturating_sub(start) <= limit => (start, end),
+        _ => (raw_start, raw_end),
+    };
     let mut snippet = text[start..end].trim().to_owned();
     let clipped = start > 0 || end < text.len();
     if clipped && start > 0 {
@@ -1886,6 +2253,19 @@ fn snippet_around(text: &str, match_at: usize, match_len: usize, limit: usize) -
         return (snippet, true);
     }
     (snippet, clipped)
+}
+
+fn sentence_boundary_end(text: &str, index: usize, character: char) -> Option<usize> {
+    if !matches!(character, '.' | '!' | '?' | '\n') {
+        return None;
+    }
+    let after = index + character.len_utf8();
+    let next = text[after..].chars().find(|next| !next.is_whitespace());
+    if next.is_none_or(|next| next.is_uppercase() || next.is_ascii_digit() || next == '(') {
+        Some(after)
+    } else {
+        None
+    }
 }
 
 fn normalized_content_fingerprint(text: &str) -> String {
@@ -1923,9 +2303,11 @@ fn hit_to_json(hit: &Hit) -> Value {
             "attribution": hit.attribution,
             "quote_status": hit.quote_status,
             "matched_seed": hit.seed.text,
+            "matched_seed_class": hit.seed.class.as_str(),
             "seed_source": hit.seed.reason,
             "snippet": hit.snippet,
             "clipped": hit.clipped,
+            "candidate_selectors": hit.candidate_selectors.iter().map(candidate_selector_to_json).collect::<Vec<_>>(),
         },
         "next_lookup": {
             "command": "engram peek",
@@ -1939,6 +2321,17 @@ fn hit_to_json(hit: &Hit) -> Value {
         "repeat_occurrences": hit.repeat_occurrences,
         "repeat_occurrences_omitted": hit.repeat_occurrences_omitted,
         "repeat_occurrences_omitted_reason": if hit.repeat_occurrences_omitted > 0 { json!(format!("repeat-reference output capped at {MAX_REPEAT_OCCURRENCES}; no shared source identity is asserted")) } else { Value::Null },
+    })
+}
+
+fn candidate_selector_to_json(selector: &CandidateSelector) -> Value {
+    json!({
+        "relation": selector.relation,
+        "task_id_kind": selector.task_id_kind,
+        "task_id": selector.task_id,
+        "event_kind": selector.event_kind,
+        "from_tape_id": selector.from_tape_id,
+        "from_event_offset": selector.from_event_offset,
     })
 }
 
@@ -1958,6 +2351,7 @@ fn repeat_occurrence_to_json(hit: &Hit) -> Value {
         "observed_speaker": hit.observed_speaker,
         "attribution": hit.attribution,
         "quote_status": hit.quote_status,
+        "candidate_selectors": hit.candidate_selectors.iter().map(candidate_selector_to_json).collect::<Vec<_>>(),
         "edit_reference": {
             "machine": hit.edit.machine,
             "store": hit.edit.store,
@@ -1990,6 +2384,7 @@ mod tests {
         Seed {
             text: text.to_owned(),
             mode,
+            class: SeedClass::Distinctive,
             reason: "test fixture",
             specificity: 10,
         }
@@ -2030,6 +2425,7 @@ mod tests {
         let seed = Seed {
             text,
             mode: SeedMode::Phrase,
+            class: SeedClass::Distinctive,
             reason: "repo_relative_file_path",
             specificity: 120,
         };
@@ -2040,6 +2436,165 @@ mod tests {
         );
         assert_eq!(find_seed("rest detail routes failed", &seed), Some(0));
         assert_eq!(meaningful_path_phrase("lib/tightbeam/gateway.ex"), None);
+    }
+
+    #[test]
+    fn two_word_basename_is_support_only_but_three_word_path_phrase_can_qualify() {
+        let mut seeds = Vec::new();
+        push_seed(
+            &mut seeds,
+            "gateway ex".to_owned(),
+            SeedMode::Phrase,
+            "repo_relative_file_path",
+            120,
+        );
+        push_seed(
+            &mut seeds,
+            "rest detail routes".to_owned(),
+            SeedMode::Phrase,
+            "repo_relative_file_path",
+            120,
+        );
+        assert_eq!(seeds[0].class, SeedClass::Supporting);
+        assert_eq!(seeds[1].class, SeedClass::Distinctive);
+    }
+
+    #[test]
+    fn exact_task_context_ids_select_dispatch_tape_without_enumerating_unrelated_tapes() {
+        let index = SqliteIndex::open_in_memory().unwrap();
+        let assignment_id = "asg_12345678-1234-1234-1234-1234567890ab";
+        let work_item_id = "wi_12345678-1234-1234-1234-1234567890ab";
+        let receipt = crate::index::TaskContextEvent {
+            event_identity: "assignment-envelope:4".to_owned(),
+            event_offset: 4,
+            result_offset: None,
+            kind: TaskContextKind::AssignmentReceipt,
+            task_id_kind: TaskIdKind::Assignment,
+            task_id: assignment_id.to_owned(),
+            work_item_id: None,
+            actor_session: None,
+            recipient_session: Some("agent:coder s_receiver".to_owned()),
+            timestamp: "2026-10-01T00:00:05Z".to_owned(),
+            event_timestamp: "2026-10-01T00:00:05Z".to_owned(),
+        };
+        let dispatch = crate::index::TaskContextEvent {
+            event_identity: "dispatch-call".to_owned(),
+            event_offset: 20,
+            result_offset: Some(21),
+            kind: TaskContextKind::AssignmentDispatch,
+            task_id_kind: TaskIdKind::Assignment,
+            task_id: assignment_id.to_owned(),
+            work_item_id: Some(work_item_id.to_owned()),
+            actor_session: Some("agent:main s_sender".to_owned()),
+            recipient_session: Some("agent:coder s_receiver".to_owned()),
+            timestamp: "2026-10-01T00:00:04Z".to_owned(),
+            event_timestamp: "2026-10-01T00:00:03Z".to_owned(),
+        };
+        index
+            .ingest_tape_events_with_context("writer-tape", &[], &[], &[receipt], 0.5)
+            .unwrap();
+        index
+            .ingest_tape_events_with_context("sender-tape", &[], &[], &[dispatch], 0.5)
+            .unwrap();
+        index
+            .ingest_tape_events("unrelated-tape", &[], 0.5)
+            .unwrap();
+
+        let edit = EditAnchor {
+            machine: "local".to_owned(),
+            store: "test-store".to_owned(),
+            tape_id: "writer-tape".to_owned(),
+            event_offset: 10,
+            file_path: "src/lib.rs".to_owned(),
+            timestamp: "2026-10-01T00:00:06Z".to_owned(),
+            selection_seed: seed("rank_span", SeedMode::Identifier),
+        };
+        let selected = select_candidate_tapes(&index, "test-store", &[edit]).unwrap();
+        let sender = selected
+            .tapes
+            .iter()
+            .find(|candidate| candidate.tape_id == "sender-tape")
+            .expect("the exact indexed dispatch ID selects its sender tape");
+        assert!(sender.selectors.iter().any(|selector| {
+            selector.relation == "indexed_assignment_id_event"
+                && selector.task_id.as_deref() == Some(assignment_id)
+                && selector.event_kind.as_deref() == Some("assignment_dispatch")
+        }));
+        assert!(selected
+            .tapes
+            .iter()
+            .all(|candidate| candidate.tape_id != "unrelated-tape"));
+        assert!(selected.incomplete_reasons.is_empty());
+    }
+
+    #[test]
+    fn pre_edit_dispatch_selects_exact_assignment_parent_without_a_receipt() {
+        let index = SqliteIndex::open_in_memory().unwrap();
+        let assignment_id = "asg_87654321-1234-1234-1234-1234567890ab";
+        let work_item_id = "wi_87654321-1234-1234-1234-1234567890ab";
+        let dispatch = crate::index::TaskContextEvent {
+            event_identity: "pre-edit-dispatch".to_owned(),
+            event_offset: 4,
+            result_offset: Some(5),
+            kind: TaskContextKind::AssignmentDispatch,
+            task_id_kind: TaskIdKind::Assignment,
+            task_id: assignment_id.to_owned(),
+            work_item_id: Some(work_item_id.to_owned()),
+            actor_session: Some("agent:main s_sender".to_owned()),
+            recipient_session: Some("agent:coder s_receiver".to_owned()),
+            timestamp: "2026-10-01T00:00:04Z".to_owned(),
+            event_timestamp: "2026-10-01T00:00:03Z".to_owned(),
+        };
+        let creation = crate::index::TaskContextEvent {
+            event_identity: "assignment-create".to_owned(),
+            event_offset: 2,
+            result_offset: Some(3),
+            kind: TaskContextKind::AssignmentCreate,
+            task_id_kind: TaskIdKind::Assignment,
+            task_id: assignment_id.to_owned(),
+            work_item_id: Some(work_item_id.to_owned()),
+            actor_session: Some("agent:main s_sender".to_owned()),
+            recipient_session: Some("agent:coder s_receiver".to_owned()),
+            timestamp: "2026-10-01T00:00:02Z".to_owned(),
+            event_timestamp: "2026-10-01T00:00:01Z".to_owned(),
+        };
+        index
+            .ingest_tape_events_with_context("edited-tape", &[], &[], &[dispatch], 0.5)
+            .unwrap();
+        index
+            .ingest_tape_events_with_context("creation-tape", &[], &[], &[creation], 0.5)
+            .unwrap();
+        index
+            .ingest_tape_events("unrelated-explain-session", &[], 0.5)
+            .unwrap();
+
+        let edit = EditAnchor {
+            machine: "local".to_owned(),
+            store: "test-store".to_owned(),
+            tape_id: "edited-tape".to_owned(),
+            event_offset: 10,
+            file_path: "src/lib.rs".to_owned(),
+            timestamp: "2026-10-01T00:00:06Z".to_owned(),
+            selection_seed: seed("rank_span", SeedMode::Identifier),
+        };
+        let selected = select_candidate_tapes(&index, "test-store", &[edit]).unwrap();
+        let parent = selected
+            .tapes
+            .iter()
+            .find(|candidate| candidate.tape_id == "creation-tape")
+            .expect("a prior dispatch ID selects its exact creation tape");
+        assert!(parent.selectors.iter().any(|selector| {
+            selector.relation == "indexed_assignment_id_event"
+                && selector.task_id.as_deref() == Some(assignment_id)
+                && selector.event_kind.as_deref() == Some("assignment_create")
+                && selector.from_tape_id.as_deref() == Some("edited-tape")
+                && selector.from_event_offset == Some(4)
+        }));
+        assert!(selected
+            .tapes
+            .iter()
+            .all(|candidate| candidate.tape_id != "unrelated-explain-session"));
+        assert!(selected.incomplete_reasons.is_empty());
     }
 
     #[test]
@@ -2167,11 +2722,9 @@ mod tests {
             &span,
             &[],
         );
-        assert!(
-            seeds
-                .iter()
-                .any(|seed| seed.text == "retire_intent_wake_id")
-        );
+        assert!(seeds
+            .iter()
+            .any(|seed| seed.text == "retire_intent_wake_id"));
         assert!(!seeds.iter().any(|seed| {
             matches!(
                 seed.text.as_str(),
@@ -2202,11 +2755,9 @@ mod tests {
             &span,
             &sessions,
         );
-        assert!(
-            seeds
-                .iter()
-                .any(|seed| seed.text == "foo bar" && seed.reason == "repo_relative_file_path")
-        );
+        assert!(seeds
+            .iter()
+            .any(|seed| seed.text == "foo bar" && seed.reason == "repo_relative_file_path"));
         assert!(seeds.iter().all(|seed| {
             matches!(
                 seed.reason,
@@ -2419,6 +2970,22 @@ mod tests {
     }
 
     #[test]
+    fn snippet_keeps_the_relevant_decision_passage_without_following_policy_text() {
+        let text = "A different route was considered first. (2) Nobody asked for a timing side-channel proof on the REST detail routes; that test broke main and stopped EVERY LANE for twelve hours. It is being deleted. Mike had already killed that idea once. SPECIFICALLY BANNED without a Mike ruling: security or hardening work beyond the deployment model. Additional unrelated explanation continues here.";
+        let at = text.find("REST detail routes").unwrap();
+        let (snippet, clipped) = snippet_around(text, at, "REST detail routes".len(), 260);
+
+        assert!(snippet
+            .strip_prefix('…')
+            .unwrap_or(&snippet)
+            .starts_with("(2) Nobody asked for a timing side-channel proof"));
+        assert!(snippet.contains("It is being deleted. Mike had already killed that idea once."));
+        assert!(!snippet.contains("SPECIFICALLY BANNED"));
+        assert!(snippet.contains("REST detail routes"));
+        assert!(clipped);
+    }
+
+    #[test]
     fn bounded_record_limit_is_reported_without_unbounded_read() {
         let bytes = b"{\"k\":\"msg.in\",\"content\":\"too long\"}\n";
         let mut reader = BufReader::new(Cursor::new(bytes));
@@ -2426,6 +2993,45 @@ mod tests {
         let error = read_grep_record(&mut reader, &mut line, Some(4), 1, 0).unwrap_err();
         assert_eq!(error.code, "over_limit");
         assert!(line.len() <= 4);
+    }
+
+    #[test]
+    fn remaining_scan_allowance_is_distinguished_from_per_record_maximum() {
+        let source = Source {
+            machine: "test-machine".to_owned(),
+            store: "test-store".to_owned(),
+            db_path: PathBuf::from("/tmp/test/index.sqlite"),
+            tapes_dir: PathBuf::from("/tmp/test/tapes"),
+        };
+        let edit = EditAnchor {
+            machine: source.machine.clone(),
+            store: source.store.clone(),
+            tape_id: "edit-tape".to_owned(),
+            event_offset: 1,
+            file_path: "src/example.rs".to_owned(),
+            timestamp: "2026-10-01T00:00:00Z".to_owned(),
+            selection_seed: seed("example_function", SeedMode::Identifier),
+        };
+        let compressed =
+            zstd::stream::encode_all(b"{\"k\":\"msg.in\",\"content\":\"long\"}\n".as_slice(), 0)
+                .unwrap();
+        let scan = scan_one_tape(
+            Cursor::new(compressed),
+            &source,
+            "discussion-tape",
+            &[seed("example_function", SeedMode::Identifier)],
+            &[edit],
+            &DateFilter::parse(None, None).unwrap(),
+            5,
+            None,
+            None,
+        )
+        .unwrap();
+        let reason = scan.issue.unwrap().reason;
+        assert!(reason.contains("remaining scan allowance of 5 bytes"));
+        assert!(reason.contains(&format!(
+            "per-record maximum remains {MAX_RECORD_BYTES} bytes"
+        )));
     }
 
     #[test]

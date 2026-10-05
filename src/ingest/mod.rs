@@ -807,6 +807,7 @@ pub fn record_transcript(
 ) -> Result<(), CliError> {
     let events = parse_jsonl_events(transcript)?;
     let dispatch_links = extract_dispatch_links_from_transcript(transcript);
+    let task_context_events = extract_task_context_events(transcript);
     let tape_id = tape_id_for_contents(transcript);
     let tape_path = tape_path_for_id(paths, &tape_id);
     let tape_file_exists = tape_path.exists();
@@ -831,10 +832,11 @@ pub fn record_transcript(
     let already_indexed = index.has_tape(&tape_id)?;
 
     if !already_indexed {
-        index.ingest_tape_events_with_dispatch(
+        index.ingest_tape_events_with_context(
             &tape_id,
             &events,
             &dispatch_links,
+            &task_context_events,
             LINK_THRESHOLD_DEFAULT,
         )?;
     }
