@@ -178,6 +178,43 @@ fn real_layout_openclaw_discovery_and_import_validation() {
 }
 
 #[test]
+fn real_layout_pi_discovery_and_import_validation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    let wrong_repo = temp.path().join("wrong-repo");
+    fs::create_dir_all(&repo).expect("repo");
+    fs::create_dir_all(&wrong_repo).expect("wrong repo");
+
+    let project_key = canonical_text(&repo)
+        .trim_start_matches(|character| character == '/' || character == '\\')
+        .replace('/', "-")
+        .replace('\\', "-")
+        .replace(':', "-");
+    let transcript = home
+        .join(".pi/agent/sessions")
+        .join(format!("--{project_key}--"))
+        .join("session.jsonl");
+    let wrong_key = canonical_text(&wrong_repo)
+        .trim_start_matches(|character| character == '/' || character == '\\')
+        .replace('/', "-")
+        .replace('\\', "-")
+        .replace(':', "-");
+    let noise = home
+        .join(".pi/agent/sessions")
+        .join(format!("--{wrong_key}--"))
+        .join("noise.jsonl");
+    write_fixture(&transcript, include_str!("fixtures/pi/session-v3.jsonl"));
+    write_fixture(&noise, include_str!("fixtures/pi/session-v3.jsonl"));
+
+    let discovered = discover_sessions_with_adapter(AdapterId::Pi, &repo, &home);
+    assert_eq!(discovered, vec![transcript.clone()]);
+    let negative = discover_sessions_with_adapter(AdapterId::Pi, &wrong_repo, &home);
+    assert_eq!(negative, vec![noise.clone()]);
+    assert_importable_with_adapter(AdapterId::Pi, &transcript);
+}
+
+#[test]
 fn real_layout_opencode_discovery_and_import_validation() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");

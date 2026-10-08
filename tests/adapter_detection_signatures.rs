@@ -50,6 +50,7 @@ fn every_adapter_has_a_positive_structural_signature() {
             AdapterId::OpenClaw,
             "tests/fixtures/openclaw/session_log.jsonl",
         ),
+        (AdapterId::Pi, "tests/fixtures/pi/session-v3.jsonl"),
     ];
 
     for (adapter, path) in fixtures {
@@ -60,6 +61,14 @@ fn every_adapter_has_a_positive_structural_signature() {
             adapter.as_str()
         );
     }
+}
+
+#[test]
+fn pi_signature_does_not_claim_openclaw_session_shape() {
+    let openclaw = fs::read_to_string("tests/fixtures/openclaw/session_log.jsonl")
+        .expect("OpenClaw fixture should load");
+
+    assert!(!adapter_claims_input(AdapterId::Pi, &openclaw));
 }
 
 #[test]
@@ -76,6 +85,7 @@ fn foreign_jsonl_has_no_positive_adapter_claims() {
         AdapterId::GeminiCli,
         AdapterId::Cursor,
         AdapterId::OpenClaw,
+        AdapterId::Pi,
     ] {
         assert!(
             !adapter_claims_input(adapter, input),

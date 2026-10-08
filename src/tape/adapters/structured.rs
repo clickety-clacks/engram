@@ -177,6 +177,10 @@ fn has_windows_drive_prefix(path: &str) -> bool {
     bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
+pub(crate) fn resolve_transcript_path(path: &str, cwd: Option<&str>) -> String {
+    shell_path(path, None, cwd)
+}
+
 fn shell_path(path: &str, workdir: Option<&str>, cwd: Option<&str>) -> String {
     let joined = if is_absolute_path(path) {
         path.to_owned()

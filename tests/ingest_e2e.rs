@@ -546,6 +546,110 @@ fn ingest_discovers_codex_sessions_for_repo_via_adapter_hook() {
 }
 
 #[test]
+fn ingest_discovers_pi_sessions_for_repo_via_adapter_hook() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo");
+    let repo_text = fs::canonicalize(&repo)
+        .expect("canonical repo")
+        .to_string_lossy()
+        .into_owned();
+    let project_key = repo_text
+        .trim_start_matches(|character| character == '/' || character == '\\')
+        .replace('/', "-")
+        .replace('\\', "-")
+        .replace(':', "-");
+    let pi_root = home
+        .join(".pi/agent/sessions")
+        .join(format!("--{project_key}--"));
+    fs::create_dir_all(&pi_root).expect("Pi session directory");
+
+    let session = include_str!("fixtures/pi/session-v3.jsonl")
+        .lines()
+        .map(|line| {
+            let mut row: Value = serde_json::from_str(line).expect("Pi fixture row");
+            if row["type"] == "session" {
+                row["cwd"] = serde_json::json!(repo_text);
+            }
+            row.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(pi_root.join("session.jsonl"), format!("{session}\n")).expect("Pi session");
+
+    let ingest = run_json(&repo, &["ingest"], None, &home);
+    assert_eq!(ingest["status"], "ok");
+    assert_eq!(ingest["imported_tapes"], 1);
+    assert!(ingest["scanned_inputs"].as_u64().unwrap_or(0) >= 1);
+
+    let call = serde_json::json!({
+        "type": "message",
+        "id": "next-assistant",
+        "parentId": "bash-1",
+        "timestamp": "2026-10-08T10:00:07.000Z",
+        "message": {
+            "role": "assistant",
+            "content": [{
+                "type": "toolCall",
+                "id": "read-next",
+                "name": "read",
+                "arguments": {"path": "src/lib.rs", "offset": 0, "limit": 1}
+            }],
+            "provider": "openai",
+            "model": "gpt-5",
+            "timestamp": 1791453607000_i64
+        }
+    });
+    fs::OpenOptions::new()
+        .append(true)
+        .open(pi_root.join("session.jsonl"))
+        .expect("open Pi session")
+        .write_all(format!("{}\n", call).as_bytes())
+        .expect("append Pi tool call");
+    let call_ingest = run_json(&repo, &["ingest"], None, &home);
+    assert_eq!(call_ingest["imported_tapes"], 1);
+
+    let result = serde_json::json!({
+        "type": "message",
+        "id": "next-result",
+        "parentId": "next-assistant",
+        "timestamp": "2026-10-08T10:00:08.000Z",
+        "message": {
+            "role": "toolResult",
+            "toolCallId": "read-next",
+            "toolName": "read",
+            "content": [{"type": "text", "text": "fn incremental() {}"}],
+            "isError": false,
+            "timestamp": 1791453608000_i64
+        }
+    });
+    fs::OpenOptions::new()
+        .append(true)
+        .open(pi_root.join("session.jsonl"))
+        .expect("open Pi session")
+        .write_all(format!("{}\n", result).as_bytes())
+        .expect("append Pi tool result");
+    let result_ingest = run_json(&repo, &["ingest"], None, &home);
+    assert_eq!(result_ingest["imported_tapes"], 1);
+
+    let source = pi_root.join("session.jsonl");
+    let cursor: Value = serde_json::from_str(
+        &fs::read_to_string(cursor_state_path(&repo, &source)).expect("Pi cursor state"),
+    )
+    .expect("Pi cursor JSON");
+    let tape_id = cursor["tape_id"].as_str().expect("tape id");
+    let compressed =
+        fs::read(home.join(format!(".engram/tapes/{tape_id}.jsonl.zst"))).expect("Pi result tape");
+    let normalized = String::from_utf8(
+        zstd::stream::decode_all(compressed.as_slice()).expect("decompress Pi tape"),
+    )
+    .expect("Pi tape text");
+    assert!(normalized.contains(r#""k":"code.read""#));
+    assert!(normalized.contains(r#""session_id":"pi-session-1""#));
+}
+
+#[test]
 fn ingest_emits_edit_winnow_evidence_that_explain_can_query() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("home");
