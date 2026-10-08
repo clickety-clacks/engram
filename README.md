@@ -34,6 +34,12 @@ engram ingest
 engram explain src/auth.rs:40-78
 ```
 
+`engram ingest` also discovers Pi's default session JSONL for the current
+workspace under `~/.pi/agent/sessions/`. Pi's adapter records message and tool
+events and emits structured file evidence where the tool arguments and results
+provide it. It does not reconstruct Pi's active branch, so alternate branches
+in a session file may also be indexed. See [the Pi adapter spec](specs/adapters/pi.md).
+
 ### Continuous ingest (recommended)
 
 ```bash

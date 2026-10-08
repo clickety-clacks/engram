@@ -10,6 +10,7 @@ use walkdir::WalkDir;
 use super::adapters::{
     claude_jsonl_to_tape_jsonl, codex_jsonl_to_tape_jsonl, cursor_jsonl_to_tape_jsonl,
     gemini_json_to_tape_jsonl, openclaw_jsonl_to_tape_jsonl, opencode_json_to_tape_jsonl,
+    pi_jsonl_to_tape_jsonl,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -20,6 +21,7 @@ pub enum AdapterId {
     GeminiCli,
     Cursor,
     OpenClaw,
+    Pi,
 }
 
 impl AdapterId {
@@ -31,6 +33,7 @@ impl AdapterId {
             Self::GeminiCli => "gemini-cli",
             Self::Cursor => "cursor",
             Self::OpenClaw => "openclaw",
+            Self::Pi => "pi",
         }
     }
 }
@@ -271,6 +274,46 @@ pub fn adapter_registry() -> &'static [AdapterDescriptor] {
                 read: CoverageGrade::Partial,
                 edit: CoverageGrade::Partial,
                 tool: CoverageGrade::Partial,
+            },
+        },
+        AdapterDescriptor {
+            id: AdapterId::Pi,
+            status: AdapterStatus::Implemented,
+            artifact_path_templates: &[
+                "~/.pi/agent/sessions/--<cwd-with-path-separators-replaced>--/*.jsonl",
+            ],
+            schema_sample_set: &["pi-session-jsonl-v1-v3"],
+            mapping_table: &[
+                MappingRule {
+                    source: "session header (id, cwd) and model changes",
+                    target: "meta",
+                    note: "session identity, workspace, provider, and model",
+                },
+                MappingRule {
+                    source: "message.role=user/assistant and text blocks",
+                    target: "msg.in|msg.out",
+                    note: "user string content is normalized to a text block",
+                },
+                MappingRule {
+                    source: "assistant.content[type=toolCall]",
+                    target: "tool.call",
+                    note: "paired with toolResult by toolCallId",
+                },
+                MappingRule {
+                    source: "message.role=toolResult|bashExecution",
+                    target: "tool.result",
+                    note: "bashExecution is normalized as a paired bash call/result",
+                },
+                MappingRule {
+                    source: "read/edit/write tool arguments and successful results",
+                    target: "code.read|code.edit",
+                    note: "structured evidence when file details are present",
+                },
+            ],
+            coverage: CoverageGrades {
+                read: CoverageGrade::Partial,
+                edit: CoverageGrade::Partial,
+                tool: CoverageGrade::Full,
             },
         },
         AdapterDescriptor {
@@ -577,6 +620,21 @@ fn discover_openclaw_sessions(repo_path: &Path, home_dir: &Path) -> Vec<PathBuf>
         }
     }
     sorted_unique(out)
+}
+
+fn discover_pi_sessions(repo_path: &Path, home_dir: &Path) -> Vec<PathBuf> {
+    let repo_text = canonicalize_or_normalize(repo_path)
+        .to_string_lossy()
+        .into_owned();
+    let project_key = repo_text
+        .trim_start_matches(|character| character == '/' || character == '\\')
+        .replace('/', "-")
+        .replace('\\', "-")
+        .replace(':', "-");
+    let project_dir = home_dir
+        .join(".pi/agent/sessions")
+        .join(format!("--{project_key}--"));
+    list_files_by_extension_recursive(&project_dir, "jsonl")
 }
 
 fn opencode_data_root(home_dir: &Path) -> PathBuf {
@@ -1051,6 +1109,33 @@ impl HarnessAdapter for OpenClawAdapter {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct PiAdapter;
+
+impl HarnessAdapter for PiAdapter {
+    fn adapter_id(&self) -> AdapterId {
+        AdapterId::Pi
+    }
+
+    fn claims_input(&self, input: &str) -> bool {
+        jsonl_has_matching_row(input, |row| {
+            row.get("type").and_then(Value::as_str) == Some("session")
+                && row.get("version").and_then(Value::as_u64).is_some()
+                && row.get("id").and_then(Value::as_str).is_some()
+                && row.get("cwd").and_then(Value::as_str).is_some()
+        })
+        .unwrap_or(false)
+    }
+
+    fn discover_sessions_for_repo(&self, repo_path: &Path, home_dir: &Path) -> Vec<PathBuf> {
+        discover_pi_sessions(repo_path, home_dir)
+    }
+
+    fn convert_to_tape_jsonl(&self, input: &str) -> Result<String, AdapterError> {
+        Ok(pi_jsonl_to_tape_jsonl(input)?)
+    }
+}
+
 pub fn convert_with_adapter(id: AdapterId, input: &str) -> Result<String, AdapterError> {
     match id {
         AdapterId::ClaudeCode => ClaudeCodeAdapter.convert_to_tape_jsonl(input),
@@ -1059,6 +1144,7 @@ pub fn convert_with_adapter(id: AdapterId, input: &str) -> Result<String, Adapte
         AdapterId::Cursor => CursorAdapter.convert_to_tape_jsonl(input),
         AdapterId::GeminiCli => GeminiCliAdapter.convert_to_tape_jsonl(input),
         AdapterId::OpenClaw => OpenClawAdapter.convert_to_tape_jsonl(input),
+        AdapterId::Pi => PiAdapter.convert_to_tape_jsonl(input),
     }
 }
 
@@ -1070,6 +1156,7 @@ pub fn adapter_claims_input(id: AdapterId, input: &str) -> bool {
         AdapterId::Cursor => CursorAdapter.claims_input(input),
         AdapterId::GeminiCli => GeminiCliAdapter.claims_input(input),
         AdapterId::OpenClaw => OpenClawAdapter.claims_input(input),
+        AdapterId::Pi => PiAdapter.claims_input(input),
     }
 }
 
@@ -1101,6 +1188,7 @@ pub fn discover_sessions_with_adapter(
         AdapterId::Cursor => CursorAdapter.discover_sessions_for_repo(repo_path, home_dir),
         AdapterId::GeminiCli => GeminiCliAdapter.discover_sessions_for_repo(repo_path, home_dir),
         AdapterId::OpenClaw => OpenClawAdapter.discover_sessions_for_repo(repo_path, home_dir),
+        AdapterId::Pi => PiAdapter.discover_sessions_for_repo(repo_path, home_dir),
     }
 }
 
@@ -1474,6 +1562,15 @@ mod tests {
         assert!(!openclaw.artifact_path_templates.is_empty());
         assert!(!openclaw.schema_sample_set.is_empty());
         assert!(!openclaw.mapping_table.is_empty());
+
+        let pi = descriptor_for(AdapterId::Pi);
+        assert_eq!(pi.status, AdapterStatus::Implemented);
+        assert_eq!(pi.coverage.tool, CoverageGrade::Full);
+        assert_eq!(pi.coverage.read, CoverageGrade::Partial);
+        assert_eq!(pi.coverage.edit, CoverageGrade::Partial);
+        assert!(!pi.artifact_path_templates.is_empty());
+        assert!(!pi.schema_sample_set.is_empty());
+        assert!(!pi.mapping_table.is_empty());
     }
 
     #[test]
@@ -1692,7 +1789,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_known_adapters() {
-        assert_eq!(adapter_registry().len(), 6);
+        assert_eq!(adapter_registry().len(), 7);
     }
 
     #[test]
