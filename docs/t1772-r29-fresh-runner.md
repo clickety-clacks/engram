@@ -359,8 +359,9 @@ not performance, concurrency correctness, macOS behavior, or proof completion.
 14,369 oracle, canonical bytes, path confinement, and Darwin signal number.
 The runtime writes `runner/test-definitions.json` with the larger P0 checks and
 records every observed result in hash-bound canonical evidence. Repository gates
-remain `cargo fmt --check`, `cargo test --all-targets`, and the release build;
-the task-specific authority now permits focused Gibson checks in isolation.
+remain `cargo test --all-targets` and the release build. Formatting is not a
+business-logic or T1772 specification test; the task-specific authority now
+permits focused Gibson checks in isolation.
 The previously accepted full Racter suite is not repeated for host parity.
 
 ## Correction after independent b7a1aa5 review
