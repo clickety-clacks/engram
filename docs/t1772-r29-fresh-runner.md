@@ -349,19 +349,28 @@ files or allocations entirely between samples. The telemetry amendment permits
 only a qualified zero-observed claim; even zero probe counters do not close those
 blind spots. Collector errors remain missing evidence and fail the gate.
 
-Product acceptance must name the specified behavior demonstrated by each result:
-index cardinality, retained provenance and history, query and concurrency
-correctness, and measured storage and latency outcomes. Hostnames, machine IDs,
-and incidental runner state are not product criteria. Execution remains a
-separate safeguard requiring explicit host-specific authority and evidence for
-the controller's Darwin `csops(CS_OPS_STATUS)` and APFS-clone dependencies, exact
-frozen source/corpus/input/candidate identity, isolation from production stores
-and services with no conflicting workload, adequate bounded capacity, and
-effective stop/one-use controls. The exact Eezo invocation below remains this
-run's admitted profile; any future route change requires fresh source, build,
-input, proof-path, and custody bindings and resolution by the brief's owner of
-its named-route language. This wording grants no host access, source placement,
-execution, or live-system authority. A Gibson compilation proves type/link
+Apply Mike's rule: “from now on if a test of a gate tests something that ISN’T
+business logic, you MUST delete the test or the gate. That is the rule.” Remove
+nonbusiness tests and gates from product acceptance; each retained product gate
+must name the specified behavior it proves. For this T1772 work, those outcomes
+are index cardinality and oracle agreement; preserved source provenance and
+event, edit, deletion, and dispatch history; read-only query, idempotent
+reingest, and concurrency correctness; and the specified storage and
+performance measurements. Hostname, machine-ID, and incidental runner-state
+checks do not prove those behaviors and are removed from product acceptance.
+
+Keep demonstrated safety and execution prerequisites separate from product
+acceptance: explicit host/route authority and independent review;
+controller-required Darwin `csops(CS_OPS_STATUS)` and APFS-clone behavior;
+frozen source/corpus/input/candidate identity; isolation from production stores
+and services with no conflicting workload; adequate capacity and bounded
+resources; and effective stop and one-use controls. The exact Eezo invocation
+below remains this run's admitted profile and the frozen brief's named-route
+limits remain in force; this wording admits no alternate host. A future route
+change requires owner resolution of those limits and fresh source, build,
+input, proof-path, and custody bindings. This text grants no host access, source
+placement, execution, or live-system authority; the `d84e701` formal-review
+hold remains separate and unchanged. A Gibson compilation proves type/link
 consistency, not performance, concurrency correctness, macOS behavior, or proof
 completion.
 
