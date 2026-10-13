@@ -349,9 +349,21 @@ files or allocations entirely between samples. The telemetry amendment permits
 only a qualified zero-observed claim; even zero probe counters do not close those
 blind spots. Collector errors remain missing evidence and fail the gate.
 
-The new measurement test definitions are source only until executed on an
-authorized non-Gibson host. A Gibson compilation proves type/link consistency,
-not performance, concurrency correctness, macOS behavior, or proof completion.
+Product acceptance must name the specified behavior demonstrated by each result:
+index cardinality, retained provenance and history, query and concurrency
+correctness, and measured storage and latency outcomes. Hostnames, machine IDs,
+and incidental runner state are not product criteria. Execution remains a
+separate safeguard requiring explicit host-specific authority and evidence for
+the controller's Darwin `csops(CS_OPS_STATUS)` and APFS-clone dependencies, exact
+frozen source/corpus/input/candidate identity, isolation from production stores
+and services with no conflicting workload, adequate bounded capacity, and
+effective stop/one-use controls. The exact Eezo invocation below remains this
+run's admitted profile; any future route change requires fresh source, build,
+input, proof-path, and custody bindings and resolution by the brief's owner of
+its named-route language. This wording grants no host access, source placement,
+execution, or live-system authority. A Gibson compilation proves type/link
+consistency, not performance, concurrency correctness, macOS behavior, or proof
+completion.
 
 ## Static verification definitions
 
