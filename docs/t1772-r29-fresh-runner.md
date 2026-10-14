@@ -349,9 +349,30 @@ files or allocations entirely between samples. The telemetry amendment permits
 only a qualified zero-observed claim; even zero probe counters do not close those
 blind spots. Collector errors remain missing evidence and fail the gate.
 
-The new measurement test definitions are source only until executed on an
-authorized non-Gibson host. A Gibson compilation proves type/link consistency,
-not performance, concurrency correctness, macOS behavior, or proof completion.
+Apply Mike's rule: “from now on if a test of a gate tests something that ISN’T
+business logic, you MUST delete the test or the gate. That is the rule.” Remove
+nonbusiness tests and gates from product acceptance; each retained product gate
+must name the specified behavior it proves. For this T1772 work, those outcomes
+are index cardinality and oracle agreement; preserved source provenance and
+event, edit, deletion, and dispatch history; read-only query, idempotent
+reingest, and concurrency correctness; and the specified storage and
+performance measurements. Hostname, machine-ID, and incidental runner-state
+checks do not prove those behaviors and are removed from product acceptance.
+
+Keep demonstrated safety and execution prerequisites separate from product
+acceptance: explicit host/route authority and independent review;
+controller-required Darwin `csops(CS_OPS_STATUS)` and APFS-clone behavior;
+frozen source/corpus/input/candidate identity; isolation from production stores
+and services with no conflicting workload; adequate capacity and bounded
+resources; and effective stop and one-use controls. The exact Eezo invocation
+below remains this run's admitted profile and the frozen brief's named-route
+limits remain in force; this wording admits no alternate host. A future route
+change requires owner resolution of those limits and fresh source, build,
+input, proof-path, and custody bindings. This text grants no host access, source
+placement, execution, or live-system authority; the `d84e701` formal-review
+hold remains separate and unchanged. A Gibson compilation proves type/link
+consistency, not performance, concurrency correctness, macOS behavior, or proof
+completion.
 
 ## Static verification definitions
 
@@ -359,8 +380,9 @@ not performance, concurrency correctness, macOS behavior, or proof completion.
 14,369 oracle, canonical bytes, path confinement, and Darwin signal number.
 The runtime writes `runner/test-definitions.json` with the larger P0 checks and
 records every observed result in hash-bound canonical evidence. Repository gates
-remain `cargo fmt --check`, `cargo test --all-targets`, and the release build;
-the task-specific authority now permits focused Gibson checks in isolation.
+remain `cargo test --all-targets` and the release build. Formatting is not a
+business-logic or T1772 specification test; the task-specific authority now
+permits focused Gibson checks in isolation.
 The previously accepted full Racter suite is not repeated for host parity.
 
 ## Correction after independent b7a1aa5 review
