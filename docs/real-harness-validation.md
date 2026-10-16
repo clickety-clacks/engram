@@ -7,6 +7,7 @@ harness-like directory layouts for all implemented adapters:
 - Codex (`codex-cli`)
 - Gemini (`gemini-cli`)
 - OpenClaw (`openclaw`)
+- Pi (`pi`)
 - OpenCode (`opencode`)
 - Cursor (`cursor`)
 
@@ -35,7 +36,8 @@ For each adapter:
 
 1. Realistic on-disk layout for discovery roots (`~/.claude/...`,
    `~/.codex/...`, `~/.gemini/...`, `~/.openclaw/...`,
-   `~/.local/share/opencode/...`, Cursor `workspaceStorage`).
+   `~/.pi/agent/sessions/...`, `~/.local/share/opencode/...`, Cursor
+   `workspaceStorage`).
 2. Positive discovery for the target repo.
 3. Negative discovery for a wrong repo (target repo artifacts are not matched).
 4. Importability check:

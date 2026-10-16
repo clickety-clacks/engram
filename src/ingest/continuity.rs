@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 
 use crate::tape::adapter::AdapterId;
 use crate::tape::adapters::codex::{CodexState, codex_jsonl_incremental};
+use crate::tape::adapters::pi::{PiState, pi_jsonl_incremental};
 use crate::tape::harness::{ClaudeState, claude_jsonl_incremental};
 
 /// Unfinished calls, session identity, and bounded native-edit correlations
@@ -12,6 +13,7 @@ use crate::tape::harness::{ClaudeState, claude_jsonl_incremental};
 pub(super) enum NativeState {
     Codex(CodexState),
     Claude(ClaudeState),
+    Pi(PiState),
 }
 
 impl NativeState {
@@ -19,6 +21,7 @@ impl NativeState {
         match adapter {
             AdapterId::CodexCli => Some(Self::Codex(CodexState::default())),
             AdapterId::ClaudeCode => Some(Self::Claude(ClaudeState::default())),
+            AdapterId::Pi => Some(Self::Pi(PiState::default())),
             _ => None,
         }
     }
@@ -27,6 +30,7 @@ impl NativeState {
         match self {
             Self::Codex(state) => codex_jsonl_incremental(input, state),
             Self::Claude(state) => claude_jsonl_incremental(input, state),
+            Self::Pi(state) => pi_jsonl_incremental(input, state),
         }
     }
 }

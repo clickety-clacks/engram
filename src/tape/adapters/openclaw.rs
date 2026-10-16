@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 
 use chrono::{SecondsFormat, TimeZone, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::structured::{bounded_shell_read, is_absolute_path, parse_patch, patch_is_complete};
 
 const DEFAULT_TS: &str = "1970-01-01T00:00:00Z";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum ToolKind {
     Read,
     Edit,
@@ -15,7 +16,7 @@ enum ToolKind {
     Other,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ToolCallContext {
     kind: ToolKind,
     file: Option<String>,
@@ -27,12 +28,25 @@ struct ToolCallContext {
     workdir: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct OpenClawState {
+    session_id: Option<String>,
+    tool_contexts: HashMap<String, ToolCallContext>,
+}
+
 pub fn openclaw_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Error> {
+    openclaw_jsonl_incremental(input, &mut OpenClawState::default())
+}
+
+pub(crate) fn openclaw_jsonl_incremental(
+    input: &str,
+    state: &mut OpenClawState,
+) -> Result<String, serde_json::Error> {
     let mut events = Vec::new();
     let mut first_ts = None::<String>;
-    let mut session_id = None::<String>;
+    let mut session_id = state.session_id.clone();
     let mut saw_json = false;
-    let mut tool_contexts = HashMap::<String, ToolCallContext>::new();
+    let mut tool_contexts = state.tool_contexts.clone();
 
     for line in input.lines() {
         if line.trim().is_empty() {
@@ -49,8 +63,10 @@ pub fn openclaw_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::E
         );
     }
 
+    state.session_id = session_id.clone();
+    state.tool_contexts = tool_contexts;
     if !saw_json {
-        return to_jsonl(&with_meta(None, events));
+        return to_jsonl(&with_meta(session_id.as_deref(), events));
     }
 
     to_jsonl(&with_meta(session_id.as_deref(), events))
@@ -536,6 +552,7 @@ fn extract_before_text(args: &Value) -> Option<String> {
     obj.get("old_string")
         .and_then(Value::as_str)
         .or_else(|| obj.get("oldString").and_then(Value::as_str))
+        .or_else(|| obj.get("oldText").and_then(Value::as_str))
         .or_else(|| obj.get("before").and_then(Value::as_str))
         .map(ToOwned::to_owned)
 }
@@ -547,6 +564,7 @@ fn extract_after_text(args: &Value) -> Option<String> {
     obj.get("new_string")
         .and_then(Value::as_str)
         .or_else(|| obj.get("newString").and_then(Value::as_str))
+        .or_else(|| obj.get("newText").and_then(Value::as_str))
         .or_else(|| obj.get("after").and_then(Value::as_str))
         .or_else(|| obj.get("content").and_then(Value::as_str))
         .map(ToOwned::to_owned)

@@ -526,22 +526,23 @@ pub(crate) fn discover_local_transcript_candidates(cwd: &Path) -> Result<Vec<Pat
 
 pub(crate) fn detect_adapter_for_input(path: &Path, input: &str) -> Option<AdapterId> {
     let lower_path = path.to_string_lossy().to_ascii_lowercase();
-    let preferred =
-        if lower_path.contains(".codex/sessions") || lower_path.ends_with("history.jsonl") {
-            Some(AdapterId::CodexCli)
-        } else if lower_path.contains(".claude/projects") {
-            Some(AdapterId::ClaudeCode)
-        } else if lower_path.contains("opencode") {
-            Some(AdapterId::OpenCode)
-        } else if lower_path.contains("cursor") {
-            Some(AdapterId::Cursor)
-        } else if lower_path.contains("gemini") {
-            Some(AdapterId::GeminiCli)
-        } else if lower_path.contains(".openclaw") || lower_path.contains("openclaw") {
-            Some(AdapterId::OpenClaw)
-        } else {
-            None
-        };
+    let preferred = if lower_path.contains(".pi/agent/sessions") {
+        Some(AdapterId::Pi)
+    } else if lower_path.contains(".codex/sessions") || lower_path.ends_with("history.jsonl") {
+        Some(AdapterId::CodexCli)
+    } else if lower_path.contains(".claude/projects") {
+        Some(AdapterId::ClaudeCode)
+    } else if lower_path.contains("opencode") {
+        Some(AdapterId::OpenCode)
+    } else if lower_path.contains("cursor") {
+        Some(AdapterId::Cursor)
+    } else if lower_path.contains("gemini") {
+        Some(AdapterId::GeminiCli)
+    } else if lower_path.contains(".openclaw") || lower_path.contains("openclaw") {
+        Some(AdapterId::OpenClaw)
+    } else {
+        None
+    };
 
     let mut candidates = Vec::new();
     if let Some(adapter) = preferred {
@@ -553,6 +554,7 @@ pub(crate) fn detect_adapter_for_input(path: &Path, input: &str) -> Option<Adapt
         AdapterId::OpenCode,
         AdapterId::Cursor,
         AdapterId::GeminiCli,
+        AdapterId::Pi,
         AdapterId::OpenClaw,
     ] {
         if !candidates.contains(&adapter) {
@@ -667,7 +669,25 @@ pub(crate) fn adapter_id_from_name(raw: &str) -> Option<AdapterId> {
         "gemini-cli" => Some(AdapterId::GeminiCli),
         "cursor" => Some(AdapterId::Cursor),
         "openclaw" => Some(AdapterId::OpenClaw),
+        "pi" => Some(AdapterId::Pi),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod pi_adapter_detection_tests {
+    use std::path::Path;
+
+    use super::{adapter_id_from_name, detect_adapter_for_input};
+    use crate::tape::adapter::AdapterId;
+
+    #[test]
+    fn pi_sessions_are_detected_before_the_compatible_openclaw_shape() {
+        let input = include_str!("../../tests/fixtures/pi/session-v3.jsonl");
+        let path = Path::new("/home/tester/.pi/agent/sessions/--workspace-demo--/session.jsonl");
+
+        assert_eq!(detect_adapter_for_input(path, input), Some(AdapterId::Pi));
+        assert_eq!(adapter_id_from_name("pi"), Some(AdapterId::Pi));
     }
 }
 
