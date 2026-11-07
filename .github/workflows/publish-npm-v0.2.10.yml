@@ -1,0 +1,40 @@
+name: Publish npm v0.2.10
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out v0.2.10 source
+        uses: actions/checkout@v4
+        with:
+          ref: v0.2.10
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Verify package identity
+        run: |
+          node -e '
+            const pkg = require("./package.json");
+            if (pkg.name !== "@clickety-clacks/engram" || pkg.version !== "0.2.10") {
+              console.error(`Expected @clickety-clacks/engram@0.2.10; found ${pkg.name}@${pkg.version}`);
+              process.exit(1);
+            }
+          '
+
+      - name: Validate npm package
+        run: npm run test:npm-package
+
+      - name: Publish npm package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
