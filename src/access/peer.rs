@@ -1473,6 +1473,23 @@ impl PeerSession {
                         return Ok(());
                     }
                 };
+                // An over-limit record is reported as its own failure, so the
+                // search stays partial, while the tape's other hits still count.
+                for skipped in &summary.skipped_records {
+                    let failure = json!({
+                        "type": "failure",
+                        "tape_id": tape_id,
+                        "error": {"code": "over_limit", "message": skipped.message()},
+                    });
+                    append_grep_failure(
+                        &mut failures,
+                        failure,
+                        id,
+                        &mut failure_bytes,
+                        top_bytes,
+                        response_limit,
+                    )?;
+                }
                 unknown_time_evidence_events = unknown_time_evidence_events
                     .saturating_add(summary.unknown_time_evidence_count);
                 unknown_time_matching_events = unknown_time_matching_events
