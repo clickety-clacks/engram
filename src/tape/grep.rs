@@ -27,6 +27,27 @@ pub(crate) struct GrepTapeSummary {
     pub(crate) total_lines: usize,
     pub(crate) anchor_line: usize,
     pub(crate) files_touched: Vec<String>,
+    /// Records over the per-record limit, in tape order. Each was skipped
+    /// without being buffered, and the rest of the tape was still scanned.
+    pub(crate) skipped_records: Vec<GrepSkippedRecord>,
+}
+
+/// One record that a limited scan skipped because it exceeds the record limit.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct GrepSkippedRecord {
+    pub(crate) line: usize,
+    pub(crate) byte_offset: u64,
+    pub(crate) bytes: u64,
+    pub(crate) limit: u64,
+}
+
+impl GrepSkippedRecord {
+    pub(crate) fn message(&self) -> String {
+        format!(
+            "decompressed JSONL record line {} at byte offset {} is {} bytes (including newline), over the {} byte limit; this record was skipped and the rest of the tape was scanned",
+            self.line, self.byte_offset, self.bytes, self.limit,
+        )
+    }
 }
 
 impl GrepTapeSummary {
@@ -37,6 +58,10 @@ impl GrepTapeSummary {
                 .saturating_mul(std::mem::size_of::<String>()),
             |bytes, path| bytes.saturating_add(path.capacity()).saturating_add(16),
         );
+        let skipped_bytes = self
+            .skipped_records
+            .capacity()
+            .saturating_mul(std::mem::size_of::<GrepSkippedRecord>());
         let timestamp_bytes = if self.timestamp.capacity() == 0 {
             0
         } else {
@@ -46,6 +71,7 @@ impl GrepTapeSummary {
         (
             std::mem::size_of::<Self>()
                 .saturating_add(files_touched_bytes)
+                .saturating_add(skipped_bytes)
                 .saturating_add(timestamp_bytes),
             self.match_count,
         )
@@ -757,19 +783,24 @@ impl GrepScanError {
     }
 }
 
+enum GrepRecord {
+    /// A record of this many bytes is in the buffer; zero means end of tape.
+    Read(usize),
+    /// A record of this many bytes exceeded the limit and was discarded.
+    Skipped(u64),
+}
+
 fn read_grep_record<R: BufRead>(
     reader: &mut R,
     record: &mut Vec<u8>,
     limit: Option<u64>,
-    line_number: usize,
-    start_offset: u64,
-) -> Result<usize, GrepScanError> {
+) -> Result<GrepRecord, GrepScanError> {
     loop {
         let available = reader
             .fill_buf()
             .map_err(|error| GrepScanError::new("decompress_error", error.to_string()))?;
         if available.is_empty() {
-            return Ok(record.len());
+            return Ok(GrepRecord::Read(record.len()));
         }
         let length = available
             .iter()
@@ -780,25 +811,48 @@ fn read_grep_record<R: BufRead>(
             GrepScanError::new("over_limit", "decompressed JSONL record length overflow")
         })?;
         if limit.is_some_and(|limit| next_length as u64 > limit) {
-            return Err(GrepScanError::new(
-                "over_limit",
-                format!(
-                    "decompressed JSONL record line {line_number} at byte offset {start_offset} exceeds {} byte limit (including newline); observed at least {next_length} bytes",
-                    limit.unwrap_or_default(),
-                ),
-            ));
+            reader.consume(length);
+            let skipped = next_length as u64;
+            record.clear();
+            if complete {
+                return Ok(GrepRecord::Skipped(skipped));
+            }
+            return discard_grep_record(reader, skipped).map(GrepRecord::Skipped);
         }
         record.extend_from_slice(&available[..length]);
         reader.consume(length);
         if complete {
-            return Ok(record.len());
+            return Ok(GrepRecord::Read(record.len()));
+        }
+    }
+}
+
+/// Read through the end of an over-limit record without buffering it, so a
+/// skipped record costs no more memory than the limit already allowed.
+fn discard_grep_record<R: BufRead>(reader: &mut R, mut skipped: u64) -> Result<u64, GrepScanError> {
+    loop {
+        let available = reader
+            .fill_buf()
+            .map_err(|error| GrepScanError::new("decompress_error", error.to_string()))?;
+        if available.is_empty() {
+            return Ok(skipped);
+        }
+        let (length, complete) = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or((available.len(), false), |index| (index + 1, true));
+        reader.consume(length);
+        skipped = skipped.saturating_add(length as u64);
+        if complete {
+            return Ok(skipped);
         }
     }
 }
 
 /// Scan one compressed JSONL tape without retaining the complete decompressed tape.
 /// A missing record limit is used only for the local path, whose existing
-/// contract has no configured per-record limit.
+/// contract has no configured per-record limit. With a limit, each record over
+/// it is skipped and listed in `skipped_records`; the rest of the tape is scanned.
 #[cfg(test)]
 pub(crate) fn scan_grep_reader<R: Read>(
     compressed: R,
@@ -829,19 +883,25 @@ pub(crate) fn scan_grep_reader_with_date<R: Read>(
     let mut first_provenance_match = None;
     let mut timestamp = String::new();
     let mut files_touched = HashSet::new();
+    let mut skipped_records = Vec::new();
 
     loop {
         line.clear();
-        let bytes = read_grep_record(
-            &mut reader,
-            &mut line,
-            record_limit,
-            total_lines.saturating_add(1),
-            bytes_read,
-        )?;
-        if bytes == 0 {
-            break;
-        }
+        let bytes = match read_grep_record(&mut reader, &mut line, record_limit)? {
+            GrepRecord::Read(0) => break,
+            GrepRecord::Read(bytes) => bytes,
+            GrepRecord::Skipped(bytes) => {
+                total_lines = total_lines.saturating_add(1);
+                skipped_records.push(GrepSkippedRecord {
+                    line: total_lines,
+                    byte_offset: bytes_read,
+                    bytes,
+                    limit: record_limit.unwrap_or_default(),
+                });
+                bytes_read = bytes_read.saturating_add(bytes);
+                continue;
+            }
+        };
         bytes_read = bytes_read.saturating_add(bytes as u64);
 
         let mut content_end = line.len();
@@ -934,6 +994,7 @@ pub(crate) fn scan_grep_reader_with_date<R: Read>(
             .unwrap_or_default()
             .saturating_add(1),
         files_touched,
+        skipped_records,
     })
 }
 
@@ -963,16 +1024,21 @@ pub(crate) fn read_tape_event_timestamps<R: Read>(
     let mut line_offset = 0u64;
     loop {
         line.clear();
-        let bytes = read_grep_record(
-            &mut reader,
-            &mut line,
-            record_limit,
-            usize::try_from(line_offset.saturating_add(1)).unwrap_or(usize::MAX),
-            bytes_read,
-        )?;
-        if bytes == 0 {
-            break;
-        }
+        let bytes = match read_grep_record(&mut reader, &mut line, record_limit)? {
+            GrepRecord::Read(0) => break,
+            GrepRecord::Read(bytes) => bytes,
+            // A timestamp lookup still fails on an over-limit record, as before.
+            GrepRecord::Skipped(bytes) => {
+                return Err(GrepScanError::new(
+                    "over_limit",
+                    format!(
+                        "decompressed JSONL record line {} at byte offset {bytes_read} exceeds {} byte limit (including newline); observed at least {bytes} bytes",
+                        line_offset.saturating_add(1),
+                        record_limit.unwrap_or_default(),
+                    ),
+                ));
+            }
+        };
         bytes_read = bytes_read.saturating_add(bytes as u64);
         if decompressed_limit.is_some_and(|limit| bytes_read > limit) {
             return Err(GrepScanError::new(
@@ -1250,29 +1316,98 @@ mod tests {
             .expect("complete tape exceeds per-record limit but each record fits");
         assert_eq!(summary.total_lines, 64);
         assert_eq!(summary.match_count, 64);
+        assert!(summary.skipped_records.is_empty());
 
-        let error = scan_grep_reader(&compressed[..], Some(record.len() as u64 - 1), "needle")
-            .expect_err("one over-limit record fails the whole tape");
-        assert_eq!(error.code, "over_limit");
-        assert!(error.message.contains("including newline"));
-        assert!(error.message.contains("line 1 at byte offset 0"));
-        assert!(
-            error
-                .message
-                .contains(&format!("observed at least {} bytes", record.len()))
+        let limit = record.len() as u64 - 1;
+        let summary = scan_grep_reader(&compressed[..], Some(limit), "needle")
+            .expect("over-limit records are skipped, not a tape failure");
+        assert_eq!(summary.match_count, 0);
+        assert_eq!(summary.total_lines, 64);
+        assert_eq!(summary.skipped_records.len(), 64);
+        assert_eq!(
+            summary.skipped_records[1],
+            GrepSkippedRecord {
+                line: 2,
+                byte_offset: record.len() as u64,
+                bytes: record.len() as u64,
+                limit,
+            }
         );
+        let message = summary.skipped_records[0].message();
+        assert!(message.contains("line 1 at byte offset 0"));
+        assert!(message.contains(&format!("is {} bytes (including newline)", record.len())));
 
         let unterminated = [record.as_slice(), &vec![b'x'; record.len() + 1]].concat();
         let compressed = zstd::stream::encode_all(&unterminated[..], 0).expect("compress tape");
-        let error = scan_grep_reader(&compressed[..], Some(record.len() as u64), "needle")
-            .expect_err("unterminated record must be bounded too");
-        assert_eq!(error.code, "over_limit");
-        assert!(
-            error
-                .message
-                .contains(&format!("line 2 at byte offset {}", record.len()))
+        let summary = scan_grep_reader(&compressed[..], Some(record.len() as u64), "needle")
+            .expect("unterminated over-limit record is skipped");
+        assert_eq!(summary.match_count, 1);
+        assert_eq!(summary.total_lines, 2);
+        assert_eq!(
+            summary.skipped_records,
+            vec![GrepSkippedRecord {
+                line: 2,
+                byte_offset: record.len() as u64,
+                bytes: record.len() as u64 + 1,
+                limit: record.len() as u64,
+            }]
         );
-        assert!(error.message.contains("observed at least"));
+    }
+
+    #[test]
+    fn scan_skips_each_over_limit_record_and_keeps_the_other_hits() {
+        let small = |label: &str| {
+            format!(
+                "{{\"t\":\"2026-11-08T00:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle {label}\"}}\n"
+            )
+        };
+        let big = |fill: usize| {
+            format!(
+                "{{\"t\":\"2026-11-08T00:00:01Z\",\"k\":\"tool.result\",\"stdout\":\"needle {}\"}}\n",
+                "x".repeat(fill)
+            )
+        };
+        let limit = 4096u64;
+        let lines = [
+            small("before"),
+            big(10_000),
+            small("between one"),
+            big(5_000),
+            big(70_000),
+            small("between two"),
+            small("after"),
+        ];
+        let content = lines.concat();
+        let compressed = zstd::stream::encode_all(content.as_bytes(), 0).expect("compress tape");
+        let summary = scan_grep_reader(&compressed[..], Some(limit), "needle").expect("scan");
+        assert_eq!(
+            summary.match_count, 4,
+            "every hit outside the skipped records"
+        );
+        assert_eq!(summary.total_lines, 7);
+        assert_eq!(summary.anchor_line, 1);
+        let offset = |line: usize| lines[..line - 1].iter().map(String::len).sum::<usize>() as u64;
+        let expected = [2usize, 4, 5]
+            .into_iter()
+            .map(|line| GrepSkippedRecord {
+                line,
+                byte_offset: offset(line),
+                bytes: lines[line - 1].len() as u64,
+                limit,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(summary.skipped_records, expected);
+
+        let only_big = [small("before"), big(10_000), small("after")].concat();
+        let compressed = zstd::stream::encode_all(only_big.as_bytes(), 0).expect("compress tape");
+        let summary = scan_grep_reader(&compressed[..], Some(limit), "needle").expect("scan");
+        assert_eq!(summary.match_count, 2);
+        assert_eq!(summary.skipped_records.len(), 1);
+        assert_eq!(summary.skipped_records[0].line, 2);
+
+        let unlimited = scan_grep_reader(&compressed[..], None, "needle").expect("local scan");
+        assert_eq!(unlimited.match_count, 3, "local scans have no record limit");
+        assert!(unlimited.skipped_records.is_empty());
     }
 
     #[test]
