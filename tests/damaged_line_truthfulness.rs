@@ -276,6 +276,7 @@ fn gap_is_recorded_before_the_cursor_moves() {
     assert_eq!(cursor(&s.repo, &s.source), fixture.pending_offset);
 }
 
+#[cfg(unix)]
 fn write_export_topology(home: &Path, self_label: &str, db: &Path, tapes: &Path) {
     let engram_dir = home.join(".engram");
     fs::create_dir_all(&engram_dir).expect("engram dir");
@@ -291,20 +292,24 @@ fn write_export_topology(home: &Path, self_label: &str, db: &Path, tapes: &Path)
     .expect("write topology");
 }
 
+#[cfg(unix)]
 fn store_db(home: &Path) -> PathBuf {
     home.join(".engram/index.sqlite")
 }
 
+#[cfg(unix)]
 fn store_tapes(home: &Path) -> PathBuf {
     home.join(".engram/tapes")
 }
 
+#[cfg(unix)]
 fn export_row(status: &Value) -> &Value {
     let rows = status["local_exports"].as_array().expect("local_exports");
     assert_eq!(rows.len(), 1, "{status}");
     &rows[0]
 }
 
+#[cfg(unix)]
 fn assert_status_gap(status: &Value, source: &Path) {
     assert_eq!(status["status"], "partial", "{status}");
     let row = export_row(status);
@@ -315,6 +320,8 @@ fn assert_status_gap(status: &Value, source: &Path) {
     assert_eq!(gaps[0]["damaged_lines"], 3);
 }
 
+// Topology status is unsupported on Windows.
+#[cfg(unix)]
 #[test]
 fn local_status_reports_the_gap_and_survives_a_rebuild() {
     let fixture = fixture_f();
@@ -385,6 +392,8 @@ fn local_status_reports_the_gap_and_survives_a_rebuild() {
     assert_status_gap(&staging_status, &s.source);
 }
 
+// Topology status is unsupported on Windows.
+#[cfg(unix)]
 #[test]
 fn an_index_without_the_gap_table_reads_as_no_gaps() {
     let fixture = fixture_f();
