@@ -912,12 +912,8 @@ fn indexed_occurrences(home: &Path, token: &str) -> u64 {
     }
     let value: Value = serde_json::from_slice(&output.stdout)
         .unwrap_or_else(|err| panic!("grep json: {err}; output: {output:?}"));
-    value["sessions"]
-        .as_array()
-        .expect("sessions")
-        .iter()
-        .map(|session| session["match_count"].as_u64().expect("match_count"))
-        .sum()
+    // Counts matching sessions; a duplicate import lands in its own session.
+    value["total"].as_u64().expect("total")
 }
 
 fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
