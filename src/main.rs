@@ -3260,52 +3260,25 @@ fn cmd_watch_with_home(cwd: &Path, args: WatchArgs, home: &Path) -> Result<(), C
     })
     .map_err(|err| CliError::new("watch_error", err.to_string()))?;
 
-    let mut last_ingest = HashMap::<(usize, PathBuf), Instant>::new();
+    // Cursors live in HOME/.engram, the same set a HOME-run `engram ingest` uses,
+    // so watch and a catch-up ingest never re-import each other's bytes.
+    let paths = repo_paths(home)?;
+    // An event marks its path pending; the path is ingested once its debounce
+    // deadline passes. Events arriving during an ingest mark it pending again,
+    // so the last append is always followed by an ingest.
+    let mut pending = HashMap::<(usize, PathBuf), Instant>::new();
     while !stop.load(Ordering::SeqCst) {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(Ok(event)) => {
-                if !watch_event_kind_supported(&event.kind) {
-                    continue;
-                }
-                for path in event.paths {
-                    for (idx, runtime) in runtimes.iter().enumerate() {
-                        if !watch_path_matches(runtime, &path) {
-                            continue;
-                        }
-                        let key = (idx, path.clone());
-                        if let Some(last) = last_ingest.get(&key)
-                            && last.elapsed() < runtime.debounce
-                        {
-                            continue;
-                        }
-                        watch_log_line(&mut log, &format!("event path={}", path.display()))?;
-                        std::thread::sleep(runtime.debounce);
-                        match run_watch_ingest(runtime, &path, &context) {
-                            WatchIngestResult::TimedOut => {
-                                watch_log_line(
-                                    &mut log,
-                                    &format!("ingest timeout path={}", path.display()),
-                                )?;
-                            }
-                            WatchIngestResult::Completed(Ok(())) => {
-                                watch_log_line(
-                                    &mut log,
-                                    &format!("ingest ok path={}", path.display()),
-                                )?;
-                            }
-                            WatchIngestResult::Completed(Err(err)) => {
-                                watch_log_line(
-                                    &mut log,
-                                    &format!(
-                                        "ingest failed path={} code={} message={}",
-                                        path.display(),
-                                        err.code,
-                                        err.message
-                                    ),
-                                )?;
+                if watch_event_kind_supported(&event.kind) {
+                    for path in event.paths {
+                        for (idx, runtime) in runtimes.iter().enumerate() {
+                            if watch_path_matches(runtime, &path) {
+                                pending
+                                    .entry((idx, path.clone()))
+                                    .or_insert_with(|| Instant::now() + runtime.debounce);
                             }
                         }
-                        last_ingest.insert(key, Instant::now());
                     }
                 }
             }
@@ -3314,6 +3287,42 @@ fn cmd_watch_with_home(cwd: &Path, args: WatchArgs, home: &Path) -> Result<(), C
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+
+        let now = Instant::now();
+        let mut due: Vec<(usize, PathBuf)> = pending
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(key, _)| key.clone())
+            .collect();
+        due.sort();
+        for key in due {
+            pending.remove(&key);
+            let (idx, path) = key;
+            let runtime = &runtimes[idx];
+            watch_log_line(&mut log, &format!("event path={}", path.display()))?;
+            match run_watch_ingest(runtime, &path, &paths, &context) {
+                WatchIngestResult::TimedOut => {
+                    watch_log_line(
+                        &mut log,
+                        &format!("ingest timeout path={}", path.display()),
+                    )?;
+                }
+                WatchIngestResult::Completed(Ok(())) => {
+                    watch_log_line(&mut log, &format!("ingest ok path={}", path.display()))?;
+                }
+                WatchIngestResult::Completed(Err(err)) => {
+                    watch_log_line(
+                        &mut log,
+                        &format!(
+                            "ingest failed path={} code={} message={}",
+                            path.display(),
+                            err.code,
+                            err.message
+                        ),
+                    )?;
+                }
+            }
         }
     }
 
@@ -3377,23 +3386,23 @@ fn watch_path_relative_to_source(runtime: &WatchSourceRuntime, path: &Path) -> O
 fn run_watch_ingest(
     runtime: &WatchSourceRuntime,
     changed_path: &Path,
+    paths: &RepoPaths,
     context: &RuntimeContext,
 ) -> WatchIngestResult {
     let source_cwd = runtime.source.path.clone();
     let changed = changed_path.to_path_buf();
+    let paths = paths.clone();
     let context = context.clone();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = repo_paths(&source_cwd).and_then(|paths| {
-            cmd_ingest(
-                &source_cwd,
-                &paths,
-                &context,
-                IngestArgs {
-                    paths: vec![changed],
-                },
-            )
-        });
+        let result = cmd_ingest(
+            &source_cwd,
+            &paths,
+            &context,
+            IngestArgs {
+                paths: vec![changed],
+            },
+        );
         let _ = tx.send(result);
     });
 
