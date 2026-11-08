@@ -382,19 +382,37 @@ impl PeerSession {
                 );
             }
             let export = self.opened.get(name).expect("inserted export");
+            // Gaps ride beside `"status":"ok"`: a v0.2.12 searcher rejects any
+            // other status value here, and the fixed searcher derives partial.
+            let gaps = match export.index.gap_entries() {
+                Ok(gaps) => gaps,
+                Err(error) => {
+                    let db = export.config.db.display().to_string();
+                    write_open_failure(
+                        output,
+                        id,
+                        &self.topology.self_label,
+                        name,
+                        "unavailable",
+                        "reader_unavailable",
+                        format!("cannot read gap entries in {db}: {error}"),
+                    )?;
+                    continue;
+                }
+            };
             opened += 1;
-            write_data(
-                output,
-                id,
-                json!({
-                    "store": format!("{}/{}", self.topology.self_label, name),
-                    "status": "ok",
-                    "db": export.config.db,
-                    "tape_dirs": export.config.tape_dirs,
-                    "reader_mode": "live",
-                    "snapshot_at": export.snapshot_at,
-                }),
-            )?;
+            let mut row = json!({
+                "store": format!("{}/{}", self.topology.self_label, name),
+                "status": "ok",
+                "db": export.config.db,
+                "tape_dirs": export.config.tape_dirs,
+                "reader_mode": "live",
+                "snapshot_at": export.snapshot_at,
+            });
+            if !gaps.is_empty() {
+                row["gaps"] = Value::Array(gaps.iter().map(|gap| gap.to_json()).collect());
+            }
+            write_data(output, id, row)?;
         }
         Ok(json!({
             "self": self.topology.self_label,
@@ -1429,6 +1447,18 @@ impl PeerSession {
         let mut unknown_time_evidence_events = 0usize;
         let mut unknown_time_matching_events = 0usize;
         let store_ref = format!("{}/{}", self.topology.self_label, stores[0]);
+        // A source file with damaged lines keeps every search of this store
+        // partial, matching or not, as an over-limit record does.
+        for gap in export.index.gap_entries()? {
+            append_grep_failure(
+                &mut failures,
+                gap.failure(),
+                id,
+                &mut failure_bytes,
+                top_bytes,
+                response_limit,
+            )?;
+        }
 
         let limits = self.topology.limits.clone();
         let scan_workers = scan_parallel_in_order(

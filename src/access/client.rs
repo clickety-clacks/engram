@@ -15,6 +15,7 @@ use std::os::fd::AsRawFd;
 use serde_json::{Value, json};
 
 use crate::config::TopologyPeer;
+use crate::index::GapEntry;
 
 pub use super::MAX_NON_FILE_RESPONSE_BYTES;
 use super::peer::{MAX_FRAME_BYTES, PROTOCOL_VERSION};
@@ -94,6 +95,8 @@ pub struct PeerExport {
     pub tape_dirs: Vec<String>,
     pub reader_mode: String,
     pub snapshot_at: String,
+    /// Gap entries the owner reported for this export's store.
+    pub gaps: Vec<GapEntry>,
 }
 
 /// One selected peer process and the negotiated exports it opened for this
@@ -317,12 +320,25 @@ impl RemoteOwner {
                                     "open export has no snapshot time",
                                 )
                             })?;
+                    let gaps = row
+                        .get("gaps")
+                        .and_then(Value::as_array)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|gap| {
+                            GapEntry::from_json(gap).ok_or_else(|| {
+                                PeerFailure::new("protocol_error", "open export has an invalid gap entry")
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
                     Ok(PeerExport {
                         name: name.to_string(),
                         db: db.to_string(),
                         tape_dirs,
                         reader_mode: reader_mode.to_string(),
                         snapshot_at: snapshot_at.to_string(),
+                        gaps,
                     })
                 }
                 "incompatible" => Err(PeerFailure::new(
