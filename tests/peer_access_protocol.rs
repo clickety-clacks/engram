@@ -8064,15 +8064,25 @@ fn peer_read_file_cap_and_grep_record_cap_are_reported_as_over_limit() {
         )
         .pop()
         .expect("grep outcome")
-        .expect("per-tape cap failure is reported in data");
-    assert_eq!(grep.data[0]["type"], "failure");
-    assert_eq!(grep.data[0]["error"]["code"], "over_limit");
-    assert!(
-        grep.data[0]["error"]["message"]
-            .as_str()
-            .expect("grep failure reason")
-            .contains("line 1 at byte offset 0")
+        .expect("per-record cap failures are reported in data");
+    assert_eq!(
+        grep.stats["failures"], 2,
+        "one failure per over-limit record"
     );
+    for (record, line) in grep
+        .data
+        .iter()
+        .zip(["line 1 at byte offset 0", "line 2 at"])
+    {
+        assert_eq!(record["type"], "failure");
+        assert_eq!(record["tape_id"], tape_id);
+        assert_eq!(record["error"]["code"], "over_limit");
+        let message = record["error"]["message"]
+            .as_str()
+            .expect("grep failure reason");
+        assert!(message.contains(line), "{message}");
+        assert!(message.contains("skipped"), "{message}");
+    }
     drop(owner);
 
     let topology = std::fs::read_to_string(&topology_path).expect("read owner topology");
@@ -8129,6 +8139,133 @@ fn peer_read_file_cap_and_grep_record_cap_are_reported_as_over_limit() {
     )
     .expect("over-limit JSON");
     assert_eq!(error["error"]["code"], "over_limit");
+}
+
+#[test]
+fn peer_grep_skips_each_over_limit_record_and_returns_the_other_hits_in_its_tape() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = env!("CARGO_BIN_EXE_engram");
+    let small = |label: &str| {
+        format!(
+            "{{\"t\":\"2026-11-08T10:00:00Z\",\"k\":\"msg.in\",\"content\":\"needle-oversized {label}\"}}\n"
+        )
+    };
+    let big = || {
+        format!(
+            "{{\"t\":\"2026-11-08T10:00:01Z\",\"k\":\"tool.result\",\"stdout\":\"needle-oversized {}\"}}\n",
+            "x".repeat(8192)
+        )
+    };
+    let one_big = [small("before"), big(), small("after")].concat();
+    let three_big = [
+        small("first"),
+        big(),
+        small("second"),
+        big(),
+        big(),
+        small("third"),
+    ]
+    .concat();
+    let clean = small("clean");
+    let peer_config = write_grep_owner(
+        temp.path(),
+        "oversized-owner",
+        binary,
+        &[
+            ("one-oversized-tape", &one_big),
+            ("three-oversized-tape", &three_big),
+            ("clean-tape", &clean),
+        ],
+    );
+    let topology_path = temp
+        .path()
+        .join("oversized-owner-home/.engram/topology.yml");
+    let topology = std::fs::read_to_string(&topology_path).expect("read owner topology");
+    std::fs::write(
+        &topology_path,
+        format!("{topology}limits:\n  grep_record_bytes: 4096\n"),
+    )
+    .expect("lower the owner grep record cap");
+
+    let (caller_home, repo) = write_local_grep_source(
+        temp.path(),
+        "caller-local-tape",
+        "{\"t\":\"2026-11-08T09:00:00Z\",\"k\":\"msg.in\",\"content\":\"unrelated\"}\n",
+    );
+    set_peer_topology(&caller_home, json!({"oversized-owner": peer_config}));
+    let output = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args(["grep", "needle-oversized", "--peers", "oversized-owner"])
+        .output()
+        .expect("run federated grep");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("grep JSON");
+
+    let mut tapes = result["sessions"]
+        .as_array()
+        .expect("sessions")
+        .iter()
+        .map(|session| session["tape_id"].as_str().expect("tape id").to_string())
+        .collect::<Vec<_>>();
+    tapes.sort();
+    assert_eq!(
+        tapes,
+        ["clean-tape", "one-oversized-tape", "three-oversized-tape"],
+        "a tape with over-limit records still returns its other hits"
+    );
+    assert_eq!(result["federation"]["coverage"], "partial");
+    let source = result["federation"]["sources"]
+        .as_array()
+        .expect("sources")
+        .iter()
+        .find(|source| source["store"] == "oversized-owner/default")
+        .expect("owner source");
+    assert_eq!(source["status"], "partial");
+    let mut skipped = source["failures"]
+        .as_array()
+        .expect("named skips")
+        .iter()
+        .map(|failure| {
+            assert_eq!(failure["error"]["code"], "over_limit");
+            let message = failure["error"]["message"].as_str().expect("skip message");
+            let line = message
+                .split("record line ")
+                .nth(1)
+                .and_then(|rest| rest.split(' ').next())
+                .expect("skipped line number");
+            format!("{}:{line}", failure["tape_id"].as_str().expect("tape id"))
+        })
+        .collect::<Vec<_>>();
+    skipped.sort();
+    assert_eq!(
+        skipped,
+        [
+            "one-oversized-tape:2",
+            "three-oversized-tape:2",
+            "three-oversized-tape:4",
+            "three-oversized-tape:5",
+        ]
+    );
+
+    let required = Command::new(binary)
+        .current_dir(&repo)
+        .env("HOME", &caller_home)
+        .args([
+            "grep",
+            "needle-oversized",
+            "--peers",
+            "oversized-owner",
+            "--require-complete",
+        ])
+        .output()
+        .expect("run complete-only federated grep");
+    assert!(!required.status.success(), "skips keep the search partial");
+    assert!(String::from_utf8_lossy(&required.stderr).contains("incomplete_coverage"));
 }
 
 #[test]

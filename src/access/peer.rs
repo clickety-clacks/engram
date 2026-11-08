@@ -1307,6 +1307,23 @@ impl PeerSession {
                         return Ok(());
                     }
                 };
+                // An over-limit record is reported as its own failure, so the
+                // search stays partial, while the tape's other hits still count.
+                for skipped in &summary.skipped_records {
+                    let failure = json!({
+                        "type": "failure",
+                        "tape_id": tape_id,
+                        "error": {"code": "over_limit", "message": skipped.message()},
+                    });
+                    append_grep_failure(
+                        &mut failures,
+                        failure,
+                        id,
+                        &mut failure_bytes,
+                        top_bytes,
+                        response_limit,
+                    )?;
+                }
                 if summary.match_count == 0
                     || !session_matches_date_filter(
                         &json!({"timestamp": summary.timestamp}),
