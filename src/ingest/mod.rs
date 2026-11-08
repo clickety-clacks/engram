@@ -62,6 +62,7 @@ pub fn run_ingest(
     let mut skipped_non_transcript = 0usize;
     let mut recovered_sources = 0usize;
     let mut recovered_tapes = 0usize;
+    let mut covered_paths = Vec::<String>::new();
 
     for path in candidates {
         scanned += 1;
@@ -85,6 +86,8 @@ pub fn run_ingest(
                 continue;
             }
         };
+
+        covered_paths.push(path_string(&abs_path));
 
         let mut prior_state = match load_ingest_state_for_path(paths, &abs_path) {
             Ok(value) => value,
@@ -197,6 +200,8 @@ pub fn run_ingest(
         let mut ingest_bytes = Vec::new();
         let mut adapter_hint = None;
         let mut next_cursor = 0u64;
+        // Damaged lines in the bytes read: (file offset, length with LF).
+        let mut damaged = Vec::<(u64, u64)>::new();
 
         if !should_run_full {
             let prev = prior_state.as_ref().expect("known state");
@@ -225,13 +230,14 @@ pub fn run_ingest(
                 }));
                 continue;
             }
-            let complete = complete_ingest_prefix_len(&abs_path, &ingest_bytes);
-            if complete == 0 {
+            let prefix = complete_ingest_prefix(&abs_path, &ingest_bytes);
+            if prefix.complete == 0 {
                 skipped_unchanged += 1;
                 continue;
             }
-            ingest_bytes.truncate(complete);
-            next_cursor = prev.byte_cursor + complete as u64;
+            damaged = prefix.damaged_at(prev.byte_cursor);
+            ingest_bytes = prefix.bytes;
+            next_cursor = prev.byte_cursor + prefix.complete as u64;
         }
 
         if should_run_full {
@@ -245,13 +251,14 @@ pub fn run_ingest(
                     continue;
                 }
             };
-            let complete = complete_ingest_prefix_len(&abs_path, &all_bytes);
-            if complete == 0 {
+            let prefix = complete_ingest_prefix(&abs_path, &all_bytes);
+            if prefix.complete == 0 {
                 skipped_unchanged += 1;
                 continue;
             }
-            ingest_bytes = all_bytes[..complete].to_vec();
-            next_cursor = complete as u64;
+            damaged = prefix.damaged_at(0);
+            next_cursor = prefix.complete as u64;
+            ingest_bytes = prefix.bytes;
             if let Some(prev) = prior_state.as_ref() {
                 adapter_hint = adapter_id_from_name(&prev.adapter);
             }
@@ -297,13 +304,14 @@ pub fn run_ingest(
                     continue;
                 }
             };
-            let complete = complete_ingest_prefix_len(&abs_path, &all_bytes);
-            if complete == 0 {
+            let prefix = complete_ingest_prefix(&abs_path, &all_bytes);
+            if prefix.complete == 0 {
                 skipped_unchanged += 1;
                 continue;
             }
-            ingest_bytes = all_bytes[..complete].to_vec();
-            next_cursor = complete as u64;
+            damaged = prefix.damaged_at(0);
+            next_cursor = prefix.complete as u64;
+            ingest_bytes = prefix.bytes;
             let input = match std::str::from_utf8(&ingest_bytes) {
                 Ok(value) => value,
                 Err(err) => {
@@ -364,6 +372,12 @@ pub fn run_ingest(
         } else {
             (normalized, 0)
         };
+        let normalized = append_gap_events(
+            normalized,
+            &path_string(&abs_path),
+            &damaged,
+            previous.and_then(|state| state.last_message_timestamp.as_deref()),
+        );
         let events = match parse_jsonl_events(&normalized) {
             Ok(events) => events,
             Err(err) => {
@@ -455,8 +469,16 @@ pub fn run_ingest(
         }
     }
 
+    covered_paths.sort();
+    covered_paths.dedup();
+    let gaps = index
+        .gap_entries()?
+        .into_iter()
+        .filter(|entry| covered_paths.binary_search(&entry.path).is_ok())
+        .map(|entry| entry.to_json())
+        .collect::<Vec<_>>();
     let mut result = json!({
-        "status": if failures.is_empty() { "ok" } else { "partial" },
+        "status": if failures.is_empty() && gaps.is_empty() { "ok" } else { "partial" },
         "scanned_inputs": scanned,
         "imported_tapes": imported,
         "skipped_unchanged": skipped_unchanged,
@@ -465,6 +487,9 @@ pub fn run_ingest(
         "failure_count": failures.len(),
         "failures": failures,
     });
+    if !gaps.is_empty() {
+        result["gaps"] = json!(gaps);
+    }
     if recovered_sources > 0 {
         result["native_recovery"] = json!({"mode":"one_time_legacy_context_v1", "sources":recovered_sources, "tapes":recovered_tapes});
     }
@@ -688,6 +713,18 @@ pub(crate) fn load_ingest_state_for_path(
     Ok(Some(parsed))
 }
 
+/// True when `path` has a cursor and the file has grown past it: bytes an
+/// earlier ingest has not read yet.
+pub fn has_unread_bytes(paths: &RepoPaths, path: &Path) -> bool {
+    let Ok(abs_path) = fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(Some(state)) = load_ingest_state_for_path(paths, &abs_path) else {
+        return false;
+    };
+    fs::metadata(&abs_path).is_ok_and(|meta| meta.len() > state.byte_cursor)
+}
+
 pub(crate) fn save_ingest_state_for_path(
     paths: &RepoPaths,
     abs_path: &Path,
@@ -741,20 +778,48 @@ pub(crate) fn ingest_cursor_guard_matches(
     Ok(sha256_hex_bytes(&bytes) == guard.hash)
 }
 
-pub(crate) fn complete_ingest_prefix_len(path: &Path, bytes: &[u8]) -> usize {
+/// The ingestible part of a read: `complete` is how far the cursor may move,
+/// relative to the read start; `bytes` is that prefix without its damaged and
+/// whitespace-only lines.
+pub(crate) struct IngestPrefix {
+    pub complete: usize,
+    pub bytes: Vec<u8>,
+    /// Damaged lines as (offset relative to the read start, length with LF).
+    pub damaged: Vec<(usize, usize)>,
+}
+
+impl IngestPrefix {
+    fn damaged_at(&self, base: u64) -> Vec<(u64, u64)> {
+        self.damaged
+            .iter()
+            .map(|(offset, len)| (base + *offset as u64, *len as u64))
+            .collect()
+    }
+}
+
+pub(crate) fn complete_ingest_prefix(path: &Path, bytes: &[u8]) -> IngestPrefix {
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
         .map(|value| value.to_ascii_lowercase());
     if matches!(extension.as_deref(), Some("json")) {
-        return bytes.len();
+        return IngestPrefix {
+            complete: bytes.len(),
+            bytes: bytes.to_vec(),
+            damaged: Vec::new(),
+        };
     }
-    complete_jsonl_prefix_len(bytes)
+    complete_jsonl_prefix(bytes)
 }
 
-pub(crate) fn complete_jsonl_prefix_len(bytes: &[u8]) -> usize {
+/// Every LF-terminated line is complete. A line that does not parse is
+/// damaged unless it is only whitespace; both are left out of `bytes`. An
+/// unterminated last line is complete only if it parses (the pending tail).
+pub(crate) fn complete_jsonl_prefix(bytes: &[u8]) -> IngestPrefix {
     let mut offset = 0usize;
     let mut complete = 0usize;
+    let mut kept = Vec::with_capacity(bytes.len());
+    let mut damaged = Vec::new();
 
     while offset < bytes.len() {
         if let Some(rel_newline) = bytes[offset..].iter().position(|value| *value == b'\n') {
@@ -766,33 +831,61 @@ pub(crate) fn complete_jsonl_prefix_len(bytes: &[u8]) -> usize {
             if let Some(stripped) = line.strip_suffix(b"\r") {
                 line = stripped;
             }
-            if line.is_empty() {
-                complete = line_end;
-                offset = line_end;
-                continue;
+            if line.is_empty() || serde_json::from_slice::<Value>(line).is_ok() {
+                kept.extend_from_slice(&bytes[offset..line_end]);
+            } else if !line.iter().all(u8::is_ascii_whitespace) {
+                damaged.push((offset, line_end - offset));
             }
-            if serde_json::from_slice::<Value>(line).is_ok() {
-                complete = line_end;
-                offset = line_end;
-                continue;
-            }
-            break;
+            complete = line_end;
+            offset = line_end;
+            continue;
         }
 
         let mut line = &bytes[offset..];
         if let Some(stripped) = line.strip_suffix(b"\r") {
             line = stripped;
         }
-        if line.is_empty() {
-            break;
-        }
-        if serde_json::from_slice::<Value>(line).is_ok() {
+        if !line.is_empty() && serde_json::from_slice::<Value>(line).is_ok() {
+            kept.extend_from_slice(&bytes[offset..]);
             complete = bytes.len();
         }
         break;
     }
 
-    complete
+    IngestPrefix {
+        complete,
+        bytes: kept,
+        damaged,
+    }
+}
+
+/// Append one `source.gap` event per damaged line. The timestamp is the last
+/// event's, so the tape id stays a function of the source bytes.
+fn append_gap_events(
+    mut normalized: String,
+    path: &str,
+    damaged: &[(u64, u64)],
+    fallback_timestamp: Option<&str>,
+) -> String {
+    if damaged.is_empty() {
+        return normalized;
+    }
+    let timestamp = normalized
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|row| row["t"].as_str().map(ToOwned::to_owned))
+        .or_else(|| fallback_timestamp.map(ToOwned::to_owned))
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+    if !normalized.is_empty() && !normalized.ends_with('\n') {
+        normalized.push('\n');
+    }
+    for (offset, length) in damaged {
+        let row = json!({"t": timestamp, "k": "source.gap", "path": path, "offset": offset, "length": length});
+        normalized.push_str(&row.to_string());
+        normalized.push('\n');
+    }
+    normalized
 }
 
 pub fn record_transcript(

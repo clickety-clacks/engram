@@ -31,6 +31,62 @@ const FEATURE_WINDOW_ANCHORS_SQL: &str = "SELECT w.anchor
      JOIN evidence_windows w ON w.evidence_id = f.evidence_id
      WHERE f.feature_hash = ?1";
 
+const SOURCE_GAPS_SQL: &str = "CREATE TABLE IF NOT EXISTS source_gaps (
+    path TEXT NOT NULL,
+    offset INTEGER NOT NULL,
+    length INTEGER NOT NULL,
+    tape_id TEXT NOT NULL,
+    PRIMARY KEY (path, offset)
+)";
+
+/// The damaged lines skipped in one source file, aggregated from `source_gaps`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GapEntry {
+    pub path: String,
+    pub damaged_lines: u64,
+    pub damaged_bytes: u64,
+    pub first_damaged_offset: u64,
+}
+
+impl GapEntry {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "path": self.path,
+            "damaged_lines": self.damaged_lines,
+            "damaged_bytes": self.damaged_bytes,
+            "first_damaged_offset": self.first_damaged_offset,
+        })
+    }
+
+    /// Read an entry back from `to_json` output, as a peer sends it.
+    pub fn from_json(value: &serde_json::Value) -> Option<Self> {
+        let field = |key: &str| value.get(key).and_then(serde_json::Value::as_u64);
+        Some(Self {
+            path: value.get("path")?.as_str()?.to_string(),
+            damaged_lines: field("damaged_lines")?,
+            damaged_bytes: field("damaged_bytes")?,
+            first_damaged_offset: field("first_damaged_offset")?,
+        })
+    }
+
+    /// The text of a `damaged_line` failure for this file.
+    pub fn message(&self) -> String {
+        format!(
+            "{}: {} damaged line(s) skipped ({} bytes, first at offset {})",
+            self.path, self.damaged_lines, self.damaged_bytes, self.first_damaged_offset
+        )
+    }
+
+    /// A `damaged_line` failure record naming this file.
+    pub fn failure(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "failure",
+            "path": self.path,
+            "error": {"code": "damaged_line", "message": self.message()},
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct EdgeRow {
     pub from_anchor: String,
@@ -166,6 +222,9 @@ impl SqliteIndex {
         if !existed {
             index.create_schema_v4()?;
         }
+        // Additive within schema v4: indexes written before gap recording
+        // lack this table, and older readers ignore it.
+        index.conn.execute_batch(SOURCE_GAPS_SQL)?;
         Ok(index)
     }
 
@@ -221,6 +280,7 @@ impl SqliteIndex {
         };
         index.configure_writer()?;
         index.create_schema_v4()?;
+        index.conn.execute_batch(SOURCE_GAPS_SQL)?;
         Ok(index)
     }
 
@@ -730,6 +790,36 @@ impl SqliteIndex {
             .is_some())
     }
 
+    /// Return one gap entry per source path with recorded damaged lines. An
+    /// index without the gap table has no gaps.
+    pub fn gap_entries(&self) -> rusqlite::Result<Vec<GapEntry>> {
+        let has_table = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'source_gaps'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !has_table {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT path, COUNT(*), SUM(length), MIN(offset)
+             FROM source_gaps GROUP BY path ORDER BY path ASC",
+        )?;
+        stmt.query_map([], |row| {
+            Ok(GapEntry {
+                path: row.get(0)?,
+                damaged_lines: row.get::<_, i64>(1)? as u64,
+                damaged_bytes: row.get::<_, i64>(2)? as u64,
+                first_damaged_offset: row.get::<_, i64>(3)? as u64,
+            })
+        })?
+        .collect()
+    }
+
     /// Return the tape IDs recorded by this index in deterministic order.
     pub fn tape_ids(&self) -> rusqlite::Result<Vec<String>> {
         let mut stmt = self
@@ -887,6 +977,13 @@ impl SqliteIndex {
                             agent_link: true,
                             note: link.note.clone(),
                         },
+                    )?;
+                }
+                TapeEventData::Gap(gap) => {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO source_gaps (path, offset, length, tape_id)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![gap.path, gap.offset as i64, gap.length as i64, tape_id],
                     )?;
                 }
                 TapeEventData::Textual(_)

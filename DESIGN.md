@@ -333,6 +333,7 @@ Event kinds and what they capture:
 | `code.read` | Agent reads a specific file/range | `file`, `range`, `anchor_hashes` |
 | `code.edit` | Agent modifies a specific file/range | `file`, `before_hash`, `after_hash`, `before_range`, `after_range` |
 | `span.link` | Explicit agent-declared lineage between two spans | `from_file`, `from_range`, `to_file`, `to_range`, `note` |
+| `source.gap` | A damaged source line that ingest skipped | `path`, `offset`, `length` |
 
 All events carry: `t` (ISO timestamp), `k` (event kind), `source` (harness + session ID).
 
