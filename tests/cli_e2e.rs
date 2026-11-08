@@ -985,6 +985,171 @@ fn global_and_dispatch_flags_are_removed_from_cli() {
     assert!(explain_err.contains("--dispatch"), "stderr={explain_err}");
 }
 
+struct WatchProcess(std::process::Child);
+
+impl Drop for WatchProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn isolated_home_command(home: &Path, cwd: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_engram"));
+    cmd.current_dir(cwd).args(args);
+    if cfg!(windows) {
+        cmd.env("USERPROFILE", home).env_remove("HOME");
+    } else {
+        cmd.env("HOME", home);
+    }
+    cmd
+}
+
+fn write_watch_config(home: &Path, source: &Path, store: &Path) -> std::path::PathBuf {
+    fs::create_dir_all(home.join(".engram")).expect("engram dir");
+    fs::create_dir_all(source).expect("source dir");
+    let log = store.join("watch.log");
+    let yaml_path = |path: &Path| serde_json::to_string(&path.to_string_lossy()).expect("path");
+    fs::write(
+        home.join(".engram/config.yml"),
+        format!(
+            "db: {}\ntapes_dir: {}\nwatch:\n  debounce_secs: 1\n  ingest_timeout_secs: 60\n  log: {}\n  sources:\n    - path: {}\n      pattern: \"*.jsonl\"\n",
+            yaml_path(&store.join("index.sqlite")),
+            yaml_path(&store.join("tapes")),
+            yaml_path(&log),
+            yaml_path(source),
+        ),
+    )
+    .expect("config");
+    log
+}
+
+fn append_claude_message(path: &Path, token: &str) {
+    let line = serde_json::json!({
+        "type": "user",
+        "session_id": "watch-session",
+        "uuid": format!("uuid-{token}"),
+        "timestamp": "2026-11-08T00:00:00.000Z",
+        "message": {"role": "user", "content": [{"type": "text", "text": format!("message {token} end")}]}
+    });
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("transcript");
+    writeln!(file, "{line}").expect("append");
+}
+
+fn indexed_occurrences(home: &Path, token: &str) -> u64 {
+    // The watch config keeps the index next to HOME; nothing is indexed before it exists.
+    if !home.join("../store/index.sqlite").exists() {
+        return 0;
+    }
+    let output = isolated_home_command(home, home, &["grep", token])
+        .output()
+        .expect("grep runs");
+    if String::from_utf8_lossy(&output.stderr).contains("\"error\":\"no_results\"") {
+        return 0;
+    }
+    let value: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|err| panic!("grep json: {err}; output: {output:?}"));
+    value["sessions"]
+        .as_array()
+        .expect("sessions")
+        .iter()
+        .map(|session| session["match_count"].as_u64().expect("match_count"))
+        .sum()
+}
+
+fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !check() {
+        assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn ingest_ok_count(log: &Path) -> usize {
+    fs::read_to_string(log)
+        .unwrap_or_default()
+        .matches("ingest ok path=")
+        .count()
+}
+
+#[test]
+fn watch_indexes_final_append_written_just_after_an_ingest_exactly_once() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let source = home.join("sessions");
+    let log = write_watch_config(&home, &source, &temp.path().join("store"));
+    let transcript = source.join("session.jsonl");
+
+    let _watch = WatchProcess(
+        isolated_home_command(&home, &home, &["watch"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("watch spawns"),
+    );
+    wait_until("watch start", || {
+        fs::read_to_string(&log).unwrap_or_default().contains("watch source path=")
+    });
+
+    append_claude_message(&transcript, "WATCHFIRSTTOKEN");
+    wait_until("first ingest", || ingest_ok_count(&log) >= 1);
+    // The session's last message lands right after an ingest and nothing is written afterwards.
+    append_claude_message(&transcript, "WATCHFINALTOKEN");
+    wait_until("final append indexed", || {
+        indexed_occurrences(&home, "WATCHFINALTOKEN") > 0
+    });
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    assert_eq!(indexed_occurrences(&home, "WATCHFIRSTTOKEN"), 1);
+    assert_eq!(indexed_occurrences(&home, "WATCHFINALTOKEN"), 1);
+}
+
+#[test]
+fn watch_shares_home_ingest_cursors_and_indexes_only_appended_bytes() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let source = home.join("sessions");
+    let log = write_watch_config(&home, &source, &temp.path().join("store"));
+    let transcript = source.join("session.jsonl");
+    append_claude_message(&transcript, "BACKFILLTOKEN");
+
+    let source_arg = source.to_string_lossy().to_string();
+    let backfill = isolated_home_command(&home, &home, &["ingest", &source_arg])
+        .output()
+        .expect("ingest runs");
+    assert!(backfill.status.success(), "backfill failed: {backfill:?}");
+    assert_eq!(indexed_occurrences(&home, "BACKFILLTOKEN"), 1);
+
+    // Start watch from a directory other than HOME; its cursors must still be HOME's.
+    let elsewhere = temp.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).expect("elsewhere");
+    let _watch = WatchProcess(
+        isolated_home_command(&home, &elsewhere, &["watch"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("watch spawns"),
+    );
+    wait_until("watch start", || {
+        fs::read_to_string(&log).unwrap_or_default().contains("watch source path=")
+    });
+
+    append_claude_message(&transcript, "APPENDEDTOKEN");
+    wait_until("append indexed", || {
+        indexed_occurrences(&home, "APPENDEDTOKEN") > 0
+    });
+    wait_until("watch ingest", || ingest_ok_count(&log) >= 1);
+
+    assert_eq!(indexed_occurrences(&home, "BACKFILLTOKEN"), 1);
+    assert_eq!(indexed_occurrences(&home, "APPENDEDTOKEN"), 1);
+    assert!(!source.join(".engram").exists(), "watch wrote cursors under the source root");
+    assert!(!elsewhere.join(".engram").exists(), "watch wrote cursors under its cwd");
+}
+
 #[test]
 fn watch_errors_clearly_when_watch_config_is_missing() {
     let temp = tempfile::tempdir().expect("tempdir");
