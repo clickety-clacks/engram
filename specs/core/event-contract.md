@@ -19,6 +19,7 @@ A harness-independent, deterministic event schema for provenance ingestion.
 - `code.read`
 - `code.edit`
 - `span.link`
+- `source.gap`
 
 ## Required fields
 All events:

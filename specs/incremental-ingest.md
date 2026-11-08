@@ -142,6 +142,10 @@ Rules:
 
 This preserves idempotency and prevents partial-write corruption.
 
+These rules cover the pending tail only. A newline-terminated line that does
+not parse is a damaged line, not an incomplete trailing record: ingest reads
+past it and records a gap, as `specs/damaged-line-truthfulness.md` specifies.
+
 ## Determinism + Idempotency Invariants
 
 Implementation MUST preserve:

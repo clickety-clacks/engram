@@ -60,6 +60,7 @@ fn collect_winnow_anchors(events: &[engram::tape::TapeEventAt]) -> BTreeSet<Stri
             TapeEventData::SpanLink(_)
             | TapeEventData::Meta(_)
             | TapeEventData::Textual(_)
+            | TapeEventData::Gap(_)
             | TapeEventData::Other { .. } => {}
         }
     }

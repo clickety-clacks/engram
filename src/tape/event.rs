@@ -10,6 +10,7 @@ pub enum EventKind {
     CodeEdit,
     SpanLink,
     Meta,
+    Gap,
     Unknown,
 }
 
@@ -32,7 +33,17 @@ pub enum TapeEventData {
     SpanLink(SpanLinkEvent),
     Textual(TextualEvent),
     Meta(MetaEvent),
+    Gap(GapEvent),
     Other { kind: EventKind },
+}
+
+/// A damaged source line that ingest skipped: its byte offset and length
+/// (LF included) in the source transcript at `path`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GapEvent {
+    pub path: String,
+    pub offset: u64,
+    pub length: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -196,6 +207,12 @@ struct RawEvent {
     stdout: Option<serde_json::Value>,
     #[serde(default)]
     stderr: Option<serde_json::Value>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    offset: Option<u64>,
+    #[serde(default)]
+    length: Option<u64>,
 }
 
 impl RawEvent {
@@ -255,6 +272,14 @@ impl RawEvent {
                 coverage_edit: self.coverage_edit,
                 coverage_tool: self.coverage_tool,
             }),
+            "source.gap" => match (self.path, self.offset, self.length) {
+                (Some(path), Some(offset), Some(length)) => TapeEventData::Gap(GapEvent {
+                    path,
+                    offset,
+                    length,
+                }),
+                _ => TapeEventData::Other { kind },
+            },
             _ => TapeEventData::Other { kind },
         };
 
@@ -298,6 +323,7 @@ fn to_kind(kind: &str) -> EventKind {
         "code.edit" => EventKind::CodeEdit,
         "span.link" => EventKind::SpanLink,
         "meta" => EventKind::Meta,
+        "source.gap" => EventKind::Gap,
         _ => EventKind::Unknown,
     }
 }

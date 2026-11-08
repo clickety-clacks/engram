@@ -33,8 +33,10 @@ use engram::dispatch::{
 };
 use engram::dispatch::task_context::attach_explain_task_ancestry;
 use engram::index::lineage::LINK_THRESHOLD_DEFAULT;
-use engram::index::{DispatchDirection, ReaderMode, SqliteIndex};
-use engram::ingest::{extract_meta, git_head, now_iso8601, record_transcript, run_ingest};
+use engram::index::{DispatchDirection, GapEntry, ReaderMode, SqliteIndex};
+use engram::ingest::{
+    extract_meta, git_head, has_unread_bytes, now_iso8601, record_transcript, run_ingest,
+};
 use engram::query::explain::ExplainTraversal;
 use engram::query::file_identity::{FileIdentityRelation, FileIdentityResolver};
 #[cfg(test)]
@@ -3440,6 +3442,21 @@ fn cmd_watch_with_home(cwd: &Path, args: WatchArgs, home: &Path) -> Result<(), C
     // deadline passes. Events arriving during an ingest mark it pending again,
     // so the last append is always followed by an ingest.
     let mut pending = HashMap::<(usize, PathBuf), Instant>::new();
+    // A file whose cursor stopped short of its end (for example behind a
+    // damaged line an older build could not pass) catches up at start,
+    // without waiting for a new append.
+    for (idx, runtime) in runtimes.iter().enumerate() {
+        for entry in walkdir::WalkDir::new(&runtime.source.path)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+        {
+            let path = entry.into_path();
+            if watch_path_matches(runtime, &path) && has_unread_bytes(&paths, &path) {
+                pending.insert((idx, path), Instant::now() + runtime.debounce);
+            }
+        }
+    }
     while !stop.load(Ordering::SeqCst) {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(Ok(event)) => {
@@ -3482,7 +3499,14 @@ fn cmd_watch_with_home(cwd: &Path, args: WatchArgs, home: &Path) -> Result<(), C
                     )?;
                 }
                 WatchIngestResult::Completed(Ok(())) => {
-                    watch_log_line(&mut log, &format!("ingest ok path={}", path.display()))?;
+                    let message = match recorded_damaged_lines(&context, &path) {
+                        Some(lines) => format!(
+                            "ingest partial path={} damaged_lines={lines}",
+                            path.display()
+                        ),
+                        None => format!("ingest ok path={}", path.display()),
+                    };
+                    watch_log_line(&mut log, &message)?;
                 }
                 WatchIngestResult::Completed(Err(err)) => {
                     watch_log_line(
@@ -3586,6 +3610,18 @@ fn run_watch_ingest(
             WatchIngestResult::Completed(Err(CliError::new("watch_error", "ingest thread ended")))
         }
     }
+}
+
+/// Damaged lines recorded for `path` in the index, if any.
+fn recorded_damaged_lines(context: &RuntimeContext, path: &Path) -> Option<u64> {
+    let abs_path = path_string(&fs::canonicalize(path).ok()?);
+    let index = SqliteIndex::open_reader(&path_string(&context.db_path)).ok()?;
+    index
+        .gap_entries()
+        .ok()?
+        .into_iter()
+        .find(|gap| gap.path == abs_path)
+        .map(|gap| gap.damaged_lines)
 }
 
 fn watch_log_line(log: &mut File, message: &str) -> Result<(), CliError> {
@@ -5100,14 +5136,22 @@ fn topology_peer_status_row(
         .exports
         .iter()
         .map(|(name, result)| match result {
-            Ok(export) => json!({
-                "store": format!("{machine}/{name}"),
-                "status": "ok",
-                "db": export.db,
-                "tape_dirs": export.tape_dirs,
-                "reader_mode": export.reader_mode,
-                "snapshot_at": export.snapshot_at,
-            }),
+            Ok(export) => {
+                let mut row = json!({
+                    "store": format!("{machine}/{name}"),
+                    "status": "ok",
+                    "db": export.db,
+                    "tape_dirs": export.tape_dirs,
+                    "reader_mode": export.reader_mode,
+                    "snapshot_at": export.snapshot_at,
+                });
+                if !export.gaps.is_empty() {
+                    failed = true;
+                    row["status"] = json!("partial");
+                    row["gaps"] = export.gaps.iter().map(GapEntry::to_json).collect();
+                }
+                row
+            }
             Err(error) => {
                 failed = true;
                 json!({
@@ -5141,14 +5185,20 @@ fn check_local_export_coverage(topology: &Topology) -> Vec<Value> {
         .exports
         .iter()
         .map(|(name, export)| match local_export_tape_coverage(export) {
-            Ok((indexed, missing)) => json!({
-                "store": format!("{}/{name}", topology.self_label),
-                "status": "ok",
-                "db": export.db,
-                "tape_dirs": export.tape_dirs,
-                "indexed_tape_count": indexed,
-                "indexed_tapes_without_file": missing,
-            }),
+            Ok((indexed, missing, gaps)) => {
+                let mut row = json!({
+                    "store": format!("{}/{name}", topology.self_label),
+                    "status": if gaps.is_empty() { "ok" } else { "partial" },
+                    "db": export.db,
+                    "tape_dirs": export.tape_dirs,
+                    "indexed_tape_count": indexed,
+                    "indexed_tapes_without_file": missing,
+                });
+                if !gaps.is_empty() {
+                    row["gaps"] = Value::Array(gaps);
+                }
+                row
+            }
             Err((code, message)) => json!({
                 "store": format!("{}/{name}", topology.self_label),
                 "status": if code == "incompatible" { "incompatible" } else { "unavailable" },
@@ -5162,7 +5212,7 @@ fn check_local_export_coverage(topology: &Topology) -> Vec<Value> {
 
 fn local_export_tape_coverage(
     export: &engram::config::TopologyExport,
-) -> Result<(usize, usize), (String, String)> {
+) -> Result<(usize, usize, Vec<Value>), (String, String)> {
     let db = export.db.to_string_lossy();
     let index = SqliteIndex::open_reader_mode(&db, ReaderMode::Live).map_err(|error| {
         let (code, message) = if matches!(error, rusqlite::Error::InvalidQuery) {
@@ -5232,7 +5282,20 @@ fn local_export_tape_coverage(
             missing += 1;
         }
     }
-    Ok((tape_ids.len(), missing))
+    let gaps = index.gap_entries().map_err(|error| {
+        (
+            "reader_unavailable".to_string(),
+            format!(
+                "cannot read gap entries in {}: {error}",
+                export.db.display()
+            ),
+        )
+    })?;
+    Ok((
+        tape_ids.len(),
+        missing,
+        gaps.iter().map(|gap| gap.to_json()).collect(),
+    ))
 }
 
 fn valid_tape_filename_segment(tape_id: &str) -> bool {
@@ -5799,6 +5862,7 @@ fn cmd_explain_with_peers_inner(
         connect_peers_concurrently(&selected_machines, &topology, query_deadline, cancelled);
     let mut owners = HashMap::<String, RemoteOwner>::new();
     let mut lookup_jobs = Vec::new();
+    let mut peer_gaps = Vec::<(String, Vec<GapEntry>)>::new();
     let mut any_peer_failure = false;
     for machine in &selected_machines {
         let peer = topology.peers.get(machine).expect("selected peer exists");
@@ -5835,6 +5899,7 @@ fn cmd_explain_with_peers_inner(
                                 "build": owner.build,
                                 "semantics": owner.query_semantics,
                             }));
+                            peer_gaps.push((format!("{machine}/{export}"), opened.gaps.clone()));
                             active_exports.push(export.clone());
                         }
                         Some(Err(failure)) => {
@@ -6845,6 +6910,21 @@ fn cmd_explain_with_peers_inner(
     } else {
         "complete"
     };
+    let stores_queried = indexes.len()
+        + sources
+            .iter()
+            .filter(|source| {
+                source.get("kind").and_then(Value::as_str) == Some("peer")
+                    && source.get("status").and_then(Value::as_str) == Some("ok")
+            })
+            .count();
+    // Damaged source lines make the answer partial without making its lineage
+    // partial: the indexed content was all read.
+    let mut any_gap = mark_local_store_gaps(&indexes, &mut sources, "explain")?;
+    for (store, gaps) in &peer_gaps {
+        any_gap |= mark_source_gaps(&mut sources, store, "explain", gaps);
+    }
+    let any_peer_failure = any_peer_failure || any_gap;
     if (any_peer_failure || temporal_incomplete) && args.require_complete {
         return Err(explain_require_complete_error(&sources));
     }
@@ -6877,7 +6957,7 @@ fn cmd_explain_with_peers_inner(
         "dispatch_unresolved": dispatch_unresolved,
         "dispatch_ambiguous": dispatch_ambiguous,
         "tombstones": tombstones,
-        "stores_queried": indexes.len() + sources.iter().filter(|source| source.get("kind").and_then(Value::as_str) == Some("peer") && source.get("status").and_then(Value::as_str) == Some("ok")).count(),
+        "stores_queried": stores_queried,
         "returned": returned,
         "total": total,
         "time_range": time_range,
@@ -7075,6 +7155,7 @@ fn cmd_grep_with_peer(
     let page_limit = args.limit.unwrap_or(context.explain_default_limit).min(25);
     let k = args.offset.saturating_add(page_limit);
     let mut source_rows = local_grep_source_rows(context, &topology.self_label);
+    let local_gaps = mark_local_store_gaps(&indexes, &mut source_rows, "grep_scan")?;
     let fallback_store = format!("{}/local-files", topology.self_label);
     for (unselected, config) in &topology.peers {
         if selected_machines
@@ -7105,7 +7186,7 @@ fn cmd_grep_with_peer(
     let mut peer_source_totals = Vec::new();
     let mut source_count_known = true;
     let mut peer_source_time_ranges = Vec::new();
-    let mut any_source_failure = false;
+    let mut any_source_failure = local_gaps;
     // Grep aggregates are scoped to every selected source. A later metadata
     // failure must not erase a terminal-success scan, but any missing or
     // incomplete grep_scan keeps the matching scope unknown.
@@ -8929,6 +9010,54 @@ fn mark_anchor_batch_failures(
                 .collect::<Vec<_>>()
         );
     }
+}
+
+/// Marks a source partial with one `damaged_line` failure per gap file, keeping
+/// any failures it already carries. Returns whether there were gaps to mark.
+fn mark_source_gaps(sources: &mut [Value], store: &str, phase: &str, gaps: &[GapEntry]) -> bool {
+    if gaps.is_empty() {
+        return false;
+    }
+    if let Some(source) = sources
+        .iter_mut()
+        .find(|source| source.get("store").and_then(Value::as_str) == Some(store))
+    {
+        source["status"] = json!("partial");
+        if source.get("phase").is_none() {
+            source["phase"] = json!(phase);
+        }
+        let mut failures = source
+            .get("failures")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        failures.extend(gaps.iter().map(GapEntry::failure));
+        source["failures"] = json!(failures);
+    }
+    true
+}
+
+/// Applies `mark_source_gaps` to the local stores, whose rows lead `sources`
+/// in the same order as `indexes`.
+fn mark_local_store_gaps(
+    indexes: &[SqliteIndex],
+    sources: &mut [Value],
+    phase: &str,
+) -> Result<bool, CliError> {
+    let mut marked = false;
+    for (position, index) in indexes.iter().enumerate() {
+        let gaps = index.gap_entries()?;
+        let Some(store) = sources
+            .get(position)
+            .and_then(|source| source.get("store"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+        else {
+            continue;
+        };
+        marked |= mark_source_gaps(sources, &store, phase, &gaps);
+    }
+    Ok(marked)
 }
 
 fn mark_source_failures(sources: &mut [Value], store: &str, phase: &str, failures: &[Value]) {
