@@ -122,6 +122,10 @@ jobs:
     if: github.event_name == 'push'
     needs: [validate, release]
     runs-on: ubuntu-latest
+    # Publishes by npm trusted publishing (OIDC) only; no token is passed.
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -136,8 +140,6 @@ jobs:
         run: npm run test:npm-package
 
       - name: Publish npm package
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public
 
   homebrew:
