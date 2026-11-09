@@ -35,7 +35,7 @@ use engram::dispatch::task_context::attach_explain_task_ancestry;
 use engram::index::lineage::LINK_THRESHOLD_DEFAULT;
 use engram::index::{DispatchDirection, GapEntry, ReaderMode, SqliteIndex};
 use engram::ingest::{
-    extract_meta, git_head, has_unread_bytes, now_iso8601, record_transcript, run_ingest,
+    extract_meta, git_head, has_pending_ingest, now_iso8601, record_transcript, run_ingest,
 };
 use engram::query::explain::ExplainTraversal;
 use engram::query::file_identity::{FileIdentityRelation, FileIdentityResolver};
@@ -3452,7 +3452,7 @@ fn cmd_watch_with_home(cwd: &Path, args: WatchArgs, home: &Path) -> Result<(), C
             .filter(|entry| entry.file_type().is_file())
         {
             let path = entry.into_path();
-            if watch_path_matches(runtime, &path) && has_unread_bytes(&paths, &path) {
+            if watch_path_matches(runtime, &path) && has_pending_ingest(&paths, &path) {
                 pending.insert((idx, path), Instant::now() + runtime.debounce);
             }
         }
