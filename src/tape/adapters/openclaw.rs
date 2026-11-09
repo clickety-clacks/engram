@@ -31,6 +31,7 @@ struct ToolCallContext {
 enum Extract {
     All,
     PlainStringUser,
+    NestedToolResult,
 }
 
 pub fn openclaw_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Error> {
@@ -43,6 +44,16 @@ pub fn openclaw_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::E
 /// there are none.
 pub fn openclaw_plain_string_user_jsonl(input: &str) -> Result<Option<String>, serde_json::Error> {
     let tape = convert(input, Extract::PlainStringUser)?;
+    // One line is the meta row alone.
+    Ok((tape.lines().count() > 1).then_some(tape))
+}
+
+/// Readers before 0.2.15 left tool-result output held in a nested
+/// `toolResult` part empty. This yields, from bytes such a reader already
+/// ingested, only what reading that output adds: each such `tool.result` and
+/// the `code.read` derived from it, or `None` when there is nothing to add.
+pub fn openclaw_nested_tool_result_jsonl(input: &str) -> Result<Option<String>, serde_json::Error> {
+    let tape = convert(input, Extract::NestedToolResult)?;
     // One line is the meta row alone.
     Ok((tape.lines().count() > 1).then_some(tape))
 }
@@ -240,7 +251,9 @@ fn extract_from_row(
     if role == "user"
         && let Some(text) = message.get("content").and_then(Value::as_str)
     {
-        emit_user_text(out, &timestamp, session_id.as_deref(), text);
+        if extract != Extract::NestedToolResult {
+            emit_user_text(out, &timestamp, session_id.as_deref(), text);
+        }
         return;
     }
     if extract == Extract::PlainStringUser {
@@ -253,16 +266,27 @@ fn extract_from_row(
         .unwrap_or_default();
 
     match role {
-        "user" => emit_user_message(out, &timestamp, session_id.as_deref(), &content_blocks),
-        "assistant" => emit_assistant_message(
-            out,
-            &timestamp,
-            session_id.as_deref(),
-            &content_blocks,
-            tool_contexts,
-        ),
+        "user" if extract == Extract::All => {
+            emit_user_message(out, &timestamp, session_id.as_deref(), &content_blocks)
+        }
+        "assistant" => {
+            // The nested catch-up still needs the tool calls' context.
+            let mut skipped = Vec::new();
+            emit_assistant_message(
+                if extract == Extract::All {
+                    out
+                } else {
+                    &mut skipped
+                },
+                &timestamp,
+                session_id.as_deref(),
+                &content_blocks,
+                tool_contexts,
+            )
+        }
         "toolResult" => emit_tool_result_message(
             out,
+            extract,
             &timestamp,
             session_id.as_deref(),
             message,
@@ -360,13 +384,14 @@ fn emit_assistant_message(
 
 fn emit_tool_result_message(
     out: &mut Vec<Value>,
+    extract: Extract,
     timestamp: &str,
     session_id: Option<&str>,
     message: &serde_json::Map<String, Value>,
     content_blocks: &[Value],
     tool_contexts: &mut HashMap<String, ToolCallContext>,
 ) {
-    let text = join_text_blocks(content_blocks);
+    let text = join_tool_result_blocks(content_blocks);
     let tool_name = message
         .get("toolName")
         .and_then(Value::as_str)
@@ -379,6 +404,16 @@ fn emit_tool_result_message(
         .get("isError")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // Older readers took only `text` parts. Their output was empty exactly
+    // when no `text` part held any; anything else they already wrote.
+    if extract == Extract::NestedToolResult
+        && (text.is_empty() || !join_text_blocks(content_blocks).is_empty())
+    {
+        if !is_error && let Some(id) = &call_id {
+            tool_contexts.remove(id);
+        }
+        return;
+    }
 
     let mut result = serde_json::Map::new();
     result.insert("t".to_string(), json!(timestamp));
@@ -423,6 +458,8 @@ fn emit_tool_result_message(
                 out.push(Value::Object(event));
             }
         }
+        // Edits come from the call's arguments, which older readers wrote.
+        ToolKind::Edit if extract == Extract::NestedToolResult => {}
         ToolKind::Edit => {
             if let Some(patch) = context.patch_text {
                 for edit in parse_patch(&patch) {
@@ -604,6 +641,28 @@ fn join_text_blocks(content_blocks: &[Value]) -> String {
             && !text.is_empty()
         {
             chunks.push(text.to_string());
+        }
+    }
+    chunks.join("\n")
+}
+
+/// Tool-result output: `text` parts and nested `toolResult` parts whose
+/// `content` is a string, in order, without empty pieces, joined by newlines.
+fn join_tool_result_blocks(content_blocks: &[Value]) -> String {
+    let mut chunks = Vec::new();
+    for block in content_blocks {
+        let Some(block_obj) = block.as_object() else {
+            continue;
+        };
+        let text = match block_obj.get("type").and_then(Value::as_str) {
+            Some("text") => block_obj.get("text"),
+            Some("toolResult") => block_obj.get("content"),
+            _ => None,
+        };
+        if let Some(text) = text.and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            chunks.push(text);
         }
     }
     chunks.join("\n")
