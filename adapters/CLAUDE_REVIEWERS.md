@@ -5,7 +5,7 @@ This guidance is for Claude-based reviewers evaluating adapter changes.
 ## Hard Rule
 
 You MUST review against `adapters/ADAPTERS.md` as the canonical contract.
-You MUST also verify `adapters/ADAPTERS.md` remains aligned with `/Users/mike/shared-workspace/shared/specs/engram.md`; if drift exists, flag it as blocking.
+You MUST also verify `adapters/ADAPTERS.md` remains aligned with `/Users/user/shared-workspace/shared/specs/engram.md`; if drift exists, flag it as blocking.
 
 ## Required Review Focus
 

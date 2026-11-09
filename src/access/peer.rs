@@ -3077,7 +3077,7 @@ mod tests {
             let matching = vec![anchor.clone()];
             let ranges = anchor_result_frame_ranges(
                 &json!(7),
-                "eezo/default",
+                "host-b/default",
                 "winnow:0123456789abcdef",
                 &matching,
                 MAX_FRAME_BYTES,
@@ -3096,7 +3096,7 @@ mod tests {
         ];
         let ranges = anchor_result_frame_ranges(
             &json!(7),
-            "eezo/default",
+            "host-b/default",
             "winnow:0123456789abcdef",
             &matching,
             180,
@@ -3112,7 +3112,7 @@ mod tests {
             assert!(
                 anchor_result_frame_bytes(
                     &json!(7),
-                    "eezo/default",
+                    "host-b/default",
                     "winnow:0123456789abcdef",
                     &matching[range],
                 )
@@ -3124,13 +3124,13 @@ mod tests {
 
     #[test]
     fn anchor_result_frames_keep_empty_results_and_reject_an_indivisible_over_limit_item() {
-        let empty = anchor_result_frame_ranges(&json!(1), "eezo/default", "query-anchor", &[], 256)
+        let empty = anchor_result_frame_ranges(&json!(1), "host-b/default", "query-anchor", &[], 256)
             .expect("empty result fits");
         assert_eq!(empty, vec![0..0]);
 
         let query = "query-anchor";
         let matched = "winnow:matched-anchor".to_string();
-        let base = anchor_result_frame_bytes(&json!(1), "eezo/default", query, &[])
+        let base = anchor_result_frame_bytes(&json!(1), "host-b/default", query, &[])
             .expect("measure empty result");
         let one = base
             + serde_json::to_vec(&matched)
@@ -3138,7 +3138,7 @@ mod tests {
                 .len();
         let failure = anchor_result_frame_ranges(
             &json!(1),
-            "eezo/default",
+            "host-b/default",
             query,
             &[matched.clone()],
             one - 1,
@@ -3157,14 +3157,14 @@ mod tests {
         let second = format!("winnow:{}", "b".repeat(700_000));
         let matching = vec![first.clone(), second];
         let first_bytes =
-            anchor_result_frame_bytes(&json!(1), "eezo/default", "query-anchor", &matching[..1])
+            anchor_result_frame_bytes(&json!(1), "host-b/default", "query-anchor", &matching[..1])
                 .expect("first frame size");
         let mut output = Vec::new();
         let mut used_bytes = 0;
         let failure = write_anchor_result_frames(
             &mut output,
             &json!(1),
-            "eezo/default",
+            "host-b/default",
             "query-anchor",
             &matching,
             &mut used_bytes,

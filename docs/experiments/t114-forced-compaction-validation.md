@@ -1,7 +1,7 @@
 # T114 Forced-Compaction Continuation Validation
 
 Date: 2026-02-27  
-Run directory: `/Users/mike/src/engram/scratch/t114-forced-compaction/20260227T161024Z`
+Run directory: `/Users/user/src/engram/scratch/t114-forced-compaction/20260227T161024Z`
 
 ## Goal
 Generate deterministic ground truth across forced compaction boundaries and evaluate continuation reconstruction accuracy end-to-end through Engram ingest/explain.
@@ -28,14 +28,14 @@ Ground truth continuation edges:
 - `oc-t114-2 -> oc-t114-3`
 
 ## Artifact outputs
-- ingest stdout: `/Users/mike/src/engram/scratch/t114-forced-compaction/20260227T161024Z/results/ingest.json`
-- ingest stderr: `/Users/mike/src/engram/scratch/t114-forced-compaction/20260227T161024Z/results/ingest.stderr`
-- explain stdout: `/Users/mike/src/engram/scratch/t114-forced-compaction/20260227T161024Z/results/explain.json`
-- explain stderr: `/Users/mike/src/engram/scratch/t114-forced-compaction/20260227T161024Z/results/explain.stderr`
-- predicted edges: `/Users/mike/src/engram/scratch/t114-forced-compaction/20260227T161024Z/results/predicted_edges.txt`
-- ground truth edges: `/Users/mike/src/engram/scratch/t114-forced-compaction/20260227T161024Z/results/ground_truth_edges.txt`
-- metrics: `/Users/mike/src/engram/scratch/t114-forced-compaction/20260227T161024Z/results/metrics.json`
-- summary: `/Users/mike/src/engram/scratch/t114-forced-compaction/20260227T161024Z/results/summary.txt`
+- ingest stdout: `/Users/user/src/engram/scratch/t114-forced-compaction/20260227T161024Z/results/ingest.json`
+- ingest stderr: `/Users/user/src/engram/scratch/t114-forced-compaction/20260227T161024Z/results/ingest.stderr`
+- explain stdout: `/Users/user/src/engram/scratch/t114-forced-compaction/20260227T161024Z/results/explain.json`
+- explain stderr: `/Users/user/src/engram/scratch/t114-forced-compaction/20260227T161024Z/results/explain.stderr`
+- predicted edges: `/Users/user/src/engram/scratch/t114-forced-compaction/20260227T161024Z/results/predicted_edges.txt`
+- ground truth edges: `/Users/user/src/engram/scratch/t114-forced-compaction/20260227T161024Z/results/ground_truth_edges.txt`
+- metrics: `/Users/user/src/engram/scratch/t114-forced-compaction/20260227T161024Z/results/metrics.json`
+- summary: `/Users/user/src/engram/scratch/t114-forced-compaction/20260227T161024Z/results/summary.txt`
 
 ## Key results
 - `ingest`: `{"status":"ok","scanned_inputs":3,"imported_tapes":3,"failure_count":0,...}`

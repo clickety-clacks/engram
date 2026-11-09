@@ -2039,7 +2039,7 @@ mod tests {
     const PARENT_ASSIGNMENT: &str = "asg_12345678-1234-1234-1234-1234567890ac";
     const SIBLING_ASSIGNMENT: &str = "asg_12345678-1234-1234-1234-1234567890ad";
     const WORK_ITEM: &str = "wi_abcdef01-2345-6789-abcd-ef0123456789";
-    const SENDER: &str = "agent:main:clawline:mike:main s_sender01";
+    const SENDER: &str = "agent:main:clawline:alex:main s_sender01";
     const RECIPIENT: &str = "agent:coder:engram s_recipient01";
 
     #[test]
@@ -2410,7 +2410,7 @@ mod tests {
                 "t":"2026-10-03T12:00:00Z",
                 "k":"msg.in",
                 "source":{"session_id":"codex-native-owner-session"},
-                "content":"[from user:mike]\n\nThe upstream edit needs its real dispatch context. Preserve the exact task and recipient identity."
+                "content":"[from user:alex]\n\nThe upstream edit needs its real dispatch context. Preserve the exact task and recipient identity."
             }),
             work_item_call,
             work_item_result,
@@ -2451,7 +2451,7 @@ mod tests {
                 "t":"2026-10-03T12:00:06Z",
                 "k":"msg.in",
                 "source":{"session_id":"codex-native-middle-session"},
-                "content":"[from user:mike]\n\nKeep the child dispatch tied to the same requested change."
+                "content":"[from user:alex]\n\nKeep the child dispatch tied to the same requested change."
             }),
             child_dispatch_call,
             child_dispatch_result,
@@ -2551,7 +2551,7 @@ mod tests {
             &mut sessions,
             &DateFilter::parse(None, None).unwrap(),
             4,
-            "gibson",
+            "host-a",
         )
         .unwrap();
 
@@ -2827,7 +2827,7 @@ mod tests {
             &mut sessions,
             &DateFilter::parse(None, None).unwrap(),
             3,
-            "gibson",
+            "host-a",
         )
         .unwrap();
 
@@ -2977,7 +2977,7 @@ mod tests {
             &mut cutoff_sessions,
             &bounded_filter,
             3,
-            "gibson",
+            "host-a",
         )
         .unwrap();
         let bounded = &cutoff_sessions[0]["task_ancestry"][0];
@@ -3107,7 +3107,7 @@ mod tests {
             &mut sessions,
             &DateFilter::parse(None, None).unwrap(),
             4,
-            "gibson",
+            "host-a",
         )
         .unwrap();
         let ancestry = &sessions[0]["task_ancestry"][0];
@@ -3206,7 +3206,7 @@ mod tests {
             &mut sessions,
             &DateFilter::parse(None, None).unwrap(),
             4,
-            "gibson",
+            "host-a",
         )
         .unwrap();
         let ancestry = &sessions[0]["task_ancestry"][0];
@@ -3305,7 +3305,7 @@ mod tests {
             &mut sessions,
             &DateFilter::parse(None, None).unwrap(),
             4,
-            "gibson",
+            "host-a",
         )
         .unwrap();
         let ancestry = &sessions[0]["task_ancestry"][0];
@@ -3373,7 +3373,7 @@ mod tests {
         let filter =
             DateFilter::parse(Some("2026-10-03T12:00:04Z"), Some("2026-10-03T12:00:07Z")).unwrap();
         let mut sessions = vec![explain_edit_session(tape_id, 6, "2026-10-03T12:00:06Z")];
-        attach_explain_task_ancestry(&context, &[index], &mut sessions, &filter, 4, "gibson")
+        attach_explain_task_ancestry(&context, &[index], &mut sessions, &filter, 4, "host-a")
             .unwrap();
         let passages = sessions[0]["task_ancestry"][0]["steps"][0]["context"]["passages"]
             .as_array()
@@ -3438,7 +3438,7 @@ mod tests {
             &mut sessions,
             &DateFilter::parse(None, None).unwrap(),
             4,
-            "gibson",
+            "host-a",
         )
         .unwrap();
         assert!(sessions[0].get("task_ancestry").is_none());
@@ -3514,7 +3514,7 @@ mod tests {
             &mut sessions,
             &DateFilter::parse(None, None).unwrap(),
             4,
-            "gibson",
+            "host-a",
         )
         .unwrap();
         assert!(

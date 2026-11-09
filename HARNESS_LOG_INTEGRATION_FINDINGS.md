@@ -1,7 +1,7 @@
 # Engram P11 Harness Log Integration Findings (Codex CLI + Claude Code)
 
 Date: 2026-02-22  
-Host: eezo (`/Users/mike`)
+Host: host-b (`/Users/user`)
 
 ## 1) On-Disk Locations
 

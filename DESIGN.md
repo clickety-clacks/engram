@@ -195,7 +195,7 @@ Auto-generated configs (`engram init` local config and first-run
 So inheritance is mainly for manually-authored configs that omit the key.
 
 Motivating use case: source transcripts live on NFS, but compiled tapes should
-be written to local disk (for example, eezo-local SSD) to avoid NFS write
+be written to local disk (for example, a host-b-local SSD) to avoid NFS write
 amplification.
 
 ### Example Configs

@@ -1545,14 +1545,14 @@ mod tests {
             command: Some(vec![
                 "/bin/sh".into(),
                 "-c".into(),
-                "while IFS= read -r request; do id=$(printf '%s\\n' \"$request\" | sed -n 's/.*\\\"id\\\":\\([0-9][0-9]*\\).*/\\1/p'); printf '{\"id\":%s,\"data\":{\"store\":\"eezo/default\",\"status\":\"ok\",\"db\":\"/owner/index.sqlite\",\"tape_dirs\":[\"/owner/tapes\"],\"reader_mode\":\"live\",\"snapshot_at\":\"2026-09-23T00:00:00Z\"}}\\n{\"id\":%s,\"end\":true,\"ok\":true,\"stats\":{\"self\":\"eezo\",\"build\":\"0.2.1\",\"protocol\":1,\"schema\":4,\"query_semantics\":1,\"limits\":{\"read_file_compressed_bytes\":268435456,\"decompressed_bytes_per_tape\":536870912}}}\\n' \"$id\" \"$id\"; done".into(),
+                "while IFS= read -r request; do id=$(printf '%s\\n' \"$request\" | sed -n 's/.*\\\"id\\\":\\([0-9][0-9]*\\).*/\\1/p'); printf '{\"id\":%s,\"data\":{\"store\":\"host-b/default\",\"status\":\"ok\",\"db\":\"/owner/index.sqlite\",\"tape_dirs\":[\"/owner/tapes\"],\"reader_mode\":\"live\",\"snapshot_at\":\"2026-09-23T00:00:00Z\"}}\\n{\"id\":%s,\"end\":true,\"ok\":true,\"stats\":{\"self\":\"host-b\",\"build\":\"0.2.1\",\"protocol\":1,\"schema\":4,\"query_semantics\":1,\"limits\":{\"read_file_compressed_bytes\":268435456,\"decompressed_bytes_per_tape\":536870912}}}\\n' \"$id\" \"$id\"; done".into(),
             ]),
             engram: "/unused".into(),
             exports: vec!["default".into()],
         };
-        let owner = RemoteOwner::connect("eezo", "gibson", &peer, Duration::from_secs(5))
+        let owner = RemoteOwner::connect("host-b", "host-a", &peer, Duration::from_secs(5))
             .expect("compatible peer");
-        assert_eq!(owner.machine, "eezo");
+        assert_eq!(owner.machine, "host-b");
         assert_eq!(owner.build, "0.2.1");
         assert_eq!(owner.protocol, PROTOCOL_VERSION);
         assert_eq!(owner.schema, crate::index::SCHEMA_VERSION as u64);

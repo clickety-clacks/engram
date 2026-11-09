@@ -49,7 +49,7 @@ queries, query plan, database bytes, and a 60-second/100-transaction concurrency
 gate; and freezes its outputs. The controller then repeats the complete input
 custody check, records any independently changing live index/WAL/SHM/cursor
 state, freezes the full output manifest, and emits a local review-eligibility
-record. Neither executable calls Tightbeam, publishes readiness, wakes Eezo,
+record. Neither executable calls Tightbeam, publishes readiness, wakes host-b,
 installs Engram, or targets the live index, tapes, WAL/SHM, cursor, or raw source
 for write.
 
@@ -75,7 +75,7 @@ manifest and are included by the existing staging sampler. APFS shared blocks
 are not deduplicated by that sampler's named-file allocated-byte sum.
 
 The API basis is Apple's [clonefile(2) manual](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/clonefile.2);
-the pinned libc 0.2.182 Darwin declarations were inspected. Gibson's Linux build
+the pinned libc 0.2.182 Darwin declarations were inspected. The Linux build host
 does not compile or execute the Darwin-only syscall branch; target validation
 remains required on an authorized host.
 
@@ -99,31 +99,31 @@ targets. It prints complete SHA-256 values plus compiler, Cargo, source, and
 source-delta provenance. The frozen review package retains that output; prefixes
 are invalid.
 
-## Exact Eezo invocation shape
+## Exact host-b invocation shape
 
 The review package replaces every `FULL_*_SHA256` token with the corresponding
 64-hex build or retained input identity and replaces `SOURCE_REVISION` with the
 reviewed 40-hex commit. No path or other argument is variable:
 
 ```sh
-/Users/mike/.tightbeam/work/d009fb9f2357/engram-t1772-p0/target/release/t1772_p0_controller \
-  --source-root /Users/mike/.tightbeam/work/d009fb9f2357/engram-t1772-p0 \
+/Users/user/.tightbeam/work/d009fb9f2357/engram-t1772-p0/target/release/t1772_p0_controller \
+  --source-root /Users/user/.tightbeam/work/d009fb9f2357/engram-t1772-p0 \
   --source-revision SOURCE_REVISION \
-  --input-root /Users/mike/shared-workspace/engram/proofs/t1772/inputs \
-  --proof-root /Users/mike/shared-workspace/engram/proofs/t1772/final-staging-asg-b260c05f-r27 \
-  --tape-root /Users/mike/.engram/tapes \
-  --live-index /Users/mike/.engram/index.sqlite \
-  --cursor-root /Users/mike/.engram/cursors \
-  --manifest /Users/mike/shared-workspace/engram/proofs/t1772/inputs/t1772-inputs-r27-9f8afc65d0b365444446a473c04389adf80bd4b3.sha256 \
-  --runner /Users/mike/.tightbeam/work/d009fb9f2357/engram-t1772-p0/target/release/t1772_p0_runner \
+  --input-root /Users/user/shared-workspace/engram/proofs/t1772/inputs \
+  --proof-root /Users/user/shared-workspace/engram/proofs/t1772/final-staging-asg-b260c05f-r27 \
+  --tape-root /Users/user/.engram/tapes \
+  --live-index /Users/user/.engram/index.sqlite \
+  --cursor-root /Users/user/.engram/cursors \
+  --manifest /Users/user/shared-workspace/engram/proofs/t1772/inputs/t1772-inputs-r27-9f8afc65d0b365444446a473c04389adf80bd4b3.sha256 \
+  --runner /Users/user/.tightbeam/work/d009fb9f2357/engram-t1772-p0/target/release/t1772_p0_runner \
   --runner-sha256 FULL_RUNNER_SHA256 \
   --controller-sha256 FULL_CONTROLLER_SHA256 \
-  --candidate-binary /Users/mike/.tightbeam/work/d009fb9f2357/engram-t1772-p0/target/release/engram \
+  --candidate-binary /Users/user/.tightbeam/work/d009fb9f2357/engram-t1772-p0/target/release/engram \
   --candidate-binary-sha256 FULL_CANDIDATE_SHA256 \
-  --baseline-binary /Users/mike/src/worktrees/engram-t1772-index-repair/scratch/t1772/engram-baseline-7282151 \
-  --baseline-database /Users/mike/shared-workspace/engram/proofs/t1772/reconstructed-comparator-asg-931d2f4b-r1/master/index.sqlite \
+  --baseline-binary /Users/user/src/worktrees/engram-t1772-index-repair/scratch/t1772/engram-baseline-7282151 \
+  --baseline-database /Users/user/shared-workspace/engram/proofs/t1772/reconstructed-comparator-asg-931d2f4b-r1/master/index.sqlite \
   --baseline-database-sha256 FULL_COMPARATOR_SHA256 \
-  --comparator-receipt /Users/mike/shared-workspace/engram/proofs/t1772/reconstructed-comparator-asg-931d2f4b-r1/receipt.json \
+  --comparator-receipt /Users/user/shared-workspace/engram/proofs/t1772/reconstructed-comparator-asg-931d2f4b-r1/receipt.json \
   --comparator-receipt-sha256 FULL_COMPARATOR_RECEIPT_SHA256
 ```
 
@@ -133,7 +133,7 @@ The baseline executable path above is the only verified pinned binary, with
 Controller preflight (before proof-root creation) and measurement entry reject
 any other path; full hash verification remains mandatory. Protocol evidence binds
 the exact path, hash and receipt identity. This is receipt consumption, not a new
-Eezo check or execution.
+host-b check or execution.
 
 The comparator paths are prospective staging locations, not observed artifacts.
 The command remains unbound until actual target executable hashes, comparator
@@ -349,7 +349,7 @@ files or allocations entirely between samples. The telemetry amendment permits
 only a qualified zero-observed claim; even zero probe counters do not close those
 blind spots. Collector errors remain missing evidence and fail the gate.
 
-Apply Mike's rule: “from now on if a test of a gate tests something that ISN’T
+Apply the product owner's rule: “from now on if a test of a gate tests something that ISN’T
 business logic, you MUST delete the test or the gate. That is the rule.” Remove
 nonbusiness tests and gates from product acceptance; each retained product gate
 must name the specified behavior it proves. For this T1772 work, those outcomes
@@ -364,13 +364,13 @@ acceptance: explicit host/route authority and independent review;
 controller-required Darwin `csops(CS_OPS_STATUS)` and APFS-clone behavior;
 frozen source/corpus/input/candidate identity; isolation from production stores
 and services with no conflicting workload; adequate capacity and bounded
-resources; and effective stop and one-use controls. The exact Eezo invocation
+resources; and effective stop and one-use controls. The exact host-b invocation
 below remains this run's admitted profile and the frozen brief's named-route
 limits remain in force; this wording admits no alternate host. A future route
 change requires owner resolution of those limits and fresh source, build,
 input, proof-path, and custody bindings. This text grants no host access, source
 placement, execution, or live-system authority; the `d84e701` formal-review
-hold remains separate and unchanged. A Gibson compilation proves type/link
+hold remains separate and unchanged. A host-a compilation proves type/link
 consistency, not performance, concurrency correctness, macOS behavior, or proof
 completion.
 
@@ -382,8 +382,8 @@ The runtime writes `runner/test-definitions.json` with the larger P0 checks and
 records every observed result in hash-bound canonical evidence. Repository gates
 remain `cargo test --all-targets` and the release build. Formatting is not a
 business-logic or T1772 specification test; the task-specific authority now
-permits focused Gibson checks in isolation.
-The previously accepted full Racter suite is not repeated for host parity.
+permits focused host-a checks in isolation.
+The previously accepted full host-c suite is not repeated for host parity.
 
 ## Correction after independent b7a1aa5 review
 
@@ -393,7 +393,7 @@ product-case comparisons. The canonical oracle, compatibility and twelve direct
 projections remain distinct mandatory gates; none alone is full §9.3.
 
 R29-1 adds two separately SHA-bound inputs under exact
-`/Users/mike/shared-workspace/engram/proofs/t1772/oracle-inputs-r29`:
+`/Users/user/shared-workspace/engram/proofs/t1772/oracle-inputs-r29`:
 `global-oracle.json` (eaaf582c89dd8437825ff2fae8829a93c98e3fa42e0eec367d80ac0f956e48ca)
 and `per-tape-oracle.jsonl` (216389baba02cae5e722118b8cdee9cc5dc128cd222a8a44d34f70610374c2a7).
 The controller/runner require `--oracle-root`; the original eleven-file manifest
@@ -468,7 +468,7 @@ Contract `art_5eec55f4`, SHA
 requires full ordered product results from independently declared inputs. The
 new `journeys` proof module supplies one explicit manifest consumer; it does
 not change product query, adapter or index semantics. The controller binds
-`--journey-root /Users/mike/shared-workspace/engram/proofs/t1772/journey-inputs-r29`
+`--journey-root /Users/user/shared-workspace/engram/proofs/t1772/journey-inputs-r29`
 and `--journey-manifest-sha256 HASH`, verifies every ledger file, and includes
 that root in pre/post immutable custody. A missing manifest, required case,
 expected file, unexpected CLI failure/output/mutation or unequal field fails.

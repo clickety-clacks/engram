@@ -1797,7 +1797,7 @@ mod tests {
     #[test]
     fn codex_adapter_emits_patch_from_recorded_assigned_exec_wrapper() {
         let input = r#"{"timestamp":"2026-08-22T09:17:27.500Z","type":"session_meta","payload":{"id":"01a028d3-ebd5-7f83-ac3c-8084d8fd686a","model_provider":"openai"}}
-{"timestamp":"2026-09-28T09:17:27.523Z","type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_05c582b826bb8eb6016aba30a59fd087d288859b23ca842429","status":"completed","call_id":"call_DRmC7XHFZMYY0GQh8AjnGuOi","name":"exec","input":"const r = await tools.apply_patch(\"*** Begin Patch\\n*** Add File: /Users/mike/.tightbeam/work/d009fb9f2357/e1-lineage-fixture-1e5d708e/scratch/e1-lineage-1e5d708e.txt\\n+e1-lineage-1e5d708e-8e69-469a-99f3-e5b95a13f7ef\\n*** End Patch\");\ntext(r);\n"}}
+{"timestamp":"2026-09-28T09:17:27.523Z","type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_05c582b826bb8eb6016aba30a59fd087d288859b23ca842429","status":"completed","call_id":"call_DRmC7XHFZMYY0GQh8AjnGuOi","name":"exec","input":"const r = await tools.apply_patch(\"*** Begin Patch\\n*** Add File: /Users/user/.tightbeam/work/d009fb9f2357/e1-lineage-fixture-1e5d708e/scratch/e1-lineage-1e5d708e.txt\\n+e1-lineage-1e5d708e-8e69-469a-99f3-e5b95a13f7ef\\n*** End Patch\");\ntext(r);\n"}}
 {"timestamp":"2026-09-28T09:17:27.611Z","type":"response_item","payload":{"type":"custom_tool_call_output","id":"ctco_01a0e74e-0ebb-7271-9450-e31838c1b72c","call_id":"call_DRmC7XHFZMYY0GQh8AjnGuOi","output":[{"type":"input_text","text":"Script completed\nWall time 0.0s\nOutput:\n"},{"type":"input_text","text":"{}"}]}}
 "#;
 
@@ -1815,7 +1815,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             edit["file"],
-            "/Users/mike/.tightbeam/work/d009fb9f2357/e1-lineage-fixture-1e5d708e/scratch/e1-lineage-1e5d708e.txt"
+            "/Users/user/.tightbeam/work/d009fb9f2357/e1-lineage-fixture-1e5d708e/scratch/e1-lineage-1e5d708e.txt"
         );
         assert_eq!(
             edit["after_text"],
@@ -1990,7 +1990,7 @@ mod tests {
 
     #[test]
     fn codex_real_patch_apply_end_add_emits_structured_edit() {
-        let patch = "*** Begin Patch\n*** Add File: /Users/mike/.tightbeam/work/d009fb9f2357/e3-three-host-endpoint-20260929.txt\n+e3-three-host-endpoint-20260929\n*** End Patch";
+        let patch = "*** Begin Patch\n*** Add File: /Users/user/.tightbeam/work/d009fb9f2357/e3-three-host-endpoint-20260929.txt\n+e3-three-host-endpoint-20260929\n*** End Patch";
         let call = serde_json::json!({
             "timestamp":"2026-09-29T08:44:22.604Z",
             "type":"response_item",
@@ -2012,11 +2012,11 @@ mod tests {
                 "type":"patch_apply_end",
                 "call_id":"exec-2b58799a-5969-491a-af28-b95497286561",
                 "turn_id":"turn_e3",
-                "stdout":"Success. Updated the following files:\nA /Users/mike/.tightbeam/work/d009fb9f2357/e3-three-host-endpoint-20260929.txt\n",
+                "stdout":"Success. Updated the following files:\nA /Users/user/.tightbeam/work/d009fb9f2357/e3-three-host-endpoint-20260929.txt\n",
                 "stderr":"",
                 "success":true,
                 "changes":{
-                    "/Users/mike/.tightbeam/work/d009fb9f2357/e3-three-host-endpoint-20260929.txt":{
+                    "/Users/user/.tightbeam/work/d009fb9f2357/e3-three-host-endpoint-20260929.txt":{
                         "type":"add",
                         "content":"e3-three-host-endpoint-20260929\n"
                     }
@@ -2051,7 +2051,7 @@ mod tests {
         assert_eq!(edits.len(), 1, "events={out}");
         assert_eq!(
             edits[0]["file"],
-            "/Users/mike/.tightbeam/work/d009fb9f2357/e3-three-host-endpoint-20260929.txt"
+            "/Users/user/.tightbeam/work/d009fb9f2357/e3-three-host-endpoint-20260929.txt"
         );
         assert_eq!(edits[0]["after_text"], "e3-three-host-endpoint-20260929\n");
         assert_eq!(edits[0]["call_id"], "call_hY8QXqvjPUQJpqBNHfOT8CHx");

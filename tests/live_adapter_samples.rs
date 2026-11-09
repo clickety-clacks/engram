@@ -158,16 +158,16 @@ where
 }
 
 #[test]
-#[ignore = "requires eezo live Claude Code sample"]
+#[ignore = "requires host-b live Claude Code sample"]
 fn claude_live_sample_yields_winnow_evidence_rows() {
     let path = home_dir().join(
-        ".claude/projects/-Users-mike-src-clawdbot/780ea36e-5dcc-459a-b768-d2f12f9381ce.jsonl",
+        ".claude/projects/-Users-user-src-clawdbot/780ea36e-5dcc-459a-b768-d2f12f9381ce.jsonl",
     );
     assert_live_sample_has_winnow_evidence("claude-live", &path, claude_jsonl_to_tape_jsonl);
 }
 
 #[test]
-#[ignore = "requires eezo live Codex sample"]
+#[ignore = "requires host-b live Codex sample"]
 fn codex_live_sample_yields_winnow_evidence_rows() {
     let path = home_dir().join(
         ".codex/sessions/2025/11/03/rollout-2025-11-03T12-59-25-019a4b84-7c94-7783-a08b-fb4674e68b65.jsonl",
@@ -176,7 +176,7 @@ fn codex_live_sample_yields_winnow_evidence_rows() {
 }
 
 #[test]
-#[ignore = "requires eezo live OpenClaw sample"]
+#[ignore = "requires host-b live OpenClaw sample"]
 fn openclaw_live_sample_yields_winnow_evidence_rows() {
     let path = home_dir().join(
         "shared-workspace/shared/openclaw-sessions/218e302f-86a9-434c-a16c-3bed54fd7a81.jsonl",
@@ -185,7 +185,7 @@ fn openclaw_live_sample_yields_winnow_evidence_rows() {
 }
 
 #[test]
-#[ignore = "requires eezo live Gemini sample"]
+#[ignore = "requires host-b live Gemini sample"]
 fn gemini_live_sample_parses_without_crash() {
     let path = home_dir().join(
         ".gemini/tmp/8958be08858fa3e266aa67bcb40164f9dea01c5a74b39dde59cb3fbb5a48b650/chats/session-2026-03-10T01-32-029b7052.json",
