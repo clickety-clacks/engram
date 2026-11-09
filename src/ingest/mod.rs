@@ -22,7 +22,11 @@ use crate::tape::adapter::{
     AdapterId, adapter_claims_input, adapter_registry, convert_with_adapter,
     discover_sessions_with_adapter,
 };
-use crate::tape::adapters::{openclaw_nested_tool_result_jsonl, openclaw_plain_string_user_jsonl};
+use crate::tape::adapters::{
+    PendingCalls, cursor_jsonl_to_tape_jsonl_with_pending,
+    openclaw_jsonl_to_tape_jsonl_with_pending, openclaw_nested_tool_result_jsonl,
+    openclaw_plain_string_user_jsonl,
+};
 use crate::tape::compress::compress_jsonl;
 use crate::tape::event::{TapeEventAt, TapeEventData, parse_jsonl_events};
 use crate::{CliError, RepoPaths, RuntimeContext, ensure_db_parent, home_dir, path_string};
@@ -438,8 +442,32 @@ pub fn run_ingest(
         let mut native = previous
             .map(|state| state.native.clone())
             .or_else(|| NativeState::new(adapter));
+        let mut pending = None::<PendingCalls>;
+        if carries_pending_calls(adapter) {
+            let carried = match prior_state.as_ref() {
+                Some(prev) if !should_run_full => match &prev.pending_calls {
+                    Some(calls) if prev.adapter == adapter.as_str() => Ok(calls.clone()),
+                    _ => seed_pending_calls(&abs_path, adapter, prev.byte_cursor),
+                },
+                _ => Ok(PendingCalls::default()),
+            };
+            match carried {
+                Ok(carried) => pending = Some(carried),
+                Err(err) => {
+                    failures.push(json!({
+                        "path": path_string(&abs_path),
+                        "adapter": adapter.as_str(),
+                        "reason": "pending_calls_seed",
+                        "error": err,
+                    }));
+                    continue;
+                }
+            }
+        }
         let conversion = if let Some(native) = native.as_mut() {
             native.convert(ingest_input).map_err(|err| err.to_string())
+        } else if let Some(pending) = pending.as_mut() {
+            convert_with_pending(adapter, ingest_input, pending).map_err(|err| err.to_string())
         } else {
             convert_with_adapter(adapter, ingest_input).map_err(|err| err.to_string())
         };
@@ -549,6 +577,7 @@ pub fn run_ingest(
             tape_id,
             openclaw_plain_string_user: adapter == AdapterId::OpenClaw,
             openclaw_nested_tool_result: adapter == AdapterId::OpenClaw,
+            pending_calls: pending,
         };
         if let Err(err) = save_ingest_state_for_path(paths, &abs_path, &state) {
             failures.push(json!({
@@ -613,6 +642,46 @@ pub(crate) struct IngestFileState {
     /// OpenClaw only: nested tool-result output before `byte_cursor` is indexed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     openclaw_nested_tool_result: bool,
+    /// OpenClaw and Cursor only: what converting the bytes before
+    /// `byte_cursor` left for the bytes after it. Always written for those
+    /// readers; absent in cursors from readers before 0.2.16.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_calls: Option<PendingCalls>,
+}
+
+fn carries_pending_calls(adapter: AdapterId) -> bool {
+    matches!(adapter, AdapterId::OpenClaw | AdapterId::Cursor)
+}
+
+fn convert_with_pending(
+    adapter: AdapterId,
+    input: &str,
+    pending: &mut PendingCalls,
+) -> Result<String, serde_json::Error> {
+    if adapter == AdapterId::OpenClaw {
+        openclaw_jsonl_to_tape_jsonl_with_pending(input, pending)
+    } else {
+        cursor_jsonl_to_tape_jsonl_with_pending(input, pending)
+    }
+}
+
+/// The pending calls a cursor written before 0.2.16 would hold: those left by
+/// converting its committed prefix the way a full ingest prepares its input.
+/// Writes no tape and changes no index row.
+fn seed_pending_calls(
+    path: &Path,
+    adapter: AdapterId,
+    byte_cursor: u64,
+) -> Result<PendingCalls, String> {
+    let mut bytes = Vec::new();
+    File::open(path)
+        .and_then(|file| file.take(byte_cursor).read_to_end(&mut bytes))
+        .map_err(|err| err.to_string())?;
+    let prefix = complete_ingest_prefix(path, &bytes);
+    let input = std::str::from_utf8(&prefix.bytes).map_err(|err| err.to_string())?;
+    let mut pending = PendingCalls::default();
+    convert_with_pending(adapter, input, &mut pending).map_err(|err| err.to_string())?;
+    Ok(pending)
 }
 
 const NESTED_TOOL_RESULT_CATCH_UP: &str = "openclaw_nested_tool_result_catch_up";
