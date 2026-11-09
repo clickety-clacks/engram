@@ -23,6 +23,7 @@ use crate::tape::adapter::{
     AdapterId, adapter_claims_input, adapter_registry, convert_with_adapter,
     discover_sessions_with_adapter,
 };
+use crate::tape::adapters::openclaw_plain_string_user_jsonl;
 use crate::tape::compress::compress_jsonl;
 use crate::tape::event::{TapeEventAt, TapeEventData, parse_jsonl_events};
 use crate::{CliError, RepoPaths, RuntimeContext, ensure_db_parent, home_dir, path_string};
@@ -63,6 +64,8 @@ pub fn run_ingest(
     let mut skipped_non_transcript = 0usize;
     let mut recovered_sources = 0usize;
     let mut recovered_tapes = 0usize;
+    let mut caught_up_sources = 0usize;
+    let mut caught_up_tapes = 0usize;
     let mut covered_paths = Vec::<String>::new();
 
     for path in candidates {
@@ -191,6 +194,62 @@ pub fn run_ingest(
                 save_ingest_state_for_path(paths, &abs_path, prev)?;
                 recovered_sources += 1;
                 recovered_tapes += recovered.len();
+            }
+            // Readers before 0.2.14 skipped plain-string user messages. Index the
+            // ones in the already-ingested prefix once. The tape is content
+            // addressed, so a run interrupted before the cursor is saved finds
+            // it indexed and does not import it again.
+            if prev.adapter == AdapterId::OpenClaw.as_str() && !prev.openclaw_plain_string_user {
+                let mut bytes = Vec::new();
+                if let Err(err) = File::open(&abs_path)
+                    .and_then(|file| file.take(prev.byte_cursor).read_to_end(&mut bytes))
+                {
+                    failures.push(json!({
+                        "path": path_string(&abs_path),
+                        "error": err.to_string(),
+                    }));
+                    continue;
+                }
+                let prefix = complete_ingest_prefix(&abs_path, &bytes);
+                let caught_up = std::str::from_utf8(&prefix.bytes)
+                    .map_err(|err| err.to_string())
+                    .and_then(|input| {
+                        openclaw_plain_string_user_jsonl(input).map_err(|err| err.to_string())
+                    })
+                    .and_then(|tape| match tape {
+                        Some(tape) => parse_jsonl_events(&tape)
+                            .map(|events| Some((tape, events)))
+                            .map_err(|err| err.to_string()),
+                        None => Ok(None),
+                    });
+                match caught_up {
+                    Ok(Some((tape, events))) => {
+                        let id = tape_id_for_contents(&tape);
+                        store_normalized(context, &id, &tape)?;
+                        if !index.has_tape(&id)? {
+                            index.ingest_tape_events_with_dispatch(
+                                &id,
+                                &events,
+                                &[],
+                                LINK_THRESHOLD_DEFAULT,
+                            )?;
+                            caught_up_tapes += 1;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        failures.push(json!({
+                            "path": path_string(&abs_path),
+                            "adapter": prev.adapter,
+                            "reason": "openclaw_plain_string_user_catch_up",
+                            "error": err,
+                        }));
+                        continue;
+                    }
+                }
+                prev.openclaw_plain_string_user = true;
+                save_ingest_state_for_path(paths, &abs_path, prev)?;
+                caught_up_sources += 1;
             }
             if metadata.len() == prev.byte_cursor {
                 skipped_unchanged += 1;
@@ -462,6 +521,7 @@ pub fn run_ingest(
                     .or_else(|| previous.and_then(|state| state.last_message_timestamp.clone())),
             }),
             tape_id,
+            openclaw_plain_string_user: adapter == AdapterId::OpenClaw,
         };
         if let Err(err) = save_ingest_state_for_path(paths, &abs_path, &state) {
             failures.push(json!({
@@ -496,6 +556,9 @@ pub fn run_ingest(
     if recovered_sources > 0 {
         result["native_recovery"] = json!({"mode":"one_time_legacy_context_v1", "sources":recovered_sources, "tapes":recovered_tapes});
     }
+    if caught_up_sources > 0 {
+        result["openclaw_catch_up"] = json!({"mode":"one_time_plain_string_user_v1", "sources":caught_up_sources, "tapes":caught_up_tapes});
+    }
     print_json(&result)
 }
 
@@ -514,6 +577,9 @@ pub(crate) struct IngestFileState {
     pub tape_id: String,
     #[serde(default)]
     continuity: Option<Continuity>,
+    /// OpenClaw only: plain-string user messages before `byte_cursor` are indexed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    openclaw_plain_string_user: bool,
 }
 
 fn store_normalized(context: &RuntimeContext, id: &str, normalized: &str) -> Result<(), CliError> {
@@ -716,16 +782,18 @@ pub(crate) fn load_ingest_state_for_path(
     Ok(Some(parsed))
 }
 
-/// True when `path` has a cursor and the file has grown past it: bytes an
-/// earlier ingest has not read yet.
-pub fn has_unread_bytes(paths: &RepoPaths, path: &Path) -> bool {
+/// True when `path` has a cursor and an earlier ingest left work for it: the
+/// file has grown past the cursor, or an OpenClaw cursor predates the
+/// plain-string user catch-up.
+pub fn has_pending_ingest(paths: &RepoPaths, path: &Path) -> bool {
     let Ok(abs_path) = fs::canonicalize(path) else {
         return false;
     };
     let Ok(Some(state)) = load_ingest_state_for_path(paths, &abs_path) else {
         return false;
     };
-    fs::metadata(&abs_path).is_ok_and(|meta| meta.len() > state.byte_cursor)
+    (state.adapter == AdapterId::OpenClaw.as_str() && !state.openclaw_plain_string_user)
+        || fs::metadata(&abs_path).is_ok_and(|meta| meta.len() > state.byte_cursor)
 }
 
 pub(crate) fn save_ingest_state_for_path(

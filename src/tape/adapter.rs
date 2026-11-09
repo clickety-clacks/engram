@@ -1029,15 +1029,13 @@ impl HarnessAdapter for OpenClawAdapter {
                     || row.get("session_id").and_then(Value::as_str).is_some()
                     || row.get("sessionId").and_then(Value::as_str).is_some()))
                 || (row.get("type").and_then(Value::as_str) == Some("message")
-                    && row
-                        .get("message")
-                        .and_then(|message| message.get("role"))
-                        .and_then(Value::as_str)
-                        .is_some_and(|role| matches!(role, "user" | "assistant" | "toolResult"))
-                    && row
-                        .get("message")
-                        .and_then(|message| message.get("content"))
-                        .is_some_and(Value::is_array))
+                    && row.get("message").is_some_and(|message| {
+                        let role = message.get("role").and_then(Value::as_str);
+                        let content = message.get("content");
+                        (matches!(role, Some("user" | "assistant" | "toolResult"))
+                            && content.is_some_and(Value::is_array))
+                            || (role == Some("user") && content.is_some_and(Value::is_string))
+                    }))
         })
         .unwrap_or(false)
     }

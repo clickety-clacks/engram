@@ -27,7 +27,27 @@ struct ToolCallContext {
     workdir: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Extract {
+    All,
+    PlainStringUser,
+}
+
 pub fn openclaw_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Error> {
+    convert(input, Extract::All)
+}
+
+/// Readers before 0.2.14 skipped user messages whose `content` is a plain
+/// string. This yields only those messages from `input`, for a one-time
+/// catch-up over bytes an older reader already ingested, or `None` when
+/// there are none.
+pub fn openclaw_plain_string_user_jsonl(input: &str) -> Result<Option<String>, serde_json::Error> {
+    let tape = convert(input, Extract::PlainStringUser)?;
+    // One line is the meta row alone.
+    Ok((tape.lines().count() > 1).then_some(tape))
+}
+
+fn convert(input: &str, extract: Extract) -> Result<String, serde_json::Error> {
     let mut events = Vec::new();
     let mut first_ts = None::<String>;
     let mut session_id = None::<String>;
@@ -42,6 +62,7 @@ pub fn openclaw_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::E
         saw_json = true;
         extract_from_row(
             &row,
+            extract,
             &mut events,
             &mut first_ts,
             &mut session_id,
@@ -162,6 +183,7 @@ fn native_coverage(events: &[Value]) -> (&'static str, &'static str) {
 
 fn extract_from_row(
     row: &Value,
+    extract: Extract,
     out: &mut Vec<Value>,
     first_ts: &mut Option<String>,
     session_id: &mut Option<String>,
@@ -215,6 +237,15 @@ fn extract_from_row(
         return;
     };
     let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+    if role == "user"
+        && let Some(text) = message.get("content").and_then(Value::as_str)
+    {
+        emit_user_text(out, &timestamp, session_id.as_deref(), text);
+        return;
+    }
+    if extract == Extract::PlainStringUser {
+        return;
+    }
     let content_blocks = message
         .get("content")
         .and_then(Value::as_array)
@@ -248,7 +279,15 @@ fn emit_user_message(
     session_id: Option<&str>,
     content_blocks: &[Value],
 ) {
-    let text = join_text_blocks(content_blocks);
+    emit_user_text(
+        out,
+        timestamp,
+        session_id,
+        &join_text_blocks(content_blocks),
+    );
+}
+
+fn emit_user_text(out: &mut Vec<Value>, timestamp: &str, session_id: Option<&str>, text: &str) {
     if text.is_empty() {
         return;
     }
