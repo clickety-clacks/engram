@@ -22,7 +22,7 @@ use crate::tape::adapter::{
     AdapterId, adapter_claims_input, adapter_registry, convert_with_adapter,
     discover_sessions_with_adapter,
 };
-use crate::tape::adapters::openclaw_plain_string_user_jsonl;
+use crate::tape::adapters::{openclaw_nested_tool_result_jsonl, openclaw_plain_string_user_jsonl};
 use crate::tape::compress::compress_jsonl;
 use crate::tape::event::{TapeEventAt, TapeEventData, parse_jsonl_events};
 use crate::{CliError, RepoPaths, RuntimeContext, ensure_db_parent, home_dir, path_string};
@@ -65,6 +65,8 @@ pub fn run_ingest(
     let mut recovered_tapes = 0usize;
     let mut caught_up_sources = 0usize;
     let mut caught_up_tapes = 0usize;
+    let mut nested_sources = 0usize;
+    let mut nested_tapes = 0usize;
     let mut covered_paths = Vec::<String>::new();
 
     for path in candidates {
@@ -139,10 +141,15 @@ pub fn run_ingest(
                         }
                     }
                     Err(err) => {
-                        failures.push(json!({
+                        let mut failure = json!({
                             "path": path_string(&abs_path),
                             "error": err.message,
-                        }));
+                        });
+                        if nested_tool_result_pending(prev) {
+                            failure["adapter"] = json!(prev.adapter);
+                            failure["reason"] = json!(NESTED_TOOL_RESULT_CATCH_UP);
+                        }
+                        failures.push(failure);
                         continue;
                     }
                 }
@@ -194,61 +201,83 @@ pub fn run_ingest(
                 recovered_sources += 1;
                 recovered_tapes += recovered.len();
             }
-            // Readers before 0.2.14 skipped plain-string user messages. Index the
-            // ones in the already-ingested prefix once. The tape is content
-            // addressed, so a run interrupted before the cursor is saved finds
-            // it indexed and does not import it again.
-            if prev.adapter == AdapterId::OpenClaw.as_str() && !prev.openclaw_plain_string_user {
+            // Readers before 0.2.14 skipped plain-string user messages, and readers
+            // before 0.2.15 left output held in nested tool-result parts empty.
+            // Index what each missed in the already-ingested prefix once, as one
+            // added tape per repair; the two tapes do not depend on each other.
+            // Tapes are content addressed, so a run interrupted before the
+            // cursor is saved finds its tape indexed and does not import it again.
+            if prev.adapter == AdapterId::OpenClaw.as_str()
+                && (!prev.openclaw_plain_string_user || nested_tool_result_pending(prev))
+            {
                 let mut bytes = Vec::new();
                 if let Err(err) = File::open(&abs_path)
                     .and_then(|file| file.take(prev.byte_cursor).read_to_end(&mut bytes))
                 {
-                    failures.push(json!({
+                    let mut failure = json!({
                         "path": path_string(&abs_path),
                         "error": err.to_string(),
-                    }));
+                    });
+                    if nested_tool_result_pending(prev) {
+                        failure["adapter"] = json!(prev.adapter);
+                        failure["reason"] = json!(NESTED_TOOL_RESULT_CATCH_UP);
+                    }
+                    failures.push(failure);
                     continue;
                 }
                 let prefix = complete_ingest_prefix(&abs_path, &bytes);
-                let caught_up = std::str::from_utf8(&prefix.bytes)
-                    .map_err(|err| err.to_string())
-                    .and_then(|input| {
-                        openclaw_plain_string_user_jsonl(input).map_err(|err| err.to_string())
-                    })
-                    .and_then(|tape| match tape {
-                        Some(tape) => parse_jsonl_events(&tape)
-                            .map(|events| Some((tape, events)))
-                            .map_err(|err| err.to_string()),
-                        None => Ok(None),
-                    });
-                match caught_up {
-                    Ok(Some((tape, events))) => {
-                        let id = tape_id_for_contents(&tape);
-                        store_normalized(context, &id, &tape)?;
-                        if !index.has_tape(&id)? {
-                            index.ingest_tape_events_with_dispatch(
-                                &id,
-                                &events,
-                                &[],
-                                LINK_THRESHOLD_DEFAULT,
-                            )?;
-                            caught_up_tapes += 1;
+                let input = std::str::from_utf8(&prefix.bytes).map_err(|err| err.to_string());
+                if !prev.openclaw_nested_tool_result {
+                    match input
+                        .clone()
+                        .and_then(|input| catch_up_tape(input, openclaw_nested_tool_result_jsonl))
+                    {
+                        Ok(tape) => {
+                            if let Some((tape, events)) = tape
+                                && index_catch_up_tape(context, &index, &tape, &events)?
+                            {
+                                nested_tapes += 1;
+                            }
+                        }
+                        Err(err) => {
+                            failures.push(json!({
+                                "path": path_string(&abs_path),
+                                "adapter": prev.adapter,
+                                "reason": NESTED_TOOL_RESULT_CATCH_UP,
+                                "error": err,
+                            }));
+                            continue;
                         }
                     }
-                    Ok(None) => {}
-                    Err(err) => {
-                        failures.push(json!({
-                            "path": path_string(&abs_path),
-                            "adapter": prev.adapter,
-                            "reason": "openclaw_plain_string_user_catch_up",
-                            "error": err,
-                        }));
-                        continue;
-                    }
+                    prev.openclaw_nested_tool_result = true;
+                    save_ingest_state_for_path(paths, &abs_path, prev)?;
+                    nested_sources += 1;
                 }
-                prev.openclaw_plain_string_user = true;
-                save_ingest_state_for_path(paths, &abs_path, prev)?;
-                caught_up_sources += 1;
+                if !prev.openclaw_plain_string_user {
+                    match input
+                        .and_then(|input| catch_up_tape(input, openclaw_plain_string_user_jsonl))
+                    {
+                        Ok(tape) => {
+                            if let Some((tape, events)) = tape
+                                && index_catch_up_tape(context, &index, &tape, &events)?
+                            {
+                                caught_up_tapes += 1;
+                            }
+                        }
+                        Err(err) => {
+                            failures.push(json!({
+                                "path": path_string(&abs_path),
+                                "adapter": prev.adapter,
+                                "reason": "openclaw_plain_string_user_catch_up",
+                                "error": err,
+                            }));
+                            continue;
+                        }
+                    }
+                    prev.openclaw_plain_string_user = true;
+                    save_ingest_state_for_path(paths, &abs_path, prev)?;
+                    caught_up_sources += 1;
+                }
             }
             if metadata.len() == prev.byte_cursor {
                 skipped_unchanged += 1;
@@ -519,6 +548,7 @@ pub fn run_ingest(
             }),
             tape_id,
             openclaw_plain_string_user: adapter == AdapterId::OpenClaw,
+            openclaw_nested_tool_result: adapter == AdapterId::OpenClaw,
         };
         if let Err(err) = save_ingest_state_for_path(paths, &abs_path, &state) {
             failures.push(json!({
@@ -556,6 +586,9 @@ pub fn run_ingest(
     if caught_up_sources > 0 {
         result["openclaw_catch_up"] = json!({"mode":"one_time_plain_string_user_v1", "sources":caught_up_sources, "tapes":caught_up_tapes});
     }
+    if nested_sources > 0 {
+        result[NESTED_TOOL_RESULT_CATCH_UP] = json!({"mode":"one_time_nested_tool_result_v1", "sources":nested_sources, "tapes":nested_tapes});
+    }
     print_json(&result)
 }
 
@@ -577,6 +610,43 @@ pub(crate) struct IngestFileState {
     /// OpenClaw only: plain-string user messages before `byte_cursor` are indexed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     openclaw_plain_string_user: bool,
+    /// OpenClaw only: nested tool-result output before `byte_cursor` is indexed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    openclaw_nested_tool_result: bool,
+}
+
+const NESTED_TOOL_RESULT_CATCH_UP: &str = "openclaw_nested_tool_result_catch_up";
+
+fn nested_tool_result_pending(state: &IngestFileState) -> bool {
+    state.adapter == AdapterId::OpenClaw.as_str() && !state.openclaw_nested_tool_result
+}
+
+/// The tape a catch-up adds for `input`, an already-ingested prefix, if any.
+fn catch_up_tape(
+    input: &str,
+    convert: fn(&str) -> Result<Option<String>, serde_json::Error>,
+) -> Result<Option<(String, Vec<TapeEventAt>)>, String> {
+    let Some(tape) = convert(input).map_err(|err| err.to_string())? else {
+        return Ok(None);
+    };
+    let events = parse_jsonl_events(&tape).map_err(|err| err.to_string())?;
+    Ok(Some((tape, events)))
+}
+
+/// Stores and indexes a catch-up tape; true when this call indexed it.
+fn index_catch_up_tape(
+    context: &RuntimeContext,
+    index: &SqliteIndex,
+    tape: &str,
+    events: &[TapeEventAt],
+) -> Result<bool, CliError> {
+    let id = tape_id_for_contents(tape);
+    store_normalized(context, &id, tape)?;
+    if index.has_tape(&id)? {
+        return Ok(false);
+    }
+    index.ingest_tape_events_with_dispatch(&id, events, &[], LINK_THRESHOLD_DEFAULT)?;
+    Ok(true)
 }
 
 fn store_normalized(context: &RuntimeContext, id: &str, normalized: &str) -> Result<(), CliError> {
@@ -781,7 +851,7 @@ pub(crate) fn load_ingest_state_for_path(
 
 /// True when `path` has a cursor and an earlier ingest left work for it: the
 /// file has grown past the cursor, or an OpenClaw cursor predates the
-/// plain-string user catch-up.
+/// plain-string user or nested tool-result catch-up.
 pub fn has_pending_ingest(paths: &RepoPaths, path: &Path) -> bool {
     let Ok(abs_path) = fs::canonicalize(path) else {
         return false;
@@ -790,6 +860,7 @@ pub fn has_pending_ingest(paths: &RepoPaths, path: &Path) -> bool {
         return false;
     };
     (state.adapter == AdapterId::OpenClaw.as_str() && !state.openclaw_plain_string_user)
+        || nested_tool_result_pending(&state)
         || fs::metadata(&abs_path).is_ok_and(|meta| meta.len() > state.byte_cursor)
 }
 
