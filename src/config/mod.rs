@@ -1061,14 +1061,14 @@ mod tests {
         std::fs::create_dir_all(home.join(".engram")).expect("home");
         std::fs::write(
             home.join(".engram/topology.yml"),
-            "version: 1\nself: gibson\nfrozen_stores:\n  - db: ~/copies/racter.sqlite\n    label: racter-copy\n    source: racter/default\n    captured_at: '2026-09-23T00:00:00Z'\n",
+            "version: 1\nself: host-a\nfrozen_stores:\n  - db: ~/copies/host-c.sqlite\n    label: host-c-copy\n    source: host-c/default\n    captured_at: '2026-09-23T00:00:00Z'\n",
         )
         .expect("topology");
 
         let stores = super::load_frozen_stores(&home).expect("frozen stores");
         assert_eq!(stores.len(), 1);
-        assert_eq!(stores[0].db, home.join("copies/racter.sqlite"));
-        assert_eq!(stores[0].label, "racter-copy");
+        assert_eq!(stores[0].db, home.join("copies/host-c.sqlite"));
+        assert_eq!(stores[0].label, "host-c-copy");
     }
 
     #[test]
@@ -1078,7 +1078,7 @@ mod tests {
         std::fs::create_dir_all(home.join(".engram")).expect("home");
         std::fs::write(
             home.join(".engram/topology.yml"),
-            "version: 1\nself: gibson\npeers:\n  eezo:\n    ssh: eezo\n    engram: bin/engram\n    exports: [default]\n",
+            "version: 1\nself: host-a\npeers:\n  host-b:\n    ssh: host-b\n    engram: bin/engram\n    exports: [default]\n",
         )
         .expect("topology");
 

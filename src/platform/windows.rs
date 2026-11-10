@@ -193,7 +193,7 @@ mod tests {
         assert!(error.message.contains("local commands remain available"));
 
         let peer = crate::config::TopologyPeer {
-            ssh: Some("eezo".into()),
+            ssh: Some("host-b".into()),
             command: None,
             engram: "engram".into(),
             exports: vec!["default".into()],

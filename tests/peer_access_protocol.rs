@@ -3291,7 +3291,7 @@ fn explain_peers_selects_earliest_global_sender_and_preserves_echoes_and_broken_
     let mut peers = serde_json::Map::new();
     let sender_specs = [
         (
-            "sender-gibson",
+            "sender-host-a",
             sender_genuine,
             100,
             "2026-09-28T13:38:51.535Z",
@@ -3363,13 +3363,13 @@ fn explain_peers_selects_earliest_global_sender_and_preserves_echoes_and_broken_
     let receiver_content = jsonl(&receiver_events);
     let receiver_owner = write_grep_owner(
         temp.path(),
-        "receiver-eezo",
+        "receiver-host-b",
         binary,
         &[(receiver_id, &receiver_content)],
     );
     ingest_owner_test_tape(
         temp.path(),
-        "receiver-eezo",
+        "receiver-host-b",
         receiver_id,
         &receiver_content,
         &[DispatchLink {
@@ -3378,7 +3378,7 @@ fn explain_peers_selects_earliest_global_sender_and_preserves_echoes_and_broken_
             direction: DispatchDirection::Received,
         }],
     );
-    peers.insert("receiver-eezo".into(), receiver_owner);
+    peers.insert("receiver-host-b".into(), receiver_owner);
 
     let (caller_home, repo) = write_local_grep_source(
         temp.path(),
@@ -3387,7 +3387,7 @@ fn explain_peers_selects_earliest_global_sender_and_preserves_echoes_and_broken_
     );
     std::fs::write(repo.join(file), &source).expect("write query source");
     set_peer_topology(&caller_home, serde_json::Value::Object(peers.clone()));
-    let peer_names = "sender-gibson,sender-quote-a,sender-quote-b,sender-report-echo,receiver-eezo";
+    let peer_names = "sender-host-a,sender-quote-a,sender-quote-b,sender-report-echo,receiver-host-b";
     let output = run_peer_explain(binary, &caller_home, &repo, file, peer_names);
     assert!(
         output.status.success(),
@@ -3470,7 +3470,7 @@ fn explain_peers_selects_earliest_global_sender_and_preserves_echoes_and_broken_
             "explain",
             file,
             "--peers",
-            "sender-gibson,sender-quote-a,sender-quote-b,sender-report-echo,receiver-eezo,offline",
+            "sender-host-a,sender-quote-a,sender-quote-b,sender-report-echo,receiver-host-b,offline",
             "--require-complete",
         ])
         .output()

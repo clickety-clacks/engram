@@ -370,7 +370,7 @@ Scope: deterministic ingestion adapters that convert external harness logs into 
 
 This file is the canonical contract for adapter behavior. If implementation, tests, or reviews conflict with this file, this file wins.
 
-Upstream authority: this contract must remain consistent with `/Users/mike/shared-workspace/shared/specs/engram.md`. If conflict exists, the Engram spec wins and this file must be updated.
+Upstream authority: this contract must remain consistent with `/Users/user/shared-workspace/shared/specs/engram.md`. If conflict exists, the Engram spec wins and this file must be updated.
 
 ## Product Intent
 
@@ -564,7 +564,7 @@ This guidance is for Claude-based reviewers evaluating adapter changes.
 ## Hard Rule
 
 You MUST review against `adapters/ADAPTERS.md` as the canonical contract.
-You MUST also verify `adapters/ADAPTERS.md` remains aligned with `/Users/mike/shared-workspace/shared/specs/engram.md`; if drift exists, flag it as blocking.
+You MUST also verify `adapters/ADAPTERS.md` remains aligned with `/Users/user/shared-workspace/shared/specs/engram.md`; if drift exists, flag it as blocking.
 
 ## Required Review Focus
 

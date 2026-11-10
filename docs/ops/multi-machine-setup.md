@@ -2,7 +2,7 @@
 
 This runbook is command-first and aligned with DESIGN.md rev2 semantics.
 
-## 1) EEZO-first ingest with git-cycle hooks (local-scoped contribution)
+## 1) Host-b-first ingest with git-cycle hooks (local-scoped contribution)
 
 Run in each repo that should contribute provenance.
 

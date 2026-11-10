@@ -9816,7 +9816,7 @@ mod tests {
     #[test]
     fn explain_require_complete_error_names_source_phase_code_and_reason() {
         let error = explain_require_complete_error(&[json!({
-            "store": "eezo/default",
+            "store": "host-b/default",
             "status": "failed",
             "phase": "locate_tapes",
             "error": {
@@ -9826,7 +9826,7 @@ mod tests {
         })]);
 
         assert_eq!(error.code, "incomplete_results");
-        assert!(error.message.contains("eezo/default"));
+        assert!(error.message.contains("host-b/default"));
         assert!(error.message.contains("phase=locate_tapes"));
         assert!(error.message.contains("protocol_error"));
         assert!(

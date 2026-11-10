@@ -157,17 +157,27 @@ where
         .expect("ingest should succeed");
 }
 
+fn find_claude_live_sample() -> Option<PathBuf> {
+    // Claude Code's project-directory name is derived from the operator's
+    // real absolute working-directory path, so there is no fixed subpath
+    // under home_dir() that stays both real and identity-free the way the
+    // Codex/OpenClaw/Gemini live-sample paths below do. The intended sample
+    // is instead named at runtime, pinning this test to one specific sample
+    // rather than silently accepting whichever session happens to qualify.
+    env::var("ENGRAM_CLAUDE_LIVE_SAMPLE").ok().map(PathBuf::from)
+}
+
 #[test]
-#[ignore = "requires eezo live Claude Code sample"]
+#[ignore = "requires ENGRAM_CLAUDE_LIVE_SAMPLE set to a live Claude Code session .jsonl path"]
 fn claude_live_sample_yields_winnow_evidence_rows() {
-    let path = home_dir().join(
-        ".claude/projects/-Users-mike-src-clawdbot/780ea36e-5dcc-459a-b768-d2f12f9381ce.jsonl",
+    let path = find_claude_live_sample().expect(
+        "set ENGRAM_CLAUDE_LIVE_SAMPLE to the path of a live Claude Code session .jsonl file",
     );
     assert_live_sample_has_winnow_evidence("claude-live", &path, claude_jsonl_to_tape_jsonl);
 }
 
 #[test]
-#[ignore = "requires eezo live Codex sample"]
+#[ignore = "requires host-b live Codex sample"]
 fn codex_live_sample_yields_winnow_evidence_rows() {
     let path = home_dir().join(
         ".codex/sessions/2025/11/03/rollout-2025-11-03T12-59-25-019a4b84-7c94-7783-a08b-fb4674e68b65.jsonl",
@@ -176,7 +186,7 @@ fn codex_live_sample_yields_winnow_evidence_rows() {
 }
 
 #[test]
-#[ignore = "requires eezo live OpenClaw sample"]
+#[ignore = "requires host-b live OpenClaw sample"]
 fn openclaw_live_sample_yields_winnow_evidence_rows() {
     let path = home_dir().join(
         "shared-workspace/shared/openclaw-sessions/218e302f-86a9-434c-a16c-3bed54fd7a81.jsonl",
@@ -185,7 +195,7 @@ fn openclaw_live_sample_yields_winnow_evidence_rows() {
 }
 
 #[test]
-#[ignore = "requires eezo live Gemini sample"]
+#[ignore = "requires host-b live Gemini sample"]
 fn gemini_live_sample_parses_without_crash() {
     let path = home_dir().join(
         ".gemini/tmp/8958be08858fa3e266aa67bcb40164f9dea01c5a74b39dde59cb3fbb5a48b650/chats/session-2026-03-10T01-32-029b7052.json",

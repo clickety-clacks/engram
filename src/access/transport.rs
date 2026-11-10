@@ -67,7 +67,7 @@ mod tests {
     #[test]
     fn ssh_launch_uses_batch_mode_no_agent_forwarding_and_quotes_only_the_executable() {
         let peer = TopologyPeer {
-            ssh: Some("eezo".into()),
+            ssh: Some("host-b".into()),
             command: None,
             engram: "/opt/Engram build/it's-safe".into(),
             exports: vec!["default".into()],
@@ -79,7 +79,7 @@ mod tests {
         assert_eq!(launch.args[2], "-o");
         assert_eq!(launch.args[3], "ForwardAgent=no");
         assert_eq!(launch.args[4], "-T");
-        assert_eq!(launch.args[5], "eezo");
+        assert_eq!(launch.args[5], "host-b");
         assert_eq!(
             launch.args[6],
             "exec '/opt/Engram build/it'\\''s-safe' peer-serve --stdio"

@@ -18,6 +18,6 @@ The spec defines `meta` as "session metadata (model, repo state, label)." The ad
 
 ### Nits
 
-**3.** `ADAPTERS.md:7` — Upstream authority references an absolute local path (`/Users/mike/shared-workspace/shared/specs/engram.md`). Works for this project's current contributors but won't resolve for anyone else. Consider a repo-relative or URL reference if the audience ever widens.
+**3.** `ADAPTERS.md:7` — Upstream authority references an absolute local path (`/Users/user/shared-workspace/shared/specs/engram.md`). Works for this project's current contributors but won't resolve for anyone else. Consider a repo-relative or URL reference if the audience ever widens.
 
 **4.** `CLAUDE_REVIEWERS.md:40` — "Output format: blocking, non-blocking, nits, or exactly No substantive findings" — the "or" is ambiguous. Reads like the reviewer should pick one of those four words. Suggest: "Output format: blocking findings, then non-blocking findings, then nits. If no substantive issues: state exactly 'No substantive findings'."
