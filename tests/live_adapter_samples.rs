@@ -159,6 +159,7 @@ where
 
 fn find_claude_live_sample() -> Option<PathBuf> {
     let projects_dir = home_dir().join(".claude/projects");
+    let mut candidates = Vec::new();
     for project_entry in fs::read_dir(&projects_dir).ok()?.flatten() {
         let project_dir = project_entry.path();
         if !project_dir.is_dir() {
@@ -167,11 +168,26 @@ fn find_claude_live_sample() -> Option<PathBuf> {
         for session_entry in fs::read_dir(&project_dir).ok()?.flatten() {
             let path = session_entry.path();
             if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
-                return Some(path);
+                candidates.push(path);
             }
         }
     }
-    None
+    // Directory iteration order is not guaranteed, so sort for a deterministic
+    // pick, and require the candidate to actually carry winnow evidence rather
+    // than trusting whichever file happens to come first.
+    candidates.sort();
+    candidates.into_iter().find(|path| {
+        let Ok(input) = fs::read_to_string(path) else {
+            return false;
+        };
+        let Ok(normalized) = claude_jsonl_to_tape_jsonl(&input) else {
+            return false;
+        };
+        let Ok(events) = parse_jsonl_events(&normalized) else {
+            return false;
+        };
+        !collect_winnow_anchors(&events).is_empty()
+    })
 }
 
 #[test]
