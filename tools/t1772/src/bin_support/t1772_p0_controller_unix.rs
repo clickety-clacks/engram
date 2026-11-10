@@ -139,7 +139,7 @@ fn run() -> ProofResult<()> {
     let args = Args::parse();
     if !cfg!(target_os = "macos") {
         return Err(
-            "the accepted P0 lane is Darwin host-b; controller refuses other operating systems"
+            "the accepted P0 lane is Darwin Eezo; controller refuses other operating systems"
                 .into(),
         );
     }
@@ -403,7 +403,7 @@ fn finalize_eligibility(root: &Path) -> ProofResult<()> {
             "eligible_for_independent_review":true,
             "eligible_for_readiness_publication":false,
             "reason":"independent review and exact authorized native execution custody remain required",
-            "required_order":["proof_passed","post_custody_passed","output_frozen","independent_review_accepted","readiness_published","host_b_launch_authorized"],
+            "required_order":["proof_passed","post_custody_passed","output_frozen","independent_review_accepted","readiness_published","eezo_launch_authorized"],
             "runner_output_manifest_sha256":runner_hash,
             "full_proof_output_manifest_sha256":payload_hash,
             "payload_exclusions":["manifests/full-proof-output.jsonl","publication/review-eligibility.json"],

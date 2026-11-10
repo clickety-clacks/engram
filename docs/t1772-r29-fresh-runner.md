@@ -99,11 +99,13 @@ targets. It prints complete SHA-256 values plus compiler, Cargo, source, and
 source-delta provenance. The frozen review package retains that output; prefixes
 are invalid.
 
-## Exact host-b invocation shape
+## Illustrative host-b invocation shape
 
 The review package replaces every `FULL_*_SHA256` token with the corresponding
 64-hex build or retained input identity and replaces `SOURCE_REVISION` with the
-reviewed 40-hex commit. No path or other argument is variable:
+reviewed 40-hex commit. The paths below are illustrative placeholders standing
+in for the real run's recorded paths, which are not reproduced in this
+document; only the token substitutions above are literal:
 
 ```sh
 /Users/user/.tightbeam/work/d009fb9f2357/engram-t1772-p0/target/release/t1772_p0_controller \
@@ -127,7 +129,8 @@ reviewed 40-hex commit. No path or other argument is variable:
   --comparator-receipt-sha256 FULL_COMPARATOR_RECEIPT_SHA256
 ```
 
-The baseline executable path above is the only verified pinned binary, with
+The real baseline executable at the real run's recorded path (not the
+illustrative path shown above) is the only verified pinned binary, with
 5,120,032 bytes and SHA-256
 `13088f949fa7920615ff8873c1040d4b7ec9180976a7121a63e0de726e47571d`.
 Controller preflight (before proof-root creation) and measurement entry reject
@@ -364,8 +367,8 @@ acceptance: explicit host/route authority and independent review;
 controller-required Darwin `csops(CS_OPS_STATUS)` and APFS-clone behavior;
 frozen source/corpus/input/candidate identity; isolation from production stores
 and services with no conflicting workload; adequate capacity and bounded
-resources; and effective stop and one-use controls. The exact host-b invocation
-below remains this run's admitted profile and the frozen brief's named-route
+resources; and effective stop and one-use controls. The illustrative host-b
+invocation below remains this run's admitted profile and the frozen brief's named-route
 limits remain in force; this wording admits no alternate host. A future route
 change requires owner resolution of those limits and fresh source, build,
 input, proof-path, and custody bindings. This text grants no host access, source
