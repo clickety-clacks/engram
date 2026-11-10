@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::pending::{PendingCalls, load_calls, store_calls};
 use super::structured::bounded_shell_read;
 
 const CURSOR_COVERAGE_TOOL: &str = "full";
@@ -9,16 +11,32 @@ const CURSOR_COVERAGE_READ: &str = "partial";
 const CURSOR_COVERAGE_EDIT: &str = "partial";
 
 pub fn cursor_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Error> {
+    convert(input, &mut PendingCalls::default())
+}
+
+/// Converts bytes appended after an earlier conversion, starting from the
+/// calls, session cwd and first timestamp `pending` holds, and leaves in it
+/// what this conversion ends with.
+pub fn cursor_jsonl_to_tape_jsonl_with_pending(
+    input: &str,
+    pending: &mut PendingCalls,
+) -> Result<String, serde_json::Error> {
+    convert(input, pending)
+}
+
+fn convert(input: &str, pending: &mut PendingCalls) -> Result<String, serde_json::Error> {
     let mut out = Vec::new();
     let mut session_id: Option<String> = None;
-    let mut first_timestamp: Option<String> = None;
+    let mut first_timestamp = pending.first_timestamp.clone();
     let mut emitted_meta = false;
+    // Calls started in this input; `carried` holds those started before it.
     let mut tool_contexts = HashMap::<String, CursorToolContext>::new();
+    let mut carried = load_calls::<CursorToolContext>(&pending.calls)?;
     let mut read_total = 0u32;
     let mut read_accounted = 0u32;
     let mut edit_total = 0u32;
     let mut edit_accounted = 0u32;
-    let mut session_cwd = None::<String>;
+    let mut session_cwd = pending.session_cwd.clone();
 
     for line in input.lines() {
         if line.trim().is_empty() {
@@ -101,14 +119,7 @@ pub fn cursor_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
                 let subtype = row.get("subtype").and_then(Value::as_str).unwrap_or("");
                 match subtype {
                     "started" => {
-                        if tool == "readToolCall" || is_shell_tool(&tool) {
-                            read_total = read_total.saturating_add(1);
-                            if is_shell_tool(&tool) {
-                                edit_total = edit_total.saturating_add(1);
-                            }
-                        } else if tool == "writeToolCall" {
-                            edit_total = edit_total.saturating_add(1);
-                        }
+                        count_call(&tool, &mut read_total, &mut edit_total);
                         let args = cursor_tool_args(&row);
                         let mut call = serde_json::Map::new();
                         call.insert("t".to_string(), json!(timestamp));
@@ -118,6 +129,7 @@ pub fn cursor_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
                         call.insert("args".to_string(), json!(args));
                         if let Some(call_id) = &call_id {
                             call.insert("call_id".to_string(), json!(call_id));
+                            carried.remove(call_id);
                             tool_contexts.insert(call_id.clone(), cursor_tool_context(&row));
                         }
                         out.push(Value::Object(call));
@@ -125,10 +137,21 @@ pub fn cursor_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
                     "completed" => {
                         let stdout = cursor_tool_stdout(&row).unwrap_or_default();
                         let function_stdout = cursor_function_stdout(&row);
-                        let context = call_id
-                            .as_ref()
-                            .and_then(|id| tool_contexts.remove(id))
-                            .unwrap_or_default();
+                        let context = match call_id.as_ref() {
+                            Some(id) => match tool_contexts.remove(id) {
+                                Some(context) => context,
+                                // This tape did not count the call when it
+                                // started, so it counts it here.
+                                None => match carried.remove(id) {
+                                    Some(context) => {
+                                        count_call(&tool, &mut read_total, &mut edit_total);
+                                        context
+                                    }
+                                    None => CursorToolContext::default(),
+                                },
+                            },
+                            None => CursorToolContext::default(),
+                        };
                         let mut result = serde_json::Map::new();
                         result.insert("t".to_string(), json!(timestamp));
                         result.insert("k".to_string(), json!("tool.result"));
@@ -142,14 +165,7 @@ pub fn cursor_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
                         }
                         out.push(Value::Object(result));
                         if cursor_tool_failed(&row) {
-                            if tool == "readToolCall" || is_shell_tool(&tool) {
-                                read_accounted = read_accounted.saturating_add(1);
-                                if is_shell_tool(&tool) {
-                                    edit_accounted = edit_accounted.saturating_add(1);
-                                }
-                            } else if tool == "writeToolCall" {
-                                edit_accounted = edit_accounted.saturating_add(1);
-                            }
+                            count_call(&tool, &mut read_accounted, &mut edit_accounted);
                         }
 
                         if cursor_tool_succeeded(&row)
@@ -212,6 +228,10 @@ pub fn cursor_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
         }
     }
 
+    pending.calls = store_calls(carried.iter().chain(tool_contexts.iter()))?;
+    pending.session_cwd = session_cwd;
+    pending.first_timestamp = first_timestamp.clone();
+
     if !emitted_meta {
         out.insert(
             0,
@@ -247,12 +267,29 @@ pub fn cursor_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Err
     to_jsonl(&out)
 }
 
-#[derive(Debug, Default)]
+/// Counts a call of `tool` toward reads and edits, as a `started` row does.
+fn count_call(tool: &str, reads: &mut u32, edits: &mut u32) {
+    if tool == "readToolCall" || is_shell_tool(tool) {
+        *reads = reads.saturating_add(1);
+        if is_shell_tool(tool) {
+            *edits = edits.saturating_add(1);
+        }
+    } else if tool == "writeToolCall" {
+        *edits = edits.saturating_add(1);
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct CursorToolContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     read_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     write_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     write_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     workdir: Option<String>,
 }
 

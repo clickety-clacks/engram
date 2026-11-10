@@ -1,13 +1,16 @@
 use std::collections::HashMap;
 
 use chrono::{SecondsFormat, TimeZone, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::pending::{PendingCalls, load_calls, store_calls};
 use super::structured::{bounded_shell_read, is_absolute_path, parse_patch, patch_is_complete};
 
 const DEFAULT_TS: &str = "1970-01-01T00:00:00Z";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum ToolKind {
     Read,
     Edit,
@@ -15,15 +18,21 @@ enum ToolKind {
     Other,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ToolCallContext {
     kind: ToolKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     file: Option<String>,
     range: [u32; 2],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     before_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     after_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     patch_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     workdir: Option<String>,
 }
 
@@ -35,7 +44,25 @@ enum Extract {
 }
 
 pub fn openclaw_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::Error> {
-    convert(input, Extract::All)
+    convert(input, Extract::All, &mut HashMap::new())
+}
+
+/// Converts bytes appended after an earlier conversion, starting from the
+/// calls `pending` holds, and leaves in it the calls still unanswered. Calls
+/// of kinds that never emit evidence are not kept: their result's own
+/// fallback context emits nothing either.
+pub fn openclaw_jsonl_to_tape_jsonl_with_pending(
+    input: &str,
+    pending: &mut PendingCalls,
+) -> Result<String, serde_json::Error> {
+    let mut tool_contexts = load_calls::<ToolCallContext>(&pending.calls)?;
+    let tape = convert(input, Extract::All, &mut tool_contexts)?;
+    pending.calls = store_calls(
+        tool_contexts
+            .iter()
+            .filter(|(_, context)| context.kind != ToolKind::Other),
+    )?;
+    Ok(tape)
 }
 
 /// Readers before 0.2.14 skipped user messages whose `content` is a plain
@@ -43,7 +70,7 @@ pub fn openclaw_jsonl_to_tape_jsonl(input: &str) -> Result<String, serde_json::E
 /// catch-up over bytes an older reader already ingested, or `None` when
 /// there are none.
 pub fn openclaw_plain_string_user_jsonl(input: &str) -> Result<Option<String>, serde_json::Error> {
-    let tape = convert(input, Extract::PlainStringUser)?;
+    let tape = convert(input, Extract::PlainStringUser, &mut HashMap::new())?;
     // One line is the meta row alone.
     Ok((tape.lines().count() > 1).then_some(tape))
 }
@@ -53,17 +80,20 @@ pub fn openclaw_plain_string_user_jsonl(input: &str) -> Result<Option<String>, s
 /// ingested, only what reading that output adds: each such `tool.result` and
 /// the `code.read` derived from it, or `None` when there is nothing to add.
 pub fn openclaw_nested_tool_result_jsonl(input: &str) -> Result<Option<String>, serde_json::Error> {
-    let tape = convert(input, Extract::NestedToolResult)?;
+    let tape = convert(input, Extract::NestedToolResult, &mut HashMap::new())?;
     // One line is the meta row alone.
     Ok((tape.lines().count() > 1).then_some(tape))
 }
 
-fn convert(input: &str, extract: Extract) -> Result<String, serde_json::Error> {
+fn convert(
+    input: &str,
+    extract: Extract,
+    tool_contexts: &mut HashMap<String, ToolCallContext>,
+) -> Result<String, serde_json::Error> {
     let mut events = Vec::new();
     let mut first_ts = None::<String>;
     let mut session_id = None::<String>;
     let mut saw_json = false;
-    let mut tool_contexts = HashMap::<String, ToolCallContext>::new();
 
     for line in input.lines() {
         if line.trim().is_empty() {
@@ -77,7 +107,7 @@ fn convert(input: &str, extract: Extract) -> Result<String, serde_json::Error> {
             &mut events,
             &mut first_ts,
             &mut session_id,
-            &mut tool_contexts,
+            tool_contexts,
         );
     }
 
