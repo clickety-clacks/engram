@@ -157,12 +157,28 @@ where
         .expect("ingest should succeed");
 }
 
+fn find_claude_live_sample() -> Option<PathBuf> {
+    let projects_dir = home_dir().join(".claude/projects");
+    for project_entry in fs::read_dir(&projects_dir).ok()?.flatten() {
+        let project_dir = project_entry.path();
+        if !project_dir.is_dir() {
+            continue;
+        }
+        for session_entry in fs::read_dir(&project_dir).ok()?.flatten() {
+            let path = session_entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 #[test]
-#[ignore = "requires host-b live Claude Code sample"]
+#[ignore = "requires a live Claude Code session sample under ~/.claude/projects"]
 fn claude_live_sample_yields_winnow_evidence_rows() {
-    let path = home_dir().join(
-        ".claude/projects/-Users-user-src-clawdbot/780ea36e-5dcc-459a-b768-d2f12f9381ce.jsonl",
-    );
+    let path = find_claude_live_sample()
+        .expect("expected at least one live Claude Code session sample under ~/.claude/projects/*/*.jsonl");
     assert_live_sample_has_winnow_evidence("claude-live", &path, claude_jsonl_to_tape_jsonl);
 }
 

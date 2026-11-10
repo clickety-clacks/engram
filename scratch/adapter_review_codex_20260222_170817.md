@@ -101,7 +101,7 @@ The sandbox's read-only filesystem and likely network restrictions prevent savin
 exec
 /bin/zsh -lc 'git show 4c72fd4 --stat' in /Users/user/src/engram succeeded in 433ms:
 commit 4c72fd46de7b457f001a2baa486ae98b93279e1f
-Author: Alex Rivera <alex@clicketyclacks.co>
+Author: Review Author <review-author@example.invalid>
 Date:   Sun Feb 22 14:03:17 2026 -0800
 
     Add unified adapter contract and conformance harness
@@ -117,7 +117,7 @@ Git showed a warning about the /tmp cache being read-only, but the operation suc
 exec
 /bin/zsh -lc 'git show 45483e0 --stat' in /Users/user/src/engram succeeded in 434ms:
 commit 45483e0a8b50840162dcb85cd4df0d4f48f785b1
-Author: Alex Rivera <alex@clicketyclacks.co>
+Author: Review Author <review-author@example.invalid>
 Date:   Sun Feb 22 14:03:23 2026 -0800
 
     Enforce deterministic Codex/Claude mapping and coverage metadata
@@ -137,7 +137,7 @@ thinking
 exec
 /bin/zsh -lc 'git show 9b426d5 --stat' in /Users/user/src/engram succeeded in 439ms:
 commit 9b426d531410d65de9164cadb7384deedb3fdf41
-Author: Alex Rivera <alex@clicketyclacks.co>
+Author: Review Author <review-author@example.invalid>
 Date:   Sun Feb 22 16:15:07 2026 -0800
 
     Fix tautological coverage in ConformanceReport and vacuous coverage grade
