@@ -74,6 +74,10 @@ fn oc_result(second: u32, call_id: &str, tool: &str, error: bool, text: &str) ->
     )
 }
 
+fn oc_ignored_entry(entry_type: &str) -> String {
+    json!({"type": entry_type, "timestamp": oc_ts(12)}).to_string()
+}
+
 /// A read, an edit, a shell read, and a read whose first result is an error
 /// and whose id later gets a success.
 fn openclaw_lines() -> Vec<String> {
@@ -99,6 +103,21 @@ fn openclaw_lines() -> Vec<String> {
             11,
             json!({"role": "assistant", "content": [{"type": "text", "text": "done"}]}),
         ),
+    ]
+}
+
+fn openclaw_r6_lines() -> Vec<String> {
+    vec![
+        json!({"type": "session", "id": "oc-r6", "timestamp": oc_ts(0)}).to_string(),
+        oc_row(
+            "u1",
+            1,
+            json!({"role": "user", "content": "read two files"}),
+        ),
+        oc_call(2, "prior", "read", json!({"path": "/repo/src/a.rs"})),
+        oc_result(3, "prior", "read", false, "fn alpha() {}"),
+        oc_call(4, "pending", "read", json!({"path": "/repo/src/b.rs"})),
+        oc_result(5, "pending", "read", false, "fn beta() {}"),
     ]
 }
 
@@ -304,6 +323,32 @@ impl Store {
             .expect("rows")
     }
 
+    fn tape_path(&self, tape_id: &str) -> PathBuf {
+        let file_name = format!("{tape_id}.jsonl.zst");
+        let mut dirs = vec![self.temp.path().to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in fs::read_dir(dir).expect("read dir") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.file_name().and_then(|name| name.to_str())
+                    == Some(file_name.as_str())
+                {
+                    return path;
+                }
+            }
+        }
+        panic!("tape file for {tape_id} not found");
+    }
+
+    fn tape_events_for_id(&self, tape_id: &str) -> Vec<Value> {
+        tape_events(&fs::read(self.tape_path(tape_id)).expect("tape bytes"))
+    }
+
+    fn remove_tape_file(&self, tape_id: &str) {
+        fs::remove_file(self.tape_path(tape_id)).expect("remove tape file");
+    }
+
     /// Events of every indexed tape, by tape id.
     fn tapes(&self) -> BTreeMap<String, Vec<Value>> {
         let indexed = self.indexed_tape_ids();
@@ -370,6 +415,19 @@ fn files(events: &[Value]) -> Vec<String> {
         .filter(|event| is_evidence(event))
         .map(|event| event["file"].as_str().expect("file").to_string())
         .collect()
+}
+
+fn openclaw_store_with_pending_read() -> (Store, Vec<String>) {
+    let lines = openclaw_r6_lines();
+    let store = Store::new(Reader::OpenClaw);
+    store.append(&lines[..2]);
+    store.ingest();
+    store.append(&lines[2..4]);
+    store.ingest();
+    store.append(&lines[4..5]);
+    store.ingest();
+    assert_eq!(store.evidence(), one_pass(Reader::OpenClaw, &lines[..5]));
+    (store, lines)
 }
 
 #[test]
@@ -686,4 +744,252 @@ fn a_lost_cursor_save_indexes_the_lost_piece_twice() {
         expected.sort();
         assert_eq!(store.evidence(), expected, "{reader:?}");
     }
+}
+
+#[test]
+fn r6_openclaw_ignored_entry_tails_keep_pending_calls_without_rereading_prefix() {
+    let ignored = [
+        ("custom", vec![oc_ignored_entry("custom")]),
+        ("custom_message", vec![oc_ignored_entry("custom_message")]),
+        ("compaction", vec![oc_ignored_entry("compaction")]),
+        ("model_change", vec![oc_ignored_entry("model_change")]),
+        (
+            "thinking_level_change",
+            vec![oc_ignored_entry("thinking_level_change")],
+        ),
+        (
+            "all ignored entry types",
+            [
+                "custom",
+                "custom_message",
+                "compaction",
+                "model_change",
+                "thinking_level_change",
+            ]
+            .into_iter()
+            .map(oc_ignored_entry)
+            .collect(),
+        ),
+    ];
+
+    for (name, tail) in ignored {
+        let (store, lines) = openclaw_store_with_pending_read();
+        let expected_lines = [&lines[..5], tail.as_slice(), &lines[5..]].concat();
+        let expected = one_pass(Reader::OpenClaw, &expected_lines);
+        let cursor_before = store.cursor();
+        let tapes_before = store.indexed_tape_ids();
+        let evidence_before = store.evidence();
+
+        store.append(&tail);
+        let report = store.ingest();
+        assert_eq!(report["imported_tapes"], 0, "{name}: {report}");
+        assert_eq!(store.cursor(), cursor_before, "{name}");
+        assert_eq!(store.indexed_tape_ids(), tapes_before, "{name}");
+        assert_eq!(store.evidence(), evidence_before, "{name}");
+        if cursor_before.get("pending_calls").is_some() {
+            assert_eq!(store.pending_call_ids(), vec!["pending"], "{name}");
+        }
+
+        store.append(&lines[5..]);
+        store.ingest();
+        assert_eq!(store.evidence(), expected, "{name}");
+        assert!(store.pending_call_ids().is_empty(), "{name}");
+    }
+}
+
+#[test]
+fn r6_openclaw_ignored_entry_tails_allow_empty_and_whitespace_lines() {
+    let (store, lines) = openclaw_store_with_pending_read();
+    let tail = vec![
+        oc_ignored_entry("custom"),
+        String::new(),
+        " \t".to_string(),
+        oc_ignored_entry("compaction"),
+    ];
+    let expected_lines = [&lines[..5], tail.as_slice(), &lines[5..]].concat();
+    let expected = one_pass(Reader::OpenClaw, &expected_lines);
+    let cursor_before = store.cursor();
+    let tapes_before = store.indexed_tape_ids();
+
+    store.append(&tail);
+    let report = store.ingest();
+    assert_eq!(report["imported_tapes"], 0, "{report}");
+    assert_eq!(store.cursor(), cursor_before);
+    assert_eq!(store.indexed_tape_ids(), tapes_before);
+    if cursor_before.get("pending_calls").is_some() {
+        assert_eq!(store.pending_call_ids(), vec!["pending"]);
+    }
+
+    store.append(&lines[5..]);
+    store.ingest();
+    assert_eq!(store.evidence(), expected);
+}
+
+#[test]
+fn r6_openclaw_tails_outside_the_ignored_entry_rule_keep_the_full_reread() {
+    let cases = vec![
+        (
+            "another row type",
+            vec![json!({"type": "frobnicate"}).to_string()],
+        ),
+        ("damaged line", vec!["{damaged".to_string()]),
+        ("blank only", vec![String::new(), " \t".to_string()]),
+        (
+            "ignored plus damaged",
+            vec![oc_ignored_entry("custom"), "{damaged".to_string()],
+        ),
+        (
+            "ignored plus another row type",
+            vec![
+                oc_ignored_entry("custom"),
+                json!({"type": "frobnicate"}).to_string(),
+            ],
+        ),
+        (
+            "ignored plus non-object value",
+            vec![oc_ignored_entry("custom"), "[1]".to_string()],
+        ),
+    ];
+
+    for (name, tail) in cases {
+        let (store, _) = openclaw_store_with_pending_read();
+        let cursor_before = store.cursor();
+        let tapes_before = store.indexed_tape_ids();
+        let evidence_before = store.evidence();
+
+        store.append(&tail);
+        let report = store.ingest();
+        assert!(
+            report["imported_tapes"].as_u64().unwrap_or(0) > 0,
+            "{name}: {report}"
+        );
+        assert_ne!(
+            store.cursor()["tape_id"],
+            cursor_before["tape_id"],
+            "{name}"
+        );
+        assert!(store.evidence().len() > evidence_before.len(), "{name}");
+        let reread = store.new_events(&tapes_before);
+        assert!(
+            files(&reread).contains(&"/repo/src/a.rs".to_string()),
+            "{name}: {reread:?}"
+        );
+    }
+}
+
+#[test]
+fn r6_legacy_openclaw_cursor_seeds_across_an_ignored_tail_and_pairs_once() {
+    let (store, lines) = openclaw_store_with_pending_read();
+    let expected = one_pass(Reader::OpenClaw, &lines);
+    let mut legacy_cursor = store.cursor();
+    legacy_cursor
+        .as_object_mut()
+        .expect("cursor object")
+        .remove("pending_calls");
+    fs::write(store.cursor_path(), legacy_cursor.to_string()).expect("legacy cursor write");
+    let cursor_before = store.cursor();
+    let tapes_before = store.indexed_tape_ids();
+
+    store.append(&[oc_ignored_entry("custom_message")]);
+    let report = store.ingest();
+    assert_eq!(report["imported_tapes"], 0, "{report}");
+    assert_eq!(store.cursor(), cursor_before);
+    assert_eq!(store.indexed_tape_ids(), tapes_before);
+    assert!(store.cursor().get("pending_calls").is_none());
+
+    store.append(&lines[5..]);
+    store.ingest();
+    assert_eq!(store.evidence(), expected);
+    assert!(store.cursor().get("pending_calls").is_some());
+    assert!(store.pending_call_ids().is_empty());
+}
+
+#[test]
+fn r6_openclaw_ignored_tail_still_full_rereads_for_guard_cursor_and_tape_failures() {
+    for reason in ["guard mismatch", "cursor past EOF", "missing tape"] {
+        let (store, _) = openclaw_store_with_pending_read();
+        let mut cursor = store.cursor();
+        let prior_tape = cursor["tape_id"].as_str().expect("tape id").to_string();
+        store.append(&[oc_ignored_entry("custom")]);
+
+        match reason {
+            "guard mismatch" => {
+                let source = fs::read_to_string(&store.source).expect("source");
+                let rewritten = source.replace("/repo/src/b.rs", "/repo/src/c.rs");
+                assert_ne!(source, rewritten, "fixture has guarded text");
+                let guard_offset = cursor["cursor_guard"]["offset"]
+                    .as_u64()
+                    .expect("guard offset") as usize;
+                let guard_len = cursor["cursor_guard"]["len"]
+                    .as_u64()
+                    .expect("guard length") as usize;
+                assert_ne!(
+                    &source.as_bytes()[guard_offset..guard_offset + guard_len],
+                    &rewritten.as_bytes()[guard_offset..guard_offset + guard_len],
+                    "rewrite changes bytes inside the cursor guard"
+                );
+                fs::write(&store.source, rewritten).expect("rewrite guarded prefix");
+            }
+            "cursor past EOF" => {
+                cursor["byte_cursor"] =
+                    json!(fs::metadata(&store.source).expect("source metadata").len() + 1);
+                fs::write(store.cursor_path(), cursor.to_string()).expect("cursor write");
+            }
+            "missing tape" => store.remove_tape_file(&prior_tape),
+            _ => unreachable!(),
+        }
+
+        let report = store.ingest();
+        assert!(
+            report["imported_tapes"].as_u64().unwrap_or(0) > 0,
+            "{reason}: {report}"
+        );
+        let after = store.cursor();
+        assert_ne!(after["tape_id"], prior_tape, "{reason}");
+        assert_eq!(
+            after["byte_cursor"],
+            fs::metadata(&store.source).expect("source metadata").len(),
+            "{reason}"
+        );
+        let reread = store.tape_events_for_id(after["tape_id"].as_str().expect("tape id"));
+        assert!(
+            files(&reread).contains(&"/repo/src/a.rs".to_string()),
+            "{reason}: {reread:?}"
+        );
+    }
+}
+
+#[test]
+fn r6_fresh_file_with_only_ignored_openclaw_rows_is_still_skipped() {
+    let store = Store::new(Reader::OpenClaw);
+    store.append(&[oc_ignored_entry("custom")]);
+    let report = store.ingest();
+    assert_eq!(report["skipped_non_transcript"], 1, "{report}");
+    assert!(store.indexed_tape_ids().is_empty());
+    assert!(!store.cursor_path().exists());
+}
+
+#[test]
+fn r6_cursor_custom_tail_keeps_the_existing_full_reread_behavior() {
+    let lines = cursor_lines();
+    let store = Store::new(Reader::Cursor);
+    store.append(&lines[..4]);
+    store.ingest();
+    store.append(&[cursor_read_started("pending", "/repo/src/b.rs")]);
+    store.ingest();
+    let tapes_before = store.indexed_tape_ids();
+    let cursor_before = store.cursor();
+
+    store.append(&[oc_ignored_entry("custom")]);
+    let report = store.ingest();
+    assert!(
+        report["imported_tapes"].as_u64().unwrap_or(0) > 0,
+        "{report}"
+    );
+    assert_ne!(store.cursor()["tape_id"], cursor_before["tape_id"]);
+    let reread = store.new_events(&tapes_before);
+    assert!(
+        files(&reread).contains(&"/repo/src/main.rs".to_string()),
+        "{reread:?}"
+    );
 }

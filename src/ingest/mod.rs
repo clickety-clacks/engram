@@ -292,6 +292,7 @@ pub fn run_ingest(
         let mut ingest_bytes = Vec::new();
         let mut adapter_hint = None;
         let mut next_cursor = 0u64;
+        let mut openclaw_ignored_tail = false;
         // Damaged lines in the bytes read: (file offset, length with LF).
         let mut damaged = Vec::<(u64, u64)>::new();
 
@@ -327,6 +328,11 @@ pub fn run_ingest(
                 skipped_unchanged += 1;
                 continue;
             }
+            openclaw_ignored_tail = adapter_hint == Some(AdapterId::OpenClaw)
+                && prior_state
+                    .as_ref()
+                    .is_some_and(|state| state.adapter == AdapterId::OpenClaw.as_str())
+                && is_openclaw_ignored_only_tail(&prefix);
             damaged = prefix.damaged_at(prev.byte_cursor);
             ingest_bytes = prefix.bytes;
             next_cursor = prev.byte_cursor + prefix.complete as u64;
@@ -374,6 +380,10 @@ pub fn run_ingest(
                 && prior_state
                     .as_ref()
                     .is_some_and(|state| state.continuity.is_some()))
+                // An OpenClaw cursor admits only clean ignored-row tails here;
+                // the converter leaves pending state unchanged, and the no-event
+                // path keeps the cursor in place for the next append.
+                || (openclaw_ignored_tail && *adapter == AdapterId::OpenClaw)
                 || adapter_claims_input(*adapter, ingest_input)
         });
         let adapter = if let Some(value) = adapter {
@@ -1018,6 +1028,40 @@ pub(crate) fn complete_ingest_prefix(path: &Path, bytes: &[u8]) -> IngestPrefix 
         };
     }
     complete_jsonl_prefix(bytes)
+}
+
+fn is_openclaw_ignored_only_tail(prefix: &IngestPrefix) -> bool {
+    if !prefix.damaged.is_empty() {
+        return false;
+    }
+
+    let mut has_ignored_entry = false;
+    for line in prefix.bytes.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(line) else {
+            return false;
+        };
+        let Some(entry_type) = value
+            .as_object()
+            .and_then(|object| object.get("type"))
+            .and_then(Value::as_str)
+        else {
+            return false;
+        };
+        if matches!(
+            entry_type,
+            "custom" | "custom_message" | "compaction" | "model_change" | "thinking_level_change"
+        ) {
+            has_ignored_entry = true;
+        } else {
+            return false;
+        }
+    }
+
+    has_ignored_entry
 }
 
 /// Every LF-terminated line is complete. A line that does not parse is
